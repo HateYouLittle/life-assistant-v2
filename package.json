@@ -1,0 +1,41 @@
+{
+  "name": "life-assistant",
+  "version": "2.0.0",
+  "description": "Life Assistant v2 — single-daemon personal life assistant (MCP + scheduler + outbox) for Hermes Agent",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "main": "dist/daemon.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "lint": "biome lint src tests",
+    "lint:fix": "biome lint --write src tests",
+    "format": "biome format --write src tests",
+    "test": "node --import tsx/esm --test \"tests/**/*.test.ts\"",
+    "start": "node dist/daemon.js",
+    "dev": "tsx src/daemon.ts",
+    "db:backup": "node dist/backup.js",
+    "dev:db:backup": "tsx src/backup.ts",
+    "import:v1": "node dist/import-v1.js",
+    "dev:import:v1": "tsx src/import-v1.ts"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.0.12",
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "hono": "^4.13.2",
+    "lunar-javascript": "^1.7.7",
+    "luxon": "^3.7.2",
+    "node-cron": "^3.0.3",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.13",
+    "@types/luxon": "^3.7.3",
+    "@types/node": "^24.0.0",
+    "@types/node-cron": "^3.0.11",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  }
+}
