@@ -24,6 +24,14 @@ export interface ImportReport {
   occurrencesDropped: number;
 }
 
+const STATUS_MAP: Record<string, "active" | "done" | "cancelled"> = {
+  active: "active",
+  completed: "done",
+  done: "done",
+  cancelled: "cancelled",
+  canceled: "cancelled",
+};
+
 const WEEKDAY_MAP: Record<string, number> = {
   mo: 0,
   tu: 1,
@@ -191,7 +199,11 @@ export function runImport(target: ReturnType<typeof openDatabase>, oldPath: stri
       for (const s of schedules) {
         const kind = ["todo", "birthday", "anniversary"].includes(s.type) ? s.type : "todo";
         const calendar = s.calendar === "lunar" ? "lunar" : "solar";
-        const status = ["active", "done", "cancelled"].includes(s.status) ? s.status : "active";
+        const mappedStatus = STATUS_MAP[s.status];
+        if (mappedStatus === undefined) {
+          report.scheduleWarnings.push(`日程「${s.title}」旧状态「${s.status}」无法识别，按 active 处理`);
+        }
+        const status = mappedStatus ?? "active";
         const { recurrence, workdayFilter } = mapRecurrence(s.recurrence_json, calendar, s.title, report.scheduleWarnings);
         const offsets = mapReminders(s.reminders_json, s.title, report.scheduleWarnings);
         const resend = s.reminder_interval_minutes !== null && s.reminder_interval_minutes > 0
@@ -218,7 +230,7 @@ export function runImport(target: ReturnType<typeof openDatabase>, oldPath: stri
           JSON.stringify(offsets),
           resend,
           workdayFilter,
-          s.enabled === 0 ? "cancelled" : status,
+          status,
           Math.max(s.version, 1),
           s.created_at,
           s.updated_at,

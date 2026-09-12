@@ -129,6 +129,35 @@ describe("import:v1", () => {
     }
   });
 
+  it("completed 映射为 done，且不以 enabled=0 推导取消", () => {
+    const env = makeTestEnv();
+    try {
+      const oldPath = `${env.dir}/old.db`;
+      buildOldDb(oldPath);
+      const old = new DatabaseSync(oldPath);
+      const ts = "2026-01-01T00:00:00.000Z";
+      const insert = old.prepare(
+        `INSERT INTO schedules (profile_id, id, type, title, status, calendar, date, time, all_day, timezone,
+           recurrence_json, reminders_json, enabled, version, created_at, updated_at)
+         VALUES (?, ?, 'todo', ?, ?, 'solar', ?, '09:00', 0, 'Asia/Shanghai', '{}', '[]', ?, 1, ?, ?)`,
+      );
+      insert.run("p1", "s5", "已完成且enabled0", "completed", "2026-04-01", 0, ts, ts);
+      insert.run("p1", "s6", "已完成且enabled1", "completed", "2026-04-02", 1, ts, ts);
+      insert.run("p1", "s7", "奇怪状态", "weird", "2026-04-03", 1, ts, ts);
+      old.close();
+
+      const report = runImport(env.db, oldPath);
+      const statusOf = (id: string): string =>
+        (env.db.prepare("SELECT status FROM schedules WHERE id = ?").get(id) as { status: string }).status;
+      assert.equal(statusOf("s5"), "done");
+      assert.equal(statusOf("s6"), "done");
+      assert.equal(statusOf("s7"), "active");
+      assert.ok(report.scheduleWarnings.some((w) => w.includes("weird")), "无法识别的状态应写 warning");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("拒绝导入非空目标库（--force 除外）", () => {
     const env = makeTestEnv();
     try {
