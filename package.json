@@ -14,12 +14,12 @@
     "lint:fix": "biome lint --write src tests",
     "format": "biome format --write src tests",
     "test": "node --import tsx/esm --test \"tests/**/*.test.ts\"",
-    "start": "node dist/daemon.js",
-    "dev": "tsx src/daemon.ts",
-    "db:backup": "node dist/backup.js",
-    "dev:db:backup": "tsx src/backup.ts",
-    "import:v1": "node dist/import-v1.js",
-    "dev:import:v1": "tsx src/import-v1.ts"
+    "start": "node --env-file-if-exists=.env dist/daemon.js",
+    "dev": "tsx --env-file-if-exists=.env src/daemon.ts",
+    "db:backup": "node --env-file-if-exists=.env dist/backup.js",
+    "dev:db:backup": "tsx --env-file-if-exists=.env src/backup.ts",
+    "import:v1": "node --env-file-if-exists=.env dist/import-v1.js",
+    "dev:import:v1": "tsx --env-file-if-exists=.env src/import-v1.ts"
   },
   "dependencies": {
     "@hono/node-server": "^2.0.12",

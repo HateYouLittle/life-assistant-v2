@@ -5,7 +5,7 @@ import type { ResolvedConfig } from "../config.js";
 
 /**
  * 模块注册表：核心不 import 模块内部文件；模块通过 tools/jobs/tick/onStart 四个
- * 扩展点接入，由契约测试强制（tests/registry-contract.test.ts）。
+ * 扩展点接入，由契约测试强制（tests/registry.test.ts）。
  */
 
 export interface NotifyBlock {

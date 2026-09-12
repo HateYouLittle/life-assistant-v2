@@ -26,7 +26,7 @@ read_when:
 | 下一假期 / 某月安排 / 某日是否上班 | `holiday {view}` |
 | 待办、生日、纪念日提醒（公历+农历） | `schedule {action}` |
 | 账本管理 | `ledger {action}` |
-| 记一笔支出 / 明细 / 汇总 | `expense {action}` |
+| 记一笔支出 / 明细 / 汇总 / 删除记错的一笔 | `expense {action}` |
 | 拉通知 / 静默时段 / 推送路由 / 取消推送 | `notify {action}` |
 
 硬性边界：
@@ -57,6 +57,7 @@ read_when:
 - 账本全局共享：任何 Profile 创建/记账/汇总均可，回执与月报会推送给所有配置了路由的 Profile。
 - 记账前先 `ledger {action: "list"}` 取得账本 id；`expense` 的 `add`/`list`/`summary` 三个 action 都必须传 `ledger_id`。
 - 汇总用 `expense {action: "summary"}`，可按 `month`、`from/to`、`by`（记账人）过滤。
+- 记错金额/分类时用 `expense {action: "delete", id}` 删除（id 从 `list` 取）再重记；删除不可恢复，删前先向用户确认。
 - 每月 1 号 09:00 自动推送上月月报（表格），不要手动复算。
 
 ## 通知
