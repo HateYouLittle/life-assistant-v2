@@ -112,7 +112,9 @@ function scheduleToolInner(args: Record<string, unknown>, ctx: ToolContext) {
         leapPolicy: patch.leapPolicy ?? "follow",
         lunarClamp: patch.lunarClamp ?? true,
         time: patch.time ?? "09:00",
-        allDay: patch.allDay ?? true,
+        // 未显式指定时按"有具体时刻"处理（对齐 v1 的 allDay 可空语义）；
+        // 否则即使传了 time，也会被展示成"全天"。
+        allDay: patch.allDay ?? false,
         recurrence: patch.recurrence ?? (kind === "todo" ? null : { freq: "yearly", interval: 1 }),
         remindOffsets: patch.remindOffsets ?? [0],
         resendMinutes: patch.resendMinutes ?? 0,
@@ -193,7 +195,7 @@ registerModule({
         leap_policy: z.enum(["follow", "regular"]).optional().describe("闰月策略，默认 follow"),
         lunar_clamp: z.boolean().optional().describe("农历日越界（如腊月三十缺失）取当月最后一天，默认 true"),
         time: z.string().regex(TIME_RE).optional().describe("提醒时刻 HH:MM，默认 09:00"),
-        all_day: z.boolean().optional().describe("默认 true"),
+        all_day: z.boolean().optional().describe("默认 false（有具体时刻按时间提醒）；纯日期事件设 true"),
         recurrence: recurrenceInput.optional(),
         workday_filter: z.enum(["any", "workday", "holiday"]).optional().describe("仅公历；节假日数据缺失时自动暂停"),
         remind_offsets: z

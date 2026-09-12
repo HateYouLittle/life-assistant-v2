@@ -98,6 +98,22 @@ describe("schedule 工具：生命周期", () => {
     }
   });
 
+  it("未传 all_day 时默认为 false：设了 time 就不该显示全天", () => {
+    const env = makeTestEnv();
+    try {
+      const created = JSON.parse(
+        (tool(env, { action: "add", title: "默认全天验证", date: todayIso(), time: "17:16" }).content[0]?.text ?? "{}"),
+      ) as { 已创建: { id: string; 时间: string } };
+      assert.doesNotMatch(created.已创建.时间, /全天/);
+      const row = env.db.prepare("SELECT all_day FROM schedules WHERE id = ?").get(created.已创建.id) as {
+        all_day: number;
+      };
+      assert.equal(row.all_day, 0);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("update 修改时间并重新物化，version 递增", () => {
     const env = makeTestEnv();
     try {
