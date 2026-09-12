@@ -334,4 +334,28 @@ describe("schedule 提醒触发", () => {
       cleanupTestEnv(env);
     }
   });
+
+  it("count 计的是事件次数，不是提醒行数", () => {
+    const env = makeTestEnv();
+    try {
+      const created = createSchedule(env.db, "default", {
+        title: "限次任务",
+        kind: "todo",
+        calendar: "solar",
+        startDate: todayIso(),
+        time: "09:00",
+        allDay: false,
+        recurrence: { freq: "daily", interval: 1, count: 3 },
+        remindOffsets: [-30, 0, 30],
+        resendMinutes: 0,
+        workdayFilter: "any",
+      });
+      const rows = occurrenceRows(env, created.id);
+      const events = new Set(rows.map((r) => r.event_at));
+      assert.equal(events.size, 3, "count=3 应物化 3 天（此前按偏移行数计数只物化 1 天）");
+      assert.equal(rows.length, 9, "3 个事件 × 3 个提醒偏移");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
 });

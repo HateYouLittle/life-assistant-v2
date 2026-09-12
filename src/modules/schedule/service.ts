@@ -67,6 +67,9 @@ const FAR_HORIZON_DAYS = 400;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 
+/** 工作日过滤暂停时的告警去重：scheduleId → 已告警的日期，避免每分钟刷屏 */
+const pausedWarned = new Map<string, string>();
+
 export function newShortId(): string {
   return randomBytes(4).toString("hex");
 }
@@ -159,9 +162,12 @@ export function listSchedules(db: DatabaseSync, profileId: string, status: strin
     .all(profileId, status, limit) as unknown as ScheduleRow[];
 }
 
-function countOccurrences(db: DatabaseSync, scheduleId: string): number {
+/** 已物化的「事件」数（同一事件的多个提醒偏移共用 event_at，只算一次） */
+function countEvents(db: DatabaseSync, scheduleId: string): number {
   const row = db
-    .prepare("SELECT COUNT(*) AS n FROM occurrences WHERE schedule_id = ? AND status != 'cancelled'")
+    .prepare(
+      "SELECT COUNT(DISTINCT event_at) AS n FROM occurrences WHERE schedule_id = ? AND status != 'cancelled'",
+    )
     .get(scheduleId) as { n: number };
   return row.n;
 }
@@ -177,7 +183,7 @@ function updateNextRunAt(db: DatabaseSync, scheduleId: string): void {
 export function materializeSchedule(db: DatabaseSync, row: ScheduleRow): void {
   if (row.status !== "active") return;
   const rec = parseRecurrence(row.recurrence_json);
-  let existing = countOccurrences(db, row.id);
+  let existing = countEvents(db, row.id);
   if (rec?.count !== undefined && existing >= rec.count) {
     updateNextRunAt(db, row.id);
     return;
@@ -199,11 +205,16 @@ export function materializeSchedule(db: DatabaseSync, row: ScheduleRow): void {
     if (row.workday_filter !== "any") {
       const cls = dayType(db, dateISO);
       if (cls === "unknown") {
-        logger.warn(
-          `日程「${row.title}」的 ${row.workday_filter} 过滤因 ${dateISO.slice(0, 4)} 年节假日数据未就绪而暂停`,
-        );
-        break; // 保守暂停语义保留，但必须留痕，不能再静默
+        // 保守暂停语义保留，但必须留痕且不能每分钟刷屏
+        if (pausedWarned.get(row.id) !== dateISO) {
+          pausedWarned.set(row.id, dateISO);
+          logger.warn(
+            `日程「${row.title}」的 ${row.workday_filter} 过滤因 ${dateISO.slice(0, 4)} 年节假日数据未就绪而暂停`,
+          );
+        }
+        break;
       }
+      pausedWarned.delete(row.id);
       const isWork = cls === "workday" || cls === "weekday";
       const isOff = cls === "holiday" || cls === "weekend";
       if (row.workday_filter === "workday" && !isWork) {
@@ -229,7 +240,7 @@ export function materializeSchedule(db: DatabaseSync, row: ScheduleRow): void {
         const due = DateTime.fromISO(eventAt).plus({ minutes: offsetMinutes });
         insert.run(row.id, `${prefix}#${idx}`, eventAt, due.toUTC().toISO() ?? eventAt);
       });
-      existing += offsets.length;
+      existing += 1;
     }
     after = date;
     if (date > nearHorizon) break;
