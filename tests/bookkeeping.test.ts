@@ -192,5 +192,35 @@ describe("bookkeeping：支出", () => {
     assert.deepEqual(monthRange("2024-02"), { from: "2024-02-01", to: "2024-02-29" });
     assert.equal(previousMonth(new Date("2026-01-05")), "2025-12");
     assert.equal(previousMonth(new Date("2026-09-15")), "2026-08");
+    // 本地已是 9 月 1 日凌晨，UTC 仍是 8 月 31 日：必须按 Asia/Shanghai 取月
+    assert.equal(previousMonth(new Date("2026-08-31T20:00:00Z")), "2026-08");
+  });
+
+  it("delete 删除记错的一笔，汇总随之变化", () => {
+    const env = makeTestEnv();
+    const t = tools(env);
+    try {
+      const ledger = JSON.parse(text(t.ledger({ action: "create", name: "日用" }))) as { 已创建: { id: string } };
+      const ledgerId = ledger.已创建.id;
+      const first = JSON.parse(text(t.expense({ action: "add", ledger_id: ledgerId, amount: 50 }))) as {
+        已记账: { id: string };
+      };
+      t.expense({ action: "add", ledger_id: ledgerId, amount: 20 });
+      const removed = JSON.parse(text(t.expense({ action: "delete", id: first.已记账.id }))) as {
+        已删除: { 金额: string };
+      };
+      assert.equal(removed.已删除.金额, "¥50.00");
+      const month = new Date().toISOString().slice(0, 7);
+      const sum = JSON.parse(text(t.expense({ action: "summary", ledger_id: ledgerId, month }))) as {
+        合计: string;
+        笔数: number;
+      };
+      assert.equal(sum.合计, "¥20.00");
+      assert.equal(sum.笔数, 1);
+      assert.equal(t.expense({ action: "delete", id: first.已记账.id }).isError, true, "重复删除应报错");
+      assert.equal(t.expense({ action: "delete" }).isError, true, "缺 id 应报错");
+    } finally {
+      cleanupTestEnv(env);
+    }
   });
 });

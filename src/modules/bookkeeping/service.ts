@@ -93,6 +93,13 @@ export function addExpense(
   return db.prepare("SELECT * FROM expenses WHERE id = ?").get(id) as unknown as ExpenseRow;
 }
 
+export function deleteExpense(db: DatabaseSync, id: string): ExpenseRow {
+  const row = db.prepare("SELECT * FROM expenses WHERE id = ?").get(id) as ExpenseRow | undefined;
+  if (row === undefined) throw new Error(`账目不存在: ${id}`);
+  db.prepare("DELETE FROM expenses WHERE id = ?").run(id);
+  return row;
+}
+
 export function listExpenses(
   db: DatabaseSync,
   ledgerId: string,
@@ -172,11 +179,10 @@ export function monthRange(ym: string): { from: string; to: string } {
   return { from, to: `${ym}-${String(lastDay).padStart(2, "0")}` };
 }
 
+/** 上一个月（按 Asia/Shanghai 本地月份，避免 UTC 月初/月末错位） */
 export function previousMonth(now: Date = new Date()): string {
-  const ym = now.toISOString().slice(0, 7);
-  const year = Number(ym.slice(0, 4));
-  const month = Number(ym.slice(5, 7));
-  return month === 1 ? `${year - 1}-12` : `${year}-${String(month - 1).padStart(2, "0")}`;
+  const local = DateTime.fromJSDate(now, { zone: TZ });
+  return local.month === 1 ? `${local.year - 1}-12` : `${local.year}-${String(local.month - 1).padStart(2, "0")}`;
 }
 
 export function monthlyReportBlocks(summary: ExpenseSummary): NotifyBlock {

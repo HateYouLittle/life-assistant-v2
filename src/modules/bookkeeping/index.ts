@@ -1,10 +1,12 @@
 import { z } from "zod";
 import { DATE_RE, todayIso } from "../../time.js";
-import { fail, okJson, registerModule, runtime, type ToolContext } from "../../core/registry.js";
+import { errorMessage, fail, okJson, registerModule, runtime, type ToolContext } from "../../core/registry.js";
+import { logger } from "../../core/logger.js";
 import {
   addExpense,
   centsToYuan,
   createLedger,
+  deleteExpense,
   entryReceiptBlocks,
   getLedger,
   listExpenses,
@@ -83,7 +85,7 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
           blocks: entryReceiptBlocks(ledger, entry),
           dedupeKey: `entry:${entry.id}`,
         })
-        .catch(() => {});
+        .catch((e) => logger.warn(`记账回执发布失败（记账已成功）: ${errorMessage(e)}`));
       return okJson({
         已记账: {
           id: entry.id,
@@ -146,6 +148,21 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
         按记账人: summary.profiles.map((p) => ({ 记账人: p.profile, 金额: `¥${centsToYuan(p.cents)}` })),
       });
     }
+    if (action === "delete") {
+      const id = args.id as string | undefined;
+      if (id === undefined) return fail("delete 需要 id（可从 expense {action:'list'} 获取）");
+      const entry = deleteExpense(db, id);
+      return okJson({
+        已删除: {
+          id: entry.id,
+          金额: `¥${centsToYuan(entry.amount_cents)}`,
+          分类: entry.category,
+          日期: entry.spent_on,
+          记账人: entry.created_by_profile,
+        },
+        说明: "该笔支出已直接删除，无法恢复",
+      });
+    }
     return fail(`未知 action: ${action}`);
   } catch (e) {
     return fail(e instanceof Error ? e.message : String(e));
@@ -171,9 +188,10 @@ registerModule({
     {
       name: "expense",
       description:
-        "支出记账：add 记一笔（ledger_id + amount 元，可选 category/note/date，回执全局推送）；list 明细（可按 month/from/to/by 过滤）；summary 汇总（按分类与记账人）。金额只支持支出，单位为元。",
+        "支出记账：add 记一笔（ledger_id + amount 元，可选 category/note/date，回执全局推送）；list 明细（可按 month/from/to/by 过滤）；summary 汇总（按分类与记账人）；delete 删除记错的一笔（id 从 list 获取）。金额只支持支出，单位为元。",
       inputSchema: {
-        action: z.enum(["add", "list", "summary"]),
+        action: z.enum(["add", "list", "summary", "delete"]),
+        id: z.string().optional().describe("delete 时的账目 id"),
         ledger_id: z
           .string()
           .optional()
