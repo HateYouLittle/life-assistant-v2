@@ -1,6 +1,6 @@
 # Life Assistant v2
 
-面向 [Hermes Agent](https://github.com/HateYouLittle/life-assistant) 的个人生活助理 MCP 服务（v2 全面重构版）。
+个人生活助理 MCP 服务（[v1](https://github.com/HateYouLittle/life-assistant) 的全面重构版），面向 Hermes Agent。
 
 单守护进程架构：一个常驻进程承载 **MCP over Streamable HTTP**、**定时调度**、**outbox 主动推送** 与**状态页**；SQLite（Node ≥22 内置 `node:sqlite`）单写者，无跨进程并发防护。
 
