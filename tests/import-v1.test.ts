@@ -158,6 +158,29 @@ describe("import:v1", () => {
     }
   });
 
+  it("支出日期按本地时区换算，不取 UTC 截断", () => {
+    const env = makeTestEnv();
+    try {
+      const oldPath = `${env.dir}/old.db`;
+      buildOldDb(oldPath);
+      const old = new DatabaseSync(oldPath);
+      const ts = "2026-01-01T00:00:00.000Z";
+      old
+        .prepare(
+          `INSERT INTO ledger_entries (ledger_id, id, profile_id, type, amount_cents, category, occurred_at, created_at, updated_at)
+           VALUES (?, ?, ?, 'expense', ?, ?, ?, ?, ?)`,
+        )
+        .run("l1", "e9", "p1", 8800, "餐饮", "2026-09-02T16:00:00.000Z", ts, ts);
+      old.close();
+
+      runImport(env.db, oldPath);
+      const e = env.db.prepare("SELECT spent_on FROM expenses WHERE id = 'e9'").get() as { spent_on: string };
+      assert.equal(e.spent_on, "2026-09-03", "UTC 16:00 应换算为北京次日");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("拒绝导入非空目标库（--force 除外）", () => {
     const env = makeTestEnv();
     try {

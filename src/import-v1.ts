@@ -1,7 +1,9 @@
 import { DatabaseSync } from "node:sqlite";
 import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { DateTime } from "luxon";
 import { loadConfig } from "./config.js";
+import { TZ } from "./time.js";
 import { openDatabase, withTransaction } from "./core/database.js";
 import { logger } from "./core/logger.js";
 import { ensureProfile, setSetting } from "./core/settings.js";
@@ -293,7 +295,7 @@ export function runImport(target: ReturnType<typeof openDatabase>, oldPath: stri
           e.amount_cents,
           e.category ?? "其他",
           e.note,
-          e.occurred_at.slice(0, 10),
+          toLocalDate(e.occurred_at, e.id, report.scheduleWarnings),
           e.profile_id,
           e.created_at,
         );
@@ -340,6 +342,16 @@ export function runImport(target: ReturnType<typeof openDatabase>, oldPath: stri
 
 function warnings(report: ImportReport, message: string): void {
   report.scheduleWarnings.push(message);
+}
+
+/** V1 occurred_at 存 UTC ISO，换算到本地时区后取日历日；解析失败回退原截取并留痕 */
+function toLocalDate(occurredAt: string, label: string, warnings: string[]): string {
+  const dt = DateTime.fromISO(occurredAt, { zone: "utc" });
+  if (!dt.isValid) {
+    warnings.push(`支出 ${label} 的 occurred_at「${occurredAt}」无法解析，按原字符串前 10 位作为日期`);
+    return occurredAt.slice(0, 10);
+  }
+  return dt.setZone(TZ).toISODate() ?? occurredAt.slice(0, 10);
 }
 
 function resolveOldDbPath(from: string): string {
