@@ -90,6 +90,22 @@ describe("bookkeeping：支出", () => {
       assert.equal(sum.笔数, 2);
       assert.equal(sum.分类明细[0]?.分类, "交通");
       assert.equal(sum.按记账人.length, 2);
+
+      const byPartner = JSON.parse(
+        text(t.expense({ action: "summary", ledger_id: ledgerId, month, by: "partner" })),
+      ) as { 合计: string; 笔数: number; 分类明细: unknown[]; 按记账人: unknown[] };
+      assert.equal(byPartner.合计, "¥30.00");
+      assert.equal(byPartner.笔数, 1);
+      assert.equal(byPartner.分类明细.length, 1);
+      assert.equal(byPartner.按记账人.length, 1);
+
+      const byNobody = JSON.parse(
+        text(t.expense({ action: "summary", ledger_id: ledgerId, month, by: "nobody" })),
+      ) as { 合计: string; 笔数: number; 分类明细: unknown[]; 按记账人: unknown[] };
+      assert.equal(byNobody.合计, "¥0.00");
+      assert.equal(byNobody.笔数, 0);
+      assert.equal(byNobody.分类明细.length, 0);
+      assert.equal(byNobody.按记账人.length, 0);
     } finally {
       cleanupTestEnv(env);
     }
@@ -124,6 +140,19 @@ describe("bookkeeping：支出", () => {
       assert.equal(summary.categories[0]?.category, "餐饮");
       assert.equal(summary.categories[0]?.share, 0.8);
       assert.equal(summary.profiles.find((p) => p.profile === "p2")?.cents, 2000);
+
+      const byP2 = summarizeExpenses(env.db, ledger.id, { from: "2026-08-01", to: "2026-08-31", by: "p2" });
+      assert.equal(byP2.total_cents, 2000);
+      assert.equal(byP2.count, 1);
+      assert.equal(byP2.categories.length, 1);
+      assert.equal(byP2.categories[0]?.share, 1);
+      assert.equal(byP2.profiles.length, 1);
+
+      const byNobody = summarizeExpenses(env.db, ledger.id, { from: "2026-08-01", to: "2026-08-31", by: "nobody" });
+      assert.equal(byNobody.total_cents, 0);
+      assert.equal(byNobody.count, 0);
+      assert.equal(byNobody.categories.length, 0);
+      assert.equal(byNobody.profiles.length, 0);
     } finally {
       cleanupTestEnv(env);
     }

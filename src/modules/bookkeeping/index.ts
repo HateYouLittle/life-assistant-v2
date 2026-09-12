@@ -127,7 +127,7 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
               from: (args.from as string | undefined) ?? `${todayIso().slice(0, 7)}-01`,
               to: (args.to as string | undefined) ?? todayIso(),
             };
-      const summary = summarizeExpenses(db, ledgerId, range);
+      const summary = summarizeExpenses(db, ledgerId, { ...range, by: args.by as string | undefined });
       return okJson({
         区间: range,
         合计: `¥${centsToYuan(summary.total_cents)}`,

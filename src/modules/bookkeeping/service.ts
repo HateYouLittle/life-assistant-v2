@@ -128,23 +128,28 @@ export interface ExpenseSummary {
 export function summarizeExpenses(
   db: DatabaseSync,
   ledgerId: string,
-  opts: { from: string; to: string },
+  opts: { from: string; to: string; by?: string },
 ): ExpenseSummary {
+  const conditions = ["ledger_id = ?", "spent_on >= ?", "spent_on <= ?"];
+  const params: string[] = [ledgerId, opts.from, opts.to];
+  if (opts.by !== undefined) {
+    conditions.push("created_by_profile = ?");
+    params.push(opts.by);
+  }
+  const where = conditions.join(" AND ");
   const range = db
-    .prepare(
-      "SELECT COALESCE(SUM(amount_cents), 0) AS total, COUNT(*) AS count FROM expenses WHERE ledger_id = ? AND spent_on >= ? AND spent_on <= ?",
-    )
-    .get(ledgerId, opts.from, opts.to) as { total: number; count: number };
+    .prepare(`SELECT COALESCE(SUM(amount_cents), 0) AS total, COUNT(*) AS count FROM expenses WHERE ${where}`)
+    .get(...params) as { total: number; count: number };
   const categories = db
     .prepare(
-      "SELECT category, SUM(amount_cents) AS cents FROM expenses WHERE ledger_id = ? AND spent_on >= ? AND spent_on <= ? GROUP BY category ORDER BY cents DESC",
+      `SELECT category, SUM(amount_cents) AS cents FROM expenses WHERE ${where} GROUP BY category ORDER BY cents DESC`,
     )
-    .all(ledgerId, opts.from, opts.to) as { category: string; cents: number }[];
+    .all(...params) as { category: string; cents: number }[];
   const profiles = db
     .prepare(
-      "SELECT created_by_profile AS profile, SUM(amount_cents) AS cents FROM expenses WHERE ledger_id = ? AND spent_on >= ? AND spent_on <= ? GROUP BY created_by_profile ORDER BY cents DESC",
+      `SELECT created_by_profile AS profile, SUM(amount_cents) AS cents FROM expenses WHERE ${where} GROUP BY created_by_profile ORDER BY cents DESC`,
     )
-    .all(ledgerId, opts.from, opts.to) as { profile: string; cents: number }[];
+    .all(...params) as { profile: string; cents: number }[];
   return {
     total_cents: range.total,
     count: range.count,
