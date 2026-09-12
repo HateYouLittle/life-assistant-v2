@@ -53,7 +53,9 @@ async function holidayTool(args: Record<string, unknown>, ctx: ToolContext) {
     return ok(`${date}：休息日（法定节假日：${name.name}）`);
   }
   if (cls === "workday") return ok(`${date}：上班日（调休补班）`);
-  return ok(`${date}：未知（不在节假日数据覆盖范围内，不猜测）`);
+  if (cls === "weekend") return ok(`${date}：休息日（周末）`);
+  if (cls === "weekday") return ok(`${date}：上班日（工作日）`);
+  return ok(`${date}：未知（${date.slice(0, 4)} 年节假日数据未就绪，不猜测）`);
 }
 
 registerModule({

@@ -7,6 +7,7 @@ import { describeRecurrence, nextDate, type OccurrenceSource, type Recurrence } 
 import type { NotifyBlock, Services } from "../../core/registry.js";
 import { withTransaction } from "../../core/database.js";
 import { ensureProfile } from "../../core/settings.js";
+import { logger } from "../../core/logger.js";
 
 export type ScheduleKind = "todo" | "birthday" | "anniversary";
 export type WorkdayFilter = "any" | "workday" | "holiday";
@@ -194,12 +195,19 @@ export function materializeSchedule(db: DatabaseSync, row: ScheduleRow): void {
     const dateISO = date.toISODate() ?? "";
     if (row.workday_filter !== "any") {
       const cls = dayType(db, dateISO);
-      if (cls === "unknown") break;
-      if (row.workday_filter === "workday" && cls !== "workday") {
+      if (cls === "unknown") {
+        logger.warn(
+          `日程「${row.title}」的 ${row.workday_filter} 过滤因 ${dateISO.slice(0, 4)} 年节假日数据未就绪而暂停`,
+        );
+        break; // 保守暂停语义保留，但必须留痕，不能再静默
+      }
+      const isWork = cls === "workday" || cls === "weekday";
+      const isOff = cls === "holiday" || cls === "weekend";
+      if (row.workday_filter === "workday" && !isWork) {
         after = date;
         continue;
       }
-      if (row.workday_filter === "holiday" && cls !== "holiday") {
+      if (row.workday_filter === "holiday" && !isOff) {
         after = date;
         continue;
       }

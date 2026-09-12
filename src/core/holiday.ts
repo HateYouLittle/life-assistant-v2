@@ -5,7 +5,7 @@ import { fetchJson } from "./http.js";
 import { withTransaction } from "./database.js";
 import { logger } from "./logger.js";
 
-export type DayType = "holiday" | "workday";
+export type DayType = "holiday" | "workday" | "weekend" | "weekday";
 
 export interface HolidayDay {
   name: string;
@@ -27,13 +27,24 @@ const SOURCES = (year: number): string[] => [
   `https://raw.githubusercontent.com/NateScarlet/holiday-cn/master/${year}.json`,
 ];
 
-/** 日期分类：严格按导入数据，未覆盖返回 unknown（调用方不猜测标准周） */
+/**
+ * 日期分类。规则：
+ * 1. 命中 cn_holiday_days → holiday / workday（权威数据）
+ * 2. 未命中但该年份 status='ready' → 按星期兜底：周六日=weekend，其余=weekday
+ * 3. 未命中且该年份数据未就绪 → unknown（调用方必须暂停，不得猜测）
+ */
 export function dayType(db: DatabaseSync, date: string): DayType | "unknown" {
   const row = db.prepare("SELECT day_type FROM cn_holiday_days WHERE date = ?").get(date) as
     | { day_type: string }
     | undefined;
-  if (row === undefined) return "unknown";
-  return row.day_type as DayType;
+  if (row !== undefined) return row.day_type as DayType;
+  const year = Number(date.slice(0, 4));
+  const meta = db.prepare("SELECT status FROM cn_holiday_years WHERE year = ?").get(year) as
+    | { status: string }
+    | undefined;
+  if (meta?.status !== "ready") return "unknown";
+  const weekday = DateTime.fromISO(date, { zone: TZ }).weekday; // 6=周六 7=周日
+  return weekday >= 6 ? "weekend" : "weekday";
 }
 
 export function holidayYearsReady(db: DatabaseSync): number[] {

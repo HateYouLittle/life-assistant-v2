@@ -84,13 +84,13 @@ describe("节假日导入与查询", () => {
       assert.equal(importYear(env.db, payload2026(), "test"), 36);
       assert.equal(dayType(env.db, "2026-01-01"), "holiday");
       assert.equal(dayType(env.db, "2026-02-14"), "workday");
-      assert.equal(dayType(env.db, "2026-03-15"), "unknown");
+      assert.equal(dayType(env.db, "2026-03-15"), "weekend", "年份就绪时未命中表按星期兜底");
       assert.deepEqual(holidayYearsReady(env.db), [2026]);
 
       const smaller = payload2026();
       smaller.days = smaller.days.filter((d) => d.date < "2026-02-01");
       importYear(env.db, smaller, "test");
-      assert.equal(dayType(env.db, "2026-02-14"), "unknown", "替换后旧数据应消失");
+      assert.equal(dayType(env.db, "2026-02-14"), "weekend", "替换后旧数据应消失，按星期兜底为周末");
     } finally {
       cleanupTestEnv(env);
     }
