@@ -99,7 +99,13 @@ export function validateYearPayload(payload: unknown): string[] {
   }
 
   if (year >= 2008) {
-    const names = new Set([...offDays, ...workdays].map((d) => d.name));
+    // 数据源在国庆与中秋重叠的年份会给出合并名（如「国庆节、中秋节」，2025/2028 均如此），
+    // 因此必须按分隔符拆成原子节日名再比对，否则整年数据会被误判为「缺少节日」而拒绝导入。
+    const names = new Set(
+      [...offDays, ...workdays]
+        .flatMap((d) => d.name.split(/[、，,／/\s]+/))
+        .filter((name) => name !== ""),
+    );
     for (const festival of FESTIVALS) {
       if (!names.has(festival)) errors.push(`缺少节日: ${festival}`);
     }

@@ -49,6 +49,14 @@ describe("节假日数据校验", () => {
     assert.ok(errors.some((e) => e.includes("春节")));
   });
 
+  it("国庆与中秋合并命名（数据源真实格式，2025/2028）不误判为缺少节日", () => {
+    const payload = payload2026();
+    for (const day of payload.days) {
+      if (day.name === "中秋节" || day.name === "国庆节") day.name = "国庆节、中秋节";
+    }
+    assert.deepEqual(validateYearPayload(payload), []);
+  });
+
   it("调休上班日不是周末报错", () => {
     const payload = payload2026();
     payload.days.push({ name: "调休", date: "2026-03-02", isOffDay: false }); // 周一
