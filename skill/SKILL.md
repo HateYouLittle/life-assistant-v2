@@ -55,6 +55,7 @@ read_when:
 
 - 只记支出，金额单位为元（`amount: 12.34`）。
 - 账本全局共享：任何 Profile 创建/记账/汇总均可，回执与月报会推送给所有配置了路由的 Profile。
+- 记账前先 `ledger {action: "list"}` 取得账本 id；`expense` 的 `add`/`list`/`summary` 三个 action 都必须传 `ledger_id`。
 - 汇总用 `expense {action: "summary"}`，可按 `month`、`from/to`、`by`（记账人）过滤。
 - 每月 1 号 09:00 自动推送上月月报（表格），不要手动复算。
 

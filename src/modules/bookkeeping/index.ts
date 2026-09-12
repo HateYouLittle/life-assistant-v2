@@ -62,7 +62,9 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
     if (action === "add") {
       const ledgerId = args.ledger_id as string | undefined;
       const amount = args.amount as number | undefined;
-      if (ledgerId === undefined || amount === undefined) return fail("add 需要 ledger_id 和 amount（元）");
+      if (ledgerId === undefined || amount === undefined) {
+        return fail('add 需要 ledger_id（先调用 ledger {action:"list"} 取账本 id）和 amount（元）');
+      }
       if (!Number.isFinite(amount) || amount <= 0 || amount > 1_000_000) return fail(`金额不合法: ${String(amount)}`);
       const cents = Math.round(amount * 100);
       const entry = addExpense(db, ctx.profileId, {
@@ -95,7 +97,9 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
     }
     if (action === "list") {
       const ledgerId = args.ledger_id as string | undefined;
-      if (ledgerId === undefined) return fail("list 需要 ledger_id");
+      if (ledgerId === undefined) {
+        return fail('list 需要 ledger_id（先调用 ledger {action:"list"} 取账本 id）');
+      }
       const range: { from?: string; to?: string } =
         args.month === undefined ? {} : monthRange(args.month as string);
       const rows = listExpenses(db, ledgerId, {
@@ -118,7 +122,9 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
     }
     if (action === "summary") {
       const ledgerId = args.ledger_id as string | undefined;
-      if (ledgerId === undefined) return fail("summary 需要 ledger_id");
+      if (ledgerId === undefined) {
+        return fail('summary 需要 ledger_id（先调用 ledger {action:"list"} 取账本 id）');
+      }
       if (getLedger(db, ledgerId) === undefined) return fail(`账本不存在: ${ledgerId}`);
       const range =
         args.month !== undefined
@@ -168,7 +174,10 @@ registerModule({
         "支出记账：add 记一笔（ledger_id + amount 元，可选 category/note/date，回执全局推送）；list 明细（可按 month/from/to/by 过滤）；summary 汇总（按分类与记账人）。金额只支持支出，单位为元。",
       inputSchema: {
         action: z.enum(["add", "list", "summary"]),
-        ledger_id: z.string().optional(),
+        ledger_id: z
+          .string()
+          .optional()
+          .describe('账本 id；add/list/summary 必填，先调用 ledger {action:"list"} 获取'),
         amount: z.number().min(0.01).max(1_000_000).optional().describe("金额（元）"),
         category: z.string().max(20).optional(),
         note: z.string().max(200).optional(),
