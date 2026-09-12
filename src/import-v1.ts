@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { DateTime } from "luxon";
 import { loadConfig } from "./config.js";
@@ -354,13 +354,43 @@ function toLocalDate(occurredAt: string, label: string, warnings: string[]): str
   return dt.setZone(TZ).toISODate() ?? occurredAt.slice(0, 10);
 }
 
-function resolveOldDbPath(from: string): string {
+const DB_CANDIDATE_NAMES = ["life-assistant.db", "life-assistant.sqlite", "assistant.db", "hermes.db"];
+
+/** 目录下疑似旧数据库（排除 -wal/-shm 与备份文件） */
+function scanDbFiles(from: string): string[] {
+  try {
+    return readdirSync(from)
+      .filter(
+        (name) =>
+          (name.endsWith(".db") || name.endsWith(".sqlite")) &&
+          !/-wal$/.test(name) &&
+          !/-shm$/.test(name) &&
+          !/\.bak-/.test(name) &&
+          !/\.backup-/.test(name),
+      )
+      .map((name) => join(from, name))
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+export function resolveOldDbPath(from: string): string {
   if (statSync(from).isFile()) return from;
-  for (const name of ["life-assistant.db", "assistant.db", "hermes.db"]) {
+  const tried: string[] = [];
+  for (const name of DB_CANDIDATE_NAMES) {
     const candidate = join(from, name);
+    tried.push(candidate);
     if (existsSync(candidate)) return candidate;
   }
-  throw new Error(`目录 ${from} 下未找到旧数据库文件（life-assistant.db / assistant.db）`);
+  const scanned = scanDbFiles(from);
+  if (scanned.length === 1) return scanned[0] as string;
+  if (scanned.length > 1) {
+    throw new Error(
+      `目录 ${from} 下发现多个候选旧数据库，无法自动选择：${scanned.join(" / ")}；请用 --from 显式指定其中一个文件`,
+    );
+  }
+  throw new Error(`目录 ${from} 下未找到旧数据库文件（已尝试：${tried.join(" / ")}）`);
 }
 
 function main(): void {

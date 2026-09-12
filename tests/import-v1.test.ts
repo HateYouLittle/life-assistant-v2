@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
-import { runImport } from "../src/import-v1.js";
+import { resolveOldDbPath, runImport } from "../src/import-v1.js";
 import { cleanupTestEnv, makeTestEnv } from "./helpers.js";
 
 const OLD_DDL = `
@@ -78,6 +79,66 @@ function buildOldDb(path: string): void {
   db.prepare("INSERT INTO cn_holiday_year_meta VALUES (2026, 'ready', 'test', 'hash', ?, NULL, NULL)").run(ts);
   db.close();
 }
+
+describe("import:v1 旧库路径解析", () => {
+  function touch(path: string): void {
+    writeFileSync(path, "");
+  }
+
+  it("优先命中固定候选名（含 V1 实际的 life-assistant.sqlite）", () => {
+    const env = makeTestEnv();
+    try {
+      const dir = `${env.dir}/data`;
+      mkdirSync(dir);
+      touch(`${dir}/life-assistant.sqlite`);
+      touch(`${dir}/life-assistant.sqlite-wal`);
+      touch(`${dir}/life-assistant.sqlite-shm`);
+      assert.equal(resolveOldDbPath(dir), `${dir}/life-assistant.sqlite`);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("固定名单未命中时，唯一 *.sqlite 自动使用，且排除 -wal/-shm/备份", () => {
+    const env = makeTestEnv();
+    try {
+      const dir = `${env.dir}/data`;
+      mkdirSync(dir);
+      touch(`${dir}/custom.sqlite`);
+      touch(`${dir}/custom.sqlite-wal`);
+      touch(`${dir}/custom.sqlite-shm`);
+      touch(`${dir}/archive.db.bak-20260101`);
+      touch(`${dir}/old.db.backup-2`);
+      assert.equal(resolveOldDbPath(dir), `${dir}/custom.sqlite`);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("多个候选时报错并列出全部候选", () => {
+    const env = makeTestEnv();
+    try {
+      const dir = `${env.dir}/data`;
+      mkdirSync(dir);
+      touch(`${dir}/a.db`);
+      touch(`${dir}/b.sqlite`);
+      assert.throws(() => resolveOldDbPath(dir), /多个候选[\s\S]*a\.db[\s\S]*b\.sqlite/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("无候选时报错并列出尝试过的固定名", () => {
+    const env = makeTestEnv();
+    try {
+      const dir = `${env.dir}/data`;
+      mkdirSync(dir);
+      assert.throws(() => resolveOldDbPath(dir), /life-assistant\.sqlite/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
 
 describe("import:v1", () => {
   it("完整映射旧库并输出报告", () => {
