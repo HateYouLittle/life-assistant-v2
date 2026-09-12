@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { loadConfig, type ResolvedConfig } from "./config.js";
 import { logger } from "./core/logger.js";
@@ -8,6 +8,10 @@ const FILE_RE = /^life-assistant-\d{8}-\d{6}\.db$/;
 const KEEP = 14;
 
 export function runBackup(config: ResolvedConfig, nowMs: number = Date.now()): string {
+  // sqlite 打开不存在的路径会顺手建一个空库，从而「成功」产出一份空备份
+  if (!existsSync(config.dbPath)) {
+    throw new Error(`数据库不存在，拒绝生成空备份: ${config.dbPath}（检查 DATA_DIR 是否指向真实数据目录）`);
+  }
   mkdirSync(config.backupDir, { recursive: true });
   const iso = new Date(nowMs).toISOString();
   const stamp = `${iso.slice(0, 10).replace(/-/g, "")}-${iso.slice(11, 19).replace(/:/g, "")}`;

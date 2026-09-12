@@ -30,6 +30,16 @@ describe("db:backup", () => {
     }
   });
 
+  it("数据库不存在时拒绝生成空备份", () => {
+    const env = makeTestEnv();
+    try {
+      const missing = { ...env.config, dbPath: join(env.dir, "nope", "life-assistant.db") };
+      assert.throws(() => runBackup(missing), /拒绝生成空备份/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("只保留最近 14 份", () => {
     const env = makeTestEnv();
     try {

@@ -17,7 +17,7 @@ export interface Recurrence {
   byweekday?: number[];
   /** 本地日期（含当天）为最后一次发生 */
   until?: string;
-  /** 由调用方按已物化的 occurrence 数执行（引擎不管历史） */
+  /** 由调用方按已物化的「事件」数执行（同一事件的多个提醒偏移只算一次；引擎不管历史） */
   count?: number;
 }
 
@@ -178,8 +178,8 @@ export function describeRecurrence(
     case "weekly": {
       const names = ["一", "二", "三", "四", "五", "六", "日"];
       const days = uniqSorted(rec.byweekday ?? []).map((d) => names[d] ?? "").join("、");
-      const body = `每周${n === 1 ? "" : n}${days === "" ? "" : days}`;
-      return body;
+      const week = n === 1 ? "每周" : `每 ${n} 周 `;
+      return `${week}${days}`;
     }
     case "monthly":
       return n === 1 ? `每月${startDate?.slice(8, 10) ?? ""}日` : `每 ${n} 个月`;

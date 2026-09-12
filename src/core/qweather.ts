@@ -1,5 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
-import { nowIso } from "../time.js";
+import { todayIso } from "../time.js";
 import { fetchJson } from "./http.js";
 import { getCache, getSetting, setCache, setSetting } from "./settings.js";
 
@@ -132,7 +132,8 @@ export async function forecast(
   )) as { code?: unknown; daily?: Array<Record<string, unknown>> };
   assertQwCode(body.code, `weather/${path}`);
   const daily = body.daily ?? [];
-  const today = nowIso().slice(0, 10);
+  // 用本地日历日过滤：UTC 日期在 00:00–08:00（Asia/Shanghai）会落在前一天，放行已过期的预报行
+  const today = todayIso();
   return daily
     .map((d) => ({
       date: String(d.fxDate ?? ""),

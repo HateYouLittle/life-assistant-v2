@@ -123,6 +123,11 @@ describe("recurrence：描述", () => {
       "每周一、五",
     );
     assert.equal(
+      describeRecurrence(solarSource("2026-01-05", { freq: "weekly", interval: 2, byweekday: [0, 2] }), "2026-01-05"),
+      "每 2 周 一、三",
+      "多周间隔要读得通，不能拼成「每周2一、三」",
+    );
+    assert.equal(
       describeRecurrence(lunarSource(5, 5), null),
       "每年农历5月5日",
     );
