@@ -2,6 +2,7 @@ import { createHmac } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { ResolvedConfig } from "../config.js";
 import { inQuietWindow, nowIso } from "../time.js";
+import { withTransaction } from "./database.js";
 import { logger } from "./logger.js";
 import { renderBlocks } from "./render.js";
 import type { PublishInput, PublishResult, Services } from "./registry.js";
@@ -121,48 +122,54 @@ export function publishProfile(
   profileId: string,
   input: PublishInput,
 ): PublishResult {
-  ensureProfile(db, profileId);
-  if (input.dedupeKey !== undefined) {
-    const existing = db
-      .prepare("SELECT id FROM notifications WHERE profile_id = ? AND dedupe_key = ?")
-      .get(profileId, input.dedupeKey) as { id: string } | undefined;
-    if (existing !== undefined) return { id: existing.id, deduped: true };
-  }
-
   const rendered = renderBlocks(input.blocks, "markdown");
   // 标题只走 title 字段：投递 payload 与 notify.pull 都单独返回标题，
   // 正文若再拼一次，两端各会多渲染一行重复标题。
   const bodyMd = rendered.body;
   const id = newId();
   const createdAt = nowIso();
-  db.prepare(
-    `INSERT INTO notifications (id, profile_id, kind, title, body_md, blocks_json, dedupe_key, read, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`,
-  ).run(
-    id,
-    profileId,
-    input.kind,
-    input.title,
-    bodyMd,
-    JSON.stringify(input.blocks),
-    input.dedupeKey ?? null,
-    createdAt,
-  );
-
   const route = getPushRoute(db, profileId);
   const secret = routeSecret(config, profileId);
-  if (route?.enabled && route.url !== "") {
-    if (secret === undefined) {
-      logger.warn(`Profile ${profileId} 已配置推送路由但 PROFILE_ROUTE_SECRETS_JSON 缺少对应 secret，通知仅保留可 pull`);
-    } else {
-      db.prepare(
-        `INSERT INTO deliveries (id, notification_id, route_name, status, next_attempt_at, created_at, updated_at)
-         VALUES (?, ?, ?, 'queued', ?, ?, ?)`,
-      ).run(newId(), id, route.name, createdAt, createdAt, createdAt);
-      drainSoon(db, config);
+  const routable = route?.enabled === true && route.url !== "";
+  const secretMissing = routable && secret === undefined;
+
+  // notification 与 delivery 必须同事务落库：只写进一半会让「有通知却没投递记录」永久卡住
+  const { result, queued } = withTransaction(db, () => {
+    ensureProfile(db, profileId);
+    if (input.dedupeKey !== undefined) {
+      const existing = db
+        .prepare("SELECT id FROM notifications WHERE profile_id = ? AND dedupe_key = ?")
+        .get(profileId, input.dedupeKey) as { id: string } | undefined;
+      if (existing !== undefined) return { result: { id: existing.id, deduped: true }, queued: false };
     }
+
+    db.prepare(
+      `INSERT INTO notifications (id, profile_id, kind, title, body_md, blocks_json, dedupe_key, read, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+    ).run(
+      id,
+      profileId,
+      input.kind,
+      input.title,
+      bodyMd,
+      JSON.stringify(input.blocks),
+      input.dedupeKey ?? null,
+      createdAt,
+    );
+
+    if (!routable || secret === undefined) return { result: { id, deduped: false }, queued: false };
+    db.prepare(
+      `INSERT INTO deliveries (id, notification_id, route_name, status, next_attempt_at, created_at, updated_at)
+       VALUES (?, ?, ?, 'queued', ?, ?, ?)`,
+    ).run(newId(), id, route.name, createdAt, createdAt, createdAt);
+    return { result: { id, deduped: false }, queued: true };
+  });
+
+  if (secretMissing) {
+    logger.warn(`Profile ${profileId} 已配置推送路由但 PROFILE_ROUTE_SECRETS_JSON 缺少对应 secret，通知仅保留可 pull`);
   }
-  return { id, deduped: false };
+  if (queued) drainSoon(db, config);
+  return result;
 }
 
 /** 全局事件：只为配置了启用路由的 Profile 物化（Profile 内去重） */
@@ -223,6 +230,13 @@ export function drainSoon(db: DatabaseSync, config: ResolvedConfig): void {
     drainTimer = null;
     void drainDue(db, config).catch((e) => logger.error(`outbox drain 失败: ${e instanceof Error ? e.message : e}`));
   }, 100);
+}
+
+/** 取消尚未触发的去抖 drain（关闭数据库/进程退出前调用，避免对已关闭的库报错） */
+export function cancelPendingDrain(): void {
+  if (drainTimer === null) return;
+  clearTimeout(drainTimer);
+  drainTimer = null;
 }
 
 /** 投递到期的 outbox 行；返回处理的行数。调度器每 20s 调一次，发布时也会即时触发 */

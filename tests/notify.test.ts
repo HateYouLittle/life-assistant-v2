@@ -332,6 +332,24 @@ describe("outbox 投递", () => {
       cleanupTestEnv(env);
     }
   });
+
+  it("投递记录写入失败时通知一并回滚（通知与 outbox 同事务）", () => {
+    const env = makeTestEnv({ PROFILE_ROUTE_SECRETS_JSON: JSON.stringify({ default: SECRET }) });
+    try {
+      setPushRoute(env.db, "default", { url: "http://127.0.0.1:9/hook" });
+      env.db.exec("CREATE TRIGGER boom BEFORE INSERT ON deliveries BEGIN SELECT RAISE(ABORT, 'boom'); END");
+      assert.throws(
+        () => publishProfile(env.db, env.config, "default", { kind: "k", title: "t", blocks: {} }),
+        /boom/,
+      );
+      const notifications = env.db.prepare("SELECT COUNT(*) AS n FROM notifications").get() as { n: number };
+      const deliveries = env.db.prepare("SELECT COUNT(*) AS n FROM deliveries").get() as { n: number };
+      assert.equal(notifications.n, 0, "回滚后不应留下「有通知却没投递记录」的孤儿行");
+      assert.equal(deliveries.n, 0);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
 });
 
 function ensureP(db: TestEnv["db"], id: string): void {
