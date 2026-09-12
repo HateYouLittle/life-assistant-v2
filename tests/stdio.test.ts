@@ -11,7 +11,7 @@ interface CapturedRequest {
   body: string;
 }
 
-function spawnShim(port: number): ReturnType<typeof spawn> {
+function spawnShim(port: number, extraEnv: Record<string, string> = {}): ReturnType<typeof spawn> {
   return spawn(
     process.execPath,
     ["--import", "tsx", join(process.cwd(), "src", "stdio.ts")],
@@ -21,6 +21,7 @@ function spawnShim(port: number): ReturnType<typeof spawn> {
         DATA_DIR: mkdtempSync(join(tmpdir(), "stdio-test-")),
         HERMES_PROFILE: "default",
         MCP_DAEMON_URL: `http://127.0.0.1:${port}`,
+        ...extraEnv,
       },
       stdio: ["pipe", "pipe", "pipe"],
     },
@@ -147,6 +148,35 @@ describe("stdio 兼容壳", () => {
         }
       },
     );
+  });
+
+  it("daemon 启用 token 时壳自动带 Authorization（MCP_DAEMON_TOKEN 优先，缺省复用 WEB_API_TOKEN）", async () => {
+    const seen: (string | undefined)[] = [];
+    await withServer(
+      (req, res, body) => {
+        seen.push(req.headers.authorization as string | undefined);
+        const parsed = JSON.parse(body) as { id: number };
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: { ok: true } }));
+      },
+      async (port) => {
+        const cases: Record<string, string>[] = [
+          { WEB_API_TOKEN: "w".repeat(32) },
+          { WEB_API_TOKEN: "w".repeat(32), MCP_DAEMON_TOKEN: "m".repeat(32) },
+        ];
+        for (const env of cases) {
+          const child = spawnShim(port, env);
+          try {
+            const promise = waitForLine(child);
+            child.stdin?.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" })}\n`);
+            await promise;
+          } finally {
+            child.kill();
+          }
+        }
+      },
+    );
+    assert.deepEqual(seen, [`Bearer ${"w".repeat(32)}`, `Bearer ${"m".repeat(32)}`]);
   });
 
   it("daemon 不可达时返回结构化错误（进程不崩溃）", async () => {

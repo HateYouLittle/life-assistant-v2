@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import type { DatabaseSync } from "node:sqlite";
 import { createRequire } from "node:module";
 import type { ResolvedConfig } from "../config.js";
+import { isRequestAuthorized } from "../core/auth.js";
 import { todayIso } from "../time.js";
 
 const require = createRequire(import.meta.url);
@@ -54,13 +55,8 @@ export function statusPayload(config: ResolvedConfig, db: DatabaseSync): Record<
 export function createStatusApp(config: ResolvedConfig, db: DatabaseSync): Hono {
   const app = new Hono();
   app.use("/api/*", async (c, next) => {
-    if (config.webApiToken !== undefined) {
-      const header = c.req.header("Authorization");
-      const bearer = header?.startsWith("Bearer ") ? header.slice(7) : undefined;
-      const query = c.req.query("token");
-      if (bearer !== config.webApiToken && query !== config.webApiToken) {
-        return c.json({ error: "unauthorized" }, 401);
-      }
+    if (!isRequestAuthorized(config.webApiToken, c.req.header("Authorization"), c.req.query("token"))) {
+      return c.json({ error: "unauthorized" }, 401);
     }
     await next();
   });

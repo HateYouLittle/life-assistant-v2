@@ -11,6 +11,8 @@ const config = loadConfig(process.env);
 const profile = parseProfileId(process.env.HERMES_PROFILE);
 const daemonUrl = process.env.MCP_DAEMON_URL ?? `http://127.0.0.1:${config.port}`;
 const endpoint = `${daemonUrl}/mcp`;
+/** daemon 启用 WEB_API_TOKEN 时（绑定非回环地址必填），壳必须带同一个 token */
+const daemonToken = process.env.MCP_DAEMON_TOKEN?.trim() || config.webApiToken;
 
 let sessionId: string | null = null;
 const queue: string[] = [];
@@ -21,12 +23,19 @@ interface IncomingMessage {
   method?: string;
 }
 
-function requestHeaders(): Record<string, string> {
+/** 不含会话头的公共头 */
+function baseHeaders(): Record<string, string> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     Accept: "application/json, text/event-stream",
     "X-Hermes-Profile": profile,
   };
+  if (daemonToken !== undefined && daemonToken !== "") headers.Authorization = `Bearer ${daemonToken}`;
+  return headers;
+}
+
+function requestHeaders(): Record<string, string> {
+  const headers = baseHeaders();
   if (sessionId !== null) headers["mcp-session-id"] = sessionId;
   return headers;
 }
@@ -41,11 +50,7 @@ async function reinitSession(): Promise<boolean> {
   try {
     const res = await fetch(endpoint, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json, text/event-stream",
-        "X-Hermes-Profile": profile,
-      },
+      headers: baseHeaders(),
       body: JSON.stringify({
         jsonrpc: "2.0",
         id: "shim-initialize",
