@@ -88,7 +88,7 @@ export function routeSecret(config: ResolvedConfig, profileId: string): string |
   return config.profileRouteSecrets[profileId];
 }
 
-function routedProfiles(db: DatabaseSync): string[] {
+export function routedProfiles(db: DatabaseSync): string[] {
   const rows = db.prepare("SELECT profile_id, value_json FROM settings WHERE key = 'push_route'").all() as {
     profile_id: string;
     value_json: string;

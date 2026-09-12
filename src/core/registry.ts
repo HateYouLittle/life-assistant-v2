@@ -58,8 +58,8 @@ export interface ToolDef {
 
 export interface JobDef {
   name: string;
-  /** 5 段 cron， Asia/Shanghai */
-  cron: string;
+  /** 5 段 cron（Asia/Shanghai）；可用函数惰性求值（如从 config 读取） */
+  cron: string | (() => string);
   handler(at: DateTime): Promise<void> | void;
 }
 

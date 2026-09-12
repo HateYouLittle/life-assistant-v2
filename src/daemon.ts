@@ -108,8 +108,8 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
   setLogLevel(config.logLevel);
   mkdirSync(config.dataDir, { recursive: true });
   const db = openDatabase(config.dbPath);
-  registerAllModules();
   initRuntime({ db, config, services: createServices(db, config) });
+  registerAllModules();
 
   const honoListener = getRequestListener(createStatusApp(config, db).fetch);
   const httpServer = createServer((req, res) => {
@@ -153,10 +153,12 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
 
   const tasks: cron.ScheduledTask[] = [];
   for (const { module, def } of allJobs()) {
+    const expr = typeof def.cron === "function" ? def.cron() : def.cron;
+    if (!cron.validate(expr)) throw new Error(`Job ${def.name} 的 cron 不合法: ${expr}`);
     tasks.push(
-      cron.schedule(def.cron, () => void runExclusive(`job:${def.name}`, () => def.handler(now())), { timezone: TZ }),
+      cron.schedule(expr, () => void runExclusive(`job:${def.name}`, () => def.handler(now())), { timezone: TZ }),
     );
-    logger.info(`注册定时任务 ${module}.${def.name}: "${def.cron}" (${TZ})`);
+    logger.info(`注册定时任务 ${module}.${def.name}: "${expr}" (${TZ})`);
   }
   tasks.push(cron.schedule("* * * * *", () => void runExclusive("tick", () => tickAll(now())), { timezone: TZ }));
   const drainTimer = setInterval(() => {

@@ -33,3 +33,19 @@ export function deleteSetting(db: DatabaseSync, profileId: string, key: string):
 export function newId(): string {
   return randomUUID();
 }
+
+export function getCache<T>(db: DatabaseSync, key: string): T | undefined {
+  const row = db.prepare("SELECT value_json FROM cache WHERE key = ? AND expires_at > ?").get(key, nowIso()) as
+    | { value_json: string }
+    | undefined;
+  if (row === undefined) return undefined;
+  return JSON.parse(row.value_json) as T;
+}
+
+export function setCache(db: DatabaseSync, key: string, value: unknown, ttlMs: number): void {
+  const expiresAt = new Date(Date.now() + ttlMs).toISOString();
+  db.prepare(
+    `INSERT INTO cache (key, value_json, expires_at) VALUES (?, ?, ?)
+     ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json, expires_at = excluded.expires_at`,
+  ).run(key, JSON.stringify(value), expiresAt);
+}

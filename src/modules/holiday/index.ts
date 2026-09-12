@@ -1,11 +1,11 @@
 import { z } from "zod";
 import { DATE_RE } from "../../time.js";
 import { dayType, ensureYears, holidayYearsReady, nextHolidayPeriod, requiredYears } from "../../core/holiday.js";
-import { errorMessage, fail, ok, okJson, registerModule, runtime, type ToolContext } from "../../core/registry.js";
+import { fail, ok, okJson, registerModule, runtime, type ToolContext } from "../../core/registry.js";
 import { logger } from "../../core/logger.js";
 
 async function holidayTool(args: Record<string, unknown>, ctx: ToolContext) {
-  const view = args["view"] as string;
+  const view = args.view as string;
   const db = ctx.db;
   if (view === "next") {
     const period = nextHolidayPeriod(db);
@@ -26,7 +26,7 @@ async function holidayTool(args: Record<string, unknown>, ctx: ToolContext) {
     });
   }
   if (view === "month") {
-    const month = typeof args["month"] === "string" ? args["month"] : "";
+    const month = typeof args.month === "string" ? args.month : "";
     if (!/^\d{4}-\d{2}$/.test(month)) return fail("month 需为 YYYY-MM 格式");
     const rows = db
       .prepare(
@@ -45,7 +45,7 @@ async function holidayTool(args: Record<string, unknown>, ctx: ToolContext) {
     });
   }
   // is_workday
-  const date = typeof args["date"] === "string" ? args["date"] : "";
+  const date = typeof args.date === "string" ? args.date : "";
   if (!DATE_RE.test(date)) return fail("date 需为 YYYY-MM-DD 格式");
   const cls = dayType(db, date);
   if (cls === "holiday") {

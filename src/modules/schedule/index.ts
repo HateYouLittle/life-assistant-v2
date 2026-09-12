@@ -38,24 +38,24 @@ function parseRecurrenceInput(value: unknown): Recurrence {
 /** 只收集显式提供的字段：add 时补默认值，update 时未提供的字段保持原值 */
 function buildPartial(args: Record<string, unknown>): SchedulePatch {
   const patch: SchedulePatch = {};
-  if (args["title"] !== undefined) patch.title = String(args["title"]);
-  if (args["note"] !== undefined) patch.note = String(args["note"]);
-  if (args["kind"] !== undefined) patch.kind = args["kind"] as ScheduleInput["kind"];
-  if (args["calendar"] !== undefined) patch.calendar = args["calendar"] as ScheduleInput["calendar"];
-  if (args["date"] !== undefined) patch.startDate = String(args["date"]);
-  if (args["lunar_month"] !== undefined) patch.lunarMonth = Number(args["lunar_month"]);
-  if (args["lunar_day"] !== undefined) patch.lunarDay = Number(args["lunar_day"]);
-  if (args["leap_policy"] !== undefined) patch.leapPolicy = args["leap_policy"] as "follow" | "regular";
-  if (args["lunar_clamp"] !== undefined) patch.lunarClamp = Boolean(args["lunar_clamp"]);
-  if (args["time"] !== undefined) patch.time = String(args["time"]);
-  if (args["all_day"] !== undefined) patch.allDay = Boolean(args["all_day"]);
-  if (args["recurrence"] !== undefined) patch.recurrence = parseRecurrenceInput(args["recurrence"]);
-  if (args["remind_offsets"] !== undefined) {
-    patch.remindOffsets = args["remind_offsets"] as number[];
+  if (args.title !== undefined) patch.title = String(args.title);
+  if (args.note !== undefined) patch.note = String(args.note);
+  if (args.kind !== undefined) patch.kind = args.kind as ScheduleInput["kind"];
+  if (args.calendar !== undefined) patch.calendar = args.calendar as ScheduleInput["calendar"];
+  if (args.date !== undefined) patch.startDate = String(args.date);
+  if (args.lunar_month !== undefined) patch.lunarMonth = Number(args.lunar_month);
+  if (args.lunar_day !== undefined) patch.lunarDay = Number(args.lunar_day);
+  if (args.leap_policy !== undefined) patch.leapPolicy = args.leap_policy as "follow" | "regular";
+  if (args.lunar_clamp !== undefined) patch.lunarClamp = Boolean(args.lunar_clamp);
+  if (args.time !== undefined) patch.time = String(args.time);
+  if (args.all_day !== undefined) patch.allDay = Boolean(args.all_day);
+  if (args.recurrence !== undefined) patch.recurrence = parseRecurrenceInput(args.recurrence);
+  if (args.remind_offsets !== undefined) {
+    patch.remindOffsets = args.remind_offsets as number[];
   }
-  if (args["resend_minutes"] !== undefined) patch.resendMinutes = Number(args["resend_minutes"]);
-  if (args["workday_filter"] !== undefined) {
-    patch.workdayFilter = args["workday_filter"] as ScheduleInput["workdayFilter"];
+  if (args.resend_minutes !== undefined) patch.resendMinutes = Number(args.resend_minutes);
+  if (args.workday_filter !== undefined) {
+    patch.workdayFilter = args.workday_filter as ScheduleInput["workdayFilter"];
   }
   return patch;
 }
@@ -94,11 +94,11 @@ export function scheduleTool(args: Record<string, unknown>, ctx: ToolContext) {
 }
 
 function scheduleToolInner(args: Record<string, unknown>, ctx: ToolContext) {
-  const action = args["action"] as string;
+  const action = args.action as string;
   const db = ctx.db;
   switch (action) {
     case "add": {
-      if (args["title"] === undefined) return fail("add 需要 title");
+      if (args.title === undefined) return fail("add 需要 title");
       const patch = buildPartial(args);
       const kind = patch.kind ?? "todo";
       const input: ScheduleInput = {
@@ -122,17 +122,17 @@ function scheduleToolInner(args: Record<string, unknown>, ctx: ToolContext) {
       return okJson({ 已创建: rowToPublic(row) });
     }
     case "list": {
-      const status = (args["status"] as string) ?? "active";
-      const limit = (args["limit"] as number) ?? 20;
+      const status = (args.status as string) ?? "active";
+      const limit = (args.limit as number) ?? 20;
       const rows = listSchedules(db, ctx.profileId, status, limit);
       return okJson({ 日程: rows.map(rowToPublic), 数量: rows.length });
     }
     case "update": {
-      const id = args["id"] as string;
+      const id = args.id as string;
       if (id === undefined) return fail("update 需要 id");
       const patch = buildPartial(args);
-      if (args["status"] !== undefined) {
-        const status = args["status"] as ScheduleRow["status"];
+      if (args.status !== undefined) {
+        const status = args.status as ScheduleRow["status"];
         if (status === "active" || status === "done" || status === "cancelled") patch.status = status;
       }
       if (Object.keys(patch).length === 0) return fail("没有提供要更新的字段");
@@ -140,21 +140,21 @@ function scheduleToolInner(args: Record<string, unknown>, ctx: ToolContext) {
       return okJson({ 已更新: rowToPublic(row) });
     }
     case "complete": {
-      const id = args["id"] as string;
+      const id = args.id as string;
       if (id === undefined) return fail("complete 需要 id");
-      const occurrenceKey = args["occurrence_key"] === undefined ? null : String(args["occurrence_key"]);
+      const occurrenceKey = args.occurrence_key === undefined ? null : String(args.occurrence_key);
       const row = completeSchedule(db, ctx.profileId, id, occurrenceKey);
       return okJson({ 已完成: rowToPublic(row) });
     }
     case "delete": {
-      const id = args["id"] as string;
+      const id = args.id as string;
       if (id === undefined) return fail("delete 需要 id");
       if (getSchedule(db, ctx.profileId, id) === undefined) return fail(`日程不存在: ${id}`);
       deleteSchedule(db, ctx.profileId, id);
       return ok(`已删除日程 ${id}`);
     }
     case "upcoming": {
-      const limit = (args["limit"] as number) ?? 10;
+      const limit = (args.limit as number) ?? 10;
       const items = upcoming(db, ctx.profileId, limit);
       return okJson({
         即将到来: items.map((i) => ({
