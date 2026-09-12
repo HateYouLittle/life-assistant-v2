@@ -1,0 +1,249 @@
+import type { DatabaseSync } from "node:sqlite";
+import { DateTime } from "luxon";
+import { TZ, todayIso } from "../time.js";
+import { fetchJson } from "./http.js";
+import { withTransaction } from "./database.js";
+import { logger } from "./logger.js";
+
+export type DayType = "holiday" | "workday";
+
+export interface HolidayDay {
+  name: string;
+  date: string;
+  isOffDay: boolean;
+}
+
+export interface HolidayYearPayload {
+  year: number;
+  days: HolidayDay[];
+}
+
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const FESTIVALS = ["元旦", "春节", "清明节", "劳动节", "端午节", "中秋节", "国庆节"];
+const FETCH_COOLDOWN_MS = 6 * 3600 * 1000;
+
+const SOURCES = (year: number): string[] => [
+  `https://cdn.jsdelivr.net/gh/NateScarlet/holiday-cn@master/${year}.json`,
+  `https://raw.githubusercontent.com/NateScarlet/holiday-cn/master/${year}.json`,
+];
+
+/** 日期分类：严格按导入数据，未覆盖返回 unknown（调用方不猜测标准周） */
+export function dayType(db: DatabaseSync, date: string): DayType | "unknown" {
+  const row = db.prepare("SELECT day_type FROM cn_holiday_days WHERE date = ?").get(date) as
+    | { day_type: string }
+    | undefined;
+  if (row === undefined) return "unknown";
+  return row.day_type as DayType;
+}
+
+export function holidayYearsReady(db: DatabaseSync): number[] {
+  return (db.prepare("SELECT year FROM cn_holiday_years WHERE status = 'ready' ORDER BY year").all() as {
+    year: number;
+  }[]).map((r) => r.year);
+}
+
+/** 校验 holiday-cn 年度数据；返回错误列表（空 = 通过） */
+export function validateYearPayload(payload: unknown): string[] {
+  const errors: string[] = [];
+  if (typeof payload !== "object" || payload === null) return ["payload 不是对象"];
+  const p = payload as { year?: unknown; days?: unknown };
+  const year = p.year;
+  if (typeof year !== "number" || !Number.isInteger(year) || year < 2004 || year > 2100) {
+    return ["year 字段不合法"];
+  }
+  if (!Array.isArray(p.days) || p.days.length === 0) return ["days 为空"];
+  const seen = new Set<string>();
+  const offDays: HolidayDay[] = [];
+  const workdays: HolidayDay[] = [];
+  for (const raw of p.days) {
+    if (typeof raw !== "object" || raw === null) {
+      errors.push("days 含非对象条目");
+      continue;
+    }
+    const d = raw as { name?: unknown; date?: unknown; isOffDay?: unknown };
+    if (typeof d.name !== "string" || d.name.trim() === "") {
+      errors.push(`日期 ${String(d.date)} 缺少 name`);
+      continue;
+    }
+    if (typeof d.date !== "string" || !DATE_RE.test(d.date)) {
+      errors.push(`日期不合法: ${String(d.date)}`);
+      continue;
+    }
+    const dt = DateTime.fromISO(d.date, { zone: TZ });
+    if (!dt.isValid || dt.year !== year) {
+      errors.push(`日期 ${d.date} 不属于 ${year} 年或不是真实日历日`);
+      continue;
+    }
+    if (typeof d.isOffDay !== "boolean") {
+      errors.push(`日期 ${d.date} 缺少 isOffDay`);
+      continue;
+    }
+    if (seen.has(d.date)) {
+      errors.push(`日期重复: ${d.date}`);
+      continue;
+    }
+    seen.add(d.date);
+    const entry: HolidayDay = { name: d.name.trim(), date: d.date, isOffDay: d.isOffDay };
+    (entry.isOffDay ? offDays : workdays).push(entry);
+  }
+
+  if (year >= 2008) {
+    const names = new Set([...offDays, ...workdays].map((d) => d.name));
+    for (const festival of FESTIVALS) {
+      if (!names.has(festival)) errors.push(`缺少节日: ${festival}`);
+    }
+  }
+  if (offDays.length < 20 || offDays.length > 45) {
+    errors.push(`全年放假天数 ${offDays.length} 超出合理范围 [20, 45]`);
+  }
+  if (workdays.length > 12) {
+    errors.push(`调休上班天数 ${workdays.length} 超过 12`);
+  }
+  for (const wd of workdays) {
+    const weekday = DateTime.fromISO(wd.date, { zone: TZ }).weekday; // 6=周六 7=周日
+    if (weekday < 6) errors.push(`调休上班日 ${wd.date} 不是周末`);
+  }
+  for (const festival of new Set(offDays.map((d) => d.name))) {
+    const dates = offDays
+      .filter((d) => d.name === festival)
+      .map((d) => DateTime.fromISO(d.date, { zone: TZ }).toMillis())
+      .sort((a, b) => a - b);
+    let segments = 1;
+    for (let i = 1; i < dates.length; i++) {
+      if ((dates[i] as number) - (dates[i - 1] as number) > 86_400_000) segments++;
+    }
+    if (segments > 4) errors.push(`节日 ${festival} 连续段超过 4 段`);
+  }
+  return errors;
+}
+
+/** 整年替换导入（按年份删除重插），并写年份元数据 */
+export function importYear(db: DatabaseSync, payload: HolidayYearPayload, source: string): number {
+  const now = new Date().toISOString();
+  return withTransaction(db, () => {
+    db.prepare("DELETE FROM cn_holiday_days WHERE year = ?").run(payload.year);
+    const insert = db.prepare(
+      "INSERT INTO cn_holiday_days (date, year, day_type, name, source, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+    );
+    let count = 0;
+    for (const day of payload.days) {
+      insert.run(day.date, payload.year, day.isOffDay ? "holiday" : "workday", day.name, source, now);
+      count++;
+    }
+    db.prepare(
+      `INSERT INTO cn_holiday_years (year, status, source, fetched_at, last_attempt_at, last_error)
+       VALUES (?, 'ready', ?, ?, ?, NULL)
+       ON CONFLICT (year) DO UPDATE SET status = 'ready', source = excluded.source,
+         fetched_at = excluded.fetched_at, last_attempt_at = excluded.last_attempt_at, last_error = NULL`,
+    ).run(payload.year, source, now, now);
+    return count;
+  });
+}
+
+function recordFailure(db: DatabaseSync, year: number, error: string): void {
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO cn_holiday_years (year, status, source, fetched_at, last_attempt_at, last_error)
+     VALUES (?, 'failed', '', ?, ?, ?)
+     ON CONFLICT (year) DO UPDATE SET status = 'failed', last_attempt_at = excluded.last_attempt_at, last_error = excluded.last_error`,
+  ).run(year, now, now, error);
+}
+
+export async function fetchYearPayload(
+  year: number,
+  fetcher: (url: string) => Promise<unknown> = fetchJson,
+): Promise<HolidayYearPayload> {
+  let lastError = "";
+  for (const url of SOURCES(year)) {
+    try {
+      const payload = (await fetcher(url)) as HolidayYearPayload;
+      return payload;
+    } catch (e) {
+      lastError = e instanceof Error ? e.message : String(e);
+    }
+  }
+  throw new Error(`年度数据抓取失败 ${year}: ${lastError}`);
+}
+
+/** 确保指定年份就绪：ready 跳过；失败后 6 小时冷却；返回本次更新的年份 */
+export async function ensureYears(
+  db: DatabaseSync,
+  years: number[],
+  fetcher?: (url: string) => Promise<unknown>,
+): Promise<{ updated: number[]; skipped: number[]; failed: string[] }> {
+  const updated: number[] = [];
+  const skipped: number[] = [];
+  const failed: string[] = [];
+  for (const year of years) {
+    const meta = db.prepare("SELECT status, last_attempt_at FROM cn_holiday_years WHERE year = ?").get(year) as
+      | { status: string; last_attempt_at: string | null }
+      | undefined;
+    if (meta?.status === "ready") {
+      skipped.push(year);
+      continue;
+    }
+    if (meta?.status === "failed" && meta.last_attempt_at !== null) {
+      const since = Date.now() - new Date(meta.last_attempt_at).getTime();
+      if (since >= 0 && since < FETCH_COOLDOWN_MS) {
+        skipped.push(year);
+        continue;
+      }
+    }
+    try {
+      const payload = await fetchYearPayload(year, fetcher);
+      const errors = validateYearPayload(payload);
+      if (errors.length > 0) throw new Error(`数据校验失败: ${errors.join("; ")}`);
+      const count = importYear(db, payload, "holiday-cn");
+      updated.push(year);
+      logger.info(`节假日数据导入 ${year} 年 ${count} 天`);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      recordFailure(db, year, message);
+      failed.push(`${year}: ${message}`);
+    }
+  }
+  return { updated, skipped, failed };
+}
+
+/** 需要保障的年份：当年 + （10 月起）下一年 */
+export function requiredYears(today: string = todayIso()): number[] {
+  const year = Number(today.slice(0, 4));
+  const month = Number(today.slice(5, 7));
+  return month >= 10 ? [year, year + 1] : [year];
+}
+
+/** 下一假期（含名称/起止/天数）；无数据返回 null */
+export function nextHolidayPeriod(db: DatabaseSync, today: string = todayIso()): {
+  name: string;
+  start: string;
+  end: string;
+  days: number;
+  inProgress: boolean;
+} | null {
+  const first = db
+    .prepare("SELECT date, name FROM cn_holiday_days WHERE day_type = 'holiday' AND date >= ? ORDER BY date LIMIT 1")
+    .get(today) as { date: string; name: string } | undefined;
+  if (first === undefined) return null;
+  const isHolidayNamed = (date: string): boolean => {
+    const row = db.prepare("SELECT name FROM cn_holiday_days WHERE date = ? AND day_type = 'holiday'").get(date) as
+      | { name: string }
+      | undefined;
+    return row !== undefined && row.name === first.name;
+  };
+  let start = first.date;
+  for (;;) {
+    const prev = DateTime.fromISO(start, { zone: TZ }).minus({ days: 1 }).toISODate();
+    if (prev === null || !isHolidayNamed(prev)) break;
+    start = prev;
+  }
+  let end = first.date;
+  for (;;) {
+    const next = DateTime.fromISO(end, { zone: TZ }).plus({ days: 1 }).toISODate();
+    if (next === null || !isHolidayNamed(next)) break;
+    end = next;
+  }
+  const days = Math.round(
+    (DateTime.fromISO(end, { zone: TZ }).toMillis() - DateTime.fromISO(start, { zone: TZ }).toMillis()) / 86_400_000,
+  ) + 1;
+  return { name: first.name, start, end, days, inProgress: start <= today };
+}

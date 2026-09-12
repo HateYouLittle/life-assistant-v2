@@ -78,6 +78,7 @@ CREATE INDEX IF NOT EXISTS idx_schedules_profile ON schedules(profile_id, status
 CREATE TABLE IF NOT EXISTS occurrences (
   schedule_id TEXT NOT NULL REFERENCES schedules(id) ON DELETE CASCADE,
   occurrence_key TEXT NOT NULL,
+  event_at TEXT NOT NULL,
   due_at TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','notified','done','cancelled')),
   PRIMARY KEY (schedule_id, occurrence_key)
