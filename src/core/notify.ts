@@ -130,7 +130,9 @@ export function publishProfile(
   }
 
   const rendered = renderBlocks(input.blocks, "markdown");
-  const bodyMd = [input.title, rendered.body].filter((s) => s !== "").join("\n\n");
+  // 标题只走 title 字段：投递 payload 与 notify.pull 都单独返回标题，
+  // 正文若再拼一次，两端各会多渲染一行重复标题。
+  const bodyMd = rendered.body;
   const id = newId();
   const createdAt = nowIso();
   db.prepare(

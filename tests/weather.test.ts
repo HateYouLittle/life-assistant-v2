@@ -161,12 +161,14 @@ describe("weather / air_quality", () => {
       await withMockFetch(handlerFor, async () => {
         await runDailyBrief();
         const rows = env.db
-          .prepare("SELECT kind, dedupe_key, body_md FROM notifications WHERE profile_id = 'default'")
-          .all() as unknown as { kind: string; dedupe_key: string; body_md: string }[];
+          .prepare("SELECT kind, dedupe_key, title, body_md FROM notifications WHERE profile_id = 'default'")
+          .all() as unknown as { kind: string; dedupe_key: string; title: string; body_md: string }[];
         assert.equal(rows.length, 1);
         assert.equal(rows[0]?.kind, "weather.brief");
         assert.match(rows[0]?.dedupe_key ?? "", /^brief:default:北京:\d{4}-\d{2}-\d{2}$/);
-        assert.match(rows[0]?.body_md ?? "", /北京 每日简报/);
+        // 标题只在 title 字段：body_md 里不得再出现，否则推送与拉取都会重复一行
+        assert.equal(rows[0]?.title, "北京 每日简报");
+        assert.doesNotMatch(rows[0]?.body_md ?? "", /北京 每日简报/);
         assert.match(rows[0]?.body_md ?? "", /AQI 42（优）/);
 
         await runDailyBrief();

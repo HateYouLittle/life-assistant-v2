@@ -123,6 +123,25 @@ describe("outbox 投递", () => {
     }
   });
 
+  it("body_md 不含标题：标题只走 title 字段，避免推送与拉取各重复一行", () => {
+    const env = makeTestEnv();
+    try {
+      publishProfile(env.db, env.config, "default", {
+        kind: "test.kind",
+        title: "唯一标题标记ABC",
+        blocks: { table: { columns: ["项目", "内容"], rows: [["天气", "晴"]] } },
+      });
+      const row = env.db
+        .prepare("SELECT title, body_md FROM notifications WHERE profile_id = 'default'")
+        .get() as { title: string; body_md: string };
+      assert.equal(row.title, "唯一标题标记ABC");
+      assert.doesNotMatch(row.body_md, /唯一标题标记ABC/);
+      assert.match(row.body_md, /晴/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("Profile 内 dedupe_key 去重", () => {
     const env = makeTestEnv({ PROFILE_ROUTE_SECRETS_JSON: JSON.stringify({ default: SECRET }) });
     try {
