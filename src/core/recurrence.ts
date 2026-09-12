@@ -61,13 +61,15 @@ function* iterate(source: OccurrenceSource, afterDay: DateTime): Generator<DateT
     if (start > afterDay) yield start;
     return;
   }
+  // interval 缺省或非法时兜底为 1，避免推进日期死循环
+  const interval = typeof rec.interval === "number" && rec.interval >= 1 ? rec.interval : 1;
   switch (rec.freq) {
     case "daily": {
       let d = start;
-      while (d <= afterDay) d = d.plus({ days: rec.interval });
+      while (d <= afterDay) d = d.plus({ days: interval });
       yield d;
       for (;;) {
-        d = d.plus({ days: rec.interval });
+        d = d.plus({ days: interval });
         yield d;
       }
     }
@@ -75,7 +77,7 @@ function* iterate(source: OccurrenceSource, afterDay: DateTime): Generator<DateT
       const monday = start.minus({ days: start.weekday - 1 });
       const days = uniqSorted(rec.byweekday ?? [start.weekday - 1]);
       for (let week = 0; ; week++) {
-        const weekStart = monday.plus({ weeks: week * rec.interval });
+        const weekStart = monday.plus({ weeks: week * interval });
         for (const dy of days) {
           const d = weekStart.plus({ days: dy });
           if (d < start) continue;
@@ -90,7 +92,7 @@ function* iterate(source: OccurrenceSource, afterDay: DateTime): Generator<DateT
       for (;;) {
         const d = clampDay(year, month, day);
         if (d >= start && d > afterDay) yield d;
-        const nextIndex = (year * 12 + (month - 1)) + rec.interval;
+        const nextIndex = (year * 12 + (month - 1)) + interval;
         year = Math.floor(nextIndex / 12);
         month = (nextIndex % 12) + 1;
       }

@@ -73,7 +73,10 @@ export function newShortId(): string {
 
 export function parseRecurrence(json: string | null): Recurrence | null {
   if (json === null) return null;
-  return JSON.parse(json) as Recurrence;
+  const rec = JSON.parse(json) as Recurrence;
+  // 缺省 interval 必须兜底为 1，否则 recurrence 引擎会在推进日期时死循环
+  const interval = typeof rec.interval === "number" && rec.interval >= 1 ? rec.interval : 1;
+  return { ...rec, interval };
 }
 
 export function sourceOf(row: ScheduleRow): OccurrenceSource {

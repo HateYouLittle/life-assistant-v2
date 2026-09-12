@@ -297,4 +297,25 @@ describe("schedule 提醒触发", () => {
       cleanupTestEnv(env);
     }
   });
+
+  it("daily 循环省略 interval 也能物化（防止日期推进死循环）", () => {
+    const env = makeTestEnv();
+    try {
+      const created = createSchedule(env.db, "default", {
+        title: "缺省间隔",
+        kind: "todo",
+        calendar: "solar",
+        startDate: todayIso(),
+        time: "09:00",
+        allDay: false,
+        recurrence: { freq: "daily" } as never,
+        remindOffsets: [0],
+        resendMinutes: 0,
+        workdayFilter: "any",
+      });
+      assert.ok(occurrenceRows(env, created.id).length > 0, "缺省 interval 应视为 1 并正常物化");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
 });

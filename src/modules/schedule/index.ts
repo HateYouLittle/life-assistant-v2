@@ -21,7 +21,7 @@ import {
 
 const recurrenceInput = z.object({
   freq: z.enum(["daily", "weekly", "monthly", "yearly"]).describe("循环频率"),
-  interval: z.number().int().min(1).max(365).optional().describe("间隔（默认 1）"),
+  interval: z.number().int().min(1).max(365).default(1).describe("间隔（默认 1）"),
   byweekday: z
     .array(z.number().int().min(0).max(6))
     .max(7)
