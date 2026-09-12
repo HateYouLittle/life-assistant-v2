@@ -39,8 +39,8 @@ Node 不会自动读取 `.env`：`set -a; source .env; set +a` 或使用 systemd
 | `DEFAULT_CITY` | | Profile 未设位置时的兜底城市 |
 | `HOST` / `PORT` | | 默认 `127.0.0.1:3080`；非回环必须配 token |
 | `WEB_API_TOKEN` | | 状态接口鉴权（Bearer 或 `?token=`） |
-| `PROFILE_ROUTE_SECRETS_JSON` | 主动推送需要 | `{"default":"<openssl rand -hex 32>"}` |
-| `DAILY_BRIEF_CRON` | | 每日简报时间，默认 `0 7 * * *`（Asia/Shanghai） |
+| `PROFILE_ROUTE_SECRETS_JSON` | 主动推送需要 | `'{"default":"<openssl rand -hex 32>"}'`（整段用单引号包裹） |
+| `DAILY_BRIEF_CRON` | | 每日简报时间，默认 `'0 7 * * *'`（含空格需单引号，Asia/Shanghai） |
 | `MCP_DAEMON_URL` | | stdio 壳连接的 daemon 地址，默认 `http://127.0.0.1:3080` |
 
 ## 启动

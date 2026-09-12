@@ -29,7 +29,9 @@ function parseSecrets(raw: string | undefined): Record<string, string> {
   try {
     parsed = JSON.parse(raw);
   } catch {
-    throw new Error("PROFILE_ROUTE_SECRETS_JSON 不是合法 JSON");
+    throw new Error(
+      "PROFILE_ROUTE_SECRETS_JSON 不是合法 JSON：值里的引号可能被 shell 吃掉，请用单引号包裹整段（例：PROFILE_ROUTE_SECRETS_JSON='{\"default\":\"<64位hex>\"}'）",
+    );
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     throw new Error("PROFILE_ROUTE_SECRETS_JSON 必须是 {profile: secret} 对象");
