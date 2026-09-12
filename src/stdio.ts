@@ -99,7 +99,15 @@ readline.on("line", (line: string) => {
   void drain();
 });
 readline.on("close", () => {
-  process.exit(0);
+  // 等 in-flight 请求排空再退出，避免丢响应；5s 兜底
+  const exit = (): void => process.exit(0);
+  const timer = setInterval(() => {
+    if (queue.length === 0 && !sending) {
+      clearInterval(timer);
+      exit();
+    }
+  }, 50);
+  setTimeout(exit, 5000).unref();
 });
 
 logger.info(`life-assistant stdio 壳就绪 → ${endpoint} (profile=${profile})`);
