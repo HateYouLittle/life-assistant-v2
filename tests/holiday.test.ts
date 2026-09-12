@@ -16,8 +16,16 @@ import { cleanupTestEnv, makeTestEnv } from "./helpers.js";
 /** 2026 年合成数据：7 个节日齐全、32 天放假、4 天周末调休 */
 function payload2026(): HolidayYearPayload {
   const days: HolidayYearPayload["days"] = [];
-  const off = (name: string, dates: string[]) => dates.forEach((date) => days.push({ name, date, isOffDay: true }));
-  const work = (dates: string[]) => dates.forEach((date) => days.push({ name: "调休", date, isOffDay: false }));
+  const off = (name: string, dates: string[]) => {
+    dates.forEach((date) => {
+      days.push({ name, date, isOffDay: true });
+    });
+  };
+  const work = (dates: string[]) => {
+    dates.forEach((date) => {
+      days.push({ name: "调休", date, isOffDay: false });
+    });
+  };
   off("元旦", ["2026-01-01", "2026-01-02", "2026-01-03"]);
   off("春节", ["2026-02-15", "2026-02-16", "2026-02-17", "2026-02-18", "2026-02-19", "2026-02-20", "2026-02-21"]);
   off("清明节", ["2026-04-04", "2026-04-05", "2026-04-06"]);

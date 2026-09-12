@@ -11,7 +11,7 @@ import {
   pushMonthlyReports,
 } from "../src/modules/bookkeeping/service.js";
 import { bookkeepingLedgerTool, bookkeepingExpenseTool } from "../src/modules/bookkeeping/index.js";
-import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
+import { cleanupTestEnv, makeTestEnv, type Published, type TestEnv } from "./helpers.js";
 
 function tools(env: TestEnv, profileId = "default") {
   const ctx = {
@@ -72,8 +72,9 @@ describe("bookkeeping：支出", () => {
       assert.equal(entry.已记账.金额, "¥12.34");
       assert.equal(entry.已记账.记账人, "default");
       assert.equal(env.published.length, 1);
-      assert.equal(env.published[0]?.input.kind, "bookkeeping.entry");
-      assert.match((env.published[0]?.input as { dedupeKey?: string }).dedupeKey ?? "", /^entry:/);
+      const receipt = env.published[0] as Published;
+      assert.equal(receipt.input.kind, "bookkeeping.entry");
+      assert.match((receipt.input as { dedupeKey?: string }).dedupeKey ?? "", /^entry:/);
 
       // 另一个 Profile 直接记账（无授权限制）
       const t2 = tools(env, "partner");
@@ -144,9 +145,13 @@ describe("bookkeeping：支出", () => {
       const pushed = await pushMonthlyReports(env.db, t.ctx.services, ym);
       assert.equal(pushed, 1, "空账本不推送");
       assert.equal(env.published.length, 1);
-      assert.equal(env.published[0]?.input.kind, "bookkeeping.monthly");
-      assert.match((env.published[0]?.input as { dedupeKey?: string }).dedupeKey ?? "", new RegExp(`report:${ledger.已创建.id}:${ym}`));
-      const blocks = env.published[0]?.input.blocks as { table: { rows: string[][] } };
+      const report = env.published[0] as Published;
+      assert.equal(report.input.kind, "bookkeeping.monthly");
+      assert.match(
+        (report.input as { dedupeKey?: string }).dedupeKey ?? "",
+        new RegExp(`report:${ledger.已创建.id}:${ym}`),
+      );
+      const blocks = report.input.blocks as { table: { rows: string[][] } };
       assert.deepEqual(blocks.table.rows[blocks.table.rows.length - 1], ["合计", "¥50.00", "100%"]);
     } finally {
       cleanupTestEnv(env);
