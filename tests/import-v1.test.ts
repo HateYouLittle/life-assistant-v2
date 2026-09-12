@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { resolveOldDbPath, runImport } from "../src/import-v1.js";
 import { cleanupTestEnv, makeTestEnv } from "./helpers.js";
@@ -93,7 +94,7 @@ describe("import:v1 旧库路径解析", () => {
       touch(`${dir}/life-assistant.sqlite`);
       touch(`${dir}/life-assistant.sqlite-wal`);
       touch(`${dir}/life-assistant.sqlite-shm`);
-      assert.equal(resolveOldDbPath(dir), `${dir}/life-assistant.sqlite`);
+      assert.equal(resolveOldDbPath(dir), join(dir, "life-assistant.sqlite"));
     } finally {
       cleanupTestEnv(env);
     }
@@ -109,7 +110,7 @@ describe("import:v1 旧库路径解析", () => {
       touch(`${dir}/custom.sqlite-shm`);
       touch(`${dir}/archive.db.bak-20260101`);
       touch(`${dir}/old.db.backup-2`);
-      assert.equal(resolveOldDbPath(dir), `${dir}/custom.sqlite`);
+      assert.equal(resolveOldDbPath(dir), join(dir, "custom.sqlite"));
     } finally {
       cleanupTestEnv(env);
     }
