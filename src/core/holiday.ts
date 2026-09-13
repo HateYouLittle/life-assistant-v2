@@ -53,7 +53,14 @@ export function holidayYearsReady(db: DatabaseSync): number[] {
   }[]).map((r) => r.year);
 }
 
-/** 校验 holiday-cn 年度数据；返回错误列表（空 = 通过） */
+/**
+ * 校验 holiday-cn 年度数据；返回错误列表（空 = 通过）。
+ *
+ * 允许「跨年日期」：上游按**假期**归档而非按日历年份 —— 例如 2023.json 声明
+ * year=2023 却包含 `2022-12-31`（元旦假期从上一年的 12-31 开始）。此前要求
+ * `dt.year === year`，会让该年整份数据校验失败、整年零行导入，进而使所有
+ * workday/holiday 过滤的日程被暂停。
+ */
 export function validateYearPayload(payload: unknown): string[] {
   const errors: string[] = [];
   if (typeof payload !== "object" || payload === null) return ["payload 不是对象"];
@@ -81,8 +88,12 @@ export function validateYearPayload(payload: unknown): string[] {
       continue;
     }
     const dt = DateTime.fromISO(d.date, { zone: TZ });
-    if (!dt.isValid || dt.year !== year) {
-      errors.push(`日期 ${d.date} 不属于 ${year} 年或不是真实日历日`);
+    // 必须是真实存在的日历日（拒绝 2026-02-30），且只接受本年度或上一年 12 月
+    // 的日期 —— 上一年 12 月正是跨年假期（元旦）所在区间。
+    const inYear = dt.isValid && dt.year === year;
+    const crossYear = dt.isValid && dt.year === year - 1 && dt.month === 12;
+    if (!inYear && !crossYear) {
+      errors.push(`日期 ${d.date} 不属于 ${year} 年（或 ${year - 1} 年 12 月）或不是真实日历日`);
       continue;
     }
     if (typeof d.isOffDay !== "boolean") {
@@ -139,12 +150,23 @@ export function importYear(db: DatabaseSync, payload: HolidayYearPayload, source
   const now = new Date().toISOString();
   return withTransaction(db, () => {
     db.prepare("DELETE FROM cn_holiday_days WHERE year = ?").run(payload.year);
-    const insert = db.prepare(
-      "INSERT INTO cn_holiday_days (date, year, day_type, name, source, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+    const select = db.prepare("SELECT year FROM cn_holiday_days WHERE date = ?");
+    const upsert = db.prepare(
+      `INSERT INTO cn_holiday_days (date, year, day_type, name, source, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT (date) DO UPDATE SET year = excluded.year, day_type = excluded.day_type,
+         name = excluded.name, source = excluded.source, updated_at = excluded.updated_at`,
     );
     let count = 0;
     for (const day of payload.days) {
-      insert.run(day.date, payload.year, day.isOffDay ? "holiday" : "workday", day.name, source, now);
+      // 跨年日期（如 2023.json 里的 2022-12-31）会同时出现在相邻两个年度的文件里。
+      // 「年份更贴近该日期」的文件更权威：12-31 的归属应由其本身所属年份的 12 月文件
+      // 决定，而不是下一年度文件的跨年条目。这样导入顺序不会改变最终结果。
+      const dateYear = Number(day.date.slice(0, 4));
+      const existing = select.get(day.date) as { year: number } | undefined;
+      if (existing !== undefined && Math.abs(existing.year - dateYear) < Math.abs(payload.year - dateYear)) {
+        continue;
+      }
+      upsert.run(day.date, payload.year, day.isOffDay ? "holiday" : "workday", day.name, source, now);
       count++;
     }
     db.prepare(
@@ -208,6 +230,11 @@ export async function ensureYears(
     }
     try {
       const payload = await fetchYearPayload(year, fetcher);
+      // CDN 可能返回缓存/错配的文件；若不比对，会把错误年份「导入成功」，
+      // 而请求的年份既没有数据行也没有 cn_holiday_years 行，永远 not ready 且不再冷却。
+      if (payload.year !== year) {
+        throw new Error(`年度数据错配: 请求 ${year} 年，数据里的 year 字段是 ${String(payload.year)}`);
+      }
       const errors = validateYearPayload(payload);
       if (errors.length > 0) throw new Error(`数据校验失败: ${errors.join("; ")}`);
       const count = importYear(db, payload, "holiday-cn");
