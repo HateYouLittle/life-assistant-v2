@@ -56,6 +56,14 @@ function assertQwCode(code: unknown, api: string): void {
 }
 
 function num(value: unknown, field: string): number {
+  // 只接受 number 或非空数字字符串：Number(null)/Number("")/Number([]) 都是 0，
+  // 会把「字段缺失」伪装成 0（aqi 缺失会被误报成「优」）。
+  if (typeof value !== "number" && typeof value !== "string") {
+    throw new Error(`QWeather ${field} 数值不合法: ${String(value)}`);
+  }
+  if (typeof value === "string" && value.trim() === "") {
+    throw new Error(`QWeather ${field} 数值不合法: 空字符串`);
+  }
   const n = Number(value);
   if (!Number.isFinite(n)) throw new Error(`QWeather ${field} 数值不合法: ${String(value)}`);
   return n;
@@ -131,18 +139,44 @@ export async function forecast(
     `https://${host}/v7/weather/${path}?location=${loc.cityId}&key=${key}`,
   )) as { code?: unknown; daily?: Array<Record<string, unknown>> };
   assertQwCode(body.code, `weather/${path}`);
-  const daily = body.daily ?? [];
+  // 缺失 daily 说明响应不完整；静默变成空预报会让简报得出「适宜出行」的错误结论。
+  if (!Array.isArray(body.daily) || body.daily.length === 0) {
+    throw new Error(`QWeather weather/${path} 响应缺少有效的 daily 数组`);
+  }
+  const daily = body.daily;
   // 用本地日历日过滤：UTC 日期在 00:00–08:00（Asia/Shanghai）会落在前一天，放行已过期的预报行
   const today = todayIso();
   return daily
-    .map((d) => ({
-      date: String(d.fxDate ?? ""),
-      tMax: num(d.tempMax, "tempMax"),
-      tMin: num(d.tempMin, "tempMin"),
-      textDay: String(d.textDay ?? "").trim(),
-      precipMm: d.precip === undefined || d.precip === "" || d.precip === "0" ? undefined : num(d.precip, "precip"),
-    }))
+    .map((d) => {
+      // 上游把「无降水」写作 "0.0"（而非 "0"），必须按数值判断
+      const precip = d.precip === undefined || d.precip === null || d.precip === "" ? 0 : num(d.precip, "precip");
+      return {
+        date: String(d.fxDate ?? ""),
+        tMax: num(d.tempMax, "tempMax"),
+        tMin: num(d.tempMin, "tempMin"),
+        textDay: String(d.textDay ?? "").trim(),
+        precipMm: precip > 0 ? precip : undefined,
+      };
+    })
     .filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d.date) && d.date >= today);
+}
+
+/** v1 预警的 color.code 即国标预警级别；也兼容少数返回英文色名的实现 */
+const ALERT_LEVEL_NAMES: Record<string, string> = {
+  blue: "蓝色",
+  yellow: "黄色",
+  orange: "橙色",
+  red: "红色",
+};
+
+function alertLevelOf(color: unknown, severity: unknown): string {
+  const code = typeof color === "string" ? color : undefined;
+  const fromObject =
+    typeof color === "object" && color !== null ? (color as { code?: unknown }).code : undefined;
+  const raw = String(fromObject ?? code ?? "").trim();
+  if (raw !== "") return ALERT_LEVEL_NAMES[raw.toLowerCase()] ?? raw;
+  const sev = String(severity ?? "").trim();
+  return sev === "unknown" ? "" : sev;
 }
 
 export async function alerts(host: string, key: string, loc: LocationInfo): Promise<WeatherAlert[]> {
@@ -152,15 +186,23 @@ export async function alerts(host: string, key: string, loc: LocationInfo): Prom
     `https://${host}/weatheralert/v1/current/${lat}/${lon}?key=${key}`,
   )) as { code?: unknown; alerts?: Array<Record<string, unknown>> };
   assertQwCode(body.code, "weatheralert");
+  // v1 预警结构为 { id, eventType{name,code}, color{code}, severity, effectiveTime,
+  // onsetTime, expireTime, headline, description }：没有 level/startsAt/endsAt/title。
+  // 此前按已废弃的 v7 结构读取，导致级别恒为空、起止时间恒为 undefined。
   return (body.alerts ?? []).map((a) => ({
     id: String(a.id ?? ""),
     title: String(a.headline ?? a.title ?? "天气预警"),
-    level: String(a.level ?? ""),
+    level: alertLevelOf(a.color, a.severity),
     type: String((a.eventType as { name?: unknown } | undefined)?.name ?? "天气预警"),
     description: String(a.description ?? a.headline ?? ""),
-    startsAt: a.startsAt === undefined ? undefined : String(a.startsAt),
-    endsAt: a.endsAt === undefined ? undefined : String(a.endsAt),
+    startsAt: isoOrUndefined(a.effectiveTime ?? a.onsetTime ?? a.startsAt),
+    endsAt: isoOrUndefined(a.expireTime ?? a.endsAt),
   }));
+}
+
+function isoOrUndefined(value: unknown): string | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  return String(value);
 }
 
 const CN_AQI_CATEGORIES: Array<[number, string]> = [

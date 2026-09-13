@@ -9,7 +9,7 @@ import cron from "node-cron";
 import type { DatabaseSync } from "node:sqlite";
 import type { DateTime } from "luxon";
 import { loadConfig, parseProfileId, type ResolvedConfig } from "./config.js";
-import { isRequestAuthorized, queryTokenOf } from "./core/auth.js";
+import { isRequestAuthorized } from "./core/auth.js";
 import { openDatabase } from "./core/database.js";
 import {
   allJobs,
@@ -102,8 +102,9 @@ export function sweepSessions(nowMs: number = Date.now()): number {
 }
 
 async function handleMcp(req: IncomingMessage, res: ServerResponse, db: DatabaseSync, config: ResolvedConfig): Promise<void> {
-  // 与 /api/* 同一套鉴权：绑定非回环地址时 config 会强制要求 WEB_API_TOKEN
-  if (!isRequestAuthorized(config.webApiToken, req.headers.authorization, queryTokenOf(req.url))) {
+  // 只接受 Authorization: Bearer。/mcp 不接受 ?token= —— URL 会进入访问日志、
+  // 浏览器历史与 Referer，凭据不应出现在那里（状态页仍支持 ?token= 首次引导）。
+  if (!isRequestAuthorized(config.webApiToken, req.headers.authorization)) {
     res.writeHead(401, { "Content-Type": "application/json" });
     res.end(
       JSON.stringify({

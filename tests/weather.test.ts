@@ -198,3 +198,215 @@ describe("weather / air_quality", () => {
     }
   });
 });
+
+describe("weather：v1 预警字段映射", () => {
+  const ALERT_BODY = {
+    code: "200",
+    alerts: [
+      {
+        id: "a1",
+        eventType: { name: "大风", code: "1006" },
+        color: { code: "red" },
+        severity: "extreme",
+        effectiveTime: "2026-09-13T10:00+08:00",
+        expireTime: "2026-09-14T10:00+08:00",
+        headline: "大风红色预警",
+        description: "预计阵风 12 级",
+      },
+    ],
+  };
+
+  function alertHandler(url: string): unknown {
+    if (url.includes("/geo/")) return GEO;
+    if (url.includes("/weatheralert/v1/current")) return ALERT_BODY;
+    if (url.includes("/v7/weather/now")) {
+      return { code: "200", now: { temp: "26", feelsLike: "28", humidity: "70", windSpeed: "12", text: "多云" } };
+    }
+    if (url.includes("/v7/weather/")) {
+      return { code: "200", daily: [{ fxDate: todayIso(), tempMax: "30", tempMin: "24", textDay: "晴", precip: "0.0" }] };
+    }
+    if (url.includes("/airquality/")) {
+      return { indexes: [{ code: "cn-mee", aqi: 42, category: "优" }], pollutants: [] };
+    }
+    throw new Error(`unexpected url ${url}`);
+  }
+
+  it("view=alert 读 color.code 得到级别（此前按 v7 读 level 恒为空）", async () => {
+    const env = makeTestEnv(ENV);
+    try {
+      await withMockFetch(alertHandler, async () => {
+        const result = (await tool(env, { view: "alert" })) as { content: { text: string }[] };
+        const payload = JSON.parse(result.content[0]?.text ?? "{}") as { 预警: { rows: string[][] } };
+        assert.deepEqual(payload.预警.rows[0], ["红色", "大风", "预计阵风 12 级"]);
+      });
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("每日简报带上预警级别，而不是只有事件名", async () => {
+    const env = makeTestEnv(ENV);
+    try {
+      setPushRoute(env.db, "default", { url: "http://127.0.0.1:9/hook" });
+      await withMockFetch(alertHandler, async () => {
+        await runDailyBrief();
+        const row = env.db
+          .prepare("SELECT body_md FROM notifications WHERE profile_id = 'default'")
+          .get() as { body_md: string };
+        assert.match(row.body_md, /红色大风/);
+      });
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("英文色名转为中文，未知取值原样保留", async () => {
+    const env = makeTestEnv(ENV);
+    try {
+      await withMockFetch(
+        (url) => {
+          if (url.includes("/geo/")) return GEO;
+          if (url.includes("/weatheralert/v1/current")) {
+            return {
+              code: "200",
+              alerts: [
+                { id: "1", eventType: { name: "高温" }, color: { code: "yellow" }, headline: "h1" },
+                { id: "2", eventType: { name: "暴雨" }, color: { code: "紫色" }, headline: "h2" },
+              ],
+            };
+          }
+          throw new Error(`unexpected url ${url}`);
+        },
+        async () => {
+          const result = (await tool(env, { view: "alert" })) as { content: { text: string }[] };
+          const payload = JSON.parse(result.content[0]?.text ?? "{}") as { 预警: { rows: string[][] } };
+          assert.equal(payload.预警.rows[0]?.[0], "黄色");
+          assert.equal(payload.预警.rows[1]?.[0], "紫色");
+        },
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("无预警时不报错", async () => {
+    const env = makeTestEnv(ENV);
+    try {
+      await withMockFetch(
+        (url) => {
+          if (url.includes("/geo/")) return GEO;
+          if (url.includes("/weatheralert/v1/current")) return { code: "200", alerts: [] };
+          throw new Error(`unexpected url ${url}`);
+        },
+        async () => {
+          const result = (await tool(env, { view: "alert" })) as { isError?: boolean; content: { text: string }[] };
+          assert.equal(result.isError, undefined);
+          assert.match(result.content[0]?.text ?? "", /无生效气象预警/);
+        },
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
+describe("weather：数值与预报健壮性", () => {
+  it("precip \"0.0\" 视为无降水（此前只判 === \"0\"，会显示 0mm）", async () => {
+    const env = makeTestEnv(ENV);
+    try {
+      await withMockFetch(
+        (url) => {
+          if (url.includes("/geo/")) return GEO;
+          if (url.includes("/v7/weather/7d") || url.includes("/v7/weather/3d")) {
+            return {
+              code: "200",
+              daily: [
+                { fxDate: todayIso(), tempMax: "30", tempMin: "24", textDay: "晴", precip: "0.0" },
+                { fxDate: todayIso(), tempMax: "29", tempMin: "23", textDay: "雷阵雨", precip: "4.5" },
+              ],
+            };
+          }
+          throw new Error(`unexpected url ${url}`);
+        },
+        async () => {
+          const result = (await tool(env, { view: "forecast" })) as { content: { text: string }[] };
+          const payload = JSON.parse(result.content[0]?.text ?? "{}") as { 预报: { rows: string[][] } };
+          assert.equal(payload.预报.rows[0]?.[3], "—", "0.0 应显示为无降水");
+          assert.equal(payload.预报.rows[1]?.[3], "4.5mm");
+        },
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("字段为 null 时报错而不是伪装成 0（aqi:null 不得变成「优」）", async () => {
+    const env = makeTestEnv(ENV);
+    try {
+      await withMockFetch(
+        (url) => {
+          if (url.includes("/geo/")) return GEO;
+          if (url.includes("/airquality/")) {
+            return { indexes: [{ code: "cn-mee", aqi: null, category: "优" }], pollutants: [] };
+          }
+          throw new Error(`unexpected url ${url}`);
+        },
+        async () => {
+          const result = (await tool(env, { view: "air" })) as { isError?: boolean; content: { text: string }[] };
+          assert.equal(result.isError, true);
+          assert.match(result.content[0]?.text ?? "", /aqi/);
+        },
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("缺少 daily 数组时报错，而不是输出空预报", async () => {
+    const env = makeTestEnv(ENV);
+    try {
+      await withMockFetch(
+        (url) => {
+          if (url.includes("/geo/")) return GEO;
+          if (url.includes("/v7/weather/")) return { code: "200" };
+          throw new Error(`unexpected url ${url}`);
+        },
+        async () => {
+          const result = (await tool(env, { view: "forecast" })) as { isError?: boolean; content: { text: string }[] };
+          assert.equal(result.isError, true);
+          assert.match(result.content[0]?.text ?? "", /daily/);
+        },
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("非 2xx 时保留上游 problem+json 的错误详情（此前只剩状态码）", async () => {
+    const env = makeTestEnv(ENV);
+    const original = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      ({
+        ok: false,
+        status: 403,
+        body: {},
+        text: async () =>
+          JSON.stringify({ error: { status: 403, title: "NO CREDIT", detail: "余额不足，请充值" } }),
+        json: async () => ({}),
+      }) as unknown as Response) as typeof fetch;
+    try {
+      const result = (await tool(env, { view: "current", city: "上海" })) as {
+        isError?: boolean;
+        content: { text: string }[];
+      };
+      assert.equal(result.isError, true);
+      const text = result.content[0]?.text ?? "";
+      assert.match(text, /403/);
+      assert.match(text, /NO CREDIT/);
+      assert.match(text, /余额不足/);
+    } finally {
+      globalThis.fetch = original;
+      cleanupTestEnv(env);
+    }
+  });
+});
