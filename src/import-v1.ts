@@ -1,8 +1,8 @@
 import { DatabaseSync } from "node:sqlite";
 import { existsSync, readdirSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { DateTime } from "luxon";
-import { loadConfig } from "./config.js";
+import { loadConfig, PROFILE_ID_RE } from "./config.js";
 import { TZ } from "./time.js";
 import { openDatabase, withTransaction } from "./core/database.js";
 import { logger } from "./core/logger.js";
@@ -14,16 +14,41 @@ import type { Recurrence } from "./core/recurrence.js";
  * 拒绝写入非空目标库（--force 跳过）。旧共享账本的角色/成员不迁移（v2 全局可编辑）。
  */
 
+export interface ImportProblem {
+  table: string;
+  id: string;
+  reason: string;
+}
+
 export interface ImportReport {
   profiles: number;
   schedules: number;
   scheduleWarnings: string[];
+  /** 逐行隔离掉的坏数据（表 / 主键 / 原因）；这些行未导入 */
+  problems: ImportProblem[];
   ledgers: number;
   expenses: number;
   entriesSkipped: number;
   holidayDays: number;
   holidayYears: number;
   occurrencesDropped: number;
+}
+
+/** 逐行隔离：一条坏数据不应导致整库零行导入 */
+function problem(report: ImportReport, table: string, id: string, reason: string): void {
+  report.problems.push({ table, id, reason });
+}
+
+const DATE_RE_IMPORT = /^\d{4}-\d{2}-\d{2}$/;
+
+/** 账本名在 v2 中要求活跃账本内唯一，旧库可能重名 */function uniqueLedgerName(target: ReturnType<typeof openDatabase>, name: string): string {
+  const exists = target.prepare("SELECT 1 FROM ledgers WHERE name = ?").get(name);
+  if (exists === undefined) return name;
+  for (let i = 2; i < 1000; i++) {
+    const candidate = `${name} (${i})`;
+    if (target.prepare("SELECT 1 FROM ledgers WHERE name = ?").get(candidate) === undefined) return candidate;
+  }
+  return `${name} (${Date.now()})`;
 }
 
 const STATUS_MAP: Record<string, "active" | "done" | "cancelled"> = {
@@ -166,11 +191,85 @@ function mapReminders(raw: string | null, title: string, warnings: string[]): nu
   }
 }
 
+/**
+ * --force 的「覆盖」语义：只清除本次导入会写入的行，不做全库清空。
+ * 普通 INSERT 遇到已存在的主键会抛错并回滚整个事务，使 --force 实际不可用；
+ * 而无关 Profile / 账本的数据不应因为一次导入被删掉。
+ * 删除与插入同事务 —— 中途失败会整体回滚，原数据保持不变。
+ */
+function forceClearImported(
+  target: ReturnType<typeof openDatabase>,
+  old: DatabaseSync,
+  report: ImportReport,
+): void {
+  let profiles: string[] = [];
+  try {
+    profiles = (old.prepare("SELECT profile_id FROM profiles").all() as { profile_id: string }[])
+      .map((r) => r.profile_id)
+      .filter((id) => PROFILE_ID_RE.test(id));
+  } catch {
+    // 旧库没有 profiles 表；下面的 step 会因缺少列而失败，忽略即可
+  }
+  let ledgers: string[] = [];
+  try {
+    ledgers = (old.prepare("SELECT id FROM ledgers").all() as { id: string }[]).map((r) => r.id);
+  } catch {
+    // 同上
+  }
+
+  const steps: Array<{ label: string; run: () => { changes: number | bigint } }> = [
+    {
+      label: "notifications",
+      run: () =>
+        target
+          .prepare(
+            `DELETE FROM notifications WHERE profile_id IN (SELECT value FROM json_each(?))`,
+          )
+          .run(JSON.stringify(profiles)),
+    },
+    {
+      label: "schedules",
+      run: () =>
+        target.prepare(`DELETE FROM schedules WHERE profile_id IN (SELECT value FROM json_each(?))`).run(
+          JSON.stringify(profiles),
+        ),
+    },
+    {
+      label: "expenses",
+      run: () =>
+        target.prepare(`DELETE FROM expenses WHERE ledger_id IN (SELECT value FROM json_each(?))`).run(
+          JSON.stringify(ledgers),
+        ),
+    },
+    {
+      label: "ledgers",
+      run: () =>
+        target.prepare(`DELETE FROM ledgers WHERE id IN (SELECT value FROM json_each(?))`).run(
+          JSON.stringify(ledgers),
+        ),
+    },
+  ];
+
+  let cleared = 0;
+  for (const step of steps) {
+    try {
+      cleared += Number(step.run().changes);
+    } catch (e) {
+      // 交付表/occurrence 由外键级联清理；这里失败不阻断导入本身
+      warnings(report, `--force 清理 ${step.label} 失败（将按新增处理）：${errorText(e)}`);
+    }
+  }
+  if (cleared > 0) {
+    warnings(report, `--force 已覆盖 ${cleared} 行既有数据（仅限本次导入涉及的 Profile / 账本）`);
+  }
+}
+
 export function runImport(target: ReturnType<typeof openDatabase>, oldPath: string, force = false): ImportReport {
   const report: ImportReport = {
     profiles: 0,
     schedules: 0,
     scheduleWarnings: [],
+    problems: [],
     ledgers: 0,
     expenses: 0,
     entriesSkipped: 0,
@@ -187,7 +286,21 @@ export function runImport(target: ReturnType<typeof openDatabase>, oldPath: stri
   const old = new DatabaseSync(oldPath, { readOnly: true });
   try {
     withTransaction(target, () => {
+      if (force) {
+        forceClearImported(target, old, report);
+      }
       for (const row of old.prepare("SELECT profile_id FROM profiles").all() as { profile_id: string }[]) {
+        if (!PROFILE_ID_RE.test(row.profile_id)) {
+          // v2 的 Profile 名有格式约束；导入非法名会让该 Profile 永远无法通过
+          // X-Hermes-Profile 访问，其依赖行也会触发外键错误。
+          problem(
+            report,
+            "profiles",
+            row.profile_id,
+            `Profile 名不合法（需匹配 ${PROFILE_ID_RE}），未导入；其日程/通知也会一并跳过`,
+          );
+          continue;
+        }
         ensureProfile(target, row.profile_id);
         report.profiles += 1;
       }
@@ -201,8 +314,11 @@ export function runImport(target: ReturnType<typeof openDatabase>, oldPath: stri
         warnings(report, "旧库没有 profile_settings 表，跳过静默时段");
       }
       for (const s of settings) {
-        if (s.quiet_start !== null && s.quiet_end !== null) {
+        if (s.quiet_start === null || s.quiet_end === null) continue;
+        try {
           setSetting(target, s.profile_id, "quiet_hours", { start: s.quiet_start, end: s.quiet_end });
+        } catch (e) {
+          problem(report, "profile_settings", s.profile_id, `静默时段未导入：${errorText(e)}`);
         }
       }
 
@@ -241,29 +357,33 @@ export function runImport(target: ReturnType<typeof openDatabase>, oldPath: stri
           report.scheduleWarnings.push(`日程「${s.title}」强提醒降级为到点 ${resend} 分钟后重发一次`);
         }
         const leapPolicy = s.leap_month_policy === "leap" ? "follow" : "regular";
-        insertSchedule.run(
-          s.id,
-          s.profile_id,
-          s.title,
-          s.note,
-          kind,
-          calendar,
-          calendar === "solar" ? s.date : null,
-          calendar === "lunar" ? s.lunar_month : null,
-          calendar === "lunar" ? s.lunar_day : null,
-          calendar === "lunar" ? leapPolicy : null,
-          s.time,
-          s.all_day,
-          recurrence === null ? null : JSON.stringify(recurrence),
-          JSON.stringify(offsets),
-          resend,
-          workdayFilter,
-          status,
-          Math.max(s.version, 1),
-          s.created_at,
-          s.updated_at,
-        );
-        report.schedules += 1;
+        try {
+          insertSchedule.run(
+            s.id,
+            s.profile_id,
+            s.title,
+            s.note,
+            kind,
+            calendar,
+            calendar === "solar" ? s.date : null,
+            calendar === "lunar" ? s.lunar_month : null,
+            calendar === "lunar" ? s.lunar_day : null,
+            calendar === "lunar" ? leapPolicy : null,
+            s.time,
+            s.all_day,
+            recurrence === null ? null : JSON.stringify(recurrence),
+            JSON.stringify(offsets),
+            resend,
+            workdayFilter,
+            status,
+            Math.max(s.version, 1),
+            s.created_at,
+            s.updated_at,
+          );
+          report.schedules += 1;
+        } catch (e) {
+          problem(report, "schedules", s.id, `日程「${s.title}」未导入：${errorText(e)}`);
+        }
       }
 
       let occurrenceCount = 0;
@@ -283,8 +403,16 @@ export function runImport(target: ReturnType<typeof openDatabase>, oldPath: stri
       }
       const insertLedger = target.prepare("INSERT INTO ledgers (id, name, created_at) VALUES (?, ?, ?)");
       for (const l of ledgers) {
-        insertLedger.run(l.id, l.name, l.created_at);
-        report.ledgers += 1;
+        try {
+          const name = uniqueLedgerName(target, l.name);
+          if (name !== l.name) {
+            report.scheduleWarnings.push(`账本「${l.name}」名称与已存在账本重复，已改名为「${name}」`);
+          }
+          insertLedger.run(l.id, name, l.created_at);
+          report.ledgers += 1;
+        } catch (e) {
+          problem(report, "ledgers", l.id, `账本「${l.name}」未导入：${errorText(e)}`);
+        }
       }
       if (report.ledgers > 0) {
         report.scheduleWarnings.push(`${report.ledgers} 个账本已迁移为全局可编辑（旧角色/成员信息不迁移）`);
@@ -315,17 +443,39 @@ export function runImport(target: ReturnType<typeof openDatabase>, oldPath: stri
           report.entriesSkipped += 1;
           continue;
         }
-        insertExpense.run(
-          e.id,
-          e.ledger_id,
-          e.amount_cents,
-          e.category ?? "其他",
-          e.note,
-          toLocalDate(e.occurred_at, e.id, report.scheduleWarnings),
-          e.profile_id,
-          e.created_at,
-        );
-        report.expenses += 1;
+        // v2 有 STRICT/CHECK 约束：金额必须是正整数分、spent_on 必须是真实日历日。
+        // 逐行校验并隔离，避免一条脏数据让整库导入回滚成 0 行。
+        if (!Number.isInteger(e.amount_cents) || e.amount_cents <= 0) {
+          problem(report, "ledger_entries", e.id, `金额不合法（${String(e.amount_cents)}），需为正整数分`);
+          continue;
+        }
+        const ledgerExists = target.prepare("SELECT 1 FROM ledgers WHERE id = ?").get(e.ledger_id);
+        if (ledgerExists === undefined) {
+          problem(report, "ledger_entries", e.id, `引用的账本 ${e.ledger_id} 不存在，无法导入`);
+          continue;
+        }
+        // 无法解析的 occurred_at 绝不能把非日期写进 spent_on —— 那会让该笔金额
+        // 对所有按月汇总永久不可见（spent_on >= / <= 过滤），而报告却声称已导入。
+        const localDate = toLocalDate(e.occurred_at);
+        if (localDate === null) {
+          problem(report, "ledger_entries", e.id, `occurred_at「${e.occurred_at}」不是合法时间，日期无法确定，未导入`);
+          continue;
+        }
+        try {
+          insertExpense.run(
+            e.id,
+            e.ledger_id,
+            e.amount_cents,
+            e.category ?? "其他",
+            e.note,
+            localDate,
+            e.profile_id,
+            e.created_at,
+          );
+          report.expenses += 1;
+        } catch (err) {
+          problem(report, "ledger_entries", e.id, `账目未导入：${errorText(err)}`);
+        }
       }
       if (report.entriesSkipped > 0) {
         report.scheduleWarnings.push(`${report.entriesSkipped} 条非支出账目（收入/转账）不迁移`);
@@ -338,11 +488,16 @@ export function runImport(target: ReturnType<typeof openDatabase>, oldPath: stri
         warnings(report, "旧库没有 cn_holiday_days 表，跳过节假日");
       }
       const insertDay = target.prepare(
-        "INSERT OR REPLACE INTO cn_holiday_days (date, year, day_type, name, source, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO cn_holiday_days (date, year, day_type, name, source, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
       );
       for (const d of holidayDays) {
-        insertDay.run(d.date, d.year, d.day_type, d.name, d.source, d.updated_at);
-        report.holidayDays += 1;
+        // OR IGNORE：不覆盖目标库中由 ensureYears 抓取的更新数据（OR REPLACE 会静默覆盖）
+        try {
+          insertDay.run(d.date, d.year, d.day_type, d.name, d.source, d.updated_at);
+          report.holidayDays += 1;
+        } catch (e) {
+          problem(report, "cn_holiday_days", d.date, `节假日数据未导入：${errorText(e)}`);
+        }
       }
       let holidayYears: Array<{ year: number; status: string; source: string; fetched_at: string }> = [];
       try {
@@ -353,11 +508,15 @@ export function runImport(target: ReturnType<typeof openDatabase>, oldPath: stri
         // 无该表
       }
       const insertYear = target.prepare(
-        `INSERT OR REPLACE INTO cn_holiday_years (year, status, source, fetched_at) VALUES (?, 'ready', ?, ?)`,
+        `INSERT OR IGNORE INTO cn_holiday_years (year, status, source, fetched_at) VALUES (?, 'ready', ?, ?)`,
       );
       for (const y of holidayYears) {
-        insertYear.run(y.year, y.source, y.fetched_at);
-        report.holidayYears += 1;
+        try {
+          insertYear.run(y.year, y.source, y.fetched_at);
+          report.holidayYears += 1;
+        } catch (e) {
+          problem(report, "cn_holiday_years", String(y.year), `节假日年份元数据未导入：${errorText(e)}`);
+        }
       }
     });
   } finally {
@@ -370,30 +529,36 @@ function warnings(report: ImportReport, message: string): void {
   report.scheduleWarnings.push(message);
 }
 
-/** V1 occurred_at 存 UTC ISO，换算到本地时区后取日历日；解析失败回退原截取并留痕 */
-function toLocalDate(occurredAt: string, label: string, warnings: string[]): string {
+function errorText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * V1 occurred_at 存 UTC ISO，换算到本地时区后取日历日。
+ * 解析失败返回 null（由调用方隔离该行）——绝不回退成非日期字符串：
+ * 那会让金额对所有按月汇总永久不可见。
+ */
+function toLocalDate(occurredAt: string): string | null {
   const dt = DateTime.fromISO(occurredAt, { zone: "utc" });
-  if (!dt.isValid) {
-    warnings.push(`支出 ${label} 的 occurred_at「${occurredAt}」无法解析，按原字符串前 10 位作为日期`);
-    return occurredAt.slice(0, 10);
-  }
-  return dt.setZone(TZ).toISODate() ?? occurredAt.slice(0, 10);
+  if (!dt.isValid) return null;
+  const local = dt.setZone(TZ).toISODate();
+  if (local === null || !DATE_RE_IMPORT.test(local)) return null;
+  return local;
 }
 
 const DB_CANDIDATE_NAMES = ["life-assistant.db", "life-assistant.sqlite", "assistant.db", "hermes.db"];
 
-/** 目录下疑似旧数据库（排除 -wal/-shm 与备份文件） */
+/** v2 自身备份的命名（与 backup.ts 的 FILE_RE 一致） */
+const V2_BACKUP_RE = /^life-assistant-\d{8}-\d{6}\.db$/;
+
+/** 目录下疑似旧数据库（排除 -wal/-shm、备份文件与 v2 自身的备份产物） */
 function scanDbFiles(from: string): string[] {
   try {
     return readdirSync(from)
-      .filter(
-        (name) =>
-          (name.endsWith(".db") || name.endsWith(".sqlite")) &&
-          !/-wal$/.test(name) &&
-          !/-shm$/.test(name) &&
-          !/\.bak-/.test(name) &&
-          !/\.backup-/.test(name),
-      )
+      // 先判扩展名再去排除项：-wal/-shm 不以 .db/.sqlite 结尾，放在后面永远不生效
+      .filter((name) => name.endsWith(".db") || name.endsWith(".sqlite"))
+      .filter((name) => !V2_BACKUP_RE.test(name))
+      .filter((name) => !/\.bak-/.test(name) && !/\.backup-/.test(name))
       .map((name) => join(from, name))
       .sort();
   } catch {
@@ -428,19 +593,39 @@ function main(): void {
   }
   const force = args.includes("--force");
   const config = loadConfig(process.env);
-  const target = openDatabase(config.dbPath);
-  const oldPath = resolveOldDbPath(args[fromIndex + 1] as string);
-  const report = runImport(target, oldPath, force);
-  logger.info(`导入完成：${JSON.stringify(report, null, 2)}`);
-  console.log(
-    `已导入 ${report.profiles} 个 Profile、${report.schedules} 个日程、${report.ledgers} 个账本、${report.expenses} 条支出、${report.holidayDays} 天节假日数据`,
-  );
-  if (report.scheduleWarnings.length > 0) {
-    console.log("注意事项：");
-    for (const w of report.scheduleWarnings) console.log(`  - ${w}`);
-  }
-  if (report.occurrencesDropped > 0) {
-    console.log(`  - ${report.occurrencesDropped} 条历史 occurrence 未迁移，v2 将按日程规则重新物化`);
+  let target: ReturnType<typeof openDatabase> | undefined;
+  try {
+    const oldPath = resolveOldDbPath(args[fromIndex + 1] as string);
+    // 指向 v2 自己的数据目录会解析到目标库本身，等于自我导入
+    if (resolve(oldPath) === resolve(config.dbPath)) {
+      throw new Error(`源库与目标库是同一个文件：${oldPath}；--from 应指向 v1 的旧库`);
+    }
+    target = openDatabase(config.dbPath);
+    const report = runImport(target, oldPath, force);
+    logger.info(`导入完成：${JSON.stringify(report, null, 2)}`);
+    console.log(
+      `已导入 ${report.profiles} 个 Profile、${report.schedules} 个日程、${report.ledgers} 个账本、${report.expenses} 条支出、${report.holidayDays} 天节假日数据`,
+    );
+    if (report.scheduleWarnings.length > 0) {
+      console.log("注意事项：");
+      for (const w of report.scheduleWarnings) console.log(`  - ${w}`);
+    }
+    if (report.occurrencesDropped > 0) {
+      console.log(`  - ${report.occurrencesDropped} 条历史 occurrence 未迁移，v2 将按日程规则重新物化`);
+    }
+    if (report.problems.length > 0) {
+      // 坏数据必须显式列出：静默跳过会悄悄丢钱/丢日程
+      console.error(`\n有 ${report.problems.length} 条数据未能导入（已隔离，其余数据已正常导入）：`);
+      for (const p of report.problems) console.error(`  - [${p.table}] ${p.id}：${p.reason}`);
+      process.exitCode = 2;
+    }
+  } catch (e) {
+    // 不打印裸 SQLite 堆栈：给出可操作的一行信息
+    console.error(`导入失败：${e instanceof Error ? e.message : String(e)}`);
+    console.error("目标库未被修改（导入在单个事务内完成）；建议先 npm run db:backup 再重试。");
+    process.exitCode = 1;
+  } finally {
+    if (target?.isOpen) target.close();
   }
 }
 
