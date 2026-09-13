@@ -1,10 +1,11 @@
 import { z } from "zod";
 import { todayIso } from "../../time.js";
 import { errorMessage, fail, ok, okJson, registerModule, runtime, type ToolContext } from "../../core/registry.js";
-import { publishProfile, routedProfiles } from "../../core/notify.js";
+import { publishProfile } from "../../core/notify.js";
 import { cachedLocation, currentWeather, saveLocation } from "../../core/qweather.js";
 import type { AirQuality, CurrentWeather, ForecastDay, LocationInfo, WeatherAlert } from "../../core/qweather.js";
 import { airQuality, alerts, forecast, geoLookup } from "../../core/qweather.js";
+import { listProfiles } from "../../core/settings.js";
 import { logger } from "../../core/logger.js";
 
 function requireQweather(ctx: ToolContext): { host: string; key: string } {
@@ -106,7 +107,10 @@ export async function runDailyBrief(): Promise<void> {
   }
   const host = rt.config.qweatherHost;
   const key = rt.config.qweatherKey;
-  const profiles = routedProfiles(rt.db);
+  // 覆盖所有已知 Profile，而不只是配置了推送路由的：publishProfile 明确「即使无路由
+  // 也保留，供 notify.pull 兜底」，只发给有路由的 Profile 会让纯 pull 型 Profile
+  // 永远收不到简报。
+  const profiles = listProfiles(rt.db);
   const cityCache = new Map<string, LocationInfo>();
   for (const profileId of profiles) {
     try {

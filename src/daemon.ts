@@ -21,6 +21,7 @@ import {
   type ToolContext,
 } from "./core/registry.js";
 import { cancelPendingDrain, createServices, drainDue } from "./core/notify.js";
+import { pruneCache } from "./core/settings.js";
 import { logger, setLogLevel } from "./core/logger.js";
 import { TZ, now } from "./time.js";
 import { registerAllModules } from "./modules/index.js";
@@ -224,6 +225,12 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
   tasks.push(cron.schedule("* * * * *", () => void runExclusive("tick", () => tickAll(now())), { timezone: TZ }));
   const drainTimer = setInterval(() => {
     void drainDue(db, config).catch((e) => logger.error(`outbox drain 失败: ${errorMessage(e)}`));
+    try {
+      const pruned = pruneCache(db);
+      if (pruned > 0) logger.debug(`清理过期缓存 ${pruned} 条`);
+    } catch (e) {
+      logger.warn(`清理缓存失败: ${errorMessage(e)}`);
+    }
     sweepSessions();
   }, 20_000);
 
@@ -239,12 +246,17 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
       (config.webApiToken === undefined ? "（未启用鉴权，仅回环地址）" : "（已启用 token 鉴权）"),
   );
 
+  // onStart 是非阻塞引导（不挡启动），但必须在关库前收敛：否则 stop() 关掉数据库后
+  // 它仍在写，日志会出现 "database is not open"，也可能留下半途而废的写入。
+  const onStartTasks: Promise<void>[] = [];
   for (const module of getModules()) {
     if (module.onStart === undefined) continue;
-    module
-      .onStart()
-      .then(() => logger.debug(`模块 ${module.name} onStart 完成`))
-      .catch((e) => logger.error(`模块 ${module.name} onStart 失败: ${errorMessage(e)}`));
+    onStartTasks.push(
+      Promise.resolve()
+        .then(() => module.onStart?.())
+        .then(() => logger.debug(`模块 ${module.name} onStart 完成`))
+        .catch((e) => logger.error(`模块 ${module.name} onStart 失败: ${errorMessage(e)}`)),
+    );
   }
 
   let stopped = false;
@@ -254,6 +266,13 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
     for (const task of tasks) task.stop();
     clearInterval(drainTimer);
     cancelPendingDrain();
+    // 给 onStart 一点时间收尾（多为网络抓取），避免关库后仍在写
+    if (onStartTasks.length > 0) {
+      await Promise.race([
+        Promise.allSettled(onStartTasks),
+        new Promise<void>((resolve) => setTimeout(resolve, 3000).unref()),
+      ]);
+    }
     for (const [id, session] of [...sessions]) dropSession(id, session);
     httpServer.closeAllConnections();
     await new Promise<void>((resolve) => httpServer.close(() => resolve()));

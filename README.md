@@ -40,7 +40,7 @@ npm run build
 | `QWEATHER_API_HOST` / `QWEATHER_KEY` | 天气需要 | QWeather 控制台获取 |
 | `DEFAULT_CITY` | | Profile 未设位置时的兜底城市 |
 | `HOST` / `PORT` | | 默认 `127.0.0.1:3080`；**非回环地址必须配 `WEB_API_TOKEN`**，否则拒绝启动 |
-| `WEB_API_TOKEN` | | 非回环地址必填；同时保护 `/api/*` 与 `/mcp`（Bearer 或 `?token=`） |
+| `WEB_API_TOKEN` | | 非回环地址必填；保护 `/api/*`（Bearer 或 `?token=`）与 `/mcp`（仅 Bearer） |
 | `MCP_DAEMON_TOKEN` | | stdio 壳访问 daemon 用的 token；缺省复用 `WEB_API_TOKEN` |
 | `PROFILE_ROUTE_SECRETS_JSON` | 主动推送需要 | `'{"default":"<openssl rand -hex 32>"}'`（整段用单引号包裹） |
 | `DAILY_BRIEF_CRON` | | 每日简报时间，默认 `'0 7 * * *'`（含空格需单引号，Asia/Shanghai） |
@@ -61,7 +61,10 @@ daemon 就绪后：
 - MCP 端点：`http://127.0.0.1:3080/mcp`（Streamable HTTP）
 - 状态页：`http://127.0.0.1:3080/`（`/api/status` 同源）
 - `X-Hermes-Profile` 头决定 Profile；缺省为 `default`
-- `/mcp` 与 `/api/*` 共用鉴权：配置了 `WEB_API_TOKEN` 时两者都需要凭据
+- 配了 `WEB_API_TOKEN` 时两者都需凭据：`/api/*` 接受 Bearer 或 `?token=`，
+  `/mcp` 只接受 `Authorization: Bearer`（避免凭据出现在 URL/日志里）
+- 状态页的 `holidays.failed` 会列出抓取失败的年份与原因（数据未就绪会让
+  `workday/holiday` 过滤的日程暂停，这里能直接看出是抓取失败还是尚未发布）
 
 ### 注册到 Hermes
 
@@ -161,11 +164,16 @@ npm run import:v1 -- --from /旧/DATA_DIR [--force]
 
 一次性导入旧库的 Profile、静默时段、日程、账本（变全局可编辑）、支出账目、节假日数据。旧 occurrence 不迁移（v2 按规则重新物化）；收入/转账账目、deadline 提醒、共享账本角色不迁移，均会在报告中列明。建议先对旧库做备份。
 
+导入是**逐行隔离**的：单条坏数据（金额非法、日期无法解析、引用不存在的账本、主键冲突等）
+不会中断整次导入，而是被跳过并在最后以 `[表] id：原因` 列出，进程以退出码 2 结束。
+合法数据照常入库，不必因为一条脏数据重来。`--force` 会先清除**本次导入涉及**的
+Profile / 账本数据再写入（不影响其它 Profile），失败时整体回滚。
+
 ## 开发
 
 ```bash
 npm run dev            # tsx 直接跑 daemon
-npm test               # node --test（114 个用例）
+npm test               # node --test（159 个用例）
 npm run lint           # Biome（0 警告）
 npm run db:backup      # VACUUM INTO 备份，保留最近 14 份
 ```
@@ -179,3 +187,25 @@ npm run db:backup      # VACUUM INTO 备份，保留最近 14 份
 - **recurrence 引擎**：自研纯函数替代 rrule，只覆盖 daily/weekly/monthly/yearly × 农历 + 工作日过滤；漏触发只补最近一次。
 - **outbox**：通知 + 投递记录同事务写入；发布即触发投递；静默时段只拦主动推送。
 - **时区**：全部调度固定 Asia/Shanghai，无 DST。
+
+### 已知取舍与后续优化（尚未实施）
+
+按收益排序，均为「已识别但未做」的项，当前实现是正确的、只是不够省：
+
+1. **QWeather 无缓存/限流/退避**：每次工具调用都是实打实的请求，`daily_brief` 每个 Profile 并发 4 个。
+   建议给现成的 `cache` 表加短 TTL（实时 ≈10min、预报 ≈1–3h、空气 ≈30–60min、预警 ≈10min），
+   加并发上限，并只对 429/5xx 做指数退避（官方文档警告重复错误流量可能导致账号封禁）。
+2. **认证方式建议迁移 JWT**：目前用 `?key=` 传 API key（会进入代理日志）。官方推荐 JWT
+   （`Authorization: Bearer`，Ed25519），并支持 `X-QW-Api-Key` 头；API-KEY 方式自 2027-01-01 起会被限流。
+3. **v7 城市版端点已宣布弃用**：迁移到 v1 `/weather/v1/...` 时注意 `humidity` 在 v1 是 0–1 小数
+   （v7 是百分数），且数值包在 `{value, unit}` 里 —— 直接换路径会静默错报湿度。
+4. **`summarizeExpenses` 不是单快照**：三条独立语句，跨进程并发写入时「合计」可能与分类明细不一致；
+   加 `BEGIN DEFERRED` 读事务即可。
+5. **契约测试名不副实**：`tests/registry.test.ts` 的注释声称「核心不 import 模块内部由该测试强制」，
+   但它只在运行时检查重名。若要真正强制，需加静态 import 图检查或 lint 规则。
+6. **`schedules.version` 列未参与并发控制**：每次更新 +1，但没有乐观校验；单写者下风险低，
+   可删列或落实校验。
+7. **节假日刷新节奏**：`FETCH_COOLDOWN_MS` 是 6h，但唯一的重试点是每天 02:00 的 job，
+   实际重试间隔为 24h。可改为 `0 */3 * * *` 或由 `tick()` 驱动，让冷却常量真正起作用。
+8. **`status` 页面无鉴权**（`/` 只有静态 HTML，数据走受保护的 `/api/status`），
+   如需对外暴露建议一并加保护。

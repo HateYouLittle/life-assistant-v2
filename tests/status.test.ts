@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createStatusApp, statusPayload } from "../src/server/status.js";
+import { todayIso } from "../src/time.js";
 import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
 
 function app(env: TestEnv) {
@@ -52,6 +53,45 @@ describe("状态接口", () => {
     try {
       const response = await app(env).request("/api/status");
       assert.equal(response.status, 200);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("未来日期的支出不计入本月支出", () => {
+    const env = makeTestEnv();
+    try {
+      env.db
+        .prepare("INSERT INTO ledgers (id, name, created_at) VALUES ('l1', '日用', '2026-01-01T00:00:00.000Z')")
+        .run();
+      const today = todayIso();
+      const insert = env.db.prepare(
+        "INSERT INTO expenses (id, ledger_id, amount_cents, spent_on, created_by_profile, created_at) VALUES (?, 'l1', ?, ?, 'default', '2026-01-01T00:00:00.000Z')",
+      );
+      insert.run("e-now", 1000, today);
+      insert.run("e-future", 9999, "2099-01-15");
+      const payload = statusPayload(env.config, env.db);
+      const expenses = payload.expenses as { month_cents: number };
+      assert.equal(expenses.month_cents, 1000, "只筛 >= 月初会把未来支出也算进本月");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("暴露抓取失败的节假日年份与原因", () => {
+    const env = makeTestEnv();
+    try {
+      env.db
+        .prepare(
+          "INSERT INTO cn_holiday_years (year, status, source, fetched_at, last_attempt_at, last_error) VALUES (2027, 'failed', '', '2027-01-01T00:00:00.000Z', '2027-01-01T00:00:00.000Z', 'HTTP 404')",
+        )
+        .run();
+      const payload = statusPayload(env.config, env.db);
+      const holidays = payload.holidays as { years: number[]; failed: { year: number; error: string }[] };
+      assert.deepEqual(holidays.years, []);
+      assert.equal(holidays.failed.length, 1);
+      assert.equal(holidays.failed[0]?.year, 2027);
+      assert.match(holidays.failed[0]?.error ?? "", /404/);
     } finally {
       cleanupTestEnv(env);
     }

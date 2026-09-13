@@ -49,3 +49,12 @@ export function setCache(db: DatabaseSync, key: string, value: unknown, ttlMs: n
      ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json, expires_at = excluded.expires_at`,
   ).run(key, JSON.stringify(value), expiresAt);
 }
+
+/**
+ * 清理已过期的缓存行。getCache 只是按 expires_at 过滤，不会删除，
+ * 而 cache 的 key 由用户输入派生（如 qweather:geo:<城市名>），长期运行会无界增长。
+ */
+export function pruneCache(db: DatabaseSync): number {
+  const result = db.prepare("DELETE FROM cache WHERE expires_at <= ?").run(nowIso());
+  return Number(result.changes);
+}

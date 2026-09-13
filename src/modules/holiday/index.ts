@@ -1,21 +1,25 @@
 import { z } from "zod";
-import { DATE_RE } from "../../time.js";
+import { DATE_RE, isDate, todayIso } from "../../time.js";
 import { dayType, ensureYears, holidayYearsReady, nextHolidayPeriod, requiredYears } from "../../core/holiday.js";
-import { fail, ok, okJson, registerModule, runtime, type ToolContext } from "../../core/registry.js";
+import { fail, ok, okJson, registerModule, runtime, type ToolContext, type ToolResult } from "../../core/registry.js";
 import { logger } from "../../core/logger.js";
 
-async function holidayTool(args: Record<string, unknown>, ctx: ToolContext) {
+export async function holidayTool(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
   const view = args.view as string;
   const db = ctx.db;
   if (view === "next") {
     const period = nextHolidayPeriod(db);
     if (period === null) {
       const years = holidayYearsReady(db);
-      return ok(
-        years.length === 0
-          ? "节假日数据尚未导入，暂无法查询（导入后每天 02:00 自动刷新）"
-          : "覆盖年份内没有更晚的假期了",
-      );
+      if (years.length === 0) {
+        return ok("节假日数据尚未导入，暂无法查询（导入后每天 02:00 自动刷新）");
+      }
+      // 覆盖到当年但查不到更晚的假期，通常是下一年数据还没导入，而不是「没有假期」。
+      const currentYear = Number(todayIso().slice(0, 4));
+      if (Math.max(...years) <= currentYear) {
+        return ok(`覆盖年份内没有更晚的假期了；下一年（${currentYear + 1} 年）数据尚未导入（通常 11 月后发布）`);
+      }
+      return ok("覆盖年份内没有更晚的假期了");
     }
     return okJson({
       下一假期: `${period.name}`,
@@ -47,6 +51,8 @@ async function holidayTool(args: Record<string, unknown>, ctx: ToolContext) {
   // is_workday
   const date = typeof args.date === "string" ? args.date : "";
   if (!DATE_RE.test(date)) return fail("date 需为 YYYY-MM-DD 格式");
+  // DATE_RE 只校验格式：2026-02-30 会因 weekday 为 NaN 被误判成「上班日（工作日）」
+  if (!isDate(date)) return fail(`date 不是真实存在的日期: ${date}`);
   const cls = dayType(db, date);
   if (cls === "holiday") {
     const name = db.prepare("SELECT name FROM cn_holiday_days WHERE date = ?").get(date) as { name: string };

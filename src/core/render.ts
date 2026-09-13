@@ -1,7 +1,6 @@
 import type { NotifyBlock } from "./registry.js";
 
 export interface Rendered {
-  title: string;
   body: string;
 }
 
@@ -9,6 +8,7 @@ export interface Rendered {
  * 通知快照在发布时渲染一次，投递时不重渲染。
  * markdown：微信/企业微信的 Markdown 表格。
  * plain：对齐的文本表格；宽度超限时降级为“键: 值”逐行。
+ * 标题不在这里渲染：发布方单独传 title，避免推送与 notify.pull 各多一行重复标题。
  */
 export function renderBlocks(blocks: NotifyBlock, mode: "markdown" | "plain"): Rendered {
   const lines: string[] = [];
@@ -18,7 +18,7 @@ export function renderBlocks(blocks: NotifyBlock, mode: "markdown" | "plain"): R
     else lines.push(...plainTable(table.columns, table.rows));
   }
   for (const note of notes ?? []) lines.push(note);
-  return { title: "", body: lines.join("\n") };
+  return { body: lines.join("\n") };
 }
 
 function markdownTable(columns: string[], rows: string[][]): string[] {

@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { DatabaseSync } from "node:sqlite";
+import { bearerToken, isRequestAuthorized } from "../src/core/auth.js";
 import { getSchemaVersion, openDatabase, withTransaction } from "../src/core/database.js";
+import { getCache, pruneCache, setCache } from "../src/core/settings.js";
 import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
 
 describe("database schema v1", () => {
@@ -98,5 +100,55 @@ describe("database schema v1", () => {
     } finally {
       cleanupTestEnv(env);
     }
+  });
+});
+
+describe("cache 过期清理", () => {
+  it("pruneCache 只删除过期行，未过期行保留", () => {
+    const env = makeTestEnv();
+    try {
+      setCache(env.db, "geo:alive", { v: 1 }, 60_000);
+      setCache(env.db, "geo:dead", { v: 2 }, -1_000);
+      assert.deepEqual(getCache(env.db, "geo:alive"), { v: 1 });
+      assert.equal(getCache(env.db, "geo:dead"), undefined);
+
+      const pruned = pruneCache(env.db);
+      assert.equal(pruned, 1, "只应清理 1 条过期行");
+      const keys = (env.db.prepare("SELECT key FROM cache").all() as { key: string }[]).map((r) => r.key);
+      assert.deepEqual(keys, ["geo:alive"], "cache 表不会被读取时自动回收，必须显式清理");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
+describe("鉴权", () => {
+  const TOKEN = "s".repeat(32);
+
+  it("Bearer 与 ?token= 均可通过，错误凭据一律拒绝", () => {
+    assert.equal(isRequestAuthorized(TOKEN, `Bearer ${TOKEN}`), true);
+    assert.equal(isRequestAuthorized(TOKEN, undefined, TOKEN), true);
+    assert.equal(isRequestAuthorized(TOKEN, `Bearer wrong`), false);
+    assert.equal(isRequestAuthorized(TOKEN, undefined), false);
+    assert.equal(isRequestAuthorized(TOKEN, `Bearer ${TOKEN}x`), false);
+  });
+
+  it("长度不同的凭据不会抛错（先哈希再定长比较）", () => {
+    // 直接 timingSafeEqual 要求等长，长度不等必须先返回 false 而不是抛异常
+    assert.equal(isRequestAuthorized(TOKEN, "Bearer short"), false);
+    assert.equal(isRequestAuthorized(TOKEN, `Bearer ${"s".repeat(1000)}`), false);
+    assert.equal(isRequestAuthorized(TOKEN, undefined, ""), false);
+  });
+
+  it("未配置 token 时不鉴权", () => {
+    assert.equal(isRequestAuthorized(undefined, undefined), true);
+    assert.equal(isRequestAuthorized(undefined, "Bearer anything"), true);
+  });
+
+  it("bearerToken 只接受 Bearer 前缀", () => {
+    assert.equal(bearerToken(`Bearer ${TOKEN}`), TOKEN);
+    assert.equal(bearerToken(`bearer ${TOKEN}`), undefined);
+    assert.equal(bearerToken("Basic abc"), undefined);
+    assert.equal(bearerToken("Bearer   "), undefined);
   });
 });

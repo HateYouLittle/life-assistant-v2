@@ -1,15 +1,18 @@
 import { Hono } from "hono";
 import type { DatabaseSync } from "node:sqlite";
 import { createRequire } from "node:module";
+import { DateTime } from "luxon";
 import type { ResolvedConfig } from "../config.js";
 import { isRequestAuthorized } from "../core/auth.js";
-import { todayIso } from "../time.js";
+import { TZ, todayIso } from "../time.js";
 
 const require = createRequire(import.meta.url);
 const VERSION = (require("../../package.json") as { version: string }).version;
 
 export function statusPayload(config: ResolvedConfig, db: DatabaseSync): Record<string, unknown> {
-  const monthStart = `${todayIso().slice(0, 7)}-01`;
+  const today = todayIso();
+  const monthStart = `${today.slice(0, 7)}-01`;
+  const monthEnd = `${today.slice(0, 7)}-${String(DateTime.fromISO(today, { zone: TZ }).daysInMonth ?? 31).padStart(2, "0")}`;
   const count = (sql: string, ...params: (string | number)[]): number => {
     const row = db.prepare(sql).get(...params) as { n: number } | undefined;
     return row?.n ?? 0;
@@ -40,14 +43,23 @@ export function statusPayload(config: ResolvedConfig, db: DatabaseSync): Record<
     },
     expenses: {
       month_cents: count(
-        "SELECT COALESCE(SUM(amount_cents), 0) AS n FROM expenses WHERE spent_on >= ?",
+        // 加上月上界：只筛 >= 月初会把未来日期的支出也算进「本月支出」
+        "SELECT COALESCE(SUM(amount_cents), 0) AS n FROM expenses WHERE spent_on >= ? AND spent_on <= ?",
         monthStart,
+        monthEnd,
       ),
     },
     holidays: {
       years: (db.prepare("SELECT year FROM cn_holiday_years WHERE status = 'ready' ORDER BY year").all() as { year: number }[]).map(
         (r) => r.year,
       ),
+      // 长期抓取失败的年份此前只显示「未导入」，看不出原因
+      failed: (db
+        .prepare("SELECT year, last_error FROM cn_holiday_years WHERE status = 'failed' ORDER BY year")
+        .all() as { year: number; last_error: string | null }[]).map((r) => ({
+        year: r.year,
+        error: (r.last_error ?? "").slice(0, 200),
+      })),
     },
   };
 }

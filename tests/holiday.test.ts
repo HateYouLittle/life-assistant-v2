@@ -312,3 +312,31 @@ describe("节假日抓取", () => {
     );
   });
 });
+
+describe("holiday 工具：日期校验", () => {
+  it("拒绝不存在的日历日，而不是误报为工作日", async () => {
+    const env = makeTestEnv();
+    try {
+      importYear(env.db, { year: 2026, days: [{ name: "元旦", date: "2026-01-01", isOffDay: true }] }, "test");
+      const ctx = {
+        profileId: "default",
+        db: env.db,
+        config: env.config,
+        services: {
+          publishProfile: async () => ({ id: "x", deduped: false }),
+          publishGlobal: async () => ({ materialized: 0 }),
+        },
+      };
+      // DATE_RE 只校验格式：此前 2026-02-30 的 weekday 为 NaN，被当成「上班日（工作日）」
+      const bad = await holidayTool({ view: "is_workday", date: "2026-02-30" }, ctx);
+      assert.equal(bad.isError, true);
+      assert.match(bad.content[0]?.text ?? "", /真实存在/);
+
+      const good = await holidayTool({ view: "is_workday", date: "2026-01-01" }, ctx);
+      assert.equal(good.isError, undefined);
+      assert.match(good.content[0]?.text ?? "", /休息日/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});

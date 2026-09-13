@@ -1,8 +1,10 @@
 import { DatabaseSync } from "node:sqlite";
 import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { DateTime } from "luxon";
 import { loadConfig, type ResolvedConfig } from "./config.js";
 import { logger } from "./core/logger.js";
+import { TZ } from "./time.js";
 
 const FILE_RE = /^life-assistant-\d{8}-\d{6}\.db$/;
 const KEEP = 14;
@@ -13,8 +15,9 @@ export function runBackup(config: ResolvedConfig, nowMs: number = Date.now()): s
     throw new Error(`数据库不存在，拒绝生成空备份: ${config.dbPath}（检查 DATA_DIR 是否指向真实数据目录）`);
   }
   mkdirSync(config.backupDir, { recursive: true });
-  const iso = new Date(nowMs).toISOString();
-  const stamp = `${iso.slice(0, 10).replace(/-/g, "")}-${iso.slice(11, 19).replace(/:/g, "")}`;
+  // 用 Asia/Shanghai 本地时间打戳：项目其余部分统一本地时区，用 UTC 会让
+  // 00:00–08:00 生成的备份被标成前一天，且与「保留最近 14 份」的字典序语义不一致。
+  const stamp = DateTime.fromMillis(nowMs, { zone: TZ }).toFormat("yyyyMMdd-HHmmss");
   const target = join(config.backupDir, `life-assistant-${stamp}.db`);
   if (statSync(target, { throwIfNoEntry: false }) !== undefined) {
     throw new Error(`备份已存在，拒绝覆盖: ${target}`);
