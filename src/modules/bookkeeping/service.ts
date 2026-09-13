@@ -62,6 +62,14 @@ export function renameLedger(db: DatabaseSync, id: string, name: string): Ledger
 export function setLedgerArchived(db: DatabaseSync, id: string, archived: boolean): LedgerRow {
   const row = getLedger(db, id);
   if (row === undefined) throw new Error(`账本不存在: ${id}`);
+  if (!archived) {
+    // 归档→新建同名→恢复，会得到两个同名活跃账本：create/rename 的重名检查
+    // 只覆盖「已存在且未归档」的账本，恢复路径此前完全没有检查。
+    const dup = db
+      .prepare("SELECT id FROM ledgers WHERE name = ? AND archived_at IS NULL AND id != ?")
+      .get(row.name, id);
+    if (dup !== undefined) throw new Error(`已有同名活跃账本「${row.name}」，请先改名或归档它再恢复`);
+  }
   db.prepare("UPDATE ledgers SET archived_at = ? WHERE id = ?").run(archived ? nowIso() : null, id);
   return getLedger(db, id) as LedgerRow;
 }
@@ -104,7 +112,7 @@ export function listExpenses(
   db: DatabaseSync,
   ledgerId: string,
   opts: { from?: string; to?: string; by?: string; limit?: number } = {},
-): ExpenseRow[] {
+): { rows: ExpenseRow[]; total: number; hasMore: boolean } {
   const conditions = ["ledger_id = ?"];
   const params: (string | number)[] = [ledgerId];
   if (opts.from !== undefined) {
@@ -119,10 +127,14 @@ export function listExpenses(
     conditions.push("created_by_profile = ?");
     params.push(opts.by);
   }
-  params.push(Math.min(opts.limit ?? 20, 200));
-  return db
-    .prepare(`SELECT * FROM expenses WHERE ${conditions.join(" AND ")} ORDER BY spent_on DESC, created_at DESC LIMIT ?`)
-    .all(...params) as unknown as ExpenseRow[];
+  const where = conditions.join(" AND ");
+  // 下限也要 clamp：SQLite 把负 LIMIT 当作「不限量」，limit:-1 会返回全表
+  const limit = Math.max(1, Math.min(opts.limit ?? 20, 200));
+  const totalRow = db.prepare(`SELECT COUNT(*) AS n FROM expenses WHERE ${where}`).get(...params) as { n: number };
+  const rows = db
+    .prepare(`SELECT * FROM expenses WHERE ${where} ORDER BY spent_on DESC, created_at DESC LIMIT ?`)
+    .all(...params, limit) as unknown as ExpenseRow[];
+  return { rows, total: totalRow.n, hasMore: totalRow.n > rows.length };
 }
 
 export interface ExpenseSummary {
@@ -211,7 +223,12 @@ export function entryReceiptBlocks(ledger: LedgerRow, entry: ExpenseRow): Notify
   return { table: { columns: ["项目", "内容"], rows } };
 }
 
-/** 月报推送：全局事件，物化到每个配置了路由的 Profile（Profile 内去重） */
+/**
+ * 月报推送：全局事件，物化到每个配置了路由的 Profile（Profile 内去重）。
+ *
+ * 覆盖**含已归档**的账本：9 月 15 日归档的账本仍持有 9 月的支出，若只遍历活跃
+ * 账本，该账本的当月账单永远不会发出（且没有任何提示）。空账本由 count === 0 跳过。
+ */
 export async function pushMonthlyReports(
   db: DatabaseSync,
   services: { publishGlobal(input: { kind: string; title: string; blocks: NotifyBlock; dedupeKey?: string }): Promise<{ materialized: number }> },
@@ -219,7 +236,7 @@ export async function pushMonthlyReports(
 ): Promise<number> {
   const { from, to } = monthRange(ym);
   let pushed = 0;
-  for (const ledger of listLedgers(db)) {
+  for (const ledger of listLedgers(db, true)) {
     const summary = summarizeExpenses(db, ledger.id, { from, to });
     if (summary.count === 0) continue;
     const result = await services.publishGlobal({
@@ -231,4 +248,43 @@ export async function pushMonthlyReports(
     pushed += result.materialized;
   }
   return pushed;
+}
+
+/** 该月的月报是否已推送过（用 dedupeKey 判断，便于补发时保持幂等） */
+export function monthlyReportPublished(db: DatabaseSync, ledgerId: string, ym: string): boolean {
+  const row = db
+    .prepare("SELECT 1 FROM notifications WHERE dedupe_key = ? LIMIT 1")
+    .get(`report:${ledgerId}:${ym}`);
+  return row !== undefined;
+}
+
+export interface MonthlyCatchup {
+  /** 未推送过年月账单的账本+月份 */
+  missing: Array<{ ledger_id: string; ledger_name: string; ym: string }>;
+}
+
+/**
+ * 找出「有支出但从未推送过」的历史月份账单。
+ * node-cron 不会补发错过的触发：1 号 09:00 停机就永久丢失该月账单。
+ * 靠 notifications.dedupe_key 判断是否推过，因此重复调用是幂等的。
+ */
+export function findMissingMonthlyReports(
+  db: DatabaseSync,
+  lookbackMonths = 6,
+  today: string = todayIso(),
+): MonthlyCatchup {
+  const missing: MonthlyCatchup["missing"] = [];
+  const currentYm = today.slice(0, 7);
+  const months: string[] = [];
+  for (let i = lookbackMonths; i >= 1; i--) {
+    months.push(DateTime.fromISO(`${currentYm}-01`, { zone: TZ }).minus({ months: i }).toFormat("yyyy-MM"));
+  }
+  for (const ledger of listLedgers(db, true)) {
+    for (const ym of months) {
+      if (monthlyReportPublished(db, ledger.id, ym)) continue;
+      if (summarizeExpenses(db, ledger.id, monthRange(ym)).count === 0) continue;
+      missing.push({ ledger_id: ledger.id, ledger_name: ledger.name, ym });
+    }
+  }
+  return { missing };
 }

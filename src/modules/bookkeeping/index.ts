@@ -8,6 +8,7 @@ import {
   createLedger,
   deleteExpense,
   entryReceiptBlocks,
+  findMissingMonthlyReports,
   getLedger,
   listExpenses,
   listLedgers,
@@ -104,14 +105,14 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
       }
       const range: { from?: string; to?: string } =
         args.month === undefined ? {} : monthRange(args.month as string);
-      const rows = listExpenses(db, ledgerId, {
+      const page = listExpenses(db, ledgerId, {
         from: (args.from as string | undefined) ?? range.from,
         to: (args.to as string | undefined) ?? range.to,
         by: args.by as string | undefined,
         limit: args.limit as number | undefined,
       });
       return okJson({
-        账目: rows.map((r) => ({
+        账目: page.rows.map((r) => ({
           id: r.id,
           金额: `¥${centsToYuan(r.amount_cents)}`,
           分类: r.category,
@@ -119,7 +120,11 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
           记账人: r.created_by_profile,
           备注: r.note,
         })),
-        数量: rows.length,
+        // 区分「返回条数」与「匹配总数」：此前 数量 只报返回行数，默认 LIMIT 20
+        // 会让调用方以为这就是全部，从而少报笔数/金额。
+        已返回: page.rows.length,
+        匹配总数: page.total,
+        还有更多: page.hasMore,
       });
     }
     if (action === "summary") {
@@ -204,7 +209,7 @@ registerModule({
         from: z.string().regex(DATE_RE).optional(),
         to: z.string().regex(DATE_RE).optional(),
         by: z.string().optional().describe("按记账人 Profile 过滤"),
-        limit: z.number().int().min(1).max(200).optional(),
+        limit: z.number().int().min(1).max(200).optional().describe("list 返回条数，默认 20，上限 200"),
       },
       handler: bookkeepingExpenseTool,
     },
@@ -215,6 +220,14 @@ registerModule({
       cron: "0 9 1 * *",
       handler: async () => {
         const rt = runtime();
+        // 上月账单必须按时发，但 node-cron 不补发错过的触发（1 号 09:00 停机即永久丢失）。
+        // 每次触发时先补齐最近几个月缺失的账单；dedupeKey 保证幂等（每月只物化一次）。
+        const catchup = findMissingMonthlyReports(rt.db);
+        const months = [...new Set(catchup.missing.map((m) => m.ym))].sort();
+        for (const ym of months) {
+          logger.warn(`补发缺失的月报：${ym}`);
+          await pushMonthlyReports(rt.db, rt.services, ym);
+        }
         await pushMonthlyReports(rt.db, rt.services, previousMonth());
       },
     },

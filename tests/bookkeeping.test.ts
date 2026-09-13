@@ -3,14 +3,18 @@ import { describe, it } from "node:test";
 import {
   addExpense,
   createLedger,
+  findMissingMonthlyReports,
+  listExpenses,
   listLedgers,
   monthRange,
+  monthlyReportPublished,
   previousMonth,
   setLedgerArchived,
   summarizeExpenses,
   pushMonthlyReports,
 } from "../src/modules/bookkeeping/service.js";
 import { bookkeepingLedgerTool, bookkeepingExpenseTool } from "../src/modules/bookkeeping/index.js";
+import { todayIso } from "../src/time.js";
 import { cleanupTestEnv, makeTestEnv, type Published, type TestEnv } from "./helpers.js";
 
 function tools(env: TestEnv, profileId = "default") {
@@ -79,7 +83,9 @@ describe("bookkeeping：支出", () => {
       // 另一个 Profile 直接记账（无授权限制）
       const t2 = tools(env, "partner");
       t2.expense({ action: "add", ledger_id: ledgerId, amount: 30, category: "交通" });
-      const month = new Date().toISOString().slice(0, 7);
+      // 用本地（Asia/Shanghai）月份：addExpense 默认 spent_on 走 todayIso()，
+      // 若这里取 UTC 月份，每月 1 号 00:00–08:00 的 8 小时窗口内断言必然失败。
+      const month = todayIso().slice(0, 7);
       const sum = JSON.parse(text(t.expense({ action: "summary", ledger_id: ledgerId, month }))) as {
         合计: string;
         笔数: number;
@@ -210,7 +216,7 @@ describe("bookkeeping：支出", () => {
         已删除: { 金额: string };
       };
       assert.equal(removed.已删除.金额, "¥50.00");
-      const month = new Date().toISOString().slice(0, 7);
+      const month = todayIso().slice(0, 7);
       const sum = JSON.parse(text(t.expense({ action: "summary", ledger_id: ledgerId, month }))) as {
         合计: string;
         笔数: number;
@@ -224,3 +230,112 @@ describe("bookkeeping：支出", () => {
     }
   });
 });
+
+describe("bookkeeping：月报覆盖与分页语义", () => {
+  it("已归档账本仍会推送其有支出的月份账单", async () => {
+    const env = makeTestEnv();
+    try {
+      const ledger = createLedger(env.db, "家庭");
+      addExpense(env.db, "default", { ledgerId: ledger.id, amountCents: 2500, spentOn: "2026-09-05" });
+      setLedgerArchived(env.db, ledger.id, true);
+
+      const pushed = await pushMonthlyReports(env.db, makeServices(env), "2026-09");
+      assert.ok(pushed >= 1, "归档账本的当月账单不应被漏发");
+      assert.ok(
+        env.published.some((p) => (p.input as { title?: string }).title?.includes("家庭")),
+        "应推送归档账本的月报",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("月报幂等：同月重复推送不产生第二条", async () => {
+    const env = makeTestEnv();
+    try {
+      const ledger = createLedger(env.db, "幂等");
+      addExpense(env.db, "default", { ledgerId: ledger.id, amountCents: 100, spentOn: "2026-09-05" });
+      const services = makeServices(env);
+      await pushMonthlyReports(env.db, services, "2026-09");
+      const first = env.published.length;
+      await pushMonthlyReports(env.db, services, "2026-09");
+      assert.equal(env.published.length, first, "同月同账本应被 dedupeKey 去重");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("能识别并补发错过的历史月报", async () => {
+    const env = makeTestEnv();
+    try {
+      const ledger = createLedger(env.db, "补发");
+      addExpense(env.db, "default", { ledgerId: ledger.id, amountCents: 500, spentOn: "2026-08-10" });
+      const missing = findMissingMonthlyReports(env.db, 6, "2026-10-05");
+      assert.ok(
+        missing.missing.some((m) => m.ym === "2026-08"),
+        `未推送的 8 月账单应被识别：${JSON.stringify(missing.missing)}`,
+      );
+      await pushMonthlyReports(env.db, makeServices(env), "2026-08");
+      assert.ok(monthlyReportPublished(env.db, ledger.id, "2026-08"));
+      const after = findMissingMonthlyReports(env.db, 6, "2026-10-05");
+      assert.ok(!after.missing.some((m) => m.ym === "2026-08"), "补发后不再缺失");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("expense list 报告真实总数与截断标志，且负数 limit 不变成不限量", () => {
+    const env = makeTestEnv();
+    try {
+      const ledger = createLedger(env.db, "多笔");
+      for (let i = 1; i <= 25; i++) {
+        addExpense(env.db, "default", { ledgerId: ledger.id, amountCents: 100 + i, spentOn: "2026-09-05" });
+      }
+      const page = listExpenses(env.db, ledger.id);
+      assert.equal(page.rows.length, 20);
+      assert.equal(page.total, 25, "匹配总数应为 25 而不只是返回的 20");
+      assert.equal(page.hasMore, true);
+
+      const neg = listExpenses(env.db, ledger.id, { limit: -1 });
+      assert.ok(neg.rows.length <= 20, `负数 limit 应被夹紧，实际 ${neg.rows.length} 行`);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("恢复归档账本时拒绝制造同名活跃账本", () => {
+    const env = makeTestEnv();
+    try {
+      const first = createLedger(env.db, "重名");
+      setLedgerArchived(env.db, first.id, true);
+      const second = createLedger(env.db, "重名");
+      assert.notEqual(first.id, second.id, "归档后允许新建同名");
+      assert.throws(() => setLedgerArchived(env.db, first.id, false), /同名/);
+      const active = env.db
+        .prepare("SELECT COUNT(*) AS n FROM ledgers WHERE name = '重名' AND archived_at IS NULL")
+        .get() as { n: number };
+      assert.equal(active.n, 1);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
+/** 用真实 notifications 表模拟 publishGlobal 的 Profile 内去重 */
+function makeServices(env: TestEnv) {
+  return {
+    publishGlobal: async (input: { kind: string; title: string; dedupeKey?: string }) => {
+      const existing = env.db
+        .prepare("SELECT 1 FROM notifications WHERE profile_id = 'default' AND dedupe_key = ?")
+        .get(input.dedupeKey ?? null);
+      if (existing !== undefined) return { materialized: 0 };
+      env.db
+        .prepare(
+          "INSERT INTO notifications (id, profile_id, kind, title, body_md, dedupe_key, read, created_at) VALUES (?, 'default', ?, ?, '', ?, 0, ?)",
+        )
+        .run(`n-${env.published.length + 1}`, input.kind, input.title, input.dedupeKey ?? null, new Date().toISOString());
+      env.published.push({ profileId: "*", input: input as never });
+      return { materialized: 1 };
+    },
+  };
+}
