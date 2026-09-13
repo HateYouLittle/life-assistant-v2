@@ -359,3 +359,156 @@ describe("schedule 提醒触发", () => {
     }
   });
 });
+
+describe("schedule 工具：weekly 空 byweekday 防护", () => {
+  it("add 传 byweekday:[] 直接报错，不进入物化（曾导致进程假死）", () => {
+    const env = makeTestEnv();
+    try {
+      const result = tool(env, {
+        action: "add",
+        title: "空星期周报",
+        date: todayIso(),
+        time: "09:00",
+        recurrence: { freq: "weekly", interval: 1, byweekday: [] },
+      });
+      assert.equal(result.isError, true);
+      assert.match(result.content[0]?.text ?? "", /byweekday/);
+      const count = env.db.prepare("SELECT COUNT(*) AS n FROM schedules").get() as { n: number };
+      assert.equal(count.n, 0, "校验失败不应落库");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("update 传 byweekday:[] 同样被拒绝", () => {
+    const env = makeTestEnv();
+    try {
+      const created = tool(env, { action: "add", title: "正常周报", date: todayIso(), time: "09:00" });
+      assert.equal(created.isError, undefined);
+      const id = (JSON.parse(created.content[0]?.text ?? "{}") as { 已创建: { id: string } }).已创建.id;
+      const result = tool(env, {
+        action: "update",
+        id,
+        recurrence: { freq: "weekly", interval: 1, byweekday: [] },
+      });
+      assert.equal(result.isError, true);
+      assert.match(result.content[0]?.text ?? "", /byweekday/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("省略 byweekday 的 weekly 正常可用（回退到开始日期的星期）", () => {
+    const env = makeTestEnv();
+    try {
+      const result = tool(env, {
+        action: "add",
+        title: "每周例会",
+        date: todayIso(),
+        time: "09:00",
+        recurrence: { freq: "weekly", interval: 1 },
+      });
+      assert.equal(result.isError, undefined);
+      const count = env.db.prepare("SELECT COUNT(*) AS n FROM occurrences").get() as { n: number };
+      assert.ok(count.n > 0, "省略 byweekday 应正常物化 occurrence");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
+describe("schedule 工具：更新不静默丢提醒", () => {
+  const keysOf = (env: TestEnv, id: string): string[] =>
+    (env.db.prepare("SELECT occurrence_key FROM occurrences WHERE schedule_id = ? ORDER BY occurrence_key").all(id) as {
+      occurrence_key: string;
+    }[]).map((r) => r.occurrence_key);
+
+  function addDaily(env: TestEnv, extra: Record<string, unknown> = {}) {
+    const created = createSchedule(env.db, "default", {
+      title: "日常提醒",
+      kind: "todo",
+      calendar: "solar",
+      startDate: todayIso(),
+      time: "23:50",
+      allDay: false,
+      recurrence: { freq: "daily", interval: 1 },
+      remindOffsets: [0],
+      resendMinutes: 0,
+      workdayFilter: "any",
+      ...extra,
+    });
+    return created;
+  }
+
+  it("新增提醒偏移会真正补上新的提醒行（此前被 #0 存在性检查吞掉）", () => {
+    const env = makeTestEnv();
+    try {
+      const created = addDaily(env);
+      assert.ok(keysOf(env, created.id).some((k) => k.endsWith("#0")));
+      assert.ok(!keysOf(env, created.id).some((k) => k.endsWith("#1")));
+
+      updateSchedule(env.db, "default", created.id, { remindOffsets: [-30, 0] });
+      assert.ok(
+        keysOf(env, created.id).some((k) => k.endsWith("#1")),
+        `新增偏移必须物化，实际 ${JSON.stringify(keysOf(env, created.id))}`,
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("只改标题不动提醒：pending occurrence 全部保留", () => {
+    const env = makeTestEnv();
+    try {
+      const created = addDaily(env);
+      const before = keysOf(env, created.id);
+      assert.ok(before.length > 0);
+      updateSchedule(env.db, "default", created.id, { title: "改个名字" });
+      assert.deepEqual(keysOf(env, created.id), before, "改标题不应删除任何 pending 提醒");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("已排定的 :resend 强提醒在编辑后仍然存在", () => {
+    const env = makeTestEnv();
+    try {
+      const created = addDaily(env, { resendMinutes: 30, time: "00:01" });
+      env.db.prepare("UPDATE occurrences SET status = 'notified' WHERE schedule_id = ?").run(created.id);
+      env.db
+        .prepare(
+          `INSERT OR IGNORE INTO occurrences (schedule_id, occurrence_key, event_at, due_at, status)
+           VALUES (?, ?, ?, ?, 'pending')`,
+        )
+        .run(
+          created.id,
+          `${todayIso()}T00:01#0:resend`,
+          new Date().toISOString(),
+          new Date(Date.now() + 60_000).toISOString(),
+        );
+      assert.ok(keysOf(env, created.id).some((k) => k.endsWith(":resend")));
+
+      updateSchedule(env.db, "default", created.id, { title: "编辑后" });
+      assert.ok(
+        keysOf(env, created.id).some((k) => k.endsWith(":resend")),
+        "pending :resend 行不应被 update 清掉",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("物化后存在 (schedule_id, status) 索引", () => {
+    const env = makeTestEnv();
+    try {
+      const created = addDaily(env);
+      materializeSchedule(env.db, getSchedule(env.db, "default", created.id) as Parameters<typeof materializeSchedule>[1]);
+      const idx = env.db
+        .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_occurrences_schedule_status'")
+        .get();
+      assert.ok(idx !== undefined, "应创建 idx_occurrences_schedule_status");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});

@@ -113,6 +113,11 @@ export function validateScheduleInput(input: ScheduleInput): void {
   }
   if (!TIME_RE.test(input.time)) throw new Error(`时间不合法: ${input.time}`);
   if (input.remindOffsets.length > 5) throw new Error("remind_offsets 最多 5 个");
+  if (input.recurrence?.freq === "weekly" && input.recurrence.byweekday !== undefined) {
+    if (input.recurrence.byweekday.filter((d) => d >= 0 && d <= 6).length === 0) {
+      throw new Error("weekly 循环的 byweekday 不能为空（或全部超出 0-6）；省略该字段表示使用开始日期的星期");
+    }
+  }
   if (input.recurrence?.until !== undefined && input.calendar === "solar" && input.startDate != null) {
     if (input.recurrence.until < input.startDate) throw new Error("until 不能早于开始日期");
   }
@@ -182,6 +187,10 @@ function updateNextRunAt(db: DatabaseSync, scheduleId: string): void {
 /** 物化接下来一段时间的 occurrence（含提醒偏移）；节假日数据缺失时暂停在该日期之前 */
 export function materializeSchedule(db: DatabaseSync, row: ScheduleRow): void {
   if (row.status !== "active") return;
+  // occurrences 的查询几乎都按 (schedule_id, status) 过滤，但 schema 只在
+  // (status, due_at) 上有索引。索引属于本模块的热路径，放这里保证已在运行的
+  // 数据库也会被补上（IF NOT EXISTS，幂等且开销极小）。
+  db.exec("CREATE INDEX IF NOT EXISTS idx_occurrences_schedule_status ON occurrences(schedule_id, status)");
   const rec = parseRecurrence(row.recurrence_json);
   let existing = countEvents(db, row.id);
   if (rec?.count !== undefined && existing >= rec.count) {
@@ -228,20 +237,20 @@ export function materializeSchedule(db: DatabaseSync, row: ScheduleRow): void {
     }
     const prefix = `${dateISO}T${row.time}`;
     const eventAt = localToInstant(dateISO, row.time);
-    const exists = db
-      .prepare("SELECT 1 FROM occurrences WHERE schedule_id = ? AND occurrence_key = ?")
-      .get(row.id, `${prefix}#0`);
-    if (exists === undefined) {
-      const insert = db.prepare(
-        `INSERT OR IGNORE INTO occurrences (schedule_id, occurrence_key, event_at, due_at, status)
-         VALUES (?, ?, ?, ?, 'pending')`,
-      );
-      offsets.forEach((offsetMinutes, idx) => {
-        const due = DateTime.fromISO(eventAt).plus({ minutes: offsetMinutes });
-        insert.run(row.id, `${prefix}#${idx}`, eventAt, due.toUTC().toISO() ?? eventAt);
-      });
-      existing += 1;
-    }
+    const insert = db.prepare(
+      `INSERT OR IGNORE INTO occurrences (schedule_id, occurrence_key, event_at, due_at, status)
+       VALUES (?, ?, ?, ?, 'pending')`,
+    );
+    // 逐偏移 INSERT OR IGNORE：只要有一条真的写入，就说明这个「事件」是新的。
+    // 这样既能在提醒偏移变化时补回缺失的偏移行（不静默丢提醒），
+    // 又不会把已存在事件重复计入 count。
+    let insertedEvent = false;
+    offsets.forEach((offsetMinutes, idx) => {
+      const due = DateTime.fromISO(eventAt).plus({ minutes: offsetMinutes });
+      const result = insert.run(row.id, `${prefix}#${idx}`, eventAt, due.toUTC().toISO() ?? eventAt);
+      if (Number(result.changes) > 0) insertedEvent = true;
+    });
+    if (insertedEvent) existing += 1;
     after = date;
     if (date > nearHorizon) break;
     if (rec?.count !== undefined && existing >= rec.count) break;
@@ -338,7 +347,7 @@ export function updateSchedule(
       ts,
       id,
     );
-    db.prepare("DELETE FROM occurrences WHERE schedule_id = ? AND status = 'pending'").run(id);
+    db.prepare("DELETE FROM occurrences WHERE schedule_id = ? AND status = 'pending' AND occurrence_key NOT LIKE '%:resend'").run(id);
   });
   const updated = getSchedule(db, profileId, id) as ScheduleRow;
   materializeSchedule(db, updated);

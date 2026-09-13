@@ -48,6 +48,13 @@ export function nextDate(
   return null;
 }
 
+/**
+ * 单次 nextDate 调用允许推进的最大迭代次数。所有分支都应在远小于该值的步数内
+ * 产出候选日期；一旦超出即视为规则不可满足（例如 weekly 没有任何可用星期），
+ * 抛错而不是让调用方的同步循环永久挂起。
+ */
+const MAX_ITERATIONS = 5000;
+
 function* iterate(source: OccurrenceSource, afterDay: DateTime): Generator<DateTime> {
   if (source.calendar === "lunar") {
     yield* iterateLunar(source, afterDay);
@@ -63,20 +70,39 @@ function* iterate(source: OccurrenceSource, afterDay: DateTime): Generator<DateT
   }
   // interval 缺省或非法时兜底为 1，避免推进日期死循环
   const interval = typeof rec.interval === "number" && rec.interval >= 1 ? rec.interval : 1;
+  let steps = 0;
+  const tick = (): void => {
+    if (++steps > MAX_ITERATIONS) {
+      throw new Error(
+        `recurrence 规则无法产生日期（freq=${rec.freq}，已迭代 ${MAX_ITERATIONS} 次）——请检查 byweekday 等参数`,
+      );
+    }
+  };
   switch (rec.freq) {
     case "daily": {
       let d = start;
-      while (d <= afterDay) d = d.plus({ days: interval });
+      while (d <= afterDay) {
+        tick();
+        d = d.plus({ days: interval });
+      }
       yield d;
       for (;;) {
+        tick();
         d = d.plus({ days: interval });
         yield d;
       }
     }
     case "weekly": {
       const monday = start.minus({ days: start.weekday - 1 });
-      const days = uniqSorted(rec.byweekday ?? [start.weekday - 1]);
+      // 关键：候选星期必须非空，否则内层 for 永不产出 → 外层 for(;;) 永不终止
+      // → 同步死循环卡死整个 daemon。两道防线：
+      //   1) 显式判空长度 —— `??` 只兜底 null/undefined，空数组兜不住；
+      //   2) uniqSorted 会把越界值（如 [9,-1]）全部滤掉，因此必须对「过滤后的结果」
+      //      再兜底，否则非空但全越界的数组仍会挂起。
+      const candidates = uniqSorted(rec.byweekday?.length ? rec.byweekday : [start.weekday - 1]);
+      const days = candidates.length > 0 ? candidates : [start.weekday - 1];
       for (let week = 0; ; week++) {
+        tick();
         const weekStart = monday.plus({ weeks: week * interval });
         for (const dy of days) {
           const d = weekStart.plus({ days: dy });
@@ -90,6 +116,7 @@ function* iterate(source: OccurrenceSource, afterDay: DateTime): Generator<DateT
       let year = start.year;
       let month = start.month;
       for (;;) {
+        tick();
         const d = clampDay(year, month, day);
         if (d >= start && d > afterDay) yield d;
         const nextIndex = (year * 12 + (month - 1)) + interval;
@@ -101,6 +128,7 @@ function* iterate(source: OccurrenceSource, afterDay: DateTime): Generator<DateT
       const month = start.month;
       const day = start.day;
       for (let year = start.year; ; year++) {
+        tick();
         const d = clampDay(year, month, day);
         if (d >= start && d > afterDay) yield d;
       }

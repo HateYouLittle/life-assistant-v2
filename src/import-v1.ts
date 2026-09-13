@@ -87,6 +87,7 @@ function mapRecurrence(
   calendar: string,
   title: string,
   warnings: string[],
+  startDate: string | null,
 ): { recurrence: Recurrence | null; workdayFilter: "any" | "workday" | "holiday" } {
   if (raw === null || raw.trim() === "" || raw === "{}") return { recurrence: null, workdayFilter: "any" };
   let parsed: {
@@ -112,8 +113,20 @@ function mapRecurrence(
       return { recurrence: null, workdayFilter: "any" };
     case "daily":
       return { recurrence: { freq: "daily", ...base }, workdayFilter: "any" };
-    case "weekly":
-      return { recurrence: { freq: "weekly", ...base, byweekday: weeklyDays }, workdayFilter: "any" };
+    case "weekly": {
+      // 空的 byweekday 会让 recurrence 引擎无候选日可产出，此前会导致进程同步死循环。
+      // 旧库的星期写法可能认不出来，此时回退到「开始日期的星期」（等价于每周一次）。
+      if (weeklyDays.length > 0) {
+        return { recurrence: { freq: "weekly", ...base, byweekday: weeklyDays }, workdayFilter: "any" };
+      }
+      const fallback = weekdayOf(startDate);
+      if (fallback !== null) {
+        warnings.push(`日程「${title}」的旧每周规则没有可识别的星期（byWeekday=${JSON.stringify(parsed.byWeekday ?? [])}），已按开始日期的星期导入`);
+        return { recurrence: { freq: "weekly", ...base, byweekday: [fallback] }, workdayFilter: "any" };
+      }
+      warnings.push(`日程「${title}」的旧每周规则没有可识别的星期且缺少开始日期，已降级为一次性导入`);
+      return { recurrence: null, workdayFilter: "any" };
+    }
     case "monthly":
       return { recurrence: { freq: "monthly", ...base }, workdayFilter: "any" };
     case "yearly":
@@ -127,6 +140,13 @@ function mapRecurrence(
   }
   warnings.push(`日程「${title}」的循环类型 ${String(parsed.frequency)}（${calendar}）不支持，按每年循环导入`);
   return { recurrence: { freq: "yearly", ...base }, workdayFilter: "any" };
+}
+
+/** 公历日期字符串 → recurrence 的星期编号（0=周一..6=周日）；不可解析返回 null */
+function weekdayOf(date: string | null): number | null {
+  if (date === null || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
+  const dt = DateTime.fromISO(date, { zone: TZ });
+  return dt.isValid ? dt.weekday - 1 : null;
 }
 
 function mapReminders(raw: string | null, title: string, warnings: string[]): number[] {
@@ -206,7 +226,13 @@ export function runImport(target: ReturnType<typeof openDatabase>, oldPath: stri
           report.scheduleWarnings.push(`日程「${s.title}」旧状态「${s.status}」无法识别，按 active 处理`);
         }
         const status = mappedStatus ?? "active";
-        const { recurrence, workdayFilter } = mapRecurrence(s.recurrence_json, calendar, s.title, report.scheduleWarnings);
+        const { recurrence, workdayFilter } = mapRecurrence(
+          s.recurrence_json,
+          calendar,
+          s.title,
+          report.scheduleWarnings,
+          s.date,
+        );
         const offsets = mapReminders(s.reminders_json, s.title, report.scheduleWarnings);
         const resend = s.reminder_interval_minutes !== null && s.reminder_interval_minutes > 0
           ? Math.min(s.reminder_interval_minutes, 1440)

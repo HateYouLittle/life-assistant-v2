@@ -32,7 +32,13 @@ const recurrenceInput = z.object({
 });
 
 function parseRecurrenceInput(value: unknown): Recurrence {
-  return recurrenceInput.parse(value) as Recurrence;
+  const parsed = recurrenceInput.parse(value) as Recurrence;
+  // 显式传空数组会让 recurrence 引擎无候选日可产出（历史上导致同步死循环），
+  // 在入口处直接拒绝，而不是留到物化阶段。
+  if (parsed.freq === "weekly" && parsed.byweekday !== undefined && parsed.byweekday.length === 0) {
+    throw new Error("weekly 循环的 byweekday 不能为空数组；省略该字段表示使用开始日期的星期");
+  }
+  return parsed;
 }
 
 /** 只收集显式提供的字段：add 时补默认值，update 时未提供的字段保持原值 */

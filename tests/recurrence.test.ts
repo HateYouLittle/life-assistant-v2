@@ -51,6 +51,23 @@ describe("recurrence：公历", () => {
     assert.equal(ymd(nextDate(src, at("2026-01-05T12:00"), HORIZON)), "2026-01-19");
   });
 
+  it("weekly 空 byweekday 不再挂起：回退到开始日期的星期", () => {
+    // 回归：uniqSorted(rec.byweekday ?? [start.weekday - 1]) 曾用 ?? 兜底，
+    // 空数组不被兜住 → 内层 for 永不产出 → 外层 for(;;) 同步死循环卡死 daemon。
+    const src = solarSource("2026-01-05", { freq: "weekly", interval: 1, byweekday: [] });
+    assert.equal(ymd(nextDate(src, at("2026-09-13"), HORIZON)), "2026-09-14");
+  });
+
+  it("weekly 全部越界 byweekday 也回退而不是挂起", () => {
+    const src = solarSource("2026-01-05", { freq: "weekly", interval: 1, byweekday: [9, -1] });
+    assert.equal(ymd(nextDate(src, at("2026-09-13"), HORIZON)), "2026-09-14");
+  });
+
+  it("weekly 省略 byweekday 仍回退到开始日期的星期", () => {
+    const src = solarSource("2026-01-05", { freq: "weekly", interval: 1 });
+    assert.equal(ymd(nextDate(src, at("2026-09-13"), HORIZON)), "2026-09-14");
+  });
+
   it("monthly 月末钳位（31 日 → 2 月 28 日）", () => {
     const src = solarSource("2026-01-31", { freq: "monthly", interval: 1 });
     assert.equal(ymd(nextDate(src, at("2026-01-31T12:00"), HORIZON)), "2026-02-28");
