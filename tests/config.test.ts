@@ -32,7 +32,11 @@ describe("config", () => {
   it("QWeather 必须成对配置", () => {
     assert.throws(() => loadConfig({ ...BASE, QWEATHER_API_HOST: "h.example.com" }), /同时/);
     assert.throws(() => loadConfig({ ...BASE, QWEATHER_KEY: "k" }), /同时/);
-    const config = loadConfig({ ...BASE, QWEATHER_API_HOST: "https://h.example.com/", QWEATHER_KEY: "k" });
+    const config = loadConfig({
+      ...BASE,
+      QWEATHER_API_HOST: "https://h.example.com/",
+      QWEATHER_KEY: "k",
+    });
     assert.equal(config.qweatherHost, "h.example.com");
   });
 
@@ -47,9 +51,18 @@ describe("config", () => {
 
   it("PROFILE_ROUTE_SECRETS_JSON 校验", () => {
     assert.throws(() => loadConfig({ ...BASE, PROFILE_ROUTE_SECRETS_JSON: "{bad" }), /JSON/);
-    assert.throws(() => loadConfig({ ...BASE, PROFILE_ROUTE_SECRETS_JSON: '{"default":"short"}' }), /32 字符/);
-    assert.throws(() => loadConfig({ ...BASE, PROFILE_ROUTE_SECRETS_JSON: `{"Bad Name":"${"a".repeat(64)}"}` }), /不合法/);
-    const config = loadConfig({ ...BASE, PROFILE_ROUTE_SECRETS_JSON: JSON.stringify({ default: SECRET }) });
+    assert.throws(
+      () => loadConfig({ ...BASE, PROFILE_ROUTE_SECRETS_JSON: '{"default":"short"}' }),
+      /32 字符/,
+    );
+    assert.throws(
+      () => loadConfig({ ...BASE, PROFILE_ROUTE_SECRETS_JSON: `{"Bad Name":"${"a".repeat(64)}"}` }),
+      /不合法/,
+    );
+    const config = loadConfig({
+      ...BASE,
+      PROFILE_ROUTE_SECRETS_JSON: JSON.stringify({ default: SECRET }),
+    });
     assert.equal(config.profileRouteSecrets.default, SECRET);
   });
 

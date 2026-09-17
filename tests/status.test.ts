@@ -14,7 +14,9 @@ describe("状态接口", () => {
     const env = makeTestEnv();
     try {
       env.db
-        .prepare("INSERT INTO ledgers (id, name, created_at) VALUES ('l1', '日用', '2026-01-01T00:00:00.000Z')")
+        .prepare(
+          "INSERT INTO ledgers (id, name, created_at) VALUES ('l1', '日用', '2026-01-01T00:00:00.000Z')",
+        )
         .run();
       env.db
         .prepare(
@@ -63,7 +65,9 @@ describe("状态接口", () => {
     const env = makeTestEnv();
     try {
       env.db
-        .prepare("INSERT INTO ledgers (id, name, created_at) VALUES ('l1', '日用', '2026-01-01T00:00:00.000Z')")
+        .prepare(
+          "INSERT INTO ledgers (id, name, created_at) VALUES ('l1', '日用', '2026-01-01T00:00:00.000Z')",
+        )
         .run();
       const today = todayIso();
       const insert = env.db.prepare(
@@ -88,7 +92,10 @@ describe("状态接口", () => {
         )
         .run();
       const payload = statusPayload(env.config, env.db);
-      const holidays = payload.holidays as { years: number[]; failed: { year: number; error: string }[] };
+      const holidays = payload.holidays as {
+        years: number[];
+        failed: { year: number; error: string }[];
+      };
       assert.deepEqual(holidays.years, []);
       assert.equal(holidays.failed.length, 1);
       assert.equal(holidays.failed[0]?.year, 2027);
@@ -101,8 +108,16 @@ describe("状态接口", () => {
 
 describe("看板明细接口", () => {
   function seedAccounting(env: TestEnv): void {
-    env.db.prepare("INSERT INTO ledgers (id, name, created_at) VALUES ('l1','家庭账本','2026-01-01T00:00:00.000Z')").run();
-    env.db.prepare("INSERT INTO ledgers (id, name, created_at) VALUES ('l2','个人账本','2026-01-01T00:00:00.000Z')").run();
+    env.db
+      .prepare(
+        "INSERT INTO ledgers (id, name, created_at) VALUES ('l1','家庭账本','2026-01-01T00:00:00.000Z')",
+      )
+      .run();
+    env.db
+      .prepare(
+        "INSERT INTO ledgers (id, name, created_at) VALUES ('l2','个人账本','2026-01-01T00:00:00.000Z')",
+      )
+      .run();
     const today = todayIso();
     const insert = env.db.prepare(
       `INSERT INTO expenses (id, ledger_id, amount_cents, category, note, spent_on, created_by_profile, created_at)
@@ -149,7 +164,9 @@ describe("看板明细接口", () => {
     const env = makeTestEnv();
     try {
       seedAccounting(env);
-      const body = (await (await app(env).request("/api/expenses?month=2099-13&limit=-1")).json()) as {
+      const body = (await (
+        await app(env).request("/api/expenses?month=2099-13&limit=-1")
+      ).json()) as {
         month: string;
         entries: unknown[];
       };
@@ -182,7 +199,13 @@ describe("看板明细接口", () => {
         )
         .run();
       const body = (await (await app(env).request("/api/schedules")).json()) as {
-        items: { id: string; title: string; kind_label: string; next_local: string | null; days_until: number | null }[];
+        items: {
+          id: string;
+          title: string;
+          kind_label: string;
+          next_local: string | null;
+          days_until: number | null;
+        }[];
       };
       assert.equal(body.items.length, 1, "取消的日程不该出现");
       assert.equal(body.items[0]?.title, "交房租");
@@ -219,7 +242,13 @@ describe("看板明细接口", () => {
       const body = (await (await app(env).request("/api/deliveries")).json()) as {
         counts: { queued: number; failed: number; sent_24h: number };
         daily: { date: string; label: string; sent: number }[];
-        items: { id: string; title: string; status: string; created_local: string; last_error: string | null }[];
+        items: {
+          id: string;
+          title: string;
+          status: string;
+          created_local: string;
+          last_error: string | null;
+        }[];
       };
       assert.equal(body.counts.failed, 1);
       assert.equal(body.counts.sent_24h, 1);
@@ -241,7 +270,9 @@ describe("看板明细接口", () => {
     try {
       const year = Number(todayIso().slice(0, 4));
       env.db
-        .prepare("INSERT INTO cn_holiday_years (year, status, source, fetched_at) VALUES (?, 'ready', 'test', '2026-01-01T00:00:00.000Z')")
+        .prepare(
+          "INSERT INTO cn_holiday_years (year, status, source, fetched_at) VALUES (?, 'ready', 'test', '2026-01-01T00:00:00.000Z')",
+        )
         .run(year);
       const insertDay = env.db.prepare(
         "INSERT INTO cn_holiday_days (date, year, day_type, name, source, updated_at) VALUES (?, ?, ?, ?, 'test', '2026-01-01T00:00:00.000Z')",
@@ -275,7 +306,11 @@ describe("看板明细接口", () => {
       const a = app(env);
       for (const path of ["/api/expenses", "/api/schedules", "/api/deliveries", "/api/holidays"]) {
         assert.equal((await a.request(path)).status, 401, `${path} 漏了鉴权`);
-        assert.equal((await a.request(`${path}?token=${"t".repeat(16)}`)).status, 200, `${path} 带 token 应放行`);
+        assert.equal(
+          (await a.request(`${path}?token=${"t".repeat(16)}`)).status,
+          200,
+          `${path} 带 token 应放行`,
+        );
       }
     } finally {
       cleanupTestEnv(env);
@@ -303,7 +338,15 @@ describe("看板明细接口", () => {
       seedAccounting(env);
       const body = (await (await app(env).request("/api/status")).json()) as {
         today: { date: string; weekday: string; time: string; label: string };
-        expenses: { month: string; count: number; month_cents: number; prev_month: string; prev_month_cents: number; categories: unknown[]; daily: unknown[] };
+        expenses: {
+          month: string;
+          count: number;
+          month_cents: number;
+          prev_month: string;
+          prev_month_cents: number;
+          categories: unknown[];
+          daily: unknown[];
+        };
         notifications: { daily: unknown[] };
         schedules: { active: number; next: unknown[] };
         holidays: { years: number[]; failed: unknown[]; next: unknown };

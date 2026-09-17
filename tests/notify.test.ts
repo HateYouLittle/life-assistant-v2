@@ -11,6 +11,7 @@ import {
   publishProfile,
   recoverStaleSending,
   setPushRoute,
+  waitForDrain,
 } from "../src/core/notify.js";
 import { setSetting } from "../src/core/settings.js";
 import { cleanupTestEnv, makeTestEnv, SECRET, type TestEnv } from "./helpers.js";
@@ -96,7 +97,10 @@ describe("outbox 投递", () => {
             createHmac("sha256", SECRET).update(`${timestamp}.${body}`).digest("hex"),
             "HMAC-SHA256 V2 签名应为 hex(timestamp.body)",
           );
-          assert.match(headers["x-request-id"] as string, /^life-assistant:default:.+:life-assistant-default:a0$/);
+          assert.match(
+            headers["x-request-id"] as string,
+            /^life-assistant:default:.+:life-assistant-default:a0$/,
+          );
 
           const payload = JSON.parse(body) as {
             event_type: string;
@@ -112,7 +116,9 @@ describe("outbox 投递", () => {
           assert.equal(rows.length, 1);
           assert.equal(rows[0]?.status, "sent");
           const notifId = rows[0]?.notification_id as string;
-          const notif = env.db.prepare("SELECT read FROM notifications WHERE id = ?").get(notifId) as {
+          const notif = env.db
+            .prepare("SELECT read FROM notifications WHERE id = ?")
+            .get(notifId) as {
             read: number;
           };
           assert.equal(notif.read, 1);
@@ -158,15 +164,17 @@ describe("outbox 投递", () => {
   });
 
   it("publishGlobal 只物化配置了启用路由的 Profile", () => {
-    const env = makeTestEnv({ PROFILE_ROUTE_SECRETS_JSON: JSON.stringify({ p1: SECRET, p2: SECRET }) });
+    const env = makeTestEnv({
+      PROFILE_ROUTE_SECRETS_JSON: JSON.stringify({ p1: SECRET, p2: SECRET }),
+    });
     try {
       ensureP(env.db, "p1");
       ensureP(env.db, "p2");
       setPushRoute(env.db, "p1", { url: "http://127.0.0.1:9/hook" });
       void publishGlobal(env.db, env.config, { kind: "k", title: "t", blocks: {} });
-      const ids = (env.db.prepare("SELECT profile_id FROM notifications").all() as { profile_id: string }[]).map(
-        (r) => r.profile_id,
-      );
+      const ids = (
+        env.db.prepare("SELECT profile_id FROM notifications").all() as { profile_id: string }[]
+      ).map((r) => r.profile_id);
       assert.deepEqual(ids, ["p1"]);
     } finally {
       cleanupTestEnv(env);
@@ -193,7 +201,8 @@ describe("outbox 投递", () => {
               assert.equal(row.status, "failed");
               assert.equal(row.confirmed_failures, attempt);
               assert.equal(row.request_id, null);
-              const deltaSec = (new Date(row.next_attempt_at as string).getTime() - Date.now()) / 1000;
+              const deltaSec =
+                (new Date(row.next_attempt_at as string).getTime() - Date.now()) / 1000;
               const expected = [60, 300, 900, 3600][attempt - 1] as number;
               assert.ok(
                 Math.abs(deltaSec - expected) < 15,
@@ -298,11 +307,19 @@ describe("outbox 投递", () => {
     const env = makeTestEnv({ PROFILE_ROUTE_SECRETS_JSON: JSON.stringify({ default: SECRET }) });
     try {
       setPushRoute(env.db, "default", { url: "http://127.0.0.1:9/hook", name: "route-a" });
-      const pub = publishProfile(env.db, env.config, "default", { kind: "k", title: "t", blocks: {} });
+      const pub = publishProfile(env.db, env.config, "default", {
+        kind: "k",
+        title: "t",
+        blocks: {},
+      });
       cancelPendingDeliveries(env.db, "default", [pub.id]);
       assert.equal(deliveryRows(env.db)[0]?.status, "cancelled");
 
-      const pub2 = publishProfile(env.db, env.config, "default", { kind: "k", title: "t2", blocks: {} });
+      const pub2 = publishProfile(env.db, env.config, "default", {
+        kind: "k",
+        title: "t2",
+        blocks: {},
+      });
       const row2 = (): Record<string, unknown> | undefined =>
         deliveryRows(env.db).find((r) => r.notification_id === pub2.id);
       assert.equal(row2()?.status, "queued");
@@ -324,10 +341,38 @@ describe("outbox 投递", () => {
   it("setPushRoute 只接受回环 URL", () => {
     const env = makeTestEnv();
     try {
-      assert.throws(() => setPushRoute(env.db, "default", { url: "http://example.com/hook" }), /主机名/);
+      assert.throws(
+        () => setPushRoute(env.db, "default", { url: "http://example.com/hook" }),
+        /主机名/,
+      );
       const route = setPushRoute(env.db, "default", { url: "http://localhost:12345/hook" });
       assert.equal(route.platform, null);
       assert.equal(route.enabled, true);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("drainDue 在途时重入返回 0，waitForDrain 等到本轮结束（停机依赖此语义）", async () => {
+    const env = makeTestEnv({ PROFILE_ROUTE_SECRETS_JSON: JSON.stringify({ default: SECRET }) });
+    try {
+      await withHookServer(
+        (_req, res) => {
+          setTimeout(() => {
+            res.writeHead(200);
+            res.end("ok");
+          }, 50);
+        },
+        async (url) => {
+          setPushRoute(env.db, "default", { url });
+          publishProfile(env.db, env.config, "default", { kind: "k", title: "t", blocks: {} });
+          const first = drainDue(env.db, env.config);
+          assert.equal(await drainDue(env.db, env.config), 0, "在途时重入不应并发投递");
+          await waitForDrain();
+          assert.equal(await first, 1, "waitForDrain 之后本轮必须已结算");
+          assert.equal(deliveryRows(env.db)[0]?.status, "sent");
+        },
+      );
     } finally {
       cleanupTestEnv(env);
     }
@@ -337,13 +382,19 @@ describe("outbox 投递", () => {
     const env = makeTestEnv({ PROFILE_ROUTE_SECRETS_JSON: JSON.stringify({ default: SECRET }) });
     try {
       setPushRoute(env.db, "default", { url: "http://127.0.0.1:9/hook" });
-      env.db.exec("CREATE TRIGGER boom BEFORE INSERT ON deliveries BEGIN SELECT RAISE(ABORT, 'boom'); END");
+      env.db.exec(
+        "CREATE TRIGGER boom BEFORE INSERT ON deliveries BEGIN SELECT RAISE(ABORT, 'boom'); END",
+      );
       assert.throws(
         () => publishProfile(env.db, env.config, "default", { kind: "k", title: "t", blocks: {} }),
         /boom/,
       );
-      const notifications = env.db.prepare("SELECT COUNT(*) AS n FROM notifications").get() as { n: number };
-      const deliveries = env.db.prepare("SELECT COUNT(*) AS n FROM deliveries").get() as { n: number };
+      const notifications = env.db.prepare("SELECT COUNT(*) AS n FROM notifications").get() as {
+        n: number;
+      };
+      const deliveries = env.db.prepare("SELECT COUNT(*) AS n FROM deliveries").get() as {
+        n: number;
+      };
       assert.equal(notifications.n, 0, "回滚后不应留下「有通知却没投递记录」的孤儿行");
       assert.equal(deliveries.n, 0);
     } finally {
@@ -353,5 +404,8 @@ describe("outbox 投递", () => {
 });
 
 function ensureP(db: TestEnv["db"], id: string): void {
-  db.prepare("INSERT OR IGNORE INTO profiles (id, created_at) VALUES (?, ?)").run(id, new Date().toISOString());
+  db.prepare("INSERT OR IGNORE INTO profiles (id, created_at) VALUES (?, ?)").run(
+    id,
+    new Date().toISOString(),
+  );
 }

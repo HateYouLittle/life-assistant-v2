@@ -95,7 +95,8 @@ export async function geoLookup(
   if (!GEO_ID_RE.test(id)) throw new Error(`未找到城市: ${trimmed}`);
   const lat = num(hit?.lat, "lat");
   const lon = num(hit?.lon, "lon");
-  if (lat < -90 || lat > 90 || lon < -180 || lon > 180) throw new Error(`城市坐标不合法: ${trimmed}`);
+  if (lat < -90 || lat > 90 || lon < -180 || lon > 180)
+    throw new Error(`城市坐标不合法: ${trimmed}`);
   setCache(db, cacheKey, { id, lat, lon }, 7 * 24 * 3600 * 1000);
   return { city: trimmed, cityId: id, lat, lon };
 }
@@ -149,7 +150,10 @@ export async function forecast(
   return daily
     .map((d) => {
       // 上游把「无降水」写作 "0.0"（而非 "0"），必须按数值判断
-      const precip = d.precip === undefined || d.precip === null || d.precip === "" ? 0 : num(d.precip, "precip");
+      const precip =
+        d.precip === undefined || d.precip === null || d.precip === ""
+          ? 0
+          : num(d.precip, "precip");
       return {
         date: String(d.fxDate ?? ""),
         tMax: num(d.tempMax, "tempMax"),
@@ -179,7 +183,11 @@ function alertLevelOf(color: unknown, severity: unknown): string {
   return sev === "unknown" ? "" : sev;
 }
 
-export async function alerts(host: string, key: string, loc: LocationInfo): Promise<WeatherAlert[]> {
+export async function alerts(
+  host: string,
+  key: string,
+  loc: LocationInfo,
+): Promise<WeatherAlert[]> {
   const lat = loc.lat.toFixed(2);
   const lon = loc.lon.toFixed(2);
   const body = (await fetchJson(
@@ -221,7 +229,11 @@ export function cnAqiCategory(aqi: number): string {
   return "严重污染";
 }
 
-export async function airQuality(host: string, key: string, loc: LocationInfo): Promise<AirQuality> {
+export async function airQuality(
+  host: string,
+  key: string,
+  loc: LocationInfo,
+): Promise<AirQuality> {
   const lat = loc.lat.toFixed(2);
   const lon = loc.lon.toFixed(2);
   const body = (await fetchJson(
@@ -232,7 +244,9 @@ export async function airQuality(host: string, key: string, loc: LocationInfo): 
     pollutants?: Array<Record<string, unknown>>;
   };
   if (body.error !== undefined) {
-    throw new Error(`QWeather airquality error ${String(body.error.status ?? "")}: ${String(body.error.title ?? "")}`);
+    throw new Error(
+      `QWeather airquality error ${String(body.error.status ?? "")}: ${String(body.error.title ?? "")}`,
+    );
   }
   const index = (body.indexes ?? []).find((i) => i.code === "cn-mee" || i.code === "cn-mee-1h");
   if (index === undefined) throw new Error("QWeather airquality 未返回国标指数(cn-mee)");
@@ -245,8 +259,11 @@ export async function airQuality(host: string, key: string, loc: LocationInfo): 
   for (const p of body.pollutants ?? []) {
     const code = String(p.code ?? "");
     const concentration = p.concentration as { value?: unknown; unit?: unknown } | undefined;
-    const unit = String(concentration?.unit ?? "").replace(/µ|μ/g, "u").replace(/\s/g, "");
-    if (concentration?.value === undefined || !Number.isFinite(Number(concentration.value))) continue;
+    const unit = String(concentration?.unit ?? "")
+      .replace(/µ|μ/g, "u")
+      .replace(/\s/g, "");
+    if (concentration?.value === undefined || !Number.isFinite(Number(concentration.value)))
+      continue;
     if (unit !== "ug/m3" && unit !== "ug/m³") continue;
     pollutants[code] = Number(concentration.value);
   }

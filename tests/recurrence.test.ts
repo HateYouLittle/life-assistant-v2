@@ -2,13 +2,21 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { DateTime } from "luxon";
 import { Lunar, LunarYear } from "lunar-javascript";
-import { describeRecurrence, lunarToSolar, nextDate, type OccurrenceSource } from "../src/core/recurrence.js";
+import {
+  describeRecurrence,
+  lunarToSolar,
+  nextDate,
+  type OccurrenceSource,
+} from "../src/core/recurrence.js";
 import { TZ } from "../src/time.js";
 
 const at = (s: string): DateTime => DateTime.fromISO(s, { zone: TZ });
 const HORIZON = at("2030-01-01");
 
-const solarSource = (startDate: string, recurrence: OccurrenceSource["recurrence"]): OccurrenceSource => ({
+const solarSource = (
+  startDate: string,
+  recurrence: OccurrenceSource["recurrence"],
+): OccurrenceSource => ({
   calendar: "solar",
   startDate,
   lunarMonth: null,
@@ -106,9 +114,17 @@ describe("recurrence：农历", () => {
   it("闰月策略 follow / regular（2025 年闰六月）", () => {
     assert.equal(LunarYear.fromYear(2025).getLeapMonth(), 6);
     const follow = nextDate(lunarSource(6, 1, { leapPolicy: "follow" }), at("2025-01-02"), HORIZON);
-    const regular = nextDate(lunarSource(6, 1, { leapPolicy: "regular" }), at("2025-01-02"), HORIZON);
+    const regular = nextDate(
+      lunarSource(6, 1, { leapPolicy: "regular" }),
+      at("2025-01-02"),
+      HORIZON,
+    );
     assert.equal(ymd(follow), Lunar.fromYmd(2025, -6, 1).getSolar().toYmd(), "follow 应落在闰六月");
-    assert.equal(ymd(regular), Lunar.fromYmd(2025, 6, 1).getSolar().toYmd(), "regular 应落在平六月");
+    assert.equal(
+      ymd(regular),
+      Lunar.fromYmd(2025, 6, 1).getSolar().toYmd(),
+      "regular 应落在平六月",
+    );
     assert.notEqual(ymd(follow), ymd(regular));
   });
 
@@ -121,10 +137,16 @@ describe("recurrence：农历", () => {
     // 农历 2025 年腊月只有 29 天
     assert.equal(twelfthMonthDays(2025), 29);
     const clamped = lunarToSolar(2025, 12, 30, "follow", true);
-    assert.equal(ymd(clamped), Lunar.fromYmd(2025, 12, 29).getSolar().toYmd(), "clamp 应取当月最后一天");
+    assert.equal(
+      ymd(clamped),
+      Lunar.fromYmd(2025, 12, 29).getSolar().toYmd(),
+      "clamp 应取当月最后一天",
+    );
     assert.equal(lunarToSolar(2025, 12, 30, "follow", false), null, "no-clamp 当年跳过");
 
-    const year30 = [2020, 2021, 2022, 2023, 2024, 2026, 2027, 2028].find((y) => twelfthMonthDays(y) === 30);
+    const year30 = [2020, 2021, 2022, 2023, 2024, 2026, 2027, 2028].find(
+      (y) => twelfthMonthDays(y) === 30,
+    );
     assert.ok(year30 !== undefined, "测试假设存在腊月 30 天的年份");
     const got = lunarToSolar(year30, 12, 30, "follow", true);
     assert.equal(ymd(got), Lunar.fromYmd(year30, 12, 30).getSolar().toYmd());
@@ -133,20 +155,29 @@ describe("recurrence：农历", () => {
 
 describe("recurrence：描述", () => {
   it("生成人话描述", () => {
-    assert.equal(describeRecurrence(solarSource("2026-01-01", null), "2026-01-01"), "一次：2026-01-01");
-    assert.equal(describeRecurrence(solarSource("2026-01-01", { freq: "daily", interval: 1 }), "2026-01-01"), "每天");
     assert.equal(
-      describeRecurrence(solarSource("2026-01-05", { freq: "weekly", interval: 1, byweekday: [0, 4] }), "2026-01-05"),
+      describeRecurrence(solarSource("2026-01-01", null), "2026-01-01"),
+      "一次：2026-01-01",
+    );
+    assert.equal(
+      describeRecurrence(solarSource("2026-01-01", { freq: "daily", interval: 1 }), "2026-01-01"),
+      "每天",
+    );
+    assert.equal(
+      describeRecurrence(
+        solarSource("2026-01-05", { freq: "weekly", interval: 1, byweekday: [0, 4] }),
+        "2026-01-05",
+      ),
       "每周一、五",
     );
     assert.equal(
-      describeRecurrence(solarSource("2026-01-05", { freq: "weekly", interval: 2, byweekday: [0, 2] }), "2026-01-05"),
+      describeRecurrence(
+        solarSource("2026-01-05", { freq: "weekly", interval: 2, byweekday: [0, 2] }),
+        "2026-01-05",
+      ),
       "每 2 周 一、三",
       "多周间隔要读得通，不能拼成「每周2一、三」",
     );
-    assert.equal(
-      describeRecurrence(lunarSource(5, 5), null),
-      "每年农历5月5日",
-    );
+    assert.equal(describeRecurrence(lunarSource(5, 5), null), "每年农历5月5日");
   });
 });

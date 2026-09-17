@@ -30,7 +30,8 @@ function baseHeaders(): Record<string, string> {
     Accept: "application/json, text/event-stream",
     "X-Hermes-Profile": profile,
   };
-  if (daemonToken !== undefined && daemonToken !== "") headers.Authorization = `Bearer ${daemonToken}`;
+  if (daemonToken !== undefined && daemonToken !== "")
+    headers.Authorization = `Bearer ${daemonToken}`;
   return headers;
 }
 
@@ -138,7 +139,10 @@ async function send(raw: string): Promise<void> {
         `${JSON.stringify({
           jsonrpc: "2.0",
           id: message.id,
-          error: { code: -32000, message: `life-assistant daemon 不可达（${endpoint}）：${detail}` },
+          error: {
+            code: -32000,
+            message: `life-assistant daemon 不可达（${endpoint}）：${detail}`,
+          },
         })}\n`,
       );
     }

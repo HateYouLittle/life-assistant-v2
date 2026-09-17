@@ -1,9 +1,23 @@
 import { z } from "zod";
 import { todayIso } from "../../time.js";
-import { errorMessage, fail, ok, okJson, registerModule, runtime, type ToolContext } from "../../core/registry.js";
+import {
+  errorMessage,
+  fail,
+  ok,
+  okJson,
+  registerModule,
+  runtime,
+  type ToolContext,
+} from "../../core/registry.js";
 import { publishProfile } from "../../core/notify.js";
 import { cachedLocation, currentWeather, saveLocation } from "../../core/qweather.js";
-import type { AirQuality, CurrentWeather, ForecastDay, LocationInfo, WeatherAlert } from "../../core/qweather.js";
+import type {
+  AirQuality,
+  CurrentWeather,
+  ForecastDay,
+  LocationInfo,
+  WeatherAlert,
+} from "../../core/qweather.js";
 import { airQuality, alerts, forecast, geoLookup } from "../../core/qweather.js";
 import { listProfiles } from "../../core/settings.js";
 import { logger } from "../../core/logger.js";
@@ -38,7 +52,12 @@ function weatherTable(cur: CurrentWeather): { columns: string[]; rows: string[][
 function forecastTable(days: ForecastDay[]): { columns: string[]; rows: string[][] } {
   return {
     columns: ["日期", "天气", "气温", "降水"],
-    rows: days.map((d) => [d.date, d.textDay, `${d.tMin}~${d.tMax}°C`, d.precipMm === undefined ? "—" : `${d.precipMm}mm`]),
+    rows: days.map((d) => [
+      d.date,
+      d.textDay,
+      `${d.tMin}~${d.tMax}°C`,
+      d.precipMm === undefined ? "—" : `${d.precipMm}mm`,
+    ]),
   };
 }
 
@@ -137,13 +156,23 @@ export async function runDailyBrief(): Promise<void> {
         rows.push(["湿度/风速", `${cur.humidity}% / ${cur.windSpeed} km/h`]);
       }
       const today = fc?.[0];
-      if (today !== undefined) rows.push(["今日气温", `${today.tMin}~${today.tMax}°C ${today.textDay}`]);
+      if (today !== undefined)
+        rows.push(["今日气温", `${today.tMin}~${today.tMax}°C ${today.textDay}`]);
       if (air !== null) rows.push(["空气质量", `AQI ${air.aqi}（${air.category}）`]);
-      rows.push(["预警", alertList === null ? "未知" : alertList.length === 0 ? "无" : alertList.map((a) => `${a.level}${a.type}`).join("；")]);
+      rows.push([
+        "预警",
+        alertList === null
+          ? "未知"
+          : alertList.length === 0
+            ? "无"
+            : alertList.map((a) => `${a.level}${a.type}`).join("；"),
+      ]);
 
       const notes: string[] = [];
-      if (today !== undefined && today.precipMm !== undefined && today.precipMm > 0) notes.push("今日有降水，出门带伞");
-      if (today !== undefined && today.tMax - today.tMin >= 10) notes.push("昼夜温差较大，注意增减衣物");
+      if (today !== undefined && today.precipMm !== undefined && today.precipMm > 0)
+        notes.push("今日有降水，出门带伞");
+      if (today !== undefined && today.tMax - today.tMin >= 10)
+        notes.push("昼夜温差较大，注意增减衣物");
       if (air !== null && air.aqi > 100) notes.push("空气质量较差，敏感人群减少户外活动");
       if (notes.length === 0) notes.push("适宜出行");
 
@@ -169,13 +198,17 @@ registerModule({
       inputSchema: {
         view: z.enum(["current", "forecast", "alert", "air", "locate"]),
         city: z.string().max(64).optional().describe("城市名；locate 时必填"),
-        days: z.union([z.literal(3), z.literal(7)]).optional().describe("预报天数，默认 7"),
+        days: z
+          .union([z.literal(3), z.literal(7)])
+          .optional()
+          .describe("预报天数，默认 7"),
       },
       handler: weatherTool,
     },
     {
       name: "air_quality",
-      description: "空气质量（QWeather 国标 AQI/PM2.5/PM10）。city 可选，缺省用已设置位置或 DEFAULT_CITY。",
+      description:
+        "空气质量（QWeather 国标 AQI/PM2.5/PM10）。city 可选，缺省用已设置位置或 DEFAULT_CITY。",
       inputSchema: {
         city: z.string().max(64).optional(),
       },

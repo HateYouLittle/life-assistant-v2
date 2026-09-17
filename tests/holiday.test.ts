@@ -28,12 +28,29 @@ function payload2026(): HolidayYearPayload {
     });
   };
   off("元旦", ["2026-01-01", "2026-01-02", "2026-01-03"]);
-  off("春节", ["2026-02-15", "2026-02-16", "2026-02-17", "2026-02-18", "2026-02-19", "2026-02-20", "2026-02-21"]);
+  off("春节", [
+    "2026-02-15",
+    "2026-02-16",
+    "2026-02-17",
+    "2026-02-18",
+    "2026-02-19",
+    "2026-02-20",
+    "2026-02-21",
+  ]);
   off("清明节", ["2026-04-04", "2026-04-05", "2026-04-06"]);
   off("劳动节", ["2026-05-01", "2026-05-02", "2026-05-03", "2026-05-04", "2026-05-05"]);
   off("端午节", ["2026-06-19", "2026-06-20", "2026-06-21"]);
   off("中秋节", ["2026-09-25", "2026-09-26", "2026-09-27"]);
-  off("国庆节", ["2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04", "2026-10-05", "2026-10-06", "2026-10-07", "2026-10-08"]);
+  off("国庆节", [
+    "2026-10-01",
+    "2026-10-02",
+    "2026-10-03",
+    "2026-10-04",
+    "2026-10-05",
+    "2026-10-06",
+    "2026-10-07",
+    "2026-10-08",
+  ]);
   work(["2026-02-14", "2026-02-28", "2026-04-26", "2026-10-10"]);
   return { year: 2026, days };
 }
@@ -68,7 +85,11 @@ describe("节假日数据校验", () => {
   it("放假天数超出合理范围报错", () => {
     const payload = payload2026();
     for (let day = 5; day <= 20; day++) {
-      payload.days.push({ name: "元旦", date: `2026-11-${String(day).padStart(2, "0")}`, isOffDay: true });
+      payload.days.push({
+        name: "元旦",
+        date: `2026-11-${String(day).padStart(2, "0")}`,
+        isOffDay: true,
+      });
     }
     const errors = validateYearPayload(payload);
     assert.ok(errors.some((e) => e.includes("超出合理范围")));
@@ -114,15 +135,37 @@ describe("节假日数据校验", () => {
     const off = (name: string, dates: string[]) => {
       for (const date of dates) payload.days.push({ name, date, isOffDay: true });
     };
-    off("春节", ["2023-01-21", "2023-01-22", "2023-01-23", "2023-01-24", "2023-01-25", "2023-01-26", "2023-01-27"]);
+    off("春节", [
+      "2023-01-21",
+      "2023-01-22",
+      "2023-01-23",
+      "2023-01-24",
+      "2023-01-25",
+      "2023-01-26",
+      "2023-01-27",
+    ]);
     off("清明节", ["2023-04-05"]);
     off("劳动节", ["2023-04-29", "2023-04-30", "2023-05-01", "2023-05-02", "2023-05-03"]);
     off("端午节", ["2023-06-22", "2023-06-23", "2023-06-24"]);
     off("中秋节、国庆节", [
-      "2023-09-29", "2023-09-30", "2023-10-01", "2023-10-02",
-      "2023-10-03", "2023-10-04", "2023-10-05", "2023-10-06",
+      "2023-09-29",
+      "2023-09-30",
+      "2023-10-01",
+      "2023-10-02",
+      "2023-10-03",
+      "2023-10-04",
+      "2023-10-05",
+      "2023-10-06",
     ]);
-    for (const date of ["2023-01-28", "2023-01-29", "2023-04-23", "2023-05-06", "2023-06-25", "2023-10-07", "2023-10-08"]) {
+    for (const date of [
+      "2023-01-28",
+      "2023-01-29",
+      "2023-04-23",
+      "2023-05-06",
+      "2023-06-25",
+      "2023-10-07",
+      "2023-10-08",
+    ]) {
       payload.days.push({ name: "调休", date, isOffDay: false });
     }
     assert.deepEqual(validateYearPayload(payload), []);
@@ -149,9 +192,9 @@ describe("节假日跨年条目归属", () => {
   });
 
   const crossYearRow = (env: ReturnType<typeof makeTestEnv>) =>
-    env.db.prepare("SELECT year, day_type, name FROM cn_holiday_days WHERE date = '2025-12-31'").get() as
-      | { year: number; day_type: string; name: string }
-      | undefined;
+    env.db
+      .prepare("SELECT year, day_type, name FROM cn_holiday_days WHERE date = '2025-12-31'")
+      .get() as { year: number; day_type: string; name: string } | undefined;
 
   /** 清空节假日表，便于在同一测试进程内换顺序重放（initRuntime 每进程只能调用一次） */
   const resetHolidayTables = (env: ReturnType<typeof makeTestEnv>) => {
@@ -208,7 +251,11 @@ describe("节假日导入与查询", () => {
       const smaller = payload2026();
       smaller.days = smaller.days.filter((d) => d.date < "2026-02-01");
       importYear(env.db, smaller, "test");
-      assert.equal(dayType(env.db, "2026-02-14"), "weekend", "替换后旧数据应消失，按星期兜底为周末");
+      assert.equal(
+        dayType(env.db, "2026-02-14"),
+        "weekend",
+        "替换后旧数据应消失，按星期兜底为周末",
+      );
     } finally {
       cleanupTestEnv(env);
     }
@@ -273,7 +320,9 @@ describe("节假日抓取", () => {
       const result = await ensureYears(env.db, [2026], fetcher);
       assert.equal(result.failed.length, 1);
       assert.deepEqual(holidayYearsReady(env.db), []);
-      const meta = env.db.prepare("SELECT status, last_error FROM cn_holiday_years WHERE year = 2026").get() as {
+      const meta = env.db
+        .prepare("SELECT status, last_error FROM cn_holiday_years WHERE year = 2026")
+        .get() as {
         status: string;
         last_error: string;
       };
@@ -307,7 +356,10 @@ describe("节假日抓取", () => {
 
   it("fetchYearPayload 在两个源都失败时抛错", async () => {
     await assert.rejects(
-      () => fetchYearPayload(2099, async () => { throw new Error("HTTP 404"); }),
+      () =>
+        fetchYearPayload(2099, async () => {
+          throw new Error("HTTP 404");
+        }),
       /抓取失败/,
     );
   });
@@ -317,7 +369,11 @@ describe("holiday 工具：日期校验", () => {
   it("拒绝不存在的日历日，而不是误报为工作日", async () => {
     const env = makeTestEnv();
     try {
-      importYear(env.db, { year: 2026, days: [{ name: "元旦", date: "2026-01-01", isOffDay: true }] }, "test");
+      importYear(
+        env.db,
+        { year: 2026, days: [{ name: "元旦", date: "2026-01-01", isOffDay: true }] },
+        "test",
+      );
       const ctx = {
         profileId: "default",
         db: env.db,

@@ -1,7 +1,17 @@
 node_modules/
 dist/
-data/
 *.log
-.env
 .DS_Store
 .zcode/
+
+# 数据目录：data/ 及迁移/校验等副本（SQLite 与 WAL/SHM，含个人数据）
+data*/
+
+# 环境与密钥：.env 本身及任何备份（如 .env.bak-*）都不得入库
+.env
+.env.*
+!.env.example
+
+# Command Code：个人/自动管理的状态（taste 学习结果、本地设置）
+.commandcode/taste/
+.commandcode/settings.local.json

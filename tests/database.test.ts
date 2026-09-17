@@ -23,17 +23,39 @@ describe("database schema v1", () => {
   it("STRICT 表拒绝错误类型与非法 CHECK", () => {
     const env = makeTestEnv();
     try {
-      env.db.prepare("INSERT INTO ledgers (id, name, created_at) VALUES ('l1', '日用', '2026-01-01T00:00:00.000Z')").run();
+      env.db
+        .prepare(
+          "INSERT INTO ledgers (id, name, created_at) VALUES ('l1', '日用', '2026-01-01T00:00:00.000Z')",
+        )
+        .run();
       assert.throws(() =>
         env.db
-          .prepare("INSERT INTO expenses (id, ledger_id, amount_cents, spent_on, created_by_profile, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+          .prepare(
+            "INSERT INTO expenses (id, ledger_id, amount_cents, spent_on, created_by_profile, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+          )
           .run("e1", "l1", "12.34元", "2026-09-11", "default", "2026-01-01T00:00:00.000Z"),
       );
       assert.throws(() =>
         env.db
-          .prepare("INSERT INTO expenses (id, ledger_id, amount_cents, spent_on, created_by_profile, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+          .prepare(
+            "INSERT INTO expenses (id, ledger_id, amount_cents, spent_on, created_by_profile, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+          )
           .run("e2", "l1", 0, "2026-09-11", "default", "2026-01-01T00:00:00.000Z"),
       );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("occurrences 的 (schedule_id, status) 索引由 migrate 建立，而不是在热路径里建", () => {
+    const env = makeTestEnv();
+    try {
+      const index = env.db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_occurrences_schedule_status'",
+        )
+        .get();
+      assert.ok(index !== undefined, "缺索引会让按 schedule_id 的物化查询退化成全表扫描");
     } finally {
       cleanupTestEnv(env);
     }
@@ -44,7 +66,9 @@ describe("database schema v1", () => {
     try {
       assert.throws(() =>
         env.db
-          .prepare("INSERT INTO expenses (id, ledger_id, amount_cents, spent_on, created_by_profile, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+          .prepare(
+            "INSERT INTO expenses (id, ledger_id, amount_cents, spent_on, created_by_profile, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+          )
           .run("e3", "missing", 100, "2026-09-11", "default", "2026-01-01T00:00:00.000Z"),
       );
     } finally {
@@ -55,7 +79,11 @@ describe("database schema v1", () => {
   it("通知去重键 Profile 内唯一", () => {
     const env = makeTestEnv();
     try {
-      env.db.prepare("INSERT INTO profiles (id, created_at) VALUES ('other', '2026-01-01T00:00:00.000Z')").run();
+      env.db
+        .prepare(
+          "INSERT INTO profiles (id, created_at) VALUES ('other', '2026-01-01T00:00:00.000Z')",
+        )
+        .run();
       const plain = env.db.prepare(
         "INSERT INTO notifications (id, profile_id, kind, title, body_md, created_at) VALUES (?, ?, 'k', 't', 'b', ?)",
       );
@@ -78,11 +106,17 @@ describe("database schema v1", () => {
     try {
       assert.throws(() =>
         withTransaction(env.db, () => {
-          env.db.prepare("INSERT INTO ledgers (id, name, created_at) VALUES ('lx', 'x', '2026-01-01T00:00:00.000Z')").run();
+          env.db
+            .prepare(
+              "INSERT INTO ledgers (id, name, created_at) VALUES ('lx', 'x', '2026-01-01T00:00:00.000Z')",
+            )
+            .run();
           throw new Error("boom");
         }),
       );
-      const row = env.db.prepare("SELECT COUNT(*) AS n FROM ledgers WHERE id = 'lx'").get() as { n: number };
+      const row = env.db.prepare("SELECT COUNT(*) AS n FROM ledgers WHERE id = 'lx'").get() as {
+        n: number;
+      };
       assert.equal(row.n, 0);
     } finally {
       cleanupTestEnv(env);
@@ -114,7 +148,9 @@ describe("cache 过期清理", () => {
 
       const pruned = pruneCache(env.db);
       assert.equal(pruned, 1, "只应清理 1 条过期行");
-      const keys = (env.db.prepare("SELECT key FROM cache").all() as { key: string }[]).map((r) => r.key);
+      const keys = (env.db.prepare("SELECT key FROM cache").all() as { key: string }[]).map(
+        (r) => r.key,
+      );
       assert.deepEqual(keys, ["geo:alive"], "cache 表不会被读取时自动回收，必须显式清理");
     } finally {
       cleanupTestEnv(env);

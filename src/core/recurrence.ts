@@ -119,7 +119,7 @@ function* iterate(source: OccurrenceSource, afterDay: DateTime): Generator<DateT
         tick();
         const d = clampDay(year, month, day);
         if (d >= start && d > afterDay) yield d;
-        const nextIndex = (year * 12 + (month - 1)) + interval;
+        const nextIndex = year * 12 + (month - 1) + interval;
         year = Math.floor(nextIndex / 12);
         month = (nextIndex % 12) + 1;
       }
@@ -158,7 +158,9 @@ export function lunarToSolar(
   clamp: boolean,
 ): DateTime | null {
   const months = LunarYear.fromYear(lunarYear).getMonths();
-  const candidates = months.filter((m) => Math.abs(m.getMonth()) === month && m.getYear() === lunarYear);
+  const candidates = months.filter(
+    (m) => Math.abs(m.getMonth()) === month && m.getYear() === lunarYear,
+  );
   if (candidates.length === 0) return null;
   let target = candidates.find((m) => (leapPolicy === "follow" ? m.isLeap() : !m.isLeap()));
   if (target === undefined) target = candidates[0];
@@ -190,7 +192,10 @@ function uniqSorted(values: number[]): number[] {
 
 /** 供通知/列表展示的循环规则人话描述 */
 export function describeRecurrence(
-  source: Pick<OccurrenceSource, "calendar" | "recurrence" | "lunarMonth" | "lunarDay" | "leapPolicy">,
+  source: Pick<
+    OccurrenceSource,
+    "calendar" | "recurrence" | "lunarMonth" | "lunarDay" | "leapPolicy"
+  >,
   startDate: string | null,
 ): string {
   const rec = source.recurrence;
@@ -205,13 +210,17 @@ export function describeRecurrence(
       return n === 1 ? "每天" : `每 ${n} 天`;
     case "weekly": {
       const names = ["一", "二", "三", "四", "五", "六", "日"];
-      const days = uniqSorted(rec.byweekday ?? []).map((d) => names[d] ?? "").join("、");
+      const days = uniqSorted(rec.byweekday ?? [])
+        .map((d) => names[d] ?? "")
+        .join("、");
       const week = n === 1 ? "每周" : `每 ${n} 周 `;
       return `${week}${days}`;
     }
     case "monthly":
       return n === 1 ? `每月${startDate?.slice(8, 10) ?? ""}日` : `每 ${n} 个月`;
     case "yearly":
-      return n === 1 ? `每年${startDate?.slice(5, 7) ?? ""}月${startDate?.slice(8, 10) ?? ""}日` : `每 ${n} 年`;
+      return n === 1
+        ? `每年${startDate?.slice(5, 7) ?? ""}月${startDate?.slice(8, 10) ?? ""}日`
+        : `每 ${n} 年`;
   }
 }

@@ -36,7 +36,7 @@ npm run build
 | 变量 | 必填 | 说明 |
 |---|---|---|
 | `DATA_DIR` | ✅ | 绝对路径；SQLite 与备份所在地 |
-| `HERMES_PROFILE` | ✅ | stdio 壳 / CLI 使用的 Profile 名 |
+| `HERMES_PROFILE` | stdio 壳 | stdio 壳 / CLI 使用的 Profile 名；纯 HTTP 直连的 daemon 不读该变量（Profile 走 `X-Hermes-Profile` 头） |
 | `QWEATHER_API_HOST` / `QWEATHER_KEY` | 天气需要 | QWeather 控制台获取 |
 | `DEFAULT_CITY` | | Profile 未设位置时的兜底城市 |
 | `HOST` / `PORT` | | 默认 `127.0.0.1:3080`；**非回环地址必须配 `WEB_API_TOKEN`**，否则拒绝启动 |
@@ -173,12 +173,13 @@ Profile / 账本数据再写入（不影响其它 Profile），失败时整体�
 
 ```bash
 npm run dev            # tsx 直接跑 daemon
-npm test               # node --test（159 个用例）
-npm run lint           # Biome（0 警告）
+npm test               # node --test（171 个用例）
+npm run lint           # Biome lint（0 警告）
+npm run format:check   # Biome 格式检查（CI 也跑）
 npm run db:backup      # VACUUM INTO 备份，保留最近 14 份
 ```
 
-结构：`src/core`（database/registry/notify/render/qweather/holiday/recurrence/http/auth）、`src/modules`（weather/holiday/schedule/bookkeeping/notify，经 `modules/index.ts` 注册，核心不反向依赖）、`src/daemon.ts`、`src/stdio.ts`、`src/import-v1.ts`、`src/backup.ts`。
+结构：`src/core`（database/registry/auth/http/logger/settings/notify/render/qweather/holiday/recurrence）、`src/modules`（weather/holiday/schedule/bookkeeping/notify，经 `modules/index.ts` 注册，核心不反向依赖）、`src/server`（status/page/details，状态页与只读 API）、`src/daemon.ts`、`src/stdio.ts`、`src/import-v1.ts`、`src/backup.ts`。
 
 ## 设计要点
 
@@ -192,7 +193,7 @@ npm run db:backup      # VACUUM INTO 备份，保留最近 14 份
 
 按收益排序，均为「已识别但未做」的项，当前实现是正确的、只是不够省：
 
-1. **QWeather 无缓存/限流/退避**：每次工具调用都是实打实的请求，`daily_brief` 每个 Profile 并发 4 个。
+1. **QWeather 天气数据无缓存/限流/退避**：GeoAPI 结果已有 7 天缓存，但实时/预报/空气/预警每次工具调用都是实打实的请求，`daily_brief` 每个 Profile 并发 4 个。
    建议给现成的 `cache` 表加短 TTL（实时 ≈10min、预报 ≈1–3h、空气 ≈30–60min、预警 ≈10min），
    加并发上限，并只对 429/5xx 做指数退避（官方文档警告重复错误流量可能导致账号封禁）。
 2. **认证方式建议迁移 JWT**：目前用 `?key=` 传 API key（会进入代理日志）。官方推荐 JWT

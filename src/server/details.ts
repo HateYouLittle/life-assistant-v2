@@ -12,7 +12,10 @@ import { TZ, todayIso } from "../time.js";
 
 const MONTH_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
 
-export function normalizeMonth(raw: string | undefined, fallback: string = todayIso().slice(0, 7)): string {
+export function normalizeMonth(
+  raw: string | undefined,
+  fallback: string = todayIso().slice(0, 7),
+): string {
   return raw !== undefined && MONTH_RE.test(raw) ? raw : fallback;
 }
 
@@ -52,13 +55,19 @@ export interface ExpenseDetails {
   entries_total: number;
 }
 
-export function expenseDetails(db: DatabaseSync, rawMonth: string | undefined, rawLimit: string | undefined): ExpenseDetails {
+export function expenseDetails(
+  db: DatabaseSync,
+  rawMonth: string | undefined,
+  rawLimit: string | undefined,
+): ExpenseDetails {
   const month = normalizeMonth(rawMonth);
   const { from, to } = monthRange(month);
   const limit = clampLimit(rawLimit, 50);
 
   const totals = db
-    .prepare("SELECT COALESCE(SUM(amount_cents), 0) AS cents, COUNT(*) AS count FROM expenses WHERE spent_on >= ? AND spent_on <= ?")
+    .prepare(
+      "SELECT COALESCE(SUM(amount_cents), 0) AS cents, COUNT(*) AS count FROM expenses WHERE spent_on >= ? AND spent_on <= ?",
+    )
     .get(from, to) as { cents: number; count: number };
 
   const categories = db
@@ -95,7 +104,9 @@ export function expenseDetails(db: DatabaseSync, rawMonth: string | undefined, r
   const prevMonth = previousMonthOf(month);
   const prevRange = monthRange(prevMonth);
   const prev = db
-    .prepare("SELECT COALESCE(SUM(amount_cents), 0) AS cents FROM expenses WHERE spent_on >= ? AND spent_on <= ?")
+    .prepare(
+      "SELECT COALESCE(SUM(amount_cents), 0) AS cents FROM expenses WHERE spent_on >= ? AND spent_on <= ?",
+    )
     .get(prevRange.from, prevRange.to) as { cents: number };
 
   return {
@@ -157,7 +168,10 @@ function localStamp(iso: string | null, allDay: boolean): string | null {
   return allDay ? dt.toFormat("yyyy-LL-dd") : dt.toFormat("yyyy-LL-dd HH:mm");
 }
 
-export function scheduleDetails(db: DatabaseSync, rawLimit: string | undefined): ScheduleDetailItem[] {
+export function scheduleDetails(
+  db: DatabaseSync,
+  rawLimit: string | undefined,
+): ScheduleDetailItem[] {
   const limit = clampLimit(rawLimit, 50, 500);
   const rows = db
     .prepare(
@@ -234,7 +248,7 @@ function localShort(iso: string | null): string | null {
 export function deliveryDetails(db: DatabaseSync, rawLimit: string | undefined): DeliveryDetails {
   const limit = clampLimit(rawLimit, 60, 500);
   const count = (sql: string, ...params: (string | number)[]): number =>
-    ((db.prepare(sql).get(...params) as { n: number } | undefined)?.n ?? 0);
+    (db.prepare(sql).get(...params) as { n: number } | undefined)?.n ?? 0;
 
   const since = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
   const sentRows = db
@@ -298,9 +312,11 @@ function weekdayLabel(date: string): string {
 }
 
 export function holidayDetails(db: DatabaseSync, rawYear: string | undefined): HolidayDetails {
-  const years = (db.prepare("SELECT year FROM cn_holiday_years WHERE status = 'ready' ORDER BY year").all() as { year: number }[]).map(
-    (r) => r.year,
-  );
+  const years = (
+    db.prepare("SELECT year FROM cn_holiday_years WHERE status = 'ready' ORDER BY year").all() as {
+      year: number;
+    }[]
+  ).map((r) => r.year);
   const today = todayIso();
   const currentYear = Number(today.slice(0, 4));
   // 默认看「还有假期的年份」：当年没排完就用当年，当年的假期已经过完则顺延到下一年
@@ -308,7 +324,10 @@ export function holidayDetails(db: DatabaseSync, rawYear: string | undefined): H
     ? currentYear
     : (years.find((y) => y > currentYear) ?? years[years.length - 1] ?? currentYear);
   const parsedYear = Number(rawYear);
-  const year = Number.isInteger(parsedYear) && parsedYear >= 2000 && parsedYear <= 2100 ? parsedYear : fallbackYear;
+  const year =
+    Number.isInteger(parsedYear) && parsedYear >= 2000 && parsedYear <= 2100
+      ? parsedYear
+      : fallbackYear;
 
   const days = db
     .prepare("SELECT date, name, day_type FROM cn_holiday_days WHERE year = ? ORDER BY date")
@@ -322,8 +341,12 @@ export function holidayDetails(db: DatabaseSync, rawYear: string | undefined): H
     const first = holidayDays[index] as { date: string; name: string };
     let span = 1;
     while (index + span < holidayDays.length) {
-      const prev = DateTime.fromISO((holidayDays[index + span - 1] as { date: string }).date, { zone: TZ });
-      const next = DateTime.fromISO((holidayDays[index + span] as { date: string }).date, { zone: TZ });
+      const prev = DateTime.fromISO((holidayDays[index + span - 1] as { date: string }).date, {
+        zone: TZ,
+      });
+      const next = DateTime.fromISO((holidayDays[index + span] as { date: string }).date, {
+        zone: TZ,
+      });
       if (next.diff(prev, "days").days !== 1) break;
       span += 1;
     }
@@ -331,7 +354,10 @@ export function holidayDetails(db: DatabaseSync, rawYear: string | undefined): H
     upcoming.push({
       date: first.date,
       name: first.name,
-      days_until: Math.max(0, Math.round(DateTime.fromISO(today, { zone: TZ }).diff(start, "days").days * -1)),
+      days_until: Math.max(
+        0,
+        Math.round(DateTime.fromISO(today, { zone: TZ }).diff(start, "days").days * -1),
+      ),
       days: span,
     });
     index += span;

@@ -2,7 +2,15 @@ import { z } from "zod";
 import { DATE_RE, TIME_RE, instantToLocalDate } from "../../time.js";
 import { describeRecurrence } from "../../core/recurrence.js";
 import type { Recurrence } from "../../core/recurrence.js";
-import { fail, ok, okJson, registerModule, runtime, errorMessage, type ToolContext } from "../../core/registry.js";
+import {
+  fail,
+  ok,
+  okJson,
+  registerModule,
+  runtime,
+  errorMessage,
+  type ToolContext,
+} from "../../core/registry.js";
 import {
   completeSchedule,
   createSchedule,
@@ -141,7 +149,8 @@ function scheduleToolInner(args: Record<string, unknown>, ctx: ToolContext) {
       const patch = buildPartial(args);
       if (args.status !== undefined) {
         const status = args.status as ScheduleRow["status"];
-        if (status === "active" || status === "done" || status === "cancelled") patch.status = status;
+        if (status === "active" || status === "done" || status === "cancelled")
+          patch.status = status;
       }
       if (Object.keys(patch).length === 0) return fail("没有提供要更新的字段");
       const row = updateSchedule(db, ctx.profileId, id, patch);
@@ -199,18 +208,36 @@ registerModule({
         lunar_month: z.number().int().min(1).max(12).optional(),
         lunar_day: z.number().int().min(1).max(30).optional(),
         leap_policy: z.enum(["follow", "regular"]).optional().describe("闰月策略，默认 follow"),
-        lunar_clamp: z.boolean().optional().describe("农历日越界（如腊月三十缺失）取当月最后一天，默认 true"),
+        lunar_clamp: z
+          .boolean()
+          .optional()
+          .describe("农历日越界（如腊月三十缺失）取当月最后一天，默认 true"),
         time: z.string().regex(TIME_RE).optional().describe("提醒时刻 HH:MM，默认 09:00"),
-        all_day: z.boolean().optional().describe("默认 false（有具体时刻按时间提醒）；纯日期事件设 true"),
+        all_day: z
+          .boolean()
+          .optional()
+          .describe("默认 false（有具体时刻按时间提醒）；纯日期事件设 true"),
         recurrence: recurrenceInput.optional(),
-        workday_filter: z.enum(["any", "workday", "holiday"]).optional().describe("仅公历；节假日数据缺失时自动暂停"),
+        workday_filter: z
+          .enum(["any", "workday", "holiday"])
+          .optional()
+          .describe("仅公历；节假日数据缺失时自动暂停"),
         remind_offsets: z
           .array(z.number().int().min(-43200).max(43200))
           .max(5)
           .optional()
           .describe("提醒偏移分钟（相对事件时间，负数=提前），默认 [0]"),
-        resend_minutes: z.number().int().min(0).max(1440).optional().describe("待办到点后 N 分钟重发一次，默认 0"),
-        status: z.enum(["active", "done", "cancelled"]).optional().describe("list 过滤 / update 修改"),
+        resend_minutes: z
+          .number()
+          .int()
+          .min(0)
+          .max(1440)
+          .optional()
+          .describe("待办到点后 N 分钟重发一次，默认 0"),
+        status: z
+          .enum(["active", "done", "cancelled"])
+          .optional()
+          .describe("list 过滤 / update 修改"),
         limit: z.number().int().min(1).max(100).optional(),
         occurrence_key: z.string().optional().describe("complete 时可选，只完成该次发生"),
       },

@@ -12,27 +12,26 @@ interface CapturedRequest {
 }
 
 function spawnShim(port: number, extraEnv: Record<string, string> = {}): ReturnType<typeof spawn> {
-  return spawn(
-    process.execPath,
-    ["--import", "tsx", join(process.cwd(), "src", "stdio.ts")],
-    {
-      env: {
-        ...process.env,
-        DATA_DIR: mkdtempSync(join(tmpdir(), "stdio-test-")),
-        HERMES_PROFILE: "default",
-        MCP_DAEMON_URL: `http://127.0.0.1:${port}`,
-        ...extraEnv,
-      },
-      stdio: ["pipe", "pipe", "pipe"],
+  return spawn(process.execPath, ["--import", "tsx", join(process.cwd(), "src", "stdio.ts")], {
+    env: {
+      ...process.env,
+      DATA_DIR: mkdtempSync(join(tmpdir(), "stdio-test-")),
+      HERMES_PROFILE: "default",
+      MCP_DAEMON_URL: `http://127.0.0.1:${port}`,
+      ...extraEnv,
     },
-  );
+    stdio: ["pipe", "pipe", "pipe"],
+  });
 }
 
 function waitForLine(child: ReturnType<typeof spawn>, timeoutMs = 5000): Promise<string> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("等待 stdio 响应超时")), timeoutMs);
     child.stdout?.on("data", (chunk: Buffer) => {
-      const lines = chunk.toString().split("\n").filter((l) => l.trim() !== "");
+      const lines = chunk
+        .toString()
+        .split("\n")
+        .filter((l) => l.trim() !== "");
       if (lines.length > 0) {
         clearTimeout(timer);
         resolve(lines[0] as string);
@@ -103,7 +102,10 @@ describe("stdio 兼容壳", () => {
     await withServer(
       (req, res, body) => {
         const parsed = JSON.parse(body) as { method?: string; id?: unknown };
-        seen.push({ session: req.headers["mcp-session-id"] as string | undefined, method: parsed.method ?? "" });
+        seen.push({
+          session: req.headers["mcp-session-id"] as string | undefined,
+          method: parsed.method ?? "",
+        });
         if (parsed.method === "initialize") {
           res.writeHead(200, { "Content-Type": "application/json", "mcp-session-id": "sess-2" });
           res.end(JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: { ok: true } }));
@@ -112,7 +114,11 @@ describe("stdio 兼容壳", () => {
         if (req.headers["mcp-session-id"] === "sess-1") {
           res.writeHead(404, { "Content-Type": "application/json" });
           res.end(
-            JSON.stringify({ jsonrpc: "2.0", error: { code: -32001, message: "Session not found" }, id: null }),
+            JSON.stringify({
+              jsonrpc: "2.0",
+              error: { code: -32001, message: "Session not found" },
+              id: null,
+            }),
           );
           return;
         }
@@ -124,14 +130,22 @@ describe("stdio 兼容壳", () => {
         try {
           // 第一次：建立会话 sess-1，正常返回
           const first = waitForLine(child);
-          child.stdin?.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" })}\n`);
+          child.stdin?.write(
+            `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" })}\n`,
+          );
           assert.equal((JSON.parse(await first) as { id: number }).id, 1);
 
           // 第二次：带 sess-1 → 404，壳应自愈后重试成功
           const second = waitForLine(child);
-          child.stdin?.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call" })}\n`);
+          child.stdin?.write(
+            `${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call" })}\n`,
+          );
           const line = await second;
-          const response = JSON.parse(line) as { id: number; result?: { ok: boolean }; error?: unknown };
+          const response = JSON.parse(line) as {
+            id: number;
+            result?: { ok: boolean };
+            error?: unknown;
+          };
           assert.equal(response.id, 2);
           assert.equal(response.error, undefined, "应自愈重试成功，而不是把 404 抛给调用方");
           assert.equal(response.result?.ok, true);

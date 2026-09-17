@@ -48,9 +48,11 @@ export function dayType(db: DatabaseSync, date: string): DayType | "unknown" {
 }
 
 export function holidayYearsReady(db: DatabaseSync): number[] {
-  return (db.prepare("SELECT year FROM cn_holiday_years WHERE status = 'ready' ORDER BY year").all() as {
-    year: number;
-  }[]).map((r) => r.year);
+  return (
+    db.prepare("SELECT year FROM cn_holiday_years WHERE status = 'ready' ORDER BY year").all() as {
+      year: number;
+    }[]
+  ).map((r) => r.year);
 }
 
 /**
@@ -163,10 +165,20 @@ export function importYear(db: DatabaseSync, payload: HolidayYearPayload, source
       // 决定，而不是下一年度文件的跨年条目。这样导入顺序不会改变最终结果。
       const dateYear = Number(day.date.slice(0, 4));
       const existing = select.get(day.date) as { year: number } | undefined;
-      if (existing !== undefined && Math.abs(existing.year - dateYear) < Math.abs(payload.year - dateYear)) {
+      if (
+        existing !== undefined &&
+        Math.abs(existing.year - dateYear) < Math.abs(payload.year - dateYear)
+      ) {
         continue;
       }
-      upsert.run(day.date, payload.year, day.isOffDay ? "holiday" : "workday", day.name, source, now);
+      upsert.run(
+        day.date,
+        payload.year,
+        day.isOffDay ? "holiday" : "workday",
+        day.name,
+        source,
+        now,
+      );
       count++;
     }
     db.prepare(
@@ -214,9 +226,9 @@ export async function ensureYears(
   const skipped: number[] = [];
   const failed: string[] = [];
   for (const year of years) {
-    const meta = db.prepare("SELECT status, last_attempt_at FROM cn_holiday_years WHERE year = ?").get(year) as
-      | { status: string; last_attempt_at: string | null }
-      | undefined;
+    const meta = db
+      .prepare("SELECT status, last_attempt_at FROM cn_holiday_years WHERE year = ?")
+      .get(year) as { status: string; last_attempt_at: string | null } | undefined;
     if (meta?.status === "ready") {
       skipped.push(year);
       continue;
@@ -233,7 +245,9 @@ export async function ensureYears(
       // CDN 可能返回缓存/错配的文件；若不比对，会把错误年份「导入成功」，
       // 而请求的年份既没有数据行也没有 cn_holiday_years 行，永远 not ready 且不再冷却。
       if (payload.year !== year) {
-        throw new Error(`年度数据错配: 请求 ${year} 年，数据里的 year 字段是 ${String(payload.year)}`);
+        throw new Error(
+          `年度数据错配: 请求 ${year} 年，数据里的 year 字段是 ${String(payload.year)}`,
+        );
       }
       const errors = validateYearPayload(payload);
       if (errors.length > 0) throw new Error(`数据校验失败: ${errors.join("; ")}`);
@@ -257,7 +271,10 @@ export function requiredYears(today: string = todayIso()): number[] {
 }
 
 /** 下一假期（含名称/起止/天数）；无数据返回 null */
-export function nextHolidayPeriod(db: DatabaseSync, today: string = todayIso()): {
+export function nextHolidayPeriod(
+  db: DatabaseSync,
+  today: string = todayIso(),
+): {
   name: string;
   start: string;
   end: string;
@@ -265,13 +282,15 @@ export function nextHolidayPeriod(db: DatabaseSync, today: string = todayIso()):
   inProgress: boolean;
 } | null {
   const first = db
-    .prepare("SELECT date, name FROM cn_holiday_days WHERE day_type = 'holiday' AND date >= ? ORDER BY date LIMIT 1")
+    .prepare(
+      "SELECT date, name FROM cn_holiday_days WHERE day_type = 'holiday' AND date >= ? ORDER BY date LIMIT 1",
+    )
     .get(today) as { date: string; name: string } | undefined;
   if (first === undefined) return null;
   const isHolidayNamed = (date: string): boolean => {
-    const row = db.prepare("SELECT name FROM cn_holiday_days WHERE date = ? AND day_type = 'holiday'").get(date) as
-      | { name: string }
-      | undefined;
+    const row = db
+      .prepare("SELECT name FROM cn_holiday_days WHERE date = ? AND day_type = 'holiday'")
+      .get(date) as { name: string } | undefined;
     return row !== undefined && row.name === first.name;
   };
   let start = first.date;
@@ -286,8 +305,11 @@ export function nextHolidayPeriod(db: DatabaseSync, today: string = todayIso()):
     if (next === null || !isHolidayNamed(next)) break;
     end = next;
   }
-  const days = Math.round(
-    (DateTime.fromISO(end, { zone: TZ }).toMillis() - DateTime.fromISO(start, { zone: TZ }).toMillis()) / 86_400_000,
-  ) + 1;
+  const days =
+    Math.round(
+      (DateTime.fromISO(end, { zone: TZ }).toMillis() -
+        DateTime.fromISO(start, { zone: TZ }).toMillis()) /
+        86_400_000,
+    ) + 1;
   return { name: first.name, start, end, days, inProgress: start <= today };
 }

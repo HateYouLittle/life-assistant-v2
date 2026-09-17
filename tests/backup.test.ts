@@ -8,13 +8,18 @@ import { TZ } from "../src/time.js";
 import { cleanupTestEnv, makeTestEnv } from "./helpers.js";
 
 /** 备份时间戳按 Asia/Shanghai 本地时间生成（与项目其余部分一致，而不是 UTC） */
-const stampOf = (ms: number): string => DateTime.fromMillis(ms, { zone: TZ }).toFormat("yyyyMMdd-HHmmss");
+const stampOf = (ms: number): string =>
+  DateTime.fromMillis(ms, { zone: TZ }).toFormat("yyyyMMdd-HHmmss");
 
 describe("db:backup", () => {
   it("生成 VACUUM INTO 备份并可独立打开", () => {
     const env = makeTestEnv();
     try {
-      env.db.prepare("INSERT INTO ledgers (id, name, created_at) VALUES ('l1', '日用', '2026-01-01T00:00:00.000Z')").run();
+      env.db
+        .prepare(
+          "INSERT INTO ledgers (id, name, created_at) VALUES ('l1', '日用', '2026-01-01T00:00:00.000Z')",
+        )
+        .run();
       const ms = Date.UTC(2026, 8, 12, 3, 4, 5);
       const target = runBackup(env.config, ms);
       assert.match(target, new RegExp(`life-assistant-${stampOf(ms)}\\.db$`));

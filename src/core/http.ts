@@ -30,7 +30,9 @@ async function readErrorDetail(response: Response): Promise<string> {
   }
   if (text.trim() === "") return "";
   try {
-    const parsed = JSON.parse(text) as { error?: { title?: unknown; detail?: unknown; status?: unknown } };
+    const parsed = JSON.parse(text) as {
+      error?: { title?: unknown; detail?: unknown; status?: unknown };
+    };
     const title = parsed.error?.title;
     const detail = parsed.error?.detail;
     const parts = [title, detail].filter((v) => typeof v === "string" && v !== "");

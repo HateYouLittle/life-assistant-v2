@@ -40,8 +40,12 @@ export function instantToLocalDate(iso: string): string {
 }
 
 /** 跨午夜静默窗口判断：start=end 视为未配置 */
-export function inQuietWindow(value: { start: string; end: string } | null | undefined, at: DateTime = now()): boolean {
-  if (!value || !isTime(value.start) || !isTime(value.end) || value.start === value.end) return false;
+export function inQuietWindow(
+  value: { start: string; end: string } | null | undefined,
+  at: DateTime = now(),
+): boolean {
+  if (!value || !isTime(value.start) || !isTime(value.end) || value.start === value.end)
+    return false;
   const minutes = at.hour * 60 + at.minute;
   const start = quietMinutes(value.start);
   const end = quietMinutes(value.end);

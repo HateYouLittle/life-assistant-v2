@@ -20,7 +20,7 @@ import {
   initRuntime,
   type ToolContext,
 } from "./core/registry.js";
-import { cancelPendingDrain, createServices, drainDue } from "./core/notify.js";
+import { cancelPendingDrain, createServices, drainDue, waitForDrain } from "./core/notify.js";
 import { pruneCache } from "./core/settings.js";
 import { logger, setLogLevel } from "./core/logger.js";
 import { TZ, now } from "./time.js";
@@ -42,23 +42,34 @@ interface Session {
 const SESSION_IDLE_MS = 2 * 3600 * 1000;
 const MAX_SESSIONS = 200;
 
-async function buildMcpServer(profileId: string, db: DatabaseSync, config: ResolvedConfig): Promise<{ server: McpServer; transport: StreamableHTTPServerTransport }> {
+async function buildMcpServer(
+  profileId: string,
+  db: DatabaseSync,
+  config: ResolvedConfig,
+): Promise<{ server: McpServer; transport: StreamableHTTPServerTransport }> {
   const server = new McpServer({ name: "life-assistant", version: VERSION });
   const services = createServices(db, config);
   for (const { def } of allTools()) {
-    server.registerTool(def.name, { description: def.description, inputSchema: def.inputSchema }, async (args, extra) => {
-      const ctx: ToolContext = {
-        profileId: extra.sessionId !== undefined ? profileIdForSession(extra.sessionId, profileId) : profileId,
-        db,
-        config,
-        services,
-      };
-      try {
-        return await def.handler(args as Record<string, unknown>, ctx);
-      } catch (e) {
-        return fail(errorMessage(e));
-      }
-    });
+    server.registerTool(
+      def.name,
+      { description: def.description, inputSchema: def.inputSchema },
+      async (args, extra) => {
+        const ctx: ToolContext = {
+          profileId:
+            extra.sessionId !== undefined
+              ? profileIdForSession(extra.sessionId, profileId)
+              : profileId,
+          db,
+          config,
+          services,
+        };
+        try {
+          return await def.handler(args as Record<string, unknown>, ctx);
+        } catch (e) {
+          return fail(errorMessage(e));
+        }
+      },
+    );
   }
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => randomUUID(),
@@ -102,7 +113,12 @@ export function sweepSessions(nowMs: number = Date.now()): number {
   return removed;
 }
 
-async function handleMcp(req: IncomingMessage, res: ServerResponse, db: DatabaseSync, config: ResolvedConfig): Promise<void> {
+async function handleMcp(
+  req: IncomingMessage,
+  res: ServerResponse,
+  db: DatabaseSync,
+  config: ResolvedConfig,
+): Promise<void> {
   // 只接受 Authorization: Bearer。/mcp 不接受 ?token= —— URL 会进入访问日志、
   // 浏览器历史与 Referer，凭据不应出现在那里（状态页仍支持 ?token= 首次引导）。
   if (!isRequestAuthorized(config.webApiToken, req.headers.authorization)) {
@@ -110,7 +126,10 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse, db: Database
     res.end(
       JSON.stringify({
         jsonrpc: "2.0",
-        error: { code: -32001, message: "unauthorized：/mcp 需要 Authorization: Bearer <WEB_API_TOKEN>" },
+        error: {
+          code: -32001,
+          message: "unauthorized：/mcp 需要 Authorization: Bearer <WEB_API_TOKEN>",
+        },
         id: null,
       }),
     );
@@ -125,7 +144,10 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse, db: Database
       res.end(
         JSON.stringify({
           jsonrpc: "2.0",
-          error: { code: -32001, message: "Session not found（daemon 可能已重启或会话已回收，请重新 initialize）" },
+          error: {
+            code: -32001,
+            message: "Session not found（daemon 可能已重启或会话已回收，请重新 initialize）",
+          },
           id: null,
         }),
       );
@@ -137,7 +159,23 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse, db: Database
   }
 
   const rawProfile = req.headers["x-hermes-profile"];
-  const profileId = typeof rawProfile === "string" && rawProfile !== "" ? parseProfileId(rawProfile, "X-Hermes-Profile") : "default";
+  let profileId = "default";
+  if (typeof rawProfile === "string" && rawProfile !== "") {
+    try {
+      profileId = parseProfileId(rawProfile, "X-Hermes-Profile");
+    } catch (e) {
+      // 客户端头非法属于请求错误（400），不应落到 500 被当成服务端故障
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          error: { code: -32602, message: `invalid params: ${errorMessage(e)}` },
+          id: null,
+        }),
+      );
+      return;
+    }
+  }
   const { server, transport } = await buildMcpServer(profileId, db, config);
   await transport.handleRequest(req, res);
   const sessionId = transport.sessionId;
@@ -163,7 +201,13 @@ export function createHttpHandler(
       handleMcp(req, res, db, config).catch((e) => {
         logger.error(`MCP 请求处理失败: ${errorMessage(e)}`);
         if (!res.headersSent) res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32603, message: "Internal error" }, id: null }));
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            error: { code: -32603, message: "Internal error" },
+            id: null,
+          }),
+        );
       });
       return;
     }
@@ -218,11 +262,17 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
     const expr = typeof def.cron === "function" ? def.cron() : def.cron;
     if (!cron.validate(expr)) throw new Error(`Job ${def.name} 的 cron 不合法: ${expr}`);
     tasks.push(
-      cron.schedule(expr, () => void runExclusive(`job:${def.name}`, () => def.handler(now())), { timezone: TZ }),
+      cron.schedule(expr, () => void runExclusive(`job:${def.name}`, () => def.handler(now())), {
+        timezone: TZ,
+      }),
     );
     logger.info(`注册定时任务 ${module}.${def.name}: "${expr}" (${TZ})`);
   }
-  tasks.push(cron.schedule("* * * * *", () => void runExclusive("tick", () => tickAll(now())), { timezone: TZ }));
+  tasks.push(
+    cron.schedule("* * * * *", () => void runExclusive("tick", () => tickAll(now())), {
+      timezone: TZ,
+    }),
+  );
   const drainTimer = setInterval(() => {
     void drainDue(db, config).catch((e) => logger.error(`outbox drain 失败: ${errorMessage(e)}`));
     try {
@@ -266,6 +316,12 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
     for (const task of tasks) task.stop();
     clearInterval(drainTimer);
     cancelPendingDrain();
+    // 在途的 outbox 投递也有 10s 级网络超时：不等它收敛就会在关库后继续写。
+    // 与 onStart 一样给个上界（这里 10s），避免停机被长时间拖住。
+    await Promise.race([
+      waitForDrain(),
+      new Promise<void>((resolve) => setTimeout(resolve, 10_000).unref()),
+    ]);
     // 给 onStart 一点时间收尾（多为网络抓取），避免关库后仍在写
     if (onStartTasks.length > 0) {
       await Promise.race([

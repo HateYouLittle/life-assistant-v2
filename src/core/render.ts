@@ -57,11 +57,12 @@ function cell(v: string | undefined): string {
 export function displayWidth(s: string): number {
   let w = 0;
   for (const ch of s) {
-    w += /[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\u{f900}-\u{fa6f}\u{fe10}-\u{fe19}\u{fe30}-\u{fe6f}\u{ff00}-\u{ff60}\u{ffe0}-\u{ffe6}\u{20000}-\u{3fffd}]/u.test(
-      ch,
-    )
-      ? 2
-      : 1;
+    w +=
+      /[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\u{f900}-\u{fa6f}\u{fe10}-\u{fe19}\u{fe30}-\u{fe6f}\u{ff00}-\u{ff60}\u{ffe0}-\u{ffe6}\u{20000}-\u{3fffd}]/u.test(
+        ch,
+      )
+        ? 2
+        : 1;
   }
   return w;
 }

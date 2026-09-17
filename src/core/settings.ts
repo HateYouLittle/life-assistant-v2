@@ -3,11 +3,16 @@ import type { DatabaseSync } from "node:sqlite";
 import { nowIso } from "../time.js";
 
 export function ensureProfile(db: DatabaseSync, profileId: string): void {
-  db.prepare("INSERT OR IGNORE INTO profiles (id, created_at) VALUES (?, ?)").run(profileId, nowIso());
+  db.prepare("INSERT OR IGNORE INTO profiles (id, created_at) VALUES (?, ?)").run(
+    profileId,
+    nowIso(),
+  );
 }
 
 export function listProfiles(db: DatabaseSync): string[] {
-  return (db.prepare("SELECT id FROM profiles ORDER BY id").all() as { id: string }[]).map((r) => r.id);
+  return (db.prepare("SELECT id FROM profiles ORDER BY id").all() as { id: string }[]).map(
+    (r) => r.id,
+  );
 }
 
 export function getSetting<T>(db: DatabaseSync, profileId: string, key: string): T | undefined {
@@ -35,9 +40,9 @@ export function newId(): string {
 }
 
 export function getCache<T>(db: DatabaseSync, key: string): T | undefined {
-  const row = db.prepare("SELECT value_json FROM cache WHERE key = ? AND expires_at > ?").get(key, nowIso()) as
-    | { value_json: string }
-    | undefined;
+  const row = db
+    .prepare("SELECT value_json FROM cache WHERE key = ? AND expires_at > ?")
+    .get(key, nowIso()) as { value_json: string } | undefined;
   if (row === undefined) return undefined;
   return JSON.parse(row.value_json) as T;
 }

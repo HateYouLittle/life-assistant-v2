@@ -3,7 +3,12 @@ import { DateTime } from "luxon";
 import type { DatabaseSync } from "node:sqlite";
 import { now, nowIso, localToInstant, instantToLocalDate, TZ } from "../../time.js";
 import { dayType } from "../../core/holiday.js";
-import { describeRecurrence, nextDate, type OccurrenceSource, type Recurrence } from "../../core/recurrence.js";
+import {
+  describeRecurrence,
+  nextDate,
+  type OccurrenceSource,
+  type Recurrence,
+} from "../../core/recurrence.js";
 import type { NotifyBlock, Services } from "../../core/registry.js";
 import { withTransaction } from "../../core/database.js";
 import { ensureProfile } from "../../core/settings.js";
@@ -98,14 +103,19 @@ export function validateScheduleInput(input: ScheduleInput): void {
   if (input.title.trim() === "") throw new Error("标题不能为空");
   if (input.title.length > 120) throw new Error("标题过长（≤120 字符）");
   if (input.calendar === "solar") {
-    if (input.startDate === null || input.startDate === undefined) throw new Error("公历日程需要提供 date（YYYY-MM-DD）");
-    if (!DATE_RE.test(input.startDate) || !DateTime.fromISO(input.startDate, { zone: TZ }).isValid) {
+    if (input.startDate === null || input.startDate === undefined)
+      throw new Error("公历日程需要提供 date（YYYY-MM-DD）");
+    if (
+      !DATE_RE.test(input.startDate) ||
+      !DateTime.fromISO(input.startDate, { zone: TZ }).isValid
+    ) {
       throw new Error(`日期不合法: ${String(input.startDate)}`);
     }
   } else {
     const m = input.lunarMonth ?? 0;
     const d = input.lunarDay ?? 0;
-    if (m < 1 || m > 12 || d < 1 || d > 30) throw new Error("农历日程需要 lunar_month(1-12) 与 lunar_day(1-30)");
+    if (m < 1 || m > 12 || d < 1 || d > 30)
+      throw new Error("农历日程需要 lunar_month(1-12) 与 lunar_day(1-30)");
     if (input.recurrence === null || input.recurrence.freq !== "yearly") {
       throw new Error("农历日程只支持按年循环（recurrence.freq = yearly）");
     }
@@ -115,15 +125,26 @@ export function validateScheduleInput(input: ScheduleInput): void {
   if (input.remindOffsets.length > 5) throw new Error("remind_offsets 最多 5 个");
   if (input.recurrence?.freq === "weekly" && input.recurrence.byweekday !== undefined) {
     if (input.recurrence.byweekday.filter((d) => d >= 0 && d <= 6).length === 0) {
-      throw new Error("weekly 循环的 byweekday 不能为空（或全部超出 0-6）；省略该字段表示使用开始日期的星期");
+      throw new Error(
+        "weekly 循环的 byweekday 不能为空（或全部超出 0-6）；省略该字段表示使用开始日期的星期",
+      );
     }
   }
-  if (input.recurrence?.until !== undefined && input.calendar === "solar" && input.startDate != null) {
+  if (
+    input.recurrence?.until !== undefined &&
+    input.calendar === "solar" &&
+    input.startDate != null
+  ) {
     if (input.recurrence.until < input.startDate) throw new Error("until 不能早于开始日期");
   }
 }
 
-function insertSchedule(db: DatabaseSync, profileId: string, input: ScheduleInput, id: string): void {
+function insertSchedule(
+  db: DatabaseSync,
+  profileId: string,
+  input: ScheduleInput,
+  id: string,
+): void {
   const ts = nowIso();
   db.prepare(
     `INSERT INTO schedules (id, profile_id, title, note, kind, calendar, start_date, lunar_month, lunar_day,
@@ -137,10 +158,10 @@ function insertSchedule(db: DatabaseSync, profileId: string, input: ScheduleInpu
     input.note ?? null,
     input.kind,
     input.calendar,
-    input.calendar === "solar" ? input.startDate ?? null : null,
-    input.calendar === "lunar" ? input.lunarMonth ?? null : null,
-    input.calendar === "lunar" ? input.lunarDay ?? null : null,
-    input.calendar === "lunar" ? input.leapPolicy ?? "follow" : null,
+    input.calendar === "solar" ? (input.startDate ?? null) : null,
+    input.calendar === "lunar" ? (input.lunarMonth ?? null) : null,
+    input.calendar === "lunar" ? (input.lunarDay ?? null) : null,
+    input.calendar === "lunar" ? (input.leapPolicy ?? "follow") : null,
     input.calendar === "lunar" ? (input.lunarClamp === false ? 0 : 1) : 1,
     input.time,
     input.allDay ? 1 : 0,
@@ -153,13 +174,22 @@ function insertSchedule(db: DatabaseSync, profileId: string, input: ScheduleInpu
   );
 }
 
-export function getSchedule(db: DatabaseSync, profileId: string, id: string): ScheduleRow | undefined {
+export function getSchedule(
+  db: DatabaseSync,
+  profileId: string,
+  id: string,
+): ScheduleRow | undefined {
   return db.prepare("SELECT * FROM schedules WHERE id = ? AND profile_id = ?").get(id, profileId) as
     | ScheduleRow
     | undefined;
 }
 
-export function listSchedules(db: DatabaseSync, profileId: string, status: string, limit: number): ScheduleRow[] {
+export function listSchedules(
+  db: DatabaseSync,
+  profileId: string,
+  status: string,
+  limit: number,
+): ScheduleRow[] {
   return db
     .prepare(
       "SELECT * FROM schedules WHERE profile_id = ? AND status = ? ORDER BY COALESCE(next_run_at, created_at) LIMIT ?",
@@ -187,10 +217,6 @@ function updateNextRunAt(db: DatabaseSync, scheduleId: string): void {
 /** 物化接下来一段时间的 occurrence（含提醒偏移）；节假日数据缺失时暂停在该日期之前 */
 export function materializeSchedule(db: DatabaseSync, row: ScheduleRow): void {
   if (row.status !== "active") return;
-  // occurrences 的查询几乎都按 (schedule_id, status) 过滤，但 schema 只在
-  // (status, due_at) 上有索引。索引属于本模块的热路径，放这里保证已在运行的
-  // 数据库也会被补上（IF NOT EXISTS，幂等且开销极小）。
-  db.exec("CREATE INDEX IF NOT EXISTS idx_occurrences_schedule_status ON occurrences(schedule_id, status)");
   const rec = parseRecurrence(row.recurrence_json);
   let existing = countEvents(db, row.id);
   if (rec?.count !== undefined && existing >= rec.count) {
@@ -200,10 +226,14 @@ export function materializeSchedule(db: DatabaseSync, row: ScheduleRow): void {
   const source = sourceOf(row);
   const offsets = JSON.parse(row.remind_offsets_json) as number[];
   const last = db
-    .prepare("SELECT MAX(event_at) AS m FROM occurrences WHERE schedule_id = ? AND status != 'cancelled'")
+    .prepare(
+      "SELECT MAX(event_at) AS m FROM occurrences WHERE schedule_id = ? AND status != 'cancelled'",
+    )
     .get(row.id) as { m: string | null };
   let after =
-    last.m !== null ? DateTime.fromISO(last.m, { zone: TZ }) : now().minus({ days: 1 }).startOf("day");
+    last.m !== null
+      ? DateTime.fromISO(last.m, { zone: TZ })
+      : now().minus({ days: 1 }).startOf("day");
   const horizon = now().plus({ days: FAR_HORIZON_DAYS });
   const nearHorizon = now().plus({ days: NEAR_HORIZON_DAYS });
 
@@ -247,7 +277,12 @@ export function materializeSchedule(db: DatabaseSync, row: ScheduleRow): void {
     let insertedEvent = false;
     offsets.forEach((offsetMinutes, idx) => {
       const due = DateTime.fromISO(eventAt).plus({ minutes: offsetMinutes });
-      const result = insert.run(row.id, `${prefix}#${idx}`, eventAt, due.toUTC().toISO() ?? eventAt);
+      const result = insert.run(
+        row.id,
+        `${prefix}#${idx}`,
+        eventAt,
+        due.toUTC().toISO() ?? eventAt,
+      );
       if (Number(result.changes) > 0) insertedEvent = true;
     });
     if (insertedEvent) existing += 1;
@@ -258,7 +293,11 @@ export function materializeSchedule(db: DatabaseSync, row: ScheduleRow): void {
   updateNextRunAt(db, row.id);
 }
 
-export function createSchedule(db: DatabaseSync, profileId: string, input: ScheduleInput): ScheduleRow {
+export function createSchedule(
+  db: DatabaseSync,
+  profileId: string,
+  input: ScheduleInput,
+): ScheduleRow {
   validateScheduleInput(input);
   ensureProfile(db, profileId);
   let lastError: unknown = null;
@@ -302,11 +341,12 @@ export function updateSchedule(
     startDate: patch.startDate !== undefined ? patch.startDate : row.start_date,
     lunarMonth: patch.lunarMonth !== undefined ? patch.lunarMonth : row.lunar_month,
     lunarDay: patch.lunarDay !== undefined ? patch.lunarDay : row.lunar_day,
-    leapPolicy: patch.leapPolicy !== undefined ? patch.leapPolicy : row.leap_policy ?? "follow",
+    leapPolicy: patch.leapPolicy !== undefined ? patch.leapPolicy : (row.leap_policy ?? "follow"),
     lunarClamp: patch.lunarClamp !== undefined ? patch.lunarClamp : row.lunar_clamp === 1,
     time: patch.time ?? row.time,
     allDay: patch.allDay !== undefined ? patch.allDay : row.all_day === 1,
-    recurrence: patch.recurrence !== undefined ? patch.recurrence : parseRecurrence(row.recurrence_json),
+    recurrence:
+      patch.recurrence !== undefined ? patch.recurrence : parseRecurrence(row.recurrence_json),
     remindOffsets: patch.remindOffsets ?? (JSON.parse(row.remind_offsets_json) as number[]),
     resendMinutes: patch.resendMinutes ?? row.resend_minutes,
     workdayFilter: patch.workdayFilter ?? row.workday_filter,
@@ -332,10 +372,10 @@ export function updateSchedule(
       merged.note ?? null,
       merged.kind,
       merged.calendar,
-      merged.calendar === "solar" ? merged.startDate ?? null : null,
-      merged.calendar === "lunar" ? merged.lunarMonth ?? null : null,
-      merged.calendar === "lunar" ? merged.lunarDay ?? null : null,
-      merged.calendar === "lunar" ? merged.leapPolicy ?? "follow" : null,
+      merged.calendar === "solar" ? (merged.startDate ?? null) : null,
+      merged.calendar === "lunar" ? (merged.lunarMonth ?? null) : null,
+      merged.calendar === "lunar" ? (merged.lunarDay ?? null) : null,
+      merged.calendar === "lunar" ? (merged.leapPolicy ?? "follow") : null,
       merged.calendar === "lunar" ? (merged.lunarClamp === false ? 0 : 1) : 1,
       merged.time,
       merged.allDay ? 1 : 0,
@@ -347,7 +387,9 @@ export function updateSchedule(
       ts,
       id,
     );
-    db.prepare("DELETE FROM occurrences WHERE schedule_id = ? AND status = 'pending' AND occurrence_key NOT LIKE '%:resend'").run(id);
+    db.prepare(
+      "DELETE FROM occurrences WHERE schedule_id = ? AND status = 'pending' AND occurrence_key NOT LIKE '%:resend'",
+    ).run(id);
   });
   const updated = getSchedule(db, profileId, id) as ScheduleRow;
   materializeSchedule(db, updated);
@@ -377,7 +419,10 @@ export function completeSchedule(
        WHERE schedule_id = ? AND status IN ('pending','notified')`,
     ).run(id);
     if (row.kind === "todo") {
-      db.prepare("UPDATE schedules SET status = 'done', updated_at = ? WHERE id = ?").run(nowIso(), id);
+      db.prepare("UPDATE schedules SET status = 'done', updated_at = ? WHERE id = ?").run(
+        nowIso(),
+        id,
+      );
     }
   }
   updateNextRunAt(db, id);
@@ -389,7 +434,10 @@ export function deleteSchedule(db: DatabaseSync, profileId: string, id: string):
   if (row === undefined) throw new Error(`日程不存在: ${id}`);
   withTransaction(db, () => {
     db.prepare("DELETE FROM occurrences WHERE schedule_id = ?").run(id);
-    db.prepare("UPDATE schedules SET status = 'cancelled', updated_at = ? WHERE id = ?").run(nowIso(), id);
+    db.prepare("UPDATE schedules SET status = 'cancelled', updated_at = ? WHERE id = ?").run(
+      nowIso(),
+      id,
+    );
   });
 }
 
@@ -424,7 +472,9 @@ export function catchupSweep(db: DatabaseSync): void {
     .all(cutoff) as { schedule_id: string }[];
   for (const g of groups) {
     const keep = db
-      .prepare("SELECT MAX(due_at) AS m FROM occurrences WHERE schedule_id = ? AND status = 'pending' AND due_at < ?")
+      .prepare(
+        "SELECT MAX(due_at) AS m FROM occurrences WHERE schedule_id = ? AND status = 'pending' AND due_at < ?",
+      )
       .get(g.schedule_id, cutoff) as { m: string | null };
     db.prepare(
       `UPDATE occurrences SET status = 'cancelled'
@@ -433,9 +483,18 @@ export function catchupSweep(db: DatabaseSync): void {
   }
 }
 
-export function reminderBlocks(row: ScheduleRow, eventAt: string, note: string | null): NotifyBlock {
+export function reminderBlocks(
+  row: ScheduleRow,
+  eventAt: string,
+  note: string | null,
+): NotifyBlock {
   const rows: string[][] = [
-    ["时间", row.all_day === 1 ? `${instantToLocalDate(eventAt)} 全天` : `${instantToLocalDate(eventAt)} ${row.time}`],
+    [
+      "时间",
+      row.all_day === 1
+        ? `${instantToLocalDate(eventAt)} 全天`
+        : `${instantToLocalDate(eventAt)} ${row.time}`,
+    ],
     ["类型", KIND_LABEL[row.kind]],
     ["重复", describeRecurrence(sourceOf(row), row.start_date)],
   ];
@@ -481,11 +540,15 @@ export async function fireDue(db: DatabaseSync, services: Services, at: DateTime
       dedupeKey: `sched:${schedule.id}:${occ.occurrence_key}`,
     });
     published += 1;
-    db.prepare("UPDATE occurrences SET status = 'notified' WHERE schedule_id = ? AND occurrence_key = ?").run(
-      occ.schedule_id,
-      occ.occurrence_key,
-    );
-    if (!isResend && schedule.kind === "todo" && schedule.resend_minutes > 0 && occ.occurrence_key.endsWith("#0")) {
+    db.prepare(
+      "UPDATE occurrences SET status = 'notified' WHERE schedule_id = ? AND occurrence_key = ?",
+    ).run(occ.schedule_id, occ.occurrence_key);
+    if (
+      !isResend &&
+      schedule.kind === "todo" &&
+      schedule.resend_minutes > 0 &&
+      occ.occurrence_key.endsWith("#0")
+    ) {
       const resendDue = DateTime.fromISO(occ.due_at).plus({ minutes: schedule.resend_minutes });
       db.prepare(
         `INSERT OR IGNORE INTO occurrences (schedule_id, occurrence_key, event_at, due_at, status)
@@ -501,11 +564,20 @@ export async function fireDue(db: DatabaseSync, services: Services, at: DateTime
   return published;
 }
 
-export async function tickSchedules(at: DateTime, services: Services, db: DatabaseSync): Promise<void> {
+export async function tickSchedules(
+  at: DateTime,
+  services: Services,
+  db: DatabaseSync,
+): Promise<void> {
   catchupSweep(db);
   await fireDue(db, services, at);
   const active = db
     .prepare("SELECT * FROM schedules WHERE status = 'active'")
     .all() as unknown as ScheduleRow[];
+  // 删除/取消的日程不会再进入 materialize，其告警去重记录需在这里回收
+  const activeIds = new Set(active.map((r) => r.id));
+  for (const id of [...pausedWarned.keys()]) {
+    if (!activeIds.has(id)) pausedWarned.delete(id);
+  }
   for (const row of active) materializeSchedule(db, row);
 }

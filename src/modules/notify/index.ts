@@ -1,7 +1,19 @@
 import { z } from "zod";
-import { TIME_RE, } from "../../time.js";
-import { errorMessage, fail, ok, okJson, registerModule, type ToolContext } from "../../core/registry.js";
-import { cancelPendingDeliveries, getPushRoute, routeSecret, setPushRoute } from "../../core/notify.js";
+import { TIME_RE } from "../../time.js";
+import {
+  errorMessage,
+  fail,
+  ok,
+  okJson,
+  registerModule,
+  type ToolContext,
+} from "../../core/registry.js";
+import {
+  cancelPendingDeliveries,
+  getPushRoute,
+  routeSecret,
+  setPushRoute,
+} from "../../core/notify.js";
 import { deleteSetting, getSetting, setSetting } from "../../core/settings.js";
 
 export function notifyTool(args: Record<string, unknown>, ctx: ToolContext) {
@@ -23,7 +35,13 @@ function notifyToolInner(args: Record<string, unknown>, ctx: ToolContext) {
       .prepare(
         "SELECT id, kind, title, body_md, created_at FROM notifications WHERE profile_id = ? AND read = 0 ORDER BY created_at DESC LIMIT ?",
       )
-      .all(profileId, limit) as { id: string; kind: string; title: string; body_md: string; created_at: string }[];
+      .all(profileId, limit) as {
+      id: string;
+      kind: string;
+      title: string;
+      body_md: string;
+      created_at: string;
+    }[];
     if (rows.length === 0) return ok("没有未读通知");
     cancelPendingDeliveries(
       db,
@@ -34,7 +52,12 @@ function notifyToolInner(args: Record<string, unknown>, ctx: ToolContext) {
       `UPDATE notifications SET read = 1 WHERE profile_id = ? AND read = 0 AND id IN (${rows.map(() => "?").join(",")})`,
     ).run(profileId, ...rows.map((r) => r.id));
     return okJson({
-      未读通知: rows.map((r) => ({ 标题: r.title, 种类: r.kind, 时间: r.created_at, 内容: r.body_md })),
+      未读通知: rows.map((r) => ({
+        标题: r.title,
+        种类: r.kind,
+        时间: r.created_at,
+        内容: r.body_md,
+      })),
       数量: rows.length,
       说明: "已标记为已读，对应待投递的主动推送已取消",
     });
@@ -48,7 +71,8 @@ function notifyToolInner(args: Record<string, unknown>, ctx: ToolContext) {
       return ok("已清除静默时段设置");
     }
     if (start !== undefined || end !== undefined) {
-      if (start === undefined || end === undefined) return fail("设置静默时段需要 start 和 end（HH:MM），或 clear=true 清除");
+      if (start === undefined || end === undefined)
+        return fail("设置静默时段需要 start 和 end（HH:MM），或 clear=true 清除");
       if (!TIME_RE.test(start) || !TIME_RE.test(end)) return fail("时间格式需为 HH:MM");
       if (start === end) return fail("start 与 end 相同视为未启用");
       setSetting(db, profileId, "quiet_hours", { start, end });
@@ -66,7 +90,9 @@ function notifyToolInner(args: Record<string, unknown>, ctx: ToolContext) {
     const enabled = args.enabled as boolean | undefined;
     if (url !== undefined) {
       if (routeSecret(ctx.config, profileId) === undefined) {
-        return fail(`PROFILE_ROUTE_SECRETS_JSON 中没有 profile "${profileId}" 的 secret，无法启用推送`);
+        return fail(
+          `PROFILE_ROUTE_SECRETS_JSON 中没有 profile "${profileId}" 的 secret，无法启用推送`,
+        );
       }
       const route = setPushRoute(db, profileId, {
         url,
@@ -83,9 +109,17 @@ function notifyToolInner(args: Record<string, unknown>, ctx: ToolContext) {
       return okJson({ 推送路由: { ...current, enabled } });
     }
     const current = getPushRoute(db, profileId);
-    if (current === null) return okJson({ 推送路由: null, 说明: "用 url 参数配置（回环地址），secret 在 PROFILE_ROUTE_SECRETS_JSON" });
+    if (current === null)
+      return okJson({
+        推送路由: null,
+        说明: "用 url 参数配置（回环地址），secret 在 PROFILE_ROUTE_SECRETS_JSON",
+      });
     return okJson({
-      推送路由: { ...current, url: current.url, secretConfigured: routeSecret(ctx.config, profileId) !== undefined },
+      推送路由: {
+        ...current,
+        url: current.url,
+        secretConfigured: routeSecret(ctx.config, profileId) !== undefined,
+      },
     });
   }
 

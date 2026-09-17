@@ -59,7 +59,11 @@ const INIT = {
   jsonrpc: "2.0",
   id: 1,
   method: "initialize",
-  params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "1" } },
+  params: {
+    protocolVersion: "2024-11-05",
+    capabilities: {},
+    clientInfo: { name: "test", version: "1" },
+  },
 };
 
 async function sessionOf(response: Response): Promise<string> {
@@ -146,11 +150,33 @@ describe("/mcp 鉴权", () => {
         headers: headers(sessionId),
       });
       await closed.text();
-      assert.ok(closed.status === 200 || closed.status === 204, `DELETE 应成功，收到 ${closed.status}`);
+      assert.ok(
+        closed.status === 200 || closed.status === 204,
+        `DELETE 应成功，收到 ${closed.status}`,
+      );
 
-      const stale = await rpc(harness.port, { jsonrpc: "2.0", id: 3, method: "tools/list" }, sessionId);
+      const stale = await rpc(
+        harness.port,
+        { jsonrpc: "2.0", id: 3, method: "tools/list" },
+        sessionId,
+      );
       assert.equal(stale.status, 404);
       await stale.text();
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("非法 X-Hermes-Profile 返回 400 而不是 500", async () => {
+    const harness = await startHarness();
+    try {
+      const response = await fetch(`http://127.0.0.1:${harness.port}/mcp`, {
+        method: "POST",
+        headers: { ...headers(), "X-Hermes-Profile": "Bad Profile" },
+        body: JSON.stringify(INIT),
+      });
+      assert.equal(response.status, 400, "客户端头非法属于请求错误，不该被当成服务端故障");
+      assert.match(await readJson(response), /invalid params/);
     } finally {
       await harness.close();
     }
@@ -162,7 +188,11 @@ describe("/mcp 鉴权", () => {
       const sessionId = await sessionOf(await rpc(harness.port, INIT));
       const removed = sweepSessions(Date.now() + 3 * 3600 * 1000);
       assert.ok(removed >= 1, "超过空闲阈值的会话应被回收");
-      const after = await rpc(harness.port, { jsonrpc: "2.0", id: 4, method: "tools/list" }, sessionId);
+      const after = await rpc(
+        harness.port,
+        { jsonrpc: "2.0", id: 4, method: "tools/list" },
+        sessionId,
+      );
       assert.equal(after.status, 404);
       await after.text();
     } finally {

@@ -102,10 +102,13 @@ describe("schedule 工具：生命周期", () => {
     const env = makeTestEnv();
     try {
       const created = JSON.parse(
-        (tool(env, { action: "add", title: "默认全天验证", date: todayIso(), time: "17:16" }).content[0]?.text ?? "{}"),
+        tool(env, { action: "add", title: "默认全天验证", date: todayIso(), time: "17:16" })
+          .content[0]?.text ?? "{}",
       ) as { 已创建: { id: string; 时间: string } };
       assert.doesNotMatch(created.已创建.时间, /全天/);
-      const row = env.db.prepare("SELECT all_day FROM schedules WHERE id = ?").get(created.已创建.id) as {
+      const row = env.db
+        .prepare("SELECT all_day FROM schedules WHERE id = ?")
+        .get(created.已创建.id) as {
         all_day: number;
       };
       assert.equal(row.all_day, 0);
@@ -118,11 +121,12 @@ describe("schedule 工具：生命周期", () => {
     const env = makeTestEnv();
     try {
       const created = JSON.parse(
-        (tool(env, { action: "add", title: "测试", date: todayIso(), time: "09:00", all_day: false }).content[0]?.text ?? "{}"),
+        tool(env, { action: "add", title: "测试", date: todayIso(), time: "09:00", all_day: false })
+          .content[0]?.text ?? "{}",
       ) as { 已创建: { id: string; 版本: number } };
       const id = created.已创建.id;
       const updated = JSON.parse(
-        (tool(env, { action: "update", id, time: "10:30", note: "改时间" }).content[0]?.text ?? "{}"),
+        tool(env, { action: "update", id, time: "10:30", note: "改时间" }).content[0]?.text ?? "{}",
       ) as { 已更新: { 版本: number; 时间: string; 重复: string } };
       assert.equal(updated.已更新.版本, 2);
       assert.match(updated.已更新.时间, /^10:30/);
@@ -141,7 +145,8 @@ describe("schedule 工具：生命周期", () => {
     const env = makeTestEnv();
     try {
       const created = JSON.parse(
-        (tool(env, { action: "add", title: "一次性任务", date: day(1), time: "09:00" }).content[0]?.text ?? "{}"),
+        tool(env, { action: "add", title: "一次性任务", date: day(1), time: "09:00" }).content[0]
+          ?.text ?? "{}",
       ) as { 已创建: { id: string } };
       const id = created.已创建.id;
       tool(env, { action: "complete", id });
@@ -149,7 +154,10 @@ describe("schedule 工具：生命周期", () => {
       assert.equal(row?.status, "done");
       const rows = occurrenceRows(env, id);
       assert.ok(rows.every((r) => r.status === "done"));
-      assert.throws(() => updateSchedule(env.db, "default", id, { status: "active" }), /不能重新激活/);
+      assert.throws(
+        () => updateSchedule(env.db, "default", id, { status: "active" }),
+        /不能重新激活/,
+      );
     } finally {
       cleanupTestEnv(env);
     }
@@ -159,7 +167,7 @@ describe("schedule 工具：生命周期", () => {
     const env = makeTestEnv();
     try {
       const created = JSON.parse(
-        (tool(env, { action: "add", title: "要删除", date: day(1) }).content[0]?.text ?? "{}"),
+        tool(env, { action: "add", title: "要删除", date: day(1) }).content[0]?.text ?? "{}",
       ) as { 已创建: { id: string } };
       const id = created.已创建.id;
       tool(env, { action: "delete", id });
@@ -181,10 +189,12 @@ describe("schedule 工具：生命周期", () => {
         lunar_month: 5,
         lunar_day: 5,
       }) as { content: { text: string }[] };
-      const payload = JSON.parse(result.content[0]?.text ?? "{}") as { 已创建: { id: string; 重复: string } };
+      const payload = JSON.parse(result.content[0]?.text ?? "{}") as {
+        已创建: { id: string; 重复: string };
+      };
       assert.equal(payload.已创建.重复, "每年农历5月5日");
       const up = JSON.parse(
-        (tool(env, { action: "upcoming", limit: 5 }).content[0]?.text ?? "{}"),
+        tool(env, { action: "upcoming", limit: 5 }).content[0]?.text ?? "{}",
       ) as { 即将到来: { 标题: string }[] };
       assert.ok(up.即将到来.some((i) => i.标题 === "妈妈生日"));
     } finally {
@@ -230,7 +240,10 @@ describe("schedule 提醒触发", () => {
 
       await fireDue(env.db, envServices(env), now().plus({ hours: 1 }));
       rows = occurrenceRows(env, created.id);
-      assert.equal(rows.find((r) => (r.occurrence_key as string).endsWith(":resend"))?.status, "notified");
+      assert.equal(
+        rows.find((r) => (r.occurrence_key as string).endsWith(":resend"))?.status,
+        "notified",
+      );
       assert.equal(env.published.length, 2);
       const notes = (env.published[1]?.input.blocks.notes ?? []).join(" ");
       assert.match(notes, /强提醒/);
@@ -266,7 +279,9 @@ describe("schedule 提醒触发", () => {
       }
       catchupSweep(env.db);
       const stale = env.db
-        .prepare("SELECT status, COUNT(*) AS n FROM occurrences WHERE schedule_id = ? GROUP BY status")
+        .prepare(
+          "SELECT status, COUNT(*) AS n FROM occurrences WHERE schedule_id = ? GROUP BY status",
+        )
         .all(created.id) as { status: string; n: number }[];
       const cancelled = stale.find((s) => s.status === "cancelled");
       const pending = stale.find((s) => s.status === "pending");
@@ -308,7 +323,10 @@ describe("schedule 提醒触发", () => {
       importYear(env.db, payload, "test");
       materializeSchedule(env.db, getSchedule(env.db, "default", created.id) as never);
       const rows = occurrenceRows(env, created.id);
-      assert.ok(rows.some((r) => (r.event_at as string).includes(target)), "数据到达后应物化目标日");
+      assert.ok(
+        rows.some((r) => (r.event_at as string).includes(target)),
+        "数据到达后应物化目标日",
+      );
     } finally {
       cleanupTestEnv(env);
     }
@@ -383,9 +401,15 @@ describe("schedule 工具：weekly 空 byweekday 防护", () => {
   it("update 传 byweekday:[] 同样被拒绝", () => {
     const env = makeTestEnv();
     try {
-      const created = tool(env, { action: "add", title: "正常周报", date: todayIso(), time: "09:00" });
+      const created = tool(env, {
+        action: "add",
+        title: "正常周报",
+        date: todayIso(),
+        time: "09:00",
+      });
       assert.equal(created.isError, undefined);
-      const id = (JSON.parse(created.content[0]?.text ?? "{}") as { 已创建: { id: string } }).已创建.id;
+      const id = (JSON.parse(created.content[0]?.text ?? "{}") as { 已创建: { id: string } }).已创建
+        .id;
       const result = tool(env, {
         action: "update",
         id,
@@ -419,9 +443,15 @@ describe("schedule 工具：weekly 空 byweekday 防护", () => {
 
 describe("schedule 工具：更新不静默丢提醒", () => {
   const keysOf = (env: TestEnv, id: string): string[] =>
-    (env.db.prepare("SELECT occurrence_key FROM occurrences WHERE schedule_id = ? ORDER BY occurrence_key").all(id) as {
-      occurrence_key: string;
-    }[]).map((r) => r.occurrence_key);
+    (
+      env.db
+        .prepare(
+          "SELECT occurrence_key FROM occurrences WHERE schedule_id = ? ORDER BY occurrence_key",
+        )
+        .all(id) as {
+        occurrence_key: string;
+      }[]
+    ).map((r) => r.occurrence_key);
 
   function addDaily(env: TestEnv, extra: Record<string, unknown> = {}) {
     const created = createSchedule(env.db, "default", {
@@ -474,7 +504,9 @@ describe("schedule 工具：更新不静默丢提醒", () => {
     const env = makeTestEnv();
     try {
       const created = addDaily(env, { resendMinutes: 30, time: "00:01" });
-      env.db.prepare("UPDATE occurrences SET status = 'notified' WHERE schedule_id = ?").run(created.id);
+      env.db
+        .prepare("UPDATE occurrences SET status = 'notified' WHERE schedule_id = ?")
+        .run(created.id);
       env.db
         .prepare(
           `INSERT OR IGNORE INTO occurrences (schedule_id, occurrence_key, event_at, due_at, status)
@@ -502,9 +534,14 @@ describe("schedule 工具：更新不静默丢提醒", () => {
     const env = makeTestEnv();
     try {
       const created = addDaily(env);
-      materializeSchedule(env.db, getSchedule(env.db, "default", created.id) as Parameters<typeof materializeSchedule>[1]);
+      materializeSchedule(
+        env.db,
+        getSchedule(env.db, "default", created.id) as Parameters<typeof materializeSchedule>[1],
+      );
       const idx = env.db
-        .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_occurrences_schedule_status'")
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_occurrences_schedule_status'",
+        )
         .get();
       assert.ok(idx !== undefined, "应创建 idx_occurrences_schedule_status");
     } finally {

@@ -9,7 +9,10 @@ function tool(env: TestEnv, args: Record<string, unknown>, profileId = "default"
     profileId,
     db: env.db,
     config: env.config,
-    services: { publishProfile: async () => ({ id: "x", deduped: false }), publishGlobal: async () => ({ materialized: 0 }) },
+    services: {
+      publishProfile: async () => ({ id: "x", deduped: false }),
+      publishGlobal: async () => ({ materialized: 0 }),
+    },
   });
 }
 
@@ -24,13 +27,34 @@ describe("notify 工具", () => {
       setPushRoute(env.db, "default", { url: "http://127.0.0.1:9/hook" });
       publishProfile(env.db, env.config, "default", { kind: "k", title: "通知一", blocks: {} });
       publishProfile(env.db, env.config, "default", { kind: "k", title: "通知二", blocks: {} });
-      assert.equal((env.db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE status = 'queued'").get() as { n: number }).n, 2);
+      assert.equal(
+        (
+          env.db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE status = 'queued'").get() as {
+            n: number;
+          }
+        ).n,
+        2,
+      );
 
       const first = tool(env, { action: "pull" });
       assert.match(text(first), /通知一/);
       assert.match(text(first), /通知二/);
-      assert.equal((env.db.prepare("SELECT COUNT(*) AS n FROM notifications WHERE read = 0").get() as { n: number }).n, 0);
-      assert.equal((env.db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE status = 'cancelled'").get() as { n: number }).n, 2);
+      assert.equal(
+        (
+          env.db.prepare("SELECT COUNT(*) AS n FROM notifications WHERE read = 0").get() as {
+            n: number;
+          }
+        ).n,
+        0,
+      );
+      assert.equal(
+        (
+          env.db
+            .prepare("SELECT COUNT(*) AS n FROM deliveries WHERE status = 'cancelled'")
+            .get() as { n: number }
+        ).n,
+        2,
+      );
 
       const second = tool(env, { action: "pull" });
       assert.match(text(second), /没有未读/);
@@ -66,7 +90,11 @@ describe("notify 工具", () => {
       const noSecret = tool(env, { action: "route", url: "http://127.0.0.1:12345/hook" }, "p2");
       assert.equal(noSecret.isError, true);
 
-      const set = tool(env, { action: "route", url: "http://127.0.0.1:12345/hook", platform: "wechat" });
+      const set = tool(env, {
+        action: "route",
+        url: "http://127.0.0.1:12345/hook",
+        platform: "wechat",
+      });
       assert.ok(!set.isError);
       const get = tool(env, { action: "route" });
       assert.match(text(get), /secretConfigured/);
@@ -83,11 +111,29 @@ describe("notify 工具", () => {
     const env = makeTestEnv({ PROFILE_ROUTE_SECRETS_JSON: JSON.stringify({ default: SECRET }) });
     try {
       setPushRoute(env.db, "default", { url: "http://127.0.0.1:9/hook" });
-      const pub = publishProfile(env.db, env.config, "default", { kind: "k", title: "要取消", blocks: {} });
+      const pub = publishProfile(env.db, env.config, "default", {
+        kind: "k",
+        title: "要取消",
+        blocks: {},
+      });
       const result = tool(env, { action: "cancel", id: pub.id });
       assert.match(text(result), /要取消/);
-      assert.equal((env.db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE status = 'cancelled'").get() as { n: number }).n, 1);
-      assert.equal((env.db.prepare("SELECT read FROM notifications WHERE id = ?").get(pub.id) as { read: number }).read, 1);
+      assert.equal(
+        (
+          env.db
+            .prepare("SELECT COUNT(*) AS n FROM deliveries WHERE status = 'cancelled'")
+            .get() as { n: number }
+        ).n,
+        1,
+      );
+      assert.equal(
+        (
+          env.db.prepare("SELECT read FROM notifications WHERE id = ?").get(pub.id) as {
+            read: number;
+          }
+        ).read,
+        1,
+      );
     } finally {
       cleanupTestEnv(env);
     }

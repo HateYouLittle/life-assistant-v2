@@ -82,7 +82,12 @@ export function setPushRoute(
 }
 
 export function clearPushRoute(db: DatabaseSync, profileId: string): void {
-  setSetting(db, profileId, "push_route", { name: `life-assistant-${profileId}`, url: "", platform: null, enabled: false });
+  setSetting(db, profileId, "push_route", {
+    name: `life-assistant-${profileId}`,
+    url: "",
+    platform: null,
+    enabled: false,
+  });
 }
 
 export function routeSecret(config: ResolvedConfig, profileId: string): string | undefined {
@@ -90,7 +95,9 @@ export function routeSecret(config: ResolvedConfig, profileId: string): string |
 }
 
 export function routedProfiles(db: DatabaseSync): string[] {
-  const rows = db.prepare("SELECT profile_id, value_json FROM settings WHERE key = 'push_route'").all() as {
+  const rows = db
+    .prepare("SELECT profile_id, value_json FROM settings WHERE key = 'push_route'")
+    .all() as {
     profile_id: string;
     value_json: string;
   }[];
@@ -140,7 +147,8 @@ export function publishProfile(
       const existing = db
         .prepare("SELECT id FROM notifications WHERE profile_id = ? AND dedupe_key = ?")
         .get(profileId, input.dedupeKey) as { id: string } | undefined;
-      if (existing !== undefined) return { result: { id: existing.id, deduped: true }, queued: false };
+      if (existing !== undefined)
+        return { result: { id: existing.id, deduped: true }, queued: false };
     }
 
     db.prepare(
@@ -166,7 +174,9 @@ export function publishProfile(
   });
 
   if (secretMissing) {
-    logger.warn(`Profile ${profileId} 已配置推送路由但 PROFILE_ROUTE_SECRETS_JSON 缺少对应 secret，通知仅保留可 pull`);
+    logger.warn(
+      `Profile ${profileId} 已配置推送路由但 PROFILE_ROUTE_SECRETS_JSON 缺少对应 secret，通知仅保留可 pull`,
+    );
   }
   if (queued) drainSoon(db, config);
   return result;
@@ -187,7 +197,11 @@ export async function publishGlobal(
 }
 
 /** 用户 pull 后，取消这些通知的待处理投递 */
-export function cancelPendingDeliveries(db: DatabaseSync, profileId: string, notificationIds: string[]): void {
+export function cancelPendingDeliveries(
+  db: DatabaseSync,
+  profileId: string,
+  notificationIds: string[],
+): void {
   if (notificationIds.length === 0) return;
   const placeholders = notificationIds.map(() => "?").join(",");
   db.prepare(
@@ -222,13 +236,17 @@ function requeueRoute(db: DatabaseSync, profileId: string, routeName: string): v
 
 let drainTimer: ReturnType<typeof setTimeout> | null = null;
 let draining = false;
+/** 当前在途的一轮投递，供停机时等待收敛（见 waitForDrain） */
+let currentDrain: Promise<number> | null = null;
 
 /** 发布后即时触发一轮投递（去抖） */
 export function drainSoon(db: DatabaseSync, config: ResolvedConfig): void {
   if (drainTimer !== null || draining) return;
   drainTimer = setTimeout(() => {
     drainTimer = null;
-    void drainDue(db, config).catch((e) => logger.error(`outbox drain 失败: ${e instanceof Error ? e.message : e}`));
+    void drainDue(db, config).catch((e) =>
+      logger.error(`outbox drain 失败: ${e instanceof Error ? e.message : e}`),
+    );
   }, 100);
 }
 
@@ -240,10 +258,10 @@ export function cancelPendingDrain(): void {
 }
 
 /** 投递到期的 outbox 行；返回处理的行数。调度器每 20s 调一次，发布时也会即时触发 */
-export async function drainDue(db: DatabaseSync, config: ResolvedConfig): Promise<number> {
-  if (draining) return 0;
+export function drainDue(db: DatabaseSync, config: ResolvedConfig): Promise<number> {
+  if (draining) return Promise.resolve(0);
   draining = true;
-  try {
+  const run = (async (): Promise<number> => {
     recoverStaleSending(db);
     const deadline = Date.now() + DRAIN_BUDGET_MS;
     let processed = 0;
@@ -265,11 +283,9 @@ export async function drainDue(db: DatabaseSync, config: ResolvedConfig): Promis
         const skip = skipReason(db, config, row);
         if (skip !== null) {
           if (skip !== "quiet-hours") {
-            db.prepare("UPDATE deliveries SET status = 'fallback', last_error = ?, updated_at = ? WHERE id = ?").run(
-              skip,
-              nowIso(),
-              row.id,
-            );
+            db.prepare(
+              "UPDATE deliveries SET status = 'fallback', last_error = ?, updated_at = ? WHERE id = ?",
+            ).run(skip, nowIso(), row.id);
           }
           continue;
         }
@@ -284,13 +300,24 @@ export async function drainDue(db: DatabaseSync, config: ResolvedConfig): Promis
       if (deliverable.length === 0) break;
     }
     return processed;
-  } finally {
+  })();
+  // 同步登记在途轮次，再由 finally 在微任务里清空；停机时 waitForDrain 等它收敛。
+  // 若在 IIFE 内部登记，draining 仍在 true 时不会有新一轮进入，顺序安全。
+  currentDrain = run.finally(() => {
     draining = false;
-  }
+    currentDrain = null;
+  });
+  return currentDrain;
+}
+
+/** 等待在途的一轮投递结束（停机前调用，避免关库后仍在写） */
+export async function waitForDrain(): Promise<void> {
+  if (currentDrain !== null) await currentDrain.catch(() => undefined);
 }
 
 function skipReason(db: DatabaseSync, config: ResolvedConfig, row: DeliveryRow): string | null {
-  const quiet = getSetting<{ start: string; end: string }>(db, row.profile_id, "quiet_hours") ?? null;
+  const quiet =
+    getSetting<{ start: string; end: string }>(db, row.profile_id, "quiet_hours") ?? null;
   if (inQuietWindow(quiet)) return "quiet-hours";
   const route = getPushRoute(db, row.profile_id);
   if (route === null || !route.enabled || route.url === "") return "route removed";
@@ -299,7 +326,11 @@ function skipReason(db: DatabaseSync, config: ResolvedConfig, row: DeliveryRow):
   return null;
 }
 
-async function deliverOne(db: DatabaseSync, config: ResolvedConfig, row: DeliveryRow): Promise<void> {
+async function deliverOne(
+  db: DatabaseSync,
+  config: ResolvedConfig,
+  row: DeliveryRow,
+): Promise<void> {
   const claimId = newId();
   const claimed = db
     .prepare(
@@ -309,12 +340,17 @@ async function deliverOne(db: DatabaseSync, config: ResolvedConfig, row: Deliver
          updated_at = ?
        WHERE id = ? AND status IN ('queued','failed')`,
     )
-    .run(`life-assistant:${row.profile_id}:${row.notification_id}:${row.route_name}:a${row.generation}`, nowIso(), nowIso(), row.id);
+    .run(
+      `life-assistant:${row.profile_id}:${row.notification_id}:${row.route_name}:a${row.generation}`,
+      nowIso(),
+      nowIso(),
+      row.id,
+    );
   if (claimed.changes !== 1) return;
 
-  const current = db.prepare("SELECT request_id, generation FROM deliveries WHERE id = ?").get(row.id) as
-    | { request_id: string | null; generation: number }
-    | undefined;
+  const current = db
+    .prepare("SELECT request_id, generation FROM deliveries WHERE id = ?")
+    .get(row.id) as { request_id: string | null; generation: number } | undefined;
   const requestId = current?.request_id ?? claimId;
 
   const payload = JSON.stringify({
@@ -395,5 +431,12 @@ function markTransportFailure(db: DatabaseSync, row: DeliveryRow, error: string)
     `UPDATE deliveries SET status = ?, transport_failures = ?, attempts = attempts + 1,
        next_attempt_at = ?, last_error = ?, updated_at = ?
      WHERE id = ?`,
-  ).run(terminal ? "fallback" : "failed", transport, nextAt, `transport: ${error}`, nowIso(), row.id);
+  ).run(
+    terminal ? "fallback" : "failed",
+    transport,
+    nextAt,
+    `transport: ${error}`,
+    nowIso(),
+    row.id,
+  );
 }

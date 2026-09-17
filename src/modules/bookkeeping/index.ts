@@ -1,6 +1,13 @@
 import { z } from "zod";
 import { DATE_RE, todayIso } from "../../time.js";
-import { errorMessage, fail, okJson, registerModule, runtime, type ToolContext } from "../../core/registry.js";
+import {
+  errorMessage,
+  fail,
+  okJson,
+  registerModule,
+  runtime,
+  type ToolContext,
+} from "../../core/registry.js";
 import { logger } from "../../core/logger.js";
 import {
   addExpense,
@@ -68,7 +75,8 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
       if (ledgerId === undefined || amount === undefined) {
         return fail('add 需要 ledger_id（先调用 ledger {action:"list"} 取账本 id）和 amount（元）');
       }
-      if (!Number.isFinite(amount) || amount <= 0 || amount > 1_000_000) return fail(`金额不合法: ${String(amount)}`);
+      if (!Number.isFinite(amount) || amount <= 0 || amount > 1_000_000)
+        return fail(`金额不合法: ${String(amount)}`);
       const cents = Math.round(amount * 100);
       const entry = addExpense(db, ctx.profileId, {
         ledgerId,
@@ -140,7 +148,10 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
               from: (args.from as string | undefined) ?? `${todayIso().slice(0, 7)}-01`,
               to: (args.to as string | undefined) ?? todayIso(),
             };
-      const summary = summarizeExpenses(db, ledgerId, { ...range, by: args.by as string | undefined });
+      const summary = summarizeExpenses(db, ledgerId, {
+        ...range,
+        by: args.by as string | undefined,
+      });
       return okJson({
         区间: range,
         合计: `¥${centsToYuan(summary.total_cents)}`,
@@ -150,7 +161,10 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
           金额: `¥${centsToYuan(c.cents)}`,
           占比: `${(c.share * 100).toFixed(1)}%`,
         })),
-        按记账人: summary.profiles.map((p) => ({ 记账人: p.profile, 金额: `¥${centsToYuan(p.cents)}` })),
+        按记账人: summary.profiles.map((p) => ({
+          记账人: p.profile,
+          金额: `¥${centsToYuan(p.cents)}`,
+        })),
       });
     }
     if (action === "delete") {
@@ -205,11 +219,21 @@ registerModule({
         category: z.string().max(20).optional(),
         note: z.string().max(200).optional(),
         date: z.string().regex(DATE_RE).optional().describe("花费日期，默认今天"),
-        month: z.string().regex(/^\d{4}-\d{2}$/).optional().describe("按月过滤/汇总"),
+        month: z
+          .string()
+          .regex(/^\d{4}-\d{2}$/)
+          .optional()
+          .describe("按月过滤/汇总"),
         from: z.string().regex(DATE_RE).optional(),
         to: z.string().regex(DATE_RE).optional(),
         by: z.string().optional().describe("按记账人 Profile 过滤"),
-        limit: z.number().int().min(1).max(200).optional().describe("list 返回条数，默认 20，上限 200"),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(200)
+          .optional()
+          .describe("list 返回条数，默认 20，上限 200"),
       },
       handler: bookkeepingExpenseTool,
     },

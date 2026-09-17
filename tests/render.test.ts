@@ -4,7 +4,13 @@ import { displayWidth, renderBlocks } from "../src/core/render.js";
 
 describe("通知渲染", () => {
   const table = {
-    table: { columns: ["项目", "内容"], rows: [["天气", "晴 26°C"], ["空气质量", "优 (AQI 42)"]], },
+    table: {
+      columns: ["项目", "内容"],
+      rows: [
+        ["天气", "晴 26°C"],
+        ["空气质量", "优 (AQI 42)"],
+      ],
+    },
     notes: ["来源：QWeather"],
   };
 
@@ -32,7 +38,11 @@ describe("通知渲染", () => {
       return displayWidth(cut < 0 ? s : s.slice(0, cut));
     };
     assert.ok(lines.length >= 5, "应包含表头、分隔线与两行数据");
-    assert.equal(col1Width(lines[0] ?? ""), col1Width(lines[2] ?? ""), "表头与数据行第一列应等宽对齐");
+    assert.equal(
+      col1Width(lines[0] ?? ""),
+      col1Width(lines[2] ?? ""),
+      "表头与数据行第一列应等宽对齐",
+    );
     assert.equal(col1Width(lines[0] ?? ""), 8, "第一列宽度应取最宽单元格（空气质量=8）");
     assert.match(lines[1] ?? "", /^─+───+$/);
   });

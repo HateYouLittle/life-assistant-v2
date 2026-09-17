@@ -1,10 +1,27 @@
 import { z } from "zod";
 import { DATE_RE, isDate, todayIso } from "../../time.js";
-import { dayType, ensureYears, holidayYearsReady, nextHolidayPeriod, requiredYears } from "../../core/holiday.js";
-import { fail, ok, okJson, registerModule, runtime, type ToolContext, type ToolResult } from "../../core/registry.js";
+import {
+  dayType,
+  ensureYears,
+  holidayYearsReady,
+  nextHolidayPeriod,
+  requiredYears,
+} from "../../core/holiday.js";
+import {
+  fail,
+  ok,
+  okJson,
+  registerModule,
+  runtime,
+  type ToolContext,
+  type ToolResult,
+} from "../../core/registry.js";
 import { logger } from "../../core/logger.js";
 
-export async function holidayTool(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+export async function holidayTool(
+  args: Record<string, unknown>,
+  ctx: ToolContext,
+): Promise<ToolResult> {
   const view = args.view as string;
   const db = ctx.db;
   if (view === "next") {
@@ -17,7 +34,9 @@ export async function holidayTool(args: Record<string, unknown>, ctx: ToolContex
       // 覆盖到当年但查不到更晚的假期，通常是下一年数据还没导入，而不是「没有假期」。
       const currentYear = Number(todayIso().slice(0, 4));
       if (Math.max(...years) <= currentYear) {
-        return ok(`覆盖年份内没有更晚的假期了；下一年（${currentYear + 1} 年）数据尚未导入（通常 11 月后发布）`);
+        return ok(
+          `覆盖年份内没有更晚的假期了；下一年（${currentYear + 1} 年）数据尚未导入（通常 11 月后发布）`,
+        );
       }
       return ok("覆盖年份内没有更晚的假期了");
     }
@@ -33,18 +52,15 @@ export async function holidayTool(args: Record<string, unknown>, ctx: ToolContex
     const month = typeof args.month === "string" ? args.month : "";
     if (!/^\d{4}-\d{2}$/.test(month)) return fail("month 需为 YYYY-MM 格式");
     const rows = db
-      .prepare(
-        "SELECT date, day_type, name FROM cn_holiday_days WHERE date LIKE ? ORDER BY date",
-      )
+      .prepare("SELECT date, day_type, name FROM cn_holiday_days WHERE date LIKE ? ORDER BY date")
       .all(`${month}-%`) as { date: string; day_type: string; name: string }[];
-    const table = rows.map((r) => [
-      r.date,
-      r.day_type === "holiday" ? "休息" : "上班",
-      r.name,
-    ]);
+    const table = rows.map((r) => [r.date, r.day_type === "holiday" ? "休息" : "上班", r.name]);
     return okJson({
       月份: month,
-      安排: table.length > 0 ? { columns: ["日期", "类型", "名称"], rows: table } : "当月无法定节假日/调休安排",
+      安排:
+        table.length > 0
+          ? { columns: ["日期", "类型", "名称"], rows: table }
+          : "当月无法定节假日/调休安排",
       数据覆盖年份: holidayYearsReady(db),
     });
   }
@@ -55,7 +71,9 @@ export async function holidayTool(args: Record<string, unknown>, ctx: ToolContex
   if (!isDate(date)) return fail(`date 不是真实存在的日期: ${date}`);
   const cls = dayType(db, date);
   if (cls === "holiday") {
-    const name = db.prepare("SELECT name FROM cn_holiday_days WHERE date = ?").get(date) as { name: string };
+    const name = db.prepare("SELECT name FROM cn_holiday_days WHERE date = ?").get(date) as {
+      name: string;
+    };
     return ok(`${date}：休息日（法定节假日：${name.name}）`);
   }
   if (cls === "workday") return ok(`${date}：上班日（调休补班）`);
@@ -73,8 +91,16 @@ registerModule({
         "中国大陆法定节假日/调休查询。view=next 查下一假期；view=month+month(YYYY-MM) 查某月安排；view=is_workday+date(YYYY-MM-DD) 判断某日是否上班。数据未覆盖时明确返回未知，绝不按星期猜测。",
       inputSchema: {
         view: z.enum(["next", "month", "is_workday"]).describe("查询类型"),
-        month: z.string().regex(/^\d{4}-\d{2}$/).optional().describe("view=month 时必填，如 2026-10"),
-        date: z.string().regex(DATE_RE).optional().describe("view=is_workday 时必填，如 2026-10-01"),
+        month: z
+          .string()
+          .regex(/^\d{4}-\d{2}$/)
+          .optional()
+          .describe("view=month 时必填，如 2026-10"),
+        date: z
+          .string()
+          .regex(DATE_RE)
+          .optional()
+          .describe("view=is_workday 时必填，如 2026-10-01"),
       },
       handler: holidayTool,
     },

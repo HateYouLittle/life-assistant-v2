@@ -41,12 +41,16 @@ function problem(report: ImportReport, table: string, id: string, reason: string
 
 const DATE_RE_IMPORT = /^\d{4}-\d{2}-\d{2}$/;
 
-/** 账本名在 v2 中要求活跃账本内唯一，旧库可能重名 */function uniqueLedgerName(target: ReturnType<typeof openDatabase>, name: string): string {
+/** 账本名在 v2 中要求活跃账本内唯一，旧库可能重名 */ function uniqueLedgerName(
+  target: ReturnType<typeof openDatabase>,
+  name: string,
+): string {
   const exists = target.prepare("SELECT 1 FROM ledgers WHERE name = ?").get(name);
   if (exists === undefined) return name;
   for (let i = 2; i < 1000; i++) {
     const candidate = `${name} (${i})`;
-    if (target.prepare("SELECT 1 FROM ledgers WHERE name = ?").get(candidate) === undefined) return candidate;
+    if (target.prepare("SELECT 1 FROM ledgers WHERE name = ?").get(candidate) === undefined)
+      return candidate;
   }
   return `${name} (${Date.now()})`;
 }
@@ -114,7 +118,8 @@ function mapRecurrence(
   warnings: string[],
   startDate: string | null,
 ): { recurrence: Recurrence | null; workdayFilter: "any" | "workday" | "holiday" } {
-  if (raw === null || raw.trim() === "" || raw === "{}") return { recurrence: null, workdayFilter: "any" };
+  if (raw === null || raw.trim() === "" || raw === "{}")
+    return { recurrence: null, workdayFilter: "any" };
   let parsed: {
     frequency?: string;
     interval?: number;
@@ -128,7 +133,10 @@ function mapRecurrence(
     warnings.push(`日程「${title}」recurrence_json 无法解析，按一次性导入`);
     return { recurrence: null, workdayFilter: "any" };
   }
-  const interval = typeof parsed.interval === "number" && parsed.interval >= 1 ? Math.min(parsed.interval, 365) : 1;
+  const interval =
+    typeof parsed.interval === "number" && parsed.interval >= 1
+      ? Math.min(parsed.interval, 365)
+      : 1;
   const base = { interval, until: parsed.until, count: parsed.count };
   const weeklyDays = (parsed.byWeekday ?? [])
     .map(mapWeekday)
@@ -142,14 +150,24 @@ function mapRecurrence(
       // 空的 byweekday 会让 recurrence 引擎无候选日可产出，此前会导致进程同步死循环。
       // 旧库的星期写法可能认不出来，此时回退到「开始日期的星期」（等价于每周一次）。
       if (weeklyDays.length > 0) {
-        return { recurrence: { freq: "weekly", ...base, byweekday: weeklyDays }, workdayFilter: "any" };
+        return {
+          recurrence: { freq: "weekly", ...base, byweekday: weeklyDays },
+          workdayFilter: "any",
+        };
       }
       const fallback = weekdayOf(startDate);
       if (fallback !== null) {
-        warnings.push(`日程「${title}」的旧每周规则没有可识别的星期（byWeekday=${JSON.stringify(parsed.byWeekday ?? [])}），已按开始日期的星期导入`);
-        return { recurrence: { freq: "weekly", ...base, byweekday: [fallback] }, workdayFilter: "any" };
+        warnings.push(
+          `日程「${title}」的旧每周规则没有可识别的星期（byWeekday=${JSON.stringify(parsed.byWeekday ?? [])}），已按开始日期的星期导入`,
+        );
+        return {
+          recurrence: { freq: "weekly", ...base, byweekday: [fallback] },
+          workdayFilter: "any",
+        };
       }
-      warnings.push(`日程「${title}」的旧每周规则没有可识别的星期且缺少开始日期，已降级为一次性导入`);
+      warnings.push(
+        `日程「${title}」的旧每周规则没有可识别的星期且缺少开始日期，已降级为一次性导入`,
+      );
       return { recurrence: null, workdayFilter: "any" };
     }
     case "monthly":
@@ -163,7 +181,9 @@ function mapRecurrence(
       if (calendar !== "solar") break;
       return { recurrence: { freq: "daily", ...base }, workdayFilter: "holiday" };
   }
-  warnings.push(`日程「${title}」的循环类型 ${String(parsed.frequency)}（${calendar}）不支持，按每年循环导入`);
+  warnings.push(
+    `日程「${title}」的循环类型 ${String(parsed.frequency)}（${calendar}）不支持，按每年循环导入`,
+  );
   return { recurrence: { freq: "yearly", ...base }, workdayFilter: "any" };
 }
 
@@ -182,7 +202,8 @@ function mapReminders(raw: string | null, title: string, warnings: string[]): nu
       .filter((r) => r.target === undefined || r.target === "occurrence")
       .map((r) => -(typeof r.minutesBefore === "number" ? r.minutesBefore : 0));
     const deadlines = parsed.filter((r) => r.target === "deadline").length;
-    if (deadlines > 0) warnings.push(`日程「${title}」有 ${deadlines} 个 deadline 提醒，v2 不支持已丢弃`);
+    if (deadlines > 0)
+      warnings.push(`日程「${title}」有 ${deadlines} 个 deadline 提醒，v2 不支持已丢弃`);
     if (offsets.length === 0) return [0];
     return offsets.slice(0, 5);
   } catch {
@@ -222,31 +243,29 @@ function forceClearImported(
       label: "notifications",
       run: () =>
         target
-          .prepare(
-            `DELETE FROM notifications WHERE profile_id IN (SELECT value FROM json_each(?))`,
-          )
+          .prepare(`DELETE FROM notifications WHERE profile_id IN (SELECT value FROM json_each(?))`)
           .run(JSON.stringify(profiles)),
     },
     {
       label: "schedules",
       run: () =>
-        target.prepare(`DELETE FROM schedules WHERE profile_id IN (SELECT value FROM json_each(?))`).run(
-          JSON.stringify(profiles),
-        ),
+        target
+          .prepare(`DELETE FROM schedules WHERE profile_id IN (SELECT value FROM json_each(?))`)
+          .run(JSON.stringify(profiles)),
     },
     {
       label: "expenses",
       run: () =>
-        target.prepare(`DELETE FROM expenses WHERE ledger_id IN (SELECT value FROM json_each(?))`).run(
-          JSON.stringify(ledgers),
-        ),
+        target
+          .prepare(`DELETE FROM expenses WHERE ledger_id IN (SELECT value FROM json_each(?))`)
+          .run(JSON.stringify(ledgers)),
     },
     {
       label: "ledgers",
       run: () =>
-        target.prepare(`DELETE FROM ledgers WHERE id IN (SELECT value FROM json_each(?))`).run(
-          JSON.stringify(ledgers),
-        ),
+        target
+          .prepare(`DELETE FROM ledgers WHERE id IN (SELECT value FROM json_each(?))`)
+          .run(JSON.stringify(ledgers)),
     },
   ];
 
@@ -264,7 +283,11 @@ function forceClearImported(
   }
 }
 
-export function runImport(target: ReturnType<typeof openDatabase>, oldPath: string, force = false): ImportReport {
+export function runImport(
+  target: ReturnType<typeof openDatabase>,
+  oldPath: string,
+  force = false,
+): ImportReport {
   const report: ImportReport = {
     profiles: 0,
     schedules: 0,
@@ -280,7 +303,9 @@ export function runImport(target: ReturnType<typeof openDatabase>, oldPath: stri
   for (const table of ["schedules", "ledgers", "notifications"]) {
     const row = target.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number };
     if (row.n > 0 && !force) {
-      throw new Error(`目标库非空（${table} 有 ${row.n} 行）。如确认覆盖请加 --force（建议先 db:backup）`);
+      throw new Error(
+        `目标库非空（${table} 有 ${row.n} 行）。如确认覆盖请加 --force（建议先 db:backup）`,
+      );
     }
   }
   const old = new DatabaseSync(oldPath, { readOnly: true });
@@ -289,7 +314,9 @@ export function runImport(target: ReturnType<typeof openDatabase>, oldPath: stri
       if (force) {
         forceClearImported(target, old, report);
       }
-      for (const row of old.prepare("SELECT profile_id FROM profiles").all() as { profile_id: string }[]) {
+      for (const row of old.prepare("SELECT profile_id FROM profiles").all() as {
+        profile_id: string;
+      }[]) {
         if (!PROFILE_ID_RE.test(row.profile_id)) {
           // v2 的 Profile 名有格式约束；导入非法名会让该 Profile 永远无法通过
           // X-Hermes-Profile 访问，其依赖行也会触发外键错误。
@@ -305,7 +332,11 @@ export function runImport(target: ReturnType<typeof openDatabase>, oldPath: stri
         report.profiles += 1;
       }
 
-      let settings: Array<{ profile_id: string; quiet_start: string | null; quiet_end: string | null }> = [];
+      let settings: Array<{
+        profile_id: string;
+        quiet_start: string | null;
+        quiet_end: string | null;
+      }> = [];
       try {
         settings = old
           .prepare("SELECT profile_id, quiet_start, quiet_end FROM profile_settings")
@@ -316,7 +347,10 @@ export function runImport(target: ReturnType<typeof openDatabase>, oldPath: stri
       for (const s of settings) {
         if (s.quiet_start === null || s.quiet_end === null) continue;
         try {
-          setSetting(target, s.profile_id, "quiet_hours", { start: s.quiet_start, end: s.quiet_end });
+          setSetting(target, s.profile_id, "quiet_hours", {
+            start: s.quiet_start,
+            end: s.quiet_end,
+          });
         } catch (e) {
           problem(report, "profile_settings", s.profile_id, `静默时段未导入：${errorText(e)}`);
         }
@@ -339,7 +373,9 @@ export function runImport(target: ReturnType<typeof openDatabase>, oldPath: stri
         const calendar = s.calendar === "lunar" ? "lunar" : "solar";
         const mappedStatus = STATUS_MAP[s.status];
         if (mappedStatus === undefined) {
-          report.scheduleWarnings.push(`日程「${s.title}」旧状态「${s.status}」无法识别，按 active 处理`);
+          report.scheduleWarnings.push(
+            `日程「${s.title}」旧状态「${s.status}」无法识别，按 active 处理`,
+          );
         }
         const status = mappedStatus ?? "active";
         const { recurrence, workdayFilter } = mapRecurrence(
@@ -350,11 +386,14 @@ export function runImport(target: ReturnType<typeof openDatabase>, oldPath: stri
           s.date,
         );
         const offsets = mapReminders(s.reminders_json, s.title, report.scheduleWarnings);
-        const resend = s.reminder_interval_minutes !== null && s.reminder_interval_minutes > 0
-          ? Math.min(s.reminder_interval_minutes, 1440)
-          : 0;
+        const resend =
+          s.reminder_interval_minutes !== null && s.reminder_interval_minutes > 0
+            ? Math.min(s.reminder_interval_minutes, 1440)
+            : 0;
         if (resend > 0) {
-          report.scheduleWarnings.push(`日程「${s.title}」强提醒降级为到点 ${resend} 分钟后重发一次`);
+          report.scheduleWarnings.push(
+            `日程「${s.title}」强提醒降级为到点 ${resend} 分钟后重发一次`,
+          );
         }
         const leapPolicy = s.leap_month_policy === "leap" ? "follow" : "regular";
         try {
@@ -388,7 +427,9 @@ export function runImport(target: ReturnType<typeof openDatabase>, oldPath: stri
 
       let occurrenceCount = 0;
       try {
-        const row = old.prepare("SELECT COUNT(*) AS n FROM schedule_occurrences").get() as { n: number };
+        const row = old.prepare("SELECT COUNT(*) AS n FROM schedule_occurrences").get() as {
+          n: number;
+        };
         occurrenceCount = row.n;
       } catch {
         // 无该表
@@ -401,12 +442,16 @@ export function runImport(target: ReturnType<typeof openDatabase>, oldPath: stri
       } catch {
         warnings(report, "旧库没有 ledgers 表，跳过账本");
       }
-      const insertLedger = target.prepare("INSERT INTO ledgers (id, name, created_at) VALUES (?, ?, ?)");
+      const insertLedger = target.prepare(
+        "INSERT INTO ledgers (id, name, created_at) VALUES (?, ?, ?)",
+      );
       for (const l of ledgers) {
         try {
           const name = uniqueLedgerName(target, l.name);
           if (name !== l.name) {
-            report.scheduleWarnings.push(`账本「${l.name}」名称与已存在账本重复，已改名为「${name}」`);
+            report.scheduleWarnings.push(
+              `账本「${l.name}」名称与已存在账本重复，已改名为「${name}」`,
+            );
           }
           insertLedger.run(l.id, name, l.created_at);
           report.ledgers += 1;
@@ -415,7 +460,9 @@ export function runImport(target: ReturnType<typeof openDatabase>, oldPath: stri
         }
       }
       if (report.ledgers > 0) {
-        report.scheduleWarnings.push(`${report.ledgers} 个账本已迁移为全局可编辑（旧角色/成员信息不迁移）`);
+        report.scheduleWarnings.push(
+          `${report.ledgers} 个账本已迁移为全局可编辑（旧角色/成员信息不迁移）`,
+        );
       }
 
       let entries: Array<{
@@ -446,7 +493,12 @@ export function runImport(target: ReturnType<typeof openDatabase>, oldPath: stri
         // v2 有 STRICT/CHECK 约束：金额必须是正整数分、spent_on 必须是真实日历日。
         // 逐行校验并隔离，避免一条脏数据让整库导入回滚成 0 行。
         if (!Number.isInteger(e.amount_cents) || e.amount_cents <= 0) {
-          problem(report, "ledger_entries", e.id, `金额不合法（${String(e.amount_cents)}），需为正整数分`);
+          problem(
+            report,
+            "ledger_entries",
+            e.id,
+            `金额不合法（${String(e.amount_cents)}），需为正整数分`,
+          );
           continue;
         }
         const ledgerExists = target.prepare("SELECT 1 FROM ledgers WHERE id = ?").get(e.ledger_id);
@@ -458,7 +510,12 @@ export function runImport(target: ReturnType<typeof openDatabase>, oldPath: stri
         // 对所有按月汇总永久不可见（spent_on >= / <= 过滤），而报告却声称已导入。
         const localDate = toLocalDate(e.occurred_at);
         if (localDate === null) {
-          problem(report, "ledger_entries", e.id, `occurred_at「${e.occurred_at}」不是合法时间，日期无法确定，未导入`);
+          problem(
+            report,
+            "ledger_entries",
+            e.id,
+            `occurred_at「${e.occurred_at}」不是合法时间，日期无法确定，未导入`,
+          );
           continue;
         }
         try {
@@ -481,9 +538,18 @@ export function runImport(target: ReturnType<typeof openDatabase>, oldPath: stri
         report.scheduleWarnings.push(`${report.entriesSkipped} 条非支出账目（收入/转账）不迁移`);
       }
 
-      let holidayDays: Array<{ date: string; year: number; day_type: string; name: string; source: string; updated_at: string }> = [];
+      let holidayDays: Array<{
+        date: string;
+        year: number;
+        day_type: string;
+        name: string;
+        source: string;
+        updated_at: string;
+      }> = [];
       try {
-        holidayDays = old.prepare("SELECT * FROM cn_holiday_days").all() as unknown as typeof holidayDays;
+        holidayDays = old
+          .prepare("SELECT * FROM cn_holiday_days")
+          .all() as unknown as typeof holidayDays;
       } catch {
         warnings(report, "旧库没有 cn_holiday_days 表，跳过节假日");
       }
@@ -499,10 +565,17 @@ export function runImport(target: ReturnType<typeof openDatabase>, oldPath: stri
           problem(report, "cn_holiday_days", d.date, `节假日数据未导入：${errorText(e)}`);
         }
       }
-      let holidayYears: Array<{ year: number; status: string; source: string; fetched_at: string }> = [];
+      let holidayYears: Array<{
+        year: number;
+        status: string;
+        source: string;
+        fetched_at: string;
+      }> = [];
       try {
         holidayYears = old
-          .prepare("SELECT year, status, source, fetched_at FROM cn_holiday_year_meta WHERE status = 'ready'")
+          .prepare(
+            "SELECT year, status, source, fetched_at FROM cn_holiday_year_meta WHERE status = 'ready'",
+          )
           .all() as typeof holidayYears;
       } catch {
         // 无该表
@@ -515,7 +588,12 @@ export function runImport(target: ReturnType<typeof openDatabase>, oldPath: stri
           insertYear.run(y.year, y.source, y.fetched_at);
           report.holidayYears += 1;
         } catch (e) {
-          problem(report, "cn_holiday_years", String(y.year), `节假日年份元数据未导入：${errorText(e)}`);
+          problem(
+            report,
+            "cn_holiday_years",
+            String(y.year),
+            `节假日年份元数据未导入：${errorText(e)}`,
+          );
         }
       }
     });
@@ -546,7 +624,12 @@ function toLocalDate(occurredAt: string): string | null {
   return local;
 }
 
-const DB_CANDIDATE_NAMES = ["life-assistant.db", "life-assistant.sqlite", "assistant.db", "hermes.db"];
+const DB_CANDIDATE_NAMES = [
+  "life-assistant.db",
+  "life-assistant.sqlite",
+  "assistant.db",
+  "hermes.db",
+];
 
 /** v2 自身备份的命名（与 backup.ts 的 FILE_RE 一致） */
 const V2_BACKUP_RE = /^life-assistant-\d{8}-\d{6}\.db$/;
@@ -554,13 +637,15 @@ const V2_BACKUP_RE = /^life-assistant-\d{8}-\d{6}\.db$/;
 /** 目录下疑似旧数据库（排除 -wal/-shm、备份文件与 v2 自身的备份产物） */
 function scanDbFiles(from: string): string[] {
   try {
-    return readdirSync(from)
-      // 先判扩展名再去排除项：-wal/-shm 不以 .db/.sqlite 结尾，放在后面永远不生效
-      .filter((name) => name.endsWith(".db") || name.endsWith(".sqlite"))
-      .filter((name) => !V2_BACKUP_RE.test(name))
-      .filter((name) => !/\.bak-/.test(name) && !/\.backup-/.test(name))
-      .map((name) => join(from, name))
-      .sort();
+    return (
+      readdirSync(from)
+        // 先判扩展名再去排除项：-wal/-shm 不以 .db/.sqlite 结尾，放在后面永远不生效
+        .filter((name) => name.endsWith(".db") || name.endsWith(".sqlite"))
+        .filter((name) => !V2_BACKUP_RE.test(name))
+        .filter((name) => !/\.bak-/.test(name) && !/\.backup-/.test(name))
+        .map((name) => join(from, name))
+        .sort()
+    );
   } catch {
     return [];
   }
@@ -611,11 +696,15 @@ function main(): void {
       for (const w of report.scheduleWarnings) console.log(`  - ${w}`);
     }
     if (report.occurrencesDropped > 0) {
-      console.log(`  - ${report.occurrencesDropped} 条历史 occurrence 未迁移，v2 将按日程规则重新物化`);
+      console.log(
+        `  - ${report.occurrencesDropped} 条历史 occurrence 未迁移，v2 将按日程规则重新物化`,
+      );
     }
     if (report.problems.length > 0) {
       // 坏数据必须显式列出：静默跳过会悄悄丢钱/丢日程
-      console.error(`\n有 ${report.problems.length} 条数据未能导入（已隔离，其余数据已正常导入）：`);
+      console.error(
+        `\n有 ${report.problems.length} 条数据未能导入（已隔离，其余数据已正常导入）：`,
+      );
       for (const p of report.problems) console.error(`  - [${p.table}] ${p.id}：${p.reason}`);
       process.exitCode = 2;
     }

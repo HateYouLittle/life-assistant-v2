@@ -12,7 +12,9 @@ const KEEP = 14;
 export function runBackup(config: ResolvedConfig, nowMs: number = Date.now()): string {
   // sqlite 打开不存在的路径会顺手建一个空库，从而「成功」产出一份空备份
   if (!existsSync(config.dbPath)) {
-    throw new Error(`数据库不存在，拒绝生成空备份: ${config.dbPath}（检查 DATA_DIR 是否指向真实数据目录）`);
+    throw new Error(
+      `数据库不存在，拒绝生成空备份: ${config.dbPath}（检查 DATA_DIR 是否指向真实数据目录）`,
+    );
   }
   mkdirSync(config.backupDir, { recursive: true });
   // 用 Asia/Shanghai 本地时间打戳：项目其余部分统一本地时区，用 UTC 会让

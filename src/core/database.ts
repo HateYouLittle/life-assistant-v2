@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS occurrences (
   PRIMARY KEY (schedule_id, occurrence_key)
 ) STRICT;
 CREATE INDEX IF NOT EXISTS idx_occurrences_due ON occurrences(status, due_at);
+CREATE INDEX IF NOT EXISTS idx_occurrences_schedule_status ON occurrences(schedule_id, status);
 
 CREATE TABLE IF NOT EXISTS notifications (
   id TEXT PRIMARY KEY,
@@ -160,7 +161,9 @@ export function migrate(db: DatabaseSync): void {
     | { value: string }
     | undefined;
   if (row === undefined) {
-    db.prepare("INSERT INTO meta (key, value) VALUES ('schema_version', ?)").run(String(SCHEMA_VERSION));
+    db.prepare("INSERT INTO meta (key, value) VALUES ('schema_version', ?)").run(
+      String(SCHEMA_VERSION),
+    );
     return;
   }
   const version = Number(row.value);

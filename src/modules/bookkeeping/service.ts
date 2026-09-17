@@ -35,16 +35,24 @@ export function getLedger(db: DatabaseSync, id: string): LedgerRow | undefined {
 
 export function listLedgers(db: DatabaseSync, includeArchived = false): LedgerRow[] {
   const where = includeArchived ? "" : "WHERE archived_at IS NULL";
-  return db.prepare(`SELECT * FROM ledgers ${where} ORDER BY created_at`).all() as unknown as LedgerRow[];
+  return db
+    .prepare(`SELECT * FROM ledgers ${where} ORDER BY created_at`)
+    .all() as unknown as LedgerRow[];
 }
 
 export function createLedger(db: DatabaseSync, name: string): LedgerRow {
   const trimmed = name.trim();
   if (trimmed === "" || trimmed.length > 40) throw new Error("账本名需为 1-40 字符");
-  const dup = db.prepare("SELECT id FROM ledgers WHERE name = ? AND archived_at IS NULL").get(trimmed);
+  const dup = db
+    .prepare("SELECT id FROM ledgers WHERE name = ? AND archived_at IS NULL")
+    .get(trimmed);
   if (dup !== undefined) throw new Error(`已存在同名账本: ${trimmed}`);
   const id = newId();
-  db.prepare("INSERT INTO ledgers (id, name, created_at) VALUES (?, ?, ?)").run(id, trimmed, nowIso());
+  db.prepare("INSERT INTO ledgers (id, name, created_at) VALUES (?, ?, ?)").run(
+    id,
+    trimmed,
+    nowIso(),
+  );
   return getLedger(db, id) as LedgerRow;
 }
 
@@ -53,7 +61,9 @@ export function renameLedger(db: DatabaseSync, id: string, name: string): Ledger
   if (row === undefined) throw new Error(`账本不存在: ${id}`);
   const trimmed = name.trim();
   if (trimmed === "" || trimmed.length > 40) throw new Error("账本名需为 1-40 字符");
-  const dup = db.prepare("SELECT id FROM ledgers WHERE name = ? AND archived_at IS NULL AND id != ?").get(trimmed, id);
+  const dup = db
+    .prepare("SELECT id FROM ledgers WHERE name = ? AND archived_at IS NULL AND id != ?")
+    .get(trimmed, id);
   if (dup !== undefined) throw new Error(`已存在同名账本: ${trimmed}`);
   db.prepare("UPDATE ledgers SET name = ? WHERE id = ?").run(trimmed, id);
   return getLedger(db, id) as LedgerRow;
@@ -68,7 +78,8 @@ export function setLedgerArchived(db: DatabaseSync, id: string, archived: boolea
     const dup = db
       .prepare("SELECT id FROM ledgers WHERE name = ? AND archived_at IS NULL AND id != ?")
       .get(row.name, id);
-    if (dup !== undefined) throw new Error(`已有同名活跃账本「${row.name}」，请先改名或归档它再恢复`);
+    if (dup !== undefined)
+      throw new Error(`已有同名活跃账本「${row.name}」，请先改名或归档它再恢复`);
   }
   db.prepare("UPDATE ledgers SET archived_at = ? WHERE id = ?").run(archived ? nowIso() : null, id);
   return getLedger(db, id) as LedgerRow;
@@ -77,7 +88,13 @@ export function setLedgerArchived(db: DatabaseSync, id: string, archived: boolea
 export function addExpense(
   db: DatabaseSync,
   profileId: string,
-  input: { ledgerId: string; amountCents: number; category?: string; note?: string | null; spentOn?: string },
+  input: {
+    ledgerId: string;
+    amountCents: number;
+    category?: string;
+    note?: string | null;
+    spentOn?: string;
+  },
 ): ExpenseRow {
   const ledger = getLedger(db, input.ledgerId);
   if (ledger === undefined) throw new Error(`账本不存在: ${input.ledgerId}`);
@@ -87,7 +104,10 @@ export function addExpense(
   }
   const category = (input.category ?? DEFAULT_CATEGORY).trim() || DEFAULT_CATEGORY;
   if (category.length > 20) throw new Error("分类过长（≤20 字符）");
-  const note = input.note === undefined || input.note === null || input.note.trim() === "" ? null : input.note.trim();
+  const note =
+    input.note === undefined || input.note === null || input.note.trim() === ""
+      ? null
+      : input.note.trim();
   if (note !== null && note.length > 200) throw new Error("备注过长（≤200 字符）");
   const spentOn = input.spentOn ?? todayIso();
   if (!/^\d{4}-\d{2}-\d{2}$/.test(spentOn) || !DateTime.fromISO(spentOn, { zone: TZ }).isValid) {
@@ -130,9 +150,13 @@ export function listExpenses(
   const where = conditions.join(" AND ");
   // 下限也要 clamp：SQLite 把负 LIMIT 当作「不限量」，limit:-1 会返回全表
   const limit = Math.max(1, Math.min(opts.limit ?? 20, 200));
-  const totalRow = db.prepare(`SELECT COUNT(*) AS n FROM expenses WHERE ${where}`).get(...params) as { n: number };
+  const totalRow = db
+    .prepare(`SELECT COUNT(*) AS n FROM expenses WHERE ${where}`)
+    .get(...params) as { n: number };
   const rows = db
-    .prepare(`SELECT * FROM expenses WHERE ${where} ORDER BY spent_on DESC, created_at DESC LIMIT ?`)
+    .prepare(
+      `SELECT * FROM expenses WHERE ${where} ORDER BY spent_on DESC, created_at DESC LIMIT ?`,
+    )
     .all(...params, limit) as unknown as ExpenseRow[];
   return { rows, total: totalRow.n, hasMore: totalRow.n > rows.length };
 }
@@ -157,7 +181,9 @@ export function summarizeExpenses(
   }
   const where = conditions.join(" AND ");
   const range = db
-    .prepare(`SELECT COALESCE(SUM(amount_cents), 0) AS total, COUNT(*) AS count FROM expenses WHERE ${where}`)
+    .prepare(
+      `SELECT COALESCE(SUM(amount_cents), 0) AS total, COUNT(*) AS count FROM expenses WHERE ${where}`,
+    )
     .get(...params) as { total: number; count: number };
   const categories = db
     .prepare(
@@ -194,7 +220,9 @@ export function monthRange(ym: string): { from: string; to: string } {
 /** 上一个月（按 Asia/Shanghai 本地月份，避免 UTC 月初/月末错位） */
 export function previousMonth(now: Date = new Date()): string {
   const local = DateTime.fromJSDate(now, { zone: TZ });
-  return local.month === 1 ? `${local.year - 1}-12` : `${local.year}-${String(local.month - 1).padStart(2, "0")}`;
+  return local.month === 1
+    ? `${local.year - 1}-12`
+    : `${local.year}-${String(local.month - 1).padStart(2, "0")}`;
 }
 
 export function monthlyReportBlocks(summary: ExpenseSummary): NotifyBlock {
@@ -206,7 +234,9 @@ export function monthlyReportBlocks(summary: ExpenseSummary): NotifyBlock {
   rows.push(["合计", `¥${centsToYuan(summary.total_cents)}`, "100%"]);
   const notes = [`共 ${summary.count} 笔`];
   if (summary.profiles.length > 1) {
-    notes.push(`记账人：${summary.profiles.map((p) => `${p.profile} ¥${centsToYuan(p.cents)}`).join("、")}`);
+    notes.push(
+      `记账人：${summary.profiles.map((p) => `${p.profile} ¥${centsToYuan(p.cents)}`).join("、")}`,
+    );
   }
   return { table: { columns: ["分类", "金额", "占比"], rows }, notes };
 }
@@ -231,7 +261,14 @@ export function entryReceiptBlocks(ledger: LedgerRow, entry: ExpenseRow): Notify
  */
 export async function pushMonthlyReports(
   db: DatabaseSync,
-  services: { publishGlobal(input: { kind: string; title: string; blocks: NotifyBlock; dedupeKey?: string }): Promise<{ materialized: number }> },
+  services: {
+    publishGlobal(input: {
+      kind: string;
+      title: string;
+      blocks: NotifyBlock;
+      dedupeKey?: string;
+    }): Promise<{ materialized: number }>;
+  },
   ym: string,
 ): Promise<number> {
   const { from, to } = monthRange(ym);
@@ -277,7 +314,9 @@ export function findMissingMonthlyReports(
   const currentYm = today.slice(0, 7);
   const months: string[] = [];
   for (let i = lookbackMonths; i >= 1; i--) {
-    months.push(DateTime.fromISO(`${currentYm}-01`, { zone: TZ }).minus({ months: i }).toFormat("yyyy-MM"));
+    months.push(
+      DateTime.fromISO(`${currentYm}-01`, { zone: TZ }).minus({ months: i }).toFormat("yyyy-MM"),
+    );
   }
   for (const ledger of listLedgers(db, true)) {
     for (const ym of months) {

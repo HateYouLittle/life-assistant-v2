@@ -30,7 +30,7 @@ function parseSecrets(raw: string | undefined): Record<string, string> {
     parsed = JSON.parse(raw);
   } catch {
     throw new Error(
-      "PROFILE_ROUTE_SECRETS_JSON 不是合法 JSON：值里的引号可能被 shell 吃掉，请用单引号包裹整段（例：PROFILE_ROUTE_SECRETS_JSON='{\"default\":\"<64位hex>\"}'）",
+      'PROFILE_ROUTE_SECRETS_JSON 不是合法 JSON：值里的引号可能被 shell 吃掉，请用单引号包裹整段（例：PROFILE_ROUTE_SECRETS_JSON=\'{"default":"<64位hex>"}\'）',
     );
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
@@ -42,7 +42,9 @@ function parseSecrets(raw: string | undefined): Record<string, string> {
       throw new Error(`PROFILE_ROUTE_SECRETS_JSON 的 profile 名不合法: ${k}`);
     }
     if (typeof v !== "string" || v.length < 32) {
-      throw new Error(`PROFILE_ROUTE_SECRETS_JSON[${k}] 的 secret 至少 32 字符（建议 openssl rand -hex 32）`);
+      throw new Error(
+        `PROFILE_ROUTE_SECRETS_JSON[${k}] 的 secret 至少 32 字符（建议 openssl rand -hex 32）`,
+      );
     }
     out[k] = v;
   }
@@ -50,7 +52,10 @@ function parseSecrets(raw: string | undefined): Record<string, string> {
 }
 
 function normalizeHost(raw: string): string {
-  const host = raw.trim().replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+  const host = raw
+    .trim()
+    .replace(/^https?:\/\//i, "")
+    .replace(/\/+$/, "");
   return host;
 }
 

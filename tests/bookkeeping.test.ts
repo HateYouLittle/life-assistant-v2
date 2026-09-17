@@ -46,11 +46,13 @@ describe("bookkeeping：账本", () => {
     const env = makeTestEnv();
     const t = tools(env);
     try {
-      const created = JSON.parse(text(t.ledger({ action: "create", name: "日用" }))) as { 已创建: { id: string } };
+      const created = JSON.parse(text(t.ledger({ action: "create", name: "日用" }))) as {
+        已创建: { id: string };
+      };
       const id = created.已创建.id;
-      assert.equal((t.ledger({ action: "create", name: "日用" })).isError, true, "重名应拒绝");
+      assert.equal(t.ledger({ action: "create", name: "日用" }).isError, true, "重名应拒绝");
       t.ledger({ action: "rename", id, name: "日常开销" });
-      assert.equal((t.ledger({ action: "create", name: "日常开销" })).isError, true);
+      assert.equal(t.ledger({ action: "create", name: "日常开销" }).isError, true);
 
       t.ledger({ action: "archive", id });
       assert.equal(listLedgers(env.db).length, 0, "归档后不在默认列表");
@@ -68,10 +70,20 @@ describe("bookkeeping：支出", () => {
     const env = makeTestEnv();
     const t = tools(env);
     try {
-      const ledger = JSON.parse(text(t.ledger({ action: "create", name: "日用" }))) as { 已创建: { id: string } };
+      const ledger = JSON.parse(text(t.ledger({ action: "create", name: "日用" }))) as {
+        已创建: { id: string };
+      };
       const ledgerId = ledger.已创建.id;
       const entry = JSON.parse(
-        text(t.expense({ action: "add", ledger_id: ledgerId, amount: 12.34, category: "餐饮", note: "午饭" })),
+        text(
+          t.expense({
+            action: "add",
+            ledger_id: ledgerId,
+            amount: 12.34,
+            category: "餐饮",
+            note: "午饭",
+          }),
+        ),
       ) as { 已记账: { id: string; 金额: string; 日期: string; 记账人: string } };
       assert.equal(entry.已记账.金额, "¥12.34");
       assert.equal(entry.已记账.记账人, "default");
@@ -86,7 +98,9 @@ describe("bookkeeping：支出", () => {
       // 用本地（Asia/Shanghai）月份：addExpense 默认 spent_on 走 todayIso()，
       // 若这里取 UTC 月份，每月 1 号 00:00–08:00 的 8 小时窗口内断言必然失败。
       const month = todayIso().slice(0, 7);
-      const sum = JSON.parse(text(t.expense({ action: "summary", ledger_id: ledgerId, month }))) as {
+      const sum = JSON.parse(
+        text(t.expense({ action: "summary", ledger_id: ledgerId, month })),
+      ) as {
         合计: string;
         笔数: number;
         分类明细: { 分类: string; 金额: string; 占比: string }[];
@@ -121,14 +135,23 @@ describe("bookkeeping：支出", () => {
     const env = makeTestEnv();
     const t = tools(env);
     try {
-      const ledger = JSON.parse(text(t.ledger({ action: "create", name: "日用" }))) as { 已创建: { id: string } };
+      const ledger = JSON.parse(text(t.ledger({ action: "create", name: "日用" }))) as {
+        已创建: { id: string };
+      };
       const ledgerId = ledger.已创建.id;
       assert.equal(t.expense({ action: "add", ledger_id: ledgerId, amount: 0 }).isError, true);
       assert.equal(t.expense({ action: "add", ledger_id: ledgerId, amount: -5 }).isError, true);
       assert.equal(t.expense({ action: "add", ledger_id: "missing", amount: 5 }).isError, true);
-      assert.equal(t.expense({ action: "add", ledger_id: ledgerId, amount: 5, date: "2026-02-30" }).isError, true);
+      assert.equal(
+        t.expense({ action: "add", ledger_id: ledgerId, amount: 5, date: "2026-02-30" }).isError,
+        true,
+      );
       setLedgerArchived(env.db, ledgerId, true);
-      assert.equal(t.expense({ action: "add", ledger_id: ledgerId, amount: 5 }).isError, true, "归档账本不可记账");
+      assert.equal(
+        t.expense({ action: "add", ledger_id: ledgerId, amount: 5 }).isError,
+        true,
+        "归档账本不可记账",
+      );
     } finally {
       cleanupTestEnv(env);
     }
@@ -138,23 +161,49 @@ describe("bookkeeping：支出", () => {
     const env = makeTestEnv();
     try {
       const ledger = createLedger(env.db, "测试账本");
-      addExpense(env.db, "p1", { ledgerId: ledger.id, amountCents: 6000, category: "餐饮", spentOn: "2026-08-02" });
-      addExpense(env.db, "p1", { ledgerId: ledger.id, amountCents: 2000, category: "交通", spentOn: "2026-08-10" });
-      addExpense(env.db, "p2", { ledgerId: ledger.id, amountCents: 2000, category: "餐饮", spentOn: "2026-08-20" });
-      const summary = summarizeExpenses(env.db, ledger.id, { from: "2026-08-01", to: "2026-08-31" });
+      addExpense(env.db, "p1", {
+        ledgerId: ledger.id,
+        amountCents: 6000,
+        category: "餐饮",
+        spentOn: "2026-08-02",
+      });
+      addExpense(env.db, "p1", {
+        ledgerId: ledger.id,
+        amountCents: 2000,
+        category: "交通",
+        spentOn: "2026-08-10",
+      });
+      addExpense(env.db, "p2", {
+        ledgerId: ledger.id,
+        amountCents: 2000,
+        category: "餐饮",
+        spentOn: "2026-08-20",
+      });
+      const summary = summarizeExpenses(env.db, ledger.id, {
+        from: "2026-08-01",
+        to: "2026-08-31",
+      });
       assert.equal(summary.total_cents, 10000);
       assert.equal(summary.categories[0]?.category, "餐饮");
       assert.equal(summary.categories[0]?.share, 0.8);
       assert.equal(summary.profiles.find((p) => p.profile === "p2")?.cents, 2000);
 
-      const byP2 = summarizeExpenses(env.db, ledger.id, { from: "2026-08-01", to: "2026-08-31", by: "p2" });
+      const byP2 = summarizeExpenses(env.db, ledger.id, {
+        from: "2026-08-01",
+        to: "2026-08-31",
+        by: "p2",
+      });
       assert.equal(byP2.total_cents, 2000);
       assert.equal(byP2.count, 1);
       assert.equal(byP2.categories.length, 1);
       assert.equal(byP2.categories[0]?.share, 1);
       assert.equal(byP2.profiles.length, 1);
 
-      const byNobody = summarizeExpenses(env.db, ledger.id, { from: "2026-08-01", to: "2026-08-31", by: "nobody" });
+      const byNobody = summarizeExpenses(env.db, ledger.id, {
+        from: "2026-08-01",
+        to: "2026-08-31",
+        by: "nobody",
+      });
       assert.equal(byNobody.total_cents, 0);
       assert.equal(byNobody.count, 0);
       assert.equal(byNobody.categories.length, 0);
@@ -168,8 +217,12 @@ describe("bookkeeping：支出", () => {
     const env = makeTestEnv();
     const t = tools(env);
     try {
-      const ledger = JSON.parse(text(t.ledger({ action: "create", name: "月报账本" }))) as { 已创建: { id: string } };
-      const _empty = JSON.parse(text(t.ledger({ action: "create", name: "空账本" }))) as { 已创建: { id: string } };
+      const ledger = JSON.parse(text(t.ledger({ action: "create", name: "月报账本" }))) as {
+        已创建: { id: string };
+      };
+      const _empty = JSON.parse(text(t.ledger({ action: "create", name: "空账本" }))) as {
+        已创建: { id: string };
+      };
       addExpense(env.db, "default", {
         ledgerId: ledger.已创建.id,
         amountCents: 5000,
@@ -206,9 +259,13 @@ describe("bookkeeping：支出", () => {
     const env = makeTestEnv();
     const t = tools(env);
     try {
-      const ledger = JSON.parse(text(t.ledger({ action: "create", name: "日用" }))) as { 已创建: { id: string } };
+      const ledger = JSON.parse(text(t.ledger({ action: "create", name: "日用" }))) as {
+        已创建: { id: string };
+      };
       const ledgerId = ledger.已创建.id;
-      const first = JSON.parse(text(t.expense({ action: "add", ledger_id: ledgerId, amount: 50 }))) as {
+      const first = JSON.parse(
+        text(t.expense({ action: "add", ledger_id: ledgerId, amount: 50 })),
+      ) as {
         已记账: { id: string };
       };
       t.expense({ action: "add", ledger_id: ledgerId, amount: 20 });
@@ -217,13 +274,19 @@ describe("bookkeeping：支出", () => {
       };
       assert.equal(removed.已删除.金额, "¥50.00");
       const month = todayIso().slice(0, 7);
-      const sum = JSON.parse(text(t.expense({ action: "summary", ledger_id: ledgerId, month }))) as {
+      const sum = JSON.parse(
+        text(t.expense({ action: "summary", ledger_id: ledgerId, month })),
+      ) as {
         合计: string;
         笔数: number;
       };
       assert.equal(sum.合计, "¥20.00");
       assert.equal(sum.笔数, 1);
-      assert.equal(t.expense({ action: "delete", id: first.已记账.id }).isError, true, "重复删除应报错");
+      assert.equal(
+        t.expense({ action: "delete", id: first.已记账.id }).isError,
+        true,
+        "重复删除应报错",
+      );
       assert.equal(t.expense({ action: "delete" }).isError, true, "缺 id 应报错");
     } finally {
       cleanupTestEnv(env);
@@ -236,7 +299,11 @@ describe("bookkeeping：月报覆盖与分页语义", () => {
     const env = makeTestEnv();
     try {
       const ledger = createLedger(env.db, "家庭");
-      addExpense(env.db, "default", { ledgerId: ledger.id, amountCents: 2500, spentOn: "2026-09-05" });
+      addExpense(env.db, "default", {
+        ledgerId: ledger.id,
+        amountCents: 2500,
+        spentOn: "2026-09-05",
+      });
       setLedgerArchived(env.db, ledger.id, true);
 
       const pushed = await pushMonthlyReports(env.db, makeServices(env), "2026-09");
@@ -254,7 +321,11 @@ describe("bookkeeping：月报覆盖与分页语义", () => {
     const env = makeTestEnv();
     try {
       const ledger = createLedger(env.db, "幂等");
-      addExpense(env.db, "default", { ledgerId: ledger.id, amountCents: 100, spentOn: "2026-09-05" });
+      addExpense(env.db, "default", {
+        ledgerId: ledger.id,
+        amountCents: 100,
+        spentOn: "2026-09-05",
+      });
       const services = makeServices(env);
       await pushMonthlyReports(env.db, services, "2026-09");
       const first = env.published.length;
@@ -269,7 +340,11 @@ describe("bookkeeping：月报覆盖与分页语义", () => {
     const env = makeTestEnv();
     try {
       const ledger = createLedger(env.db, "补发");
-      addExpense(env.db, "default", { ledgerId: ledger.id, amountCents: 500, spentOn: "2026-08-10" });
+      addExpense(env.db, "default", {
+        ledgerId: ledger.id,
+        amountCents: 500,
+        spentOn: "2026-08-10",
+      });
       const missing = findMissingMonthlyReports(env.db, 6, "2026-10-05");
       assert.ok(
         missing.missing.some((m) => m.ym === "2026-08"),
@@ -289,7 +364,11 @@ describe("bookkeeping：月报覆盖与分页语义", () => {
     try {
       const ledger = createLedger(env.db, "多笔");
       for (let i = 1; i <= 25; i++) {
-        addExpense(env.db, "default", { ledgerId: ledger.id, amountCents: 100 + i, spentOn: "2026-09-05" });
+        addExpense(env.db, "default", {
+          ledgerId: ledger.id,
+          amountCents: 100 + i,
+          spentOn: "2026-09-05",
+        });
       }
       const page = listExpenses(env.db, ledger.id);
       assert.equal(page.rows.length, 20);
@@ -333,7 +412,13 @@ function makeServices(env: TestEnv) {
         .prepare(
           "INSERT INTO notifications (id, profile_id, kind, title, body_md, dedupe_key, read, created_at) VALUES (?, 'default', ?, ?, '', ?, 0, ?)",
         )
-        .run(`n-${env.published.length + 1}`, input.kind, input.title, input.dedupeKey ?? null, new Date().toISOString());
+        .run(
+          `n-${env.published.length + 1}`,
+          input.kind,
+          input.title,
+          input.dedupeKey ?? null,
+          new Date().toISOString(),
+        );
       env.published.push({ profileId: "*", input: input as never });
       return { materialized: 1 };
     },
