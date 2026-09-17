@@ -5,7 +5,8 @@ dist/
 .zcode/
 
 # 数据目录：data/ 及迁移/校验等副本（SQLite 与 WAL/SHM，含个人数据）
-data*/
+# 只锚定仓库根，避免误伤将来可能出现的 src/data 之类源码目录
+/data*/
 
 # 环境与密钥：.env 本身及任何备份（如 .env.bak-*）都不得入库
 .env

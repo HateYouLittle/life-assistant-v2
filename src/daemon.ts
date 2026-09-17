@@ -341,7 +341,9 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
       logger.info("已退出");
       process.exit(0);
     });
-    setTimeout(() => process.exit(0), 3000).unref();
+    // 兜底硬退：必须大于 stop() 内部的等待上界（drain ≤10s + onStart ≤3s + 其余收尾），
+    // 否则在途投递的收敛等待会被这里提前打断，db.close() 也不会执行。
+    setTimeout(() => process.exit(0), 15_000).unref();
   };
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
