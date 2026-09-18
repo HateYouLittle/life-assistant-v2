@@ -188,6 +188,8 @@ npm run db:backup      # VACUUM INTO 备份，保留最近 14 份
 - **recurrence 引擎**：自研纯函数替代 rrule，只覆盖 daily/weekly/monthly/yearly × 农历 + 工作日过滤；漏触发只补最近一次。
 - **outbox**：通知 + 投递记录同事务写入；发布即触发投递；静默时段只拦主动推送。
 - **时区**：全部调度固定 Asia/Shanghai，无 DST。
+- **物化窗口**：occurrence 只物化到 `now + 62 天`。若某日程此刻一条 `pending` 都没有（远期生日、远期一次性待办），额外豁免**恰好 1 条**越过窗口的 occurrence，保证「下一条」在 `list`/`upcoming`/状态页始终可见；豁免资格取自入库状态，补上第一条即失效，因此不会随时间累积增长。
+- **历史回收**：`schedule.occurrence_cleanup`（每日 04:30）只清理 90 天前的 `notified`/`done`/`cancelled` 行 —— `pending` 永不删；使用 `recurrence.count` 的日程整条豁免（发生次数上限依赖历史行数，删历史会让已达上限的循环复活）。上线或调参前可用 `previewOccurrenceCleanup(db, days)` 只读预演将删除的行数与涉及日程。
 
 ### 已知取舍与后续优化（尚未实施）
 
@@ -206,7 +208,6 @@ npm run db:backup      # VACUUM INTO 备份，保留最近 14 份
    但它只在运行时检查重名。若要真正强制，需加静态 import 图检查或 lint 规则。
 6. **`schedules.version` 列未参与并发控制**：每次更新 +1，但没有乐观校验；单写者下风险低，
    可删列或落实校验。
-7. **节假日刷新节奏**：`FETCH_COOLDOWN_MS` 是 6h，但唯一的重试点是每天 02:00 的 job，
-   实际重试间隔为 24h。可改为 `0 */3 * * *` 或由 `tick()` 驱动，让冷却常量真正起作用。
+7. **节假日刷新节奏**：`FETCH_COOLDOWN_MS` 是 6h，但主动重试点仍是每天 02:00 的 job（`requiredYears()` 到 10 月才要求下一年），实际重试间隔为 24h。物化撞到未就绪年份的路径已改为由 `tick()` 触发按需补齐、真正受 6h 冷却约束；若要提前拿到下一年数据，可把 job 改为 `0 */3 * * *`。
 8. **`status` 页面无鉴权**（`/` 只有静态 HTML，数据走受保护的 `/api/status`），
    如需对外暴露建议一并加保护。
