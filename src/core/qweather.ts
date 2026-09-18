@@ -1,11 +1,22 @@
 import type { DatabaseSync } from "node:sqlite";
-import { todayIso } from "../time.js";
-import { fetchJson } from "./http.js";
+import { DateTime } from "luxon";
+import { TZ, todayIso } from "../time.js";
+import { HttpError, fetchJson } from "./http.js";
+import type { JwtSigner } from "./qweather-jwt.js";
 import { getCache, getSetting, setCache, setSetting } from "./settings.js";
 
 /**
  * QWeather 客户端（v2 唯一天气数据源）。
- * 端点与参数对照旧仓库 provider 实现，key 走 query 参数、业务错误为 HTTP 200 + body.code。
+ * 端点与参数对照旧仓库 provider 实现，业务错误为 HTTP 200 + body.code。
+ *
+ * 认证：JWT（Ed25519）优先，API KEY 保留为回退（官方自 2027-02-01 起限制 API KEY 日请求量）。
+ * JWT 模式带 `Authorization: Bearer <token>` 且 URL 不带 `key=`；API KEY 模式 URL 带 `key=`。
+ *
+ * 上游合规约束（本文件的三条红线，均来自 QWeather 官方文档）：
+ * 1. 《缓存你的数据》：按数据类型缓存推荐时间内的结果；
+ * 2. 《优化请求》：限制并发，只对 429/5xx 做指数退避，4xx 立即停止 —— 反复重试
+ *    错误请求会被判定为攻击并冻结账号；
+ * 3. GeoAPI 结果不得缓存/批量存储/建索引，只允许进程内短期 memo。
  */
 
 export interface LocationInfo {
@@ -49,10 +60,303 @@ export interface AirQuality {
   pm10?: number;
 }
 
+/**
+ * 缓存 TTL。QWeather《缓存你的数据》给出的是区间，本项目只取中间值：
+ * 实时天气 10–30min → 20min；逐天预报 1–6h → 2h；天气预警 5–20min → 10min；
+ * 实时空气质量 30–60min → 45min。
+ */
+export const CACHE_TTL_MS = {
+  now: 20 * 60_000,
+  daily: 2 * 3_600_000,
+  alerts: 10 * 60_000,
+  air: 45 * 60_000,
+} as const;
+
+/** 同一进程内对 QWeather 的并发请求上限（《优化请求》要求限制并发）。 */
+export const QWEATHER_MAX_CONCURRENCY = 3;
+
+/** 指数退避：t = b^c（b=2），c 上限 10，单次等待上限 15 分钟。 */
+export const BACKOFF_BASE = 2;
+export const BACKOFF_MAX_EXPONENT = 10;
+export const BACKOFF_MAX_WAIT_MS = 15 * 60_000;
+
+/** 供测试注入假 sleep / 假随机数；生产走默认实现。 */
+export interface QweatherDeps {
+  sleep(ms: number): Promise<void>;
+  random(): number;
+  /** 单次调用最多尝试次数（含首次） */
+  maxAttempts: number;
+  /** 单次退避等待上限 */
+  maxWaitMs: number;
+}
+
+const defaultDeps: QweatherDeps = {
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  random: Math.random,
+  maxAttempts: 3,
+  maxWaitMs: BACKOFF_MAX_WAIT_MS,
+};
+
+let deps: QweatherDeps = defaultDeps;
+
+/** 进程内连续可重试错误计数 c；跨调用保留，任一次成功即重置。 */
+let backoffExponent = 0;
+
+/**
+ * 并发闸门：同一时刻在飞的 QWeather 请求不超过 max，超出者排队等待
+ * （不丢请求、不抛错）。释放时把名额直接移交给下一个等待者，避免瞬时超额。
+ */
+class Semaphore {
+  private active = 0;
+  private readonly queue: Array<() => void> = [];
+
+  constructor(private readonly max: number) {}
+
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    await this.acquire();
+    try {
+      return await fn();
+    } finally {
+      this.release();
+    }
+  }
+
+  private acquire(): Promise<void> {
+    if (this.active < this.max) {
+      this.active += 1;
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      this.queue.push(resolve);
+    });
+  }
+
+  private release(): void {
+    const next = this.queue.shift();
+    if (next === undefined) this.active -= 1;
+    else next();
+  }
+}
+
+const gate = new Semaphore(QWEATHER_MAX_CONCURRENCY);
+
+/** QWeather 认证：JWT（Ed25519，官方长期方案）优先；API KEY 保留为回退。 */
+export type QweatherAuth = { mode: "jwt"; signer: JwtSigner } | { mode: "key"; apiKey: string };
+
+const JWT_AUTH_HINT =
+  "JWT 认证失败：核对 kid、项目 ID(sub)、开发者 ID(iss) 是否与上传到 QWeather 控制台的公钥匹配";
+const KEY_AUTH_HINT =
+  "API KEY 认证失败：核对 QWEATHER_KEY 是否有效、是否与 QWEATHER_API_HOST 属于同一项目";
+
+/**
+ * 当前认证方式。生产环境由 config 在启动时注入一次；模块内所有 QWeather 请求共用。
+ * 之所以放在模块级而非逐调用传参：调用方（weather 模块）按旧签名只传 host+key，
+ * 无法在不改动其契约的前提下携带 JWT 签名器。
+ */
+let activeAuth: QweatherAuth | null = null;
+
+/** 注入当前认证方式（config 启动时调用；传 null 表示未配置 QWeather）。 */
+export function setQweatherAuth(auth: QweatherAuth | null): void {
+  activeAuth = auth;
+}
+
+/** 仅供测试：注入假 sleep/随机数并重置进程内状态。 */
+export function setQweatherDepsForTests(overrides: Partial<QweatherDeps> | null): void {
+  deps = overrides === null ? defaultDeps : { ...defaultDeps, ...overrides };
+}
+
+/** 仅供测试：重置退避计数、Geo memo 与认证方式，避免用例之间相互影响。 */
+export function resetQweatherStateForTests(): void {
+  deps = defaultDeps;
+  backoffExponent = 0;
+  activeAuth = null;
+  geoMemo.clear();
+}
+
+export class QweatherApiError extends Error {
+  readonly code: string;
+
+  constructor(api: string, code: string) {
+    super(`QWeather ${api} error code ${code}`);
+    this.name = "QweatherApiError";
+    this.code = code;
+  }
+}
+
 function assertQwCode(code: unknown, api: string): void {
   if (code === undefined || code === null) return;
   if (String(code) === "200") return;
-  throw new Error(`QWeather ${api} error code ${String(code)}`);
+  throw new QweatherApiError(api, String(code));
+}
+
+/** 429 与 5xx 才是可重试的限流/服务端故障；4xx 不是。 */
+function isRetryableStatus(status: number | string): boolean {
+  const n = Number(status);
+  return n === 429 || (n >= 500 && n <= 599);
+}
+
+/**
+ * 官方红线：对错误的请求反复重试会被视为攻击、导致账号冻结。
+ * 因此只对 429/5xx 与瞬时网络故障退避重试；400/401/403/404 等 4xx 与
+ * 业务参数错误一律立即抛出，绝不重试。
+ */
+function isRetryableError(e: unknown): boolean {
+  if (e instanceof HttpError) return isRetryableStatus(e.status);
+  if (e instanceof QweatherApiError) return isRetryableStatus(e.code);
+  // fetch 自身的网络失败：undici 抛 TypeError；超时被中止时抛 DOMException
+  return (
+    e instanceof TypeError ||
+    (e instanceof DOMException && (e.name === "AbortError" || e.name === "TimeoutError"))
+  );
+}
+
+/** 第 c 次退避的等待毫秒数：2^c 秒 + [0, 2^c - 1] 秒抖动，再受 maxWaitMs 约束。 */
+export function backoffDelayMs(c: number, random: () => number, maxWaitMs: number): number {
+  const exponent = Math.min(c, BACKOFF_MAX_EXPONENT);
+  const baseSeconds = BACKOFF_BASE ** exponent;
+  const jitterSeconds = Math.floor(random() * baseSeconds);
+  return Math.min((baseSeconds + jitterSeconds) * 1000, maxWaitMs);
+}
+
+/**
+ * 退避重试。整个重试序列只在真正发起网络请求时占用并发名额，退避等待期间不占名额，
+ * 避免一个被限流的请求拖住其它请求。operation 里只做「取数 + 判定是否可重试」，
+ * 解析/校验失败抛普通 Error（不可重试）。
+ */
+async function withRetry<T>(operation: () => Promise<T>): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= deps.maxAttempts; attempt += 1) {
+    try {
+      const value = await operation();
+      backoffExponent = 0; // 任一次成功即重置退避
+      return value;
+    } catch (e) {
+      if (!isRetryableError(e)) throw e;
+      lastError = e;
+      backoffExponent = Math.min(backoffExponent + 1, BACKOFF_MAX_EXPONENT);
+      if (attempt < deps.maxAttempts) {
+        await deps.sleep(backoffDelayMs(backoffExponent, deps.random, deps.maxWaitMs));
+      }
+    }
+  }
+  throw lastError;
+}
+
+interface QwRequest {
+  url: string;
+  headers: Record<string, string>;
+}
+
+/**
+ * 认证方式的判定顺序：显式注入的 activeAuth（生产由 config 启动时设置）优先；
+ * 否则退回调用方传入的 API KEY（测试直连场景）。两者都没有则明确报错，绝不发匿名请求。
+ */
+function resolveAuth(key: string): QweatherAuth {
+  if (activeAuth !== null) return activeAuth;
+  if (key !== "") return { mode: "key", apiKey: key };
+  throw new Error("QWeather 未配置认证凭据（QWEATHER_KEY 或 QWEATHER_JWT_*）");
+}
+
+/**
+ * 统一的 URL + 认证头构造：
+ * - JWT 模式：URL 不带 `key=`，带 `Authorization: Bearer <token>`；
+ * - API KEY 模式：URL 带 `key=`，不带 Authorization 头。
+ * token 只在此处取一次：整个退避重试序列复用同一 token，不逐次重签。
+ */
+function buildRequest(
+  host: string,
+  path: string,
+  params: Record<string, string>,
+  auth: QweatherAuth,
+): QwRequest {
+  const search = new URLSearchParams(params);
+  const headers: Record<string, string> = {};
+  if (auth.mode === "jwt") headers.Authorization = `Bearer ${auth.signer.token()}`;
+  else search.set("key", auth.apiKey);
+  const query = search.toString();
+  return { url: `https://${host}${path}${query === "" ? "" : `?${query}`}`, headers };
+}
+
+/**
+ * 401/403 补一句可操作的排查提示；其他错误原样返回。提示里不含 token / key。
+ * 转成普通 Error 后不再被 isRetryableError 视为可重试 —— 认证失败重试无意义。
+ */
+function withAuthHint(e: unknown, auth: QweatherAuth): unknown {
+  const unauthorized =
+    (e instanceof HttpError && (e.status === 401 || e.status === 403)) ||
+    (e instanceof QweatherApiError && (e.code === "401" || e.code === "403"));
+  if (!unauthorized) return e;
+  const message = e instanceof Error ? e.message : String(e);
+  return new Error(`${message}（${auth.mode === "jwt" ? JWT_AUTH_HINT : KEY_AUTH_HINT}）`);
+}
+
+async function gateFetch(req: QwRequest): Promise<Record<string, unknown>> {
+  return gate.run(
+    async () => (await fetchJson(req.url, undefined, req.headers)) as Record<string, unknown>,
+  );
+}
+
+/**
+ * 取 JSON 并校验 QWeather 业务码。业务码校验必须在重试循环内 —— 否则 HTTP 200 +
+ * body.code=429 这类限流会被当成不可重试，白白绕过退避直接失败。
+ */
+async function requestQw(
+  req: QwRequest,
+  auth: QweatherAuth,
+  api: string,
+): Promise<Record<string, unknown>> {
+  try {
+    return await withRetry(async () => {
+      const body = await gateFetch(req);
+      assertQwCode(body.code, api);
+      return body;
+    });
+  } catch (e) {
+    throw withAuthHint(e, auth);
+  }
+}
+
+/**
+ * 空气质量 v1 的失败契约是 HTTP 200 + body.error{status,title}（不是 body.code）。
+ * 仍按 status 判定是否可重试：429/5xx 退避，其余（401/403/404…）立即抛出。
+ */
+async function requestAirQuality(
+  req: QwRequest,
+  auth: QweatherAuth,
+): Promise<Record<string, unknown>> {
+  try {
+    return await withRetry(async () => {
+      const body = await gateFetch(req);
+      if (body.error !== undefined) {
+        const err = body.error as { status?: unknown; title?: unknown };
+        const status = Number(err.status);
+        if (isRetryableStatus(status)) throw new QweatherApiError("airquality", String(err.status));
+        throw new Error(
+          `QWeather airquality error ${String(err.status ?? "")}: ${String(err.title ?? "")}`,
+        );
+      }
+      return body;
+    });
+  } catch (e) {
+    throw withAuthHint(e, auth);
+  }
+}
+
+/**
+ * 读缓存 → 未命中则请求 → 仅成功结果写缓存。
+ * produce 抛错时不会写缓存（错误被固化会让故障长期自愈不了）。
+ */
+async function cached<T>(
+  db: DatabaseSync,
+  cacheKey: string,
+  ttlMs: number,
+  produce: () => Promise<T>,
+): Promise<T> {
+  const hit = getCache<T>(db, cacheKey);
+  if (hit !== undefined) return hit;
+  const value = await produce();
+  setCache(db, cacheKey, value, ttlMs);
+  return value;
 }
 
 function num(value: unknown, field: string): number {
@@ -71,6 +375,43 @@ function num(value: unknown, field: string): number {
 
 const GEO_ID_RE = /^[A-Za-z0-9]+$/;
 
+/** Geo memo 容量与有效期（仅进程内，绝不落盘）。 */
+const GEO_MEMO_MAX = 64;
+const GEO_MEMO_TTL_MS = 24 * 3_600_000;
+const geoMemo = new Map<string, { at: number; value: LocationInfo }>();
+const legacyGeoCleared = new WeakSet<object>();
+
+/**
+ * GeoAPI 合规红线：官方《缓存你的数据》与《使用限制》明确禁止缓存、提取、
+ * 批量存储 GeoAPI 数据，也不得据此建立索引（版权方要求，违规可能承担法律责任）。
+ * 旧实现曾把结果写进 cache 表 7 天，这里清理可能残留的历史行（每库一次）。
+ */
+function clearLegacyGeoCache(db: DatabaseSync): void {
+  if (legacyGeoCleared.has(db)) return;
+  legacyGeoCleared.add(db);
+  db.prepare("DELETE FROM cache WHERE key LIKE 'qweather:geo:%'").run();
+}
+
+function geoMemoGet(city: string, nowMs: number): LocationInfo | undefined {
+  const entry = geoMemo.get(city);
+  if (entry === undefined) return undefined;
+  if (nowMs - entry.at > GEO_MEMO_TTL_MS) {
+    geoMemo.delete(city);
+    return undefined;
+  }
+  return entry.value;
+}
+
+function geoMemoSet(city: string, value: LocationInfo, nowMs: number): void {
+  geoMemo.delete(city);
+  geoMemo.set(city, { at: nowMs, value });
+  while (geoMemo.size > GEO_MEMO_MAX) {
+    const oldest = geoMemo.keys().next().value;
+    if (oldest === undefined) break;
+    geoMemo.delete(oldest);
+  }
+}
+
 export async function geoLookup(
   db: DatabaseSync,
   host: string,
@@ -79,17 +420,16 @@ export async function geoLookup(
 ): Promise<LocationInfo> {
   const trimmed = city.trim();
   if (trimmed === "" || trimmed.length > 64) throw new Error(`城市名不合法: ${trimmed}`);
-  const cacheKey = `qweather:geo:${trimmed}`;
-  const cached = getCache<{ id: string; lat: number; lon: number }>(db, cacheKey);
-  if (cached !== undefined) {
-    if (GEO_ID_RE.test(cached.id) && Number.isFinite(cached.lat) && Number.isFinite(cached.lon)) {
-      return { city: trimmed, cityId: cached.id, lat: cached.lat, lon: cached.lon };
-    }
-  }
-  const body = (await fetchJson(
-    `https://${host}/geo/v2/city/lookup?location=${encodeURIComponent(trimmed)}&key=${key}`,
+  clearLegacyGeoCache(db);
+  const nowMs = Date.now();
+  const memo = geoMemoGet(trimmed, nowMs);
+  if (memo !== undefined) return memo;
+  const auth = resolveAuth(key);
+  const body = (await requestQw(
+    buildRequest(host, "/geo/v2/city/lookup", { location: trimmed }, auth),
+    auth,
+    "GeoAPI",
   )) as { code?: unknown; location?: Array<{ id: string; lat: string; lon: string }> };
-  assertQwCode(body.code, "GeoAPI");
   const hit = body.location?.[0];
   const id = hit?.id ?? "";
   if (!GEO_ID_RE.test(id)) throw new Error(`未找到城市: ${trimmed}`);
@@ -97,8 +437,9 @@ export async function geoLookup(
   const lon = num(hit?.lon, "lon");
   if (lat < -90 || lat > 90 || lon < -180 || lon > 180)
     throw new Error(`城市坐标不合法: ${trimmed}`);
-  setCache(db, cacheKey, { id, lat, lon }, 7 * 24 * 3600 * 1000);
-  return { city: trimmed, cityId: id, lat, lon };
+  const value = { city: trimmed, cityId: id, lat, lon };
+  geoMemoSet(trimmed, value, nowMs);
+  return value;
 }
 
 export function cachedLocation(db: DatabaseSync, profileId: string): LocationInfo | null {
@@ -110,59 +451,80 @@ export function saveLocation(db: DatabaseSync, profileId: string, loc: LocationI
 }
 
 export async function currentWeather(
+  db: DatabaseSync,
   host: string,
   key: string,
   loc: LocationInfo,
 ): Promise<CurrentWeather> {
-  const body = (await fetchJson(
-    `https://${host}/v7/weather/now?location=${loc.cityId}&key=${key}`,
-  )) as { code?: unknown; now?: Record<string, unknown> };
-  assertQwCode(body.code, "weather/now");
-  const now = body.now;
-  if (now === undefined) throw new Error("QWeather weather/now 响应缺少 now");
-  return {
-    temp: num(now.temp, "temp"),
-    feelsLike: num(now.feelsLike, "feelsLike"),
-    humidity: num(now.humidity, "humidity"),
-    windSpeed: num(now.windSpeed, "windSpeed"),
-    text: String(now.text ?? ""),
-  };
+  const auth = resolveAuth(key);
+  return cached(db, `qweather:now:${loc.cityId}`, CACHE_TTL_MS.now, async () => {
+    const body = (await requestQw(
+      buildRequest(host, "/v7/weather/now", { location: loc.cityId }, auth),
+      auth,
+      "weather/now",
+    )) as { code?: unknown; now?: Record<string, unknown> };
+    const now = body.now;
+    if (now === undefined) throw new Error("QWeather weather/now 响应缺少 now");
+    return {
+      temp: num(now.temp, "temp"),
+      feelsLike: num(now.feelsLike, "feelsLike"),
+      humidity: num(now.humidity, "humidity"),
+      windSpeed: num(now.windSpeed, "windSpeed"),
+      text: String(now.text ?? ""),
+    };
+  });
+}
+
+/**
+ * 逐天预报的跨日陷阱：23:00 取到的 7 天预报若沿用 2 小时 TTL，过了 00:00 首日
+ * 会变成「昨天」。因此 TTL 取 min(2h, 距本地次日 00:00 的剩余时间)。
+ */
+export function dailyForecastTtlMs(nowMs: number): number {
+  const dt = DateTime.fromMillis(nowMs, { zone: TZ });
+  const nextMidnight = dt.startOf("day").plus({ days: 1 });
+  return Math.max(0, Math.min(CACHE_TTL_MS.daily, nextMidnight.toMillis() - nowMs));
 }
 
 export async function forecast(
+  db: DatabaseSync,
   host: string,
   key: string,
   loc: LocationInfo,
   days: 3 | 7,
 ): Promise<ForecastDay[]> {
   const path = days <= 3 ? "3d" : "7d";
-  const body = (await fetchJson(
-    `https://${host}/v7/weather/${path}?location=${loc.cityId}&key=${key}`,
-  )) as { code?: unknown; daily?: Array<Record<string, unknown>> };
-  assertQwCode(body.code, `weather/${path}`);
-  // 缺失 daily 说明响应不完整；静默变成空预报会让简报得出「适宜出行」的错误结论。
-  if (!Array.isArray(body.daily) || body.daily.length === 0) {
-    throw new Error(`QWeather weather/${path} 响应缺少有效的 daily 数组`);
-  }
-  const daily = body.daily;
-  // 用本地日历日过滤：UTC 日期在 00:00–08:00（Asia/Shanghai）会落在前一天，放行已过期的预报行
-  const today = todayIso();
-  return daily
-    .map((d) => {
-      // 上游把「无降水」写作 "0.0"（而非 "0"），必须按数值判断
-      const precip =
-        d.precip === undefined || d.precip === null || d.precip === ""
-          ? 0
-          : num(d.precip, "precip");
-      return {
-        date: String(d.fxDate ?? ""),
-        tMax: num(d.tempMax, "tempMax"),
-        tMin: num(d.tempMin, "tempMin"),
-        textDay: String(d.textDay ?? "").trim(),
-        precipMm: precip > 0 ? precip : undefined,
-      };
-    })
-    .filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d.date) && d.date >= today);
+  const ttl = dailyForecastTtlMs(Date.now());
+  const auth = resolveAuth(key);
+  return cached(db, `qweather:daily:${days}:${loc.cityId}`, ttl, async () => {
+    const body = (await requestQw(
+      buildRequest(host, `/v7/weather/${path}`, { location: loc.cityId }, auth),
+      auth,
+      `weather/${path}`,
+    )) as { code?: unknown; daily?: Array<Record<string, unknown>> };
+    // 缺失 daily 说明响应不完整；静默变成空预报会让简报得出「适宜出行」的错误结论。
+    if (!Array.isArray(body.daily) || body.daily.length === 0) {
+      throw new Error(`QWeather weather/${path} 响应缺少有效的 daily 数组`);
+    }
+    const daily = body.daily;
+    // 用本地日历日过滤：UTC 日期在 00:00–08:00（Asia/Shanghai）会落在前一天，放行已过期的预报行
+    const today = todayIso();
+    return daily
+      .map((d) => {
+        // 上游把「无降水」写作 "0.0"（而非 "0"），必须按数值判断
+        const precip =
+          d.precip === undefined || d.precip === null || d.precip === ""
+            ? 0
+            : num(d.precip, "precip");
+        return {
+          date: String(d.fxDate ?? ""),
+          tMax: num(d.tempMax, "tempMax"),
+          tMin: num(d.tempMin, "tempMin"),
+          textDay: String(d.textDay ?? "").trim(),
+          precipMm: precip > 0 ? precip : undefined,
+        };
+      })
+      .filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d.date) && d.date >= today);
+  });
 }
 
 /** v1 预警的 color.code 即国标预警级别；也兼容少数返回英文色名的实现 */
@@ -184,28 +546,33 @@ function alertLevelOf(color: unknown, severity: unknown): string {
 }
 
 export async function alerts(
+  db: DatabaseSync,
   host: string,
   key: string,
   loc: LocationInfo,
 ): Promise<WeatherAlert[]> {
   const lat = loc.lat.toFixed(2);
   const lon = loc.lon.toFixed(2);
-  const body = (await fetchJson(
-    `https://${host}/weatheralert/v1/current/${lat}/${lon}?key=${key}`,
-  )) as { code?: unknown; alerts?: Array<Record<string, unknown>> };
-  assertQwCode(body.code, "weatheralert");
-  // v1 预警结构为 { id, eventType{name,code}, color{code}, severity, effectiveTime,
-  // onsetTime, expireTime, headline, description }：没有 level/startsAt/endsAt/title。
-  // 此前按已废弃的 v7 结构读取，导致级别恒为空、起止时间恒为 undefined。
-  return (body.alerts ?? []).map((a) => ({
-    id: String(a.id ?? ""),
-    title: String(a.headline ?? a.title ?? "天气预警"),
-    level: alertLevelOf(a.color, a.severity),
-    type: String((a.eventType as { name?: unknown } | undefined)?.name ?? "天气预警"),
-    description: String(a.description ?? a.headline ?? ""),
-    startsAt: isoOrUndefined(a.effectiveTime ?? a.onsetTime ?? a.startsAt),
-    endsAt: isoOrUndefined(a.expireTime ?? a.endsAt),
-  }));
+  const auth = resolveAuth(key);
+  return cached(db, `qweather:alerts:${lat},${lon}`, CACHE_TTL_MS.alerts, async () => {
+    const body = (await requestQw(
+      buildRequest(host, `/weatheralert/v1/current/${lat}/${lon}`, {}, auth),
+      auth,
+      "weatheralert",
+    )) as { code?: unknown; alerts?: Array<Record<string, unknown>> };
+    // v1 预警结构为 { id, eventType{name,code}, color{code}, severity, effectiveTime,
+    // onsetTime, expireTime, headline, description }：没有 level/startsAt/endsAt/title。
+    // 此前按已废弃的 v7 结构读取，导致级别恒为空、起止时间恒为 undefined。
+    return (body.alerts ?? []).map((a) => ({
+      id: String(a.id ?? ""),
+      title: String(a.headline ?? a.title ?? "天气预警"),
+      level: alertLevelOf(a.color, a.severity),
+      type: String((a.eventType as { name?: unknown } | undefined)?.name ?? "天气预警"),
+      description: String(a.description ?? a.headline ?? ""),
+      startsAt: isoOrUndefined(a.effectiveTime ?? a.onsetTime ?? a.startsAt),
+      endsAt: isoOrUndefined(a.expireTime ?? a.endsAt),
+    }));
+  });
 }
 
 function isoOrUndefined(value: unknown): string | undefined {
@@ -230,48 +597,49 @@ export function cnAqiCategory(aqi: number): string {
 }
 
 export async function airQuality(
+  db: DatabaseSync,
   host: string,
   key: string,
   loc: LocationInfo,
 ): Promise<AirQuality> {
   const lat = loc.lat.toFixed(2);
   const lon = loc.lon.toFixed(2);
-  const body = (await fetchJson(
-    `https://${host}/airquality/v1/current/${lat}/${lon}?key=${key}&lang=zh`,
-  )) as {
-    error?: { status?: unknown; title?: unknown };
-    indexes?: Array<Record<string, unknown>>;
-    pollutants?: Array<Record<string, unknown>>;
-  };
-  if (body.error !== undefined) {
-    throw new Error(
-      `QWeather airquality error ${String(body.error.status ?? "")}: ${String(body.error.title ?? "")}`,
+  const auth = resolveAuth(key);
+  return cached(db, `qweather:air:${lat},${lon}`, CACHE_TTL_MS.air, async () => {
+    const body = (await requestAirQuality(
+      buildRequest(host, `/airquality/v1/current/${lat}/${lon}`, { lang: "zh" }, auth),
+      auth,
+    )) as {
+      indexes?: Array<Record<string, unknown>>;
+      pollutants?: Array<Record<string, unknown>>;
+    };
+    const index = (body.indexes ?? []).find((i) => i.code === "cn-mee" || i.code === "cn-mee-1h");
+    if (index === undefined) throw new Error("QWeather airquality 未返回国标指数(cn-mee)");
+    const aqi = num(index.aqi, "aqi");
+    if (aqi < 0 || aqi > 500) throw new Error(`QWeather aqi 超出范围: ${aqi}`);
+    const rawCategory = String(index.category ?? "");
+    const category = /\p{Script=Han}/u.test(rawCategory) ? rawCategory : cnAqiCategory(aqi);
+    const primaryRaw = String(
+      (index.primaryPollutant as { name?: unknown } | undefined)?.name ?? "",
     );
-  }
-  const index = (body.indexes ?? []).find((i) => i.code === "cn-mee" || i.code === "cn-mee-1h");
-  if (index === undefined) throw new Error("QWeather airquality 未返回国标指数(cn-mee)");
-  const aqi = num(index.aqi, "aqi");
-  if (aqi < 0 || aqi > 500) throw new Error(`QWeather aqi 超出范围: ${aqi}`);
-  const rawCategory = String(index.category ?? "");
-  const category = /\p{Script=Han}/u.test(rawCategory) ? rawCategory : cnAqiCategory(aqi);
-  const primaryRaw = String((index.primaryPollutant as { name?: unknown } | undefined)?.name ?? "");
-  const pollutants: Record<string, number> = {};
-  for (const p of body.pollutants ?? []) {
-    const code = String(p.code ?? "");
-    const concentration = p.concentration as { value?: unknown; unit?: unknown } | undefined;
-    const unit = String(concentration?.unit ?? "")
-      .replace(/µ|μ/g, "u")
-      .replace(/\s/g, "");
-    if (concentration?.value === undefined || !Number.isFinite(Number(concentration.value)))
-      continue;
-    if (unit !== "ug/m3" && unit !== "ug/m³") continue;
-    pollutants[code] = Number(concentration.value);
-  }
-  return {
-    aqi,
-    category,
-    primary: primaryRaw === "" || primaryRaw === "NA" ? undefined : primaryRaw,
-    pm25: pollutants.pm2p5,
-    pm10: pollutants.pm10,
-  };
+    const pollutants: Record<string, number> = {};
+    for (const p of body.pollutants ?? []) {
+      const code = String(p.code ?? "");
+      const concentration = p.concentration as { value?: unknown; unit?: unknown } | undefined;
+      const unit = String(concentration?.unit ?? "")
+        .replace(/µ|μ/g, "u")
+        .replace(/\s/g, "");
+      if (concentration?.value === undefined || !Number.isFinite(Number(concentration.value)))
+        continue;
+      if (unit !== "ug/m3" && unit !== "ug/m³") continue;
+      pollutants[code] = Number(concentration.value);
+    }
+    return {
+      aqi,
+      category,
+      primary: primaryRaw === "" || primaryRaw === "NA" ? undefined : primaryRaw,
+      pm25: pollutants.pm2p5,
+      pm10: pollutants.pm10,
+    };
+  });
 }

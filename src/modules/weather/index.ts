@@ -91,24 +91,24 @@ export async function weatherTool(args: Record<string, unknown>, ctx: ToolContex
     const loc = await resolveLocation(ctx, city);
     if (view === "current") {
       const { host, key } = requireQweather(ctx);
-      const cur = await currentWeather(host, key, loc);
+      const cur = await currentWeather(ctx.db, host, key, loc);
       return okJson({ 城市: loc.city, 天气: weatherTable(cur) });
     }
     if (view === "forecast") {
       const { host, key } = requireQweather(ctx);
       const days = (args.days as number) === 3 ? 3 : 7;
-      const list = await forecast(host, key, loc, days);
+      const list = await forecast(ctx.db, host, key, loc, days);
       return okJson({ 城市: loc.city, 预报: forecastTable(list) });
     }
     if (view === "alert") {
       const { host, key } = requireQweather(ctx);
-      const list = await alerts(host, key, loc);
+      const list = await alerts(ctx.db, host, key, loc);
       if (list.length === 0) return ok(`${loc.city}：当前无生效气象预警`);
       return okJson({ 城市: loc.city, 预警: alertTable(list) });
     }
     if (view === "air") {
       const { host, key } = requireQweather(ctx);
-      const air = await airQuality(host, key, loc);
+      const air = await airQuality(ctx.db, host, key, loc);
       return okJson({ 城市: loc.city, 空气质量: airTable(air) });
     }
     return fail(`未知 view: ${view}`);
@@ -141,10 +141,10 @@ export async function runDailyBrief(): Promise<void> {
         cityCache.set(city, loc);
       }
       const [cur, fc, air, alertList] = await Promise.all([
-        currentWeather(host, key, loc).catch(() => null),
-        forecast(host, key, loc, 7).catch(() => null),
-        airQuality(host, key, loc).catch(() => null),
-        alerts(host, key, loc).catch(() => null),
+        currentWeather(rt.db, host, key, loc).catch(() => null),
+        forecast(rt.db, host, key, loc, 7).catch(() => null),
+        airQuality(rt.db, host, key, loc).catch(() => null),
+        alerts(rt.db, host, key, loc).catch(() => null),
       ]);
       if (cur === null && fc === null) {
         logger.warn(`每日简报跳过 ${profileId}(${city})：天气与预报均失败`);
@@ -216,7 +216,7 @@ registerModule({
         try {
           const loc = await resolveLocation(ctx, args.city as string | undefined);
           const { host, key } = requireQweather(ctx);
-          const air = await airQuality(host, key, loc);
+          const air = await airQuality(ctx.db, host, key, loc);
           return okJson({ 城市: loc.city, 空气质量: airTable(air) });
         } catch (e) {
           return fail(errorMessage(e));
