@@ -270,6 +270,87 @@ export function requiredYears(today: string = todayIso()): number[] {
   return month >= 10 ? [year, year + 1] : [year];
 }
 
+/** 假期区间（由连续的 holiday 行合并而成） */
+export interface HolidayPeriodInfo {
+  name: string;
+  start: string;
+  end: string;
+  days: number;
+  /** 该假期的调休上班日（按日期升序）；按假期名分词匹配归属 */
+  workdays: string[];
+}
+
+function nameTokens(name: string): Set<string> {
+  return new Set(name.split(/[、，,／/\s]+/).filter((token) => token !== ""));
+}
+
+/**
+ * 全部假期区间：`day_type='holiday'` 且日期连续的行合并为一段（首尾相接即同一假期，
+ * 因此跨年元旦会自然衔接）。区间名取段内出现次数最多的 name —— 数据源会用
+ * 「国庆节、中秋节」这类合并名，同一段内也可能逐行不同，取众数最稳定。
+ * 调休上班日按假期名分词匹配（生产库中 workday 行的 name 即所属假期名，如「国庆节」）。
+ */
+export function holidayPeriods(db: DatabaseSync): HolidayPeriodInfo[] {
+  const holidays = db
+    .prepare("SELECT date, name FROM cn_holiday_days WHERE day_type = 'holiday' ORDER BY date")
+    .all() as { date: string; name: string }[];
+  const workdayRows = db
+    .prepare("SELECT date, name FROM cn_holiday_days WHERE day_type = 'workday' ORDER BY date")
+    .all() as { date: string; name: string }[];
+
+  const groups: { dates: string[]; names: string[] }[] = [];
+  for (const row of holidays) {
+    const current = groups[groups.length - 1];
+    const last = current?.dates[current.dates.length - 1];
+    const contiguous =
+      last !== undefined &&
+      DateTime.fromISO(last, { zone: TZ }).plus({ days: 1 }).toISODate() === row.date;
+    if (current !== undefined && contiguous) {
+      current.dates.push(row.date);
+      current.names.push(row.name);
+    } else {
+      groups.push({ dates: [row.date], names: [row.name] });
+    }
+  }
+
+  return groups.map((group) => {
+    const counts = new Map<string, number>();
+    for (const candidate of group.names) counts.set(candidate, (counts.get(candidate) ?? 0) + 1);
+    let name = group.names[0] as string;
+    let best = 0;
+    for (const [candidate, count] of counts) {
+      if (count > best) {
+        best = count;
+        name = candidate;
+      }
+    }
+    const tokens = nameTokens(name);
+    const workdays = workdayRows
+      .filter((row) => {
+        for (const token of nameTokens(row.name)) {
+          if (tokens.has(token)) return true;
+        }
+        return false;
+      })
+      .map((row) => row.date);
+    return {
+      name,
+      start: group.dates[0] as string,
+      end: group.dates[group.dates.length - 1] as string,
+      days: group.dates.length,
+      workdays,
+    };
+  });
+}
+
+/** 该日期在 cn_holiday_days 里的名称（holiday/workday 均可）；未命中返回 null */
+export function holidayDayName(db: DatabaseSync, date: string): string | null {
+  const row = db.prepare("SELECT name FROM cn_holiday_days WHERE date = ?").get(date) as
+    | { name: string }
+    | undefined;
+  return row?.name ?? null;
+}
+
 /** 下一假期（含名称/起止/天数）；无数据返回 null */
 export function nextHolidayPeriod(
   db: DatabaseSync,

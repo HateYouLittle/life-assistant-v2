@@ -1,5 +1,6 @@
 import { z } from "zod";
-import { todayIso } from "../../time.js";
+import { DateTime } from "luxon";
+import { TZ, todayIso } from "../../time.js";
 import {
   errorMessage,
   fail,
@@ -7,9 +8,12 @@ import {
   okJson,
   registerModule,
   runtime,
+  type NotifyBlock,
   type ToolContext,
 } from "../../core/registry.js";
 import { publishProfile } from "../../core/notify.js";
+import type { DatabaseSync } from "node:sqlite";
+import { dayType, holidayDayName, holidayPeriods } from "../../core/holiday.js";
 import { cachedLocation, currentWeather, saveLocation } from "../../core/qweather.js";
 import type {
   AirQuality,
@@ -117,6 +121,53 @@ export async function weatherTool(args: Record<string, unknown>, ctx: ToolContex
   }
 }
 
+/** 简报里的紧凑时刻；无法解析时返回空串，由调用方决定省略 */
+function compactInstant(iso: string | undefined): string {
+  if (iso === undefined) return "";
+  const dt = DateTime.fromISO(iso, { zone: TZ });
+  return dt.isValid ? dt.toFormat("MM-dd HH:mm") : "";
+}
+
+/** 简报预警描述：级别 + 类型 + 起止时间（时间缺失时省略括号，避免出现空括号） */
+function briefAlertText(alert: WeatherAlert): string {
+  const start = compactInstant(alert.startsAt);
+  const end = compactInstant(alert.endsAt);
+  if (start === "" && end === "") return `${alert.level}${alert.type}`;
+  return `${alert.level}${alert.type}（${start || "?"}–${end || "?"}）`;
+}
+
+/** MM-DD，用于简报里的紧凑日期区间 */
+function shortDate(date: string): string {
+  return date.slice(5);
+}
+
+/**
+ * 简报的「补班/放假」提示行：今天补班 → 明天补班 → 明天开始放假，按序取首个命中。
+ * 都不命中返回 null（保持简报简洁）；节假日数据 unknown 时同样返回 null，绝不猜测。
+ */
+function holidayNote(db: DatabaseSync, today: string): string | null {
+  const todayType = dayType(db, today);
+  if (todayType === "unknown") return null;
+  if (todayType === "workday") {
+    const name = holidayDayName(db, today);
+    if (name !== null) return `⚠️ 今天要补班（${name}调休）`;
+  }
+  const tomorrow = DateTime.fromISO(today, { zone: TZ }).plus({ days: 1 }).toISODate();
+  if (tomorrow === null) return null;
+  const tomorrowType = dayType(db, tomorrow);
+  if (tomorrowType === "workday") {
+    const name = holidayDayName(db, tomorrow);
+    if (name !== null) return `⚠️ 明天要补班（${name}调休）`;
+  }
+  if (tomorrowType === "holiday") {
+    const period = holidayPeriods(db).find((candidate) => candidate.start === tomorrow);
+    if (period !== undefined) {
+      return `🎉 明天开始放假（${period.name}，${shortDate(period.start)}–${shortDate(period.end)}，共 ${period.days} 天）`;
+    }
+  }
+  return null;
+}
+
 /** 每日简报：确定性组装，无 LLM；单边数据失败用另一侧，全部失败不发送 */
 export async function runDailyBrief(): Promise<void> {
   const rt = runtime();
@@ -165,10 +216,12 @@ export async function runDailyBrief(): Promise<void> {
           ? "未知"
           : alertList.length === 0
             ? "无"
-            : alertList.map((a) => `${a.level}${a.type}`).join("；"),
+            : alertList.map(briefAlertText).join("；"),
       ]);
 
       const notes: string[] = [];
+      const calendarNote = holidayNote(rt.db, todayIso());
+      if (calendarNote !== null) notes.push(calendarNote);
       if (today !== undefined && today.precipMm !== undefined && today.precipMm > 0)
         notes.push("今日有降水，出门带伞");
       if (today !== undefined && today.tMax - today.tMin >= 10)
@@ -184,6 +237,118 @@ export async function runDailyBrief(): Promise<void> {
       });
     } catch (e) {
       logger.error(`每日简报失败 ${profileId}: ${errorMessage(e)}`);
+    }
+  }
+}
+
+/**
+ * 预警级别 → 序号（越大越严重）。上游 level 既可能是中文色名（qweather 客户端已把英文
+ * 色名转成中文），也可能直接是英文色名，两种都认。
+ */
+const ALERT_LEVEL_RANK: Record<string, number> = {
+  blue: 1,
+  蓝: 1,
+  蓝色: 1,
+  yellow: 2,
+  黄: 2,
+  黄色: 2,
+  orange: 3,
+  橙: 3,
+  橙色: 3,
+  red: 4,
+  红: 4,
+  红色: 4,
+};
+
+/**
+ * 无法识别的级别（含空串）按最高优先级处理：宁可多推，不可漏推。
+ */
+const UNKNOWN_LEVEL_RANK = 5;
+
+function levelRank(level: string): number {
+  const key = level.trim().toLowerCase();
+  if (key === "") return UNKNOWN_LEVEL_RANK;
+  return ALERT_LEVEL_RANK[key] ?? UNKNOWN_LEVEL_RANK;
+}
+
+/** endsAt 已早于当前时刻的预警不再推送；无 endsAt 或解析失败时保留（不误杀）。 */
+function isExpiredAlert(alert: WeatherAlert, nowMs: number): boolean {
+  if (alert.endsAt === undefined) return false;
+  const end = Date.parse(alert.endsAt);
+  return Number.isFinite(end) && end < nowMs;
+}
+
+/**
+ * 去重键：weather.alert:<id>:<级别>。同一预警同级别只推一次；级别升级会得到新键而再推一次。
+ * id 缺失时不能退化成空串（不同预警会共用一个键相互覆盖），改用标题构造稳定串。
+ */
+function alertDedupeKey(alert: WeatherAlert): string {
+  const level = alert.level.trim();
+  const id = alert.id.trim();
+  return id === ""
+    ? `weather.alert:title:${alert.title.trim()}:${level}`
+    : `weather.alert:${id}:${level}`;
+}
+
+function alertTitle(alert: WeatherAlert): string {
+  const level = alert.level.trim();
+  return level === "" ? `⚠️ 气象预警：${alert.type}` : `⚠️ 气象预警：${alert.type} ${level}`;
+}
+
+function alertBlocks(alert: WeatherAlert): NotifyBlock {
+  return {
+    table: {
+      columns: ["级别", "类型", "生效", "失效", "说明"],
+      rows: [
+        [
+          alert.level.trim() || "—",
+          alert.type,
+          alert.startsAt ?? "—",
+          alert.endsAt ?? "—",
+          alert.description,
+        ],
+      ],
+    },
+  };
+}
+
+/**
+ * 气象预警巡检：为每个 Profile（与每日简报同为 listProfiles 口径）检查其位置的生效预警，
+ * 命中即推。走普通通知路径（publishProfile）——静默时段由投递层照常拦截，这里不做任何绕过。
+ * 单个 Profile 失败只记日志，不影响其它 Profile，也不让 job 抛出。
+ */
+export async function runAlertWatch(): Promise<void> {
+  const rt = runtime();
+  if (rt.config.qweatherHost === undefined || rt.config.qweatherKey === undefined) {
+    logger.warn("气象预警巡检跳过：未配置 QWeather");
+    return;
+  }
+  const host = rt.config.qweatherHost;
+  const key = rt.config.qweatherKey;
+  const minRank = ALERT_LEVEL_RANK[rt.config.alertMinLevel] ?? 1;
+  const nowMs = Date.now();
+  const cityCache = new Map<string, LocationInfo>();
+  for (const profileId of listProfiles(rt.db)) {
+    try {
+      const city = cachedLocation(rt.db, profileId)?.city ?? rt.config.defaultCity;
+      let loc = cityCache.get(city);
+      if (loc === undefined) {
+        loc = await geoLookup(rt.db, host, key, city);
+        cityCache.set(city, loc);
+      }
+      const list = await alerts(rt.db, host, key, loc);
+      for (const alert of list) {
+        if (isExpiredAlert(alert, nowMs)) continue;
+        if (levelRank(alert.level) < minRank) continue;
+        await publishProfile(rt.db, rt.config, profileId, {
+          kind: "weather.alert",
+          title: alertTitle(alert),
+          blocks: alertBlocks(alert),
+          dedupeKey: alertDedupeKey(alert),
+        });
+      }
+    } catch (e) {
+      logger.warn(`气象预警巡检失败 ${profileId}: ${errorMessage(e)}`);
     }
   }
 }
@@ -229,6 +394,11 @@ registerModule({
       name: "daily_brief",
       cron: () => runtime().config.dailyBriefCron,
       handler: runDailyBrief,
+    },
+    {
+      name: "alert_watch",
+      cron: () => runtime().config.alertWatchCron,
+      handler: runAlertWatch,
     },
   ],
 });

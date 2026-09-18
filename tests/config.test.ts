@@ -19,6 +19,10 @@ describe("config", () => {
     assert.equal(config.host, "127.0.0.1");
     assert.equal(config.port, 3080);
     assert.equal(config.dailyBriefCron, "0 7 * * *");
+    assert.equal(config.alertWatchCron, "*/20 * * * *");
+    assert.equal(config.alertMinLevel, "blue");
+    assert.equal(config.workdayWatchCron, "0 7 * * *");
+    assert.equal(config.workdayRemindDaysBefore, 3);
     assert.equal(config.defaultCity, "北京");
     assert.equal(config.webApiToken, undefined);
   });
@@ -42,6 +46,37 @@ describe("config", () => {
 
   it("DAILY_BRIEF_CRON 非法拒绝启动", () => {
     assert.throws(() => loadConfig({ ...BASE, DAILY_BRIEF_CRON: "not-cron" }), /cron/);
+  });
+
+  it("ALERT_WATCH_CRON 非法拒绝启动，合法则生效", () => {
+    assert.throws(() => loadConfig({ ...BASE, ALERT_WATCH_CRON: "not-cron" }), /cron/);
+    const config = loadConfig({ ...BASE, ALERT_WATCH_CRON: "*/5 * * * *" });
+    assert.equal(config.alertWatchCron, "*/5 * * * *");
+  });
+
+  it("WORKDAY_WATCH_CRON 非法拒绝启动，合法则生效", () => {
+    assert.throws(() => loadConfig({ ...BASE, WORKDAY_WATCH_CRON: "not-cron" }), /cron/);
+    const config = loadConfig({ ...BASE, WORKDAY_WATCH_CRON: "0 6 * * *" });
+    assert.equal(config.workdayWatchCron, "0 6 * * *");
+  });
+
+  it("WORKDAY_REMIND_DAYS_BEFORE 非法拒绝启动，合法则生效", () => {
+    assert.throws(
+      () => loadConfig({ ...BASE, WORKDAY_REMIND_DAYS_BEFORE: "abc" }),
+      /WORKDAY_REMIND_DAYS_BEFORE/,
+    );
+    assert.throws(
+      () => loadConfig({ ...BASE, WORKDAY_REMIND_DAYS_BEFORE: "-1" }),
+      /WORKDAY_REMIND_DAYS_BEFORE/,
+    );
+    const config = loadConfig({ ...BASE, WORKDAY_REMIND_DAYS_BEFORE: "5" });
+    assert.equal(config.workdayRemindDaysBefore, 5);
+  });
+
+  it("ALERT_MIN_LEVEL 非法拒绝启动，合法则生效", () => {
+    assert.throws(() => loadConfig({ ...BASE, ALERT_MIN_LEVEL: "purple" }), /ALERT_MIN_LEVEL/);
+    const config = loadConfig({ ...BASE, ALERT_MIN_LEVEL: "orange" });
+    assert.equal(config.alertMinLevel, "orange");
   });
 
   it("PORT 非法拒绝启动", () => {

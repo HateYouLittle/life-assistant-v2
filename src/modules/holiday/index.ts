@@ -1,13 +1,17 @@
 import { z } from "zod";
-import { DATE_RE, isDate, todayIso } from "../../time.js";
+import { DateTime } from "luxon";
+import { DATE_RE, TZ, isDate, todayIso } from "../../time.js";
 import {
   dayType,
   ensureYears,
+  holidayDayName,
+  holidayPeriods,
   holidayYearsReady,
   nextHolidayPeriod,
   requiredYears,
 } from "../../core/holiday.js";
 import {
+  errorMessage,
   fail,
   ok,
   okJson,
@@ -16,7 +20,81 @@ import {
   type ToolContext,
   type ToolResult,
 } from "../../core/registry.js";
+import { listProfiles } from "../../core/settings.js";
+import { publishProfile } from "../../core/notify.js";
 import { logger } from "../../core/logger.js";
+
+const ONE_DAY_MS = 86_400_000;
+
+/**
+ * 调休/补班提醒（job workday_watch）。三个互不干扰的触发条件，各自独立去重：
+ * ① 今天补班；② 假期临近（首日距今 ≤ WORKDAY_REMIND_DAYS_BEFORE）；③ 假期最后一天。
+ * 遍历口径与 runDailyBrief 一致（listProfiles）：即使无推送路由也保留通知，供 notify.pull 兜底。
+ * 当天年份数据 unknown 时一律跳过、不猜；单个 Profile 失败只记日志，job 不抛。
+ */
+export async function runWorkdayWatch(): Promise<void> {
+  const rt = runtime();
+  const db = rt.db;
+  const today = todayIso();
+  const todayType = dayType(db, today);
+  if (todayType === "unknown") return;
+
+  const periods = holidayPeriods(db);
+  const remindDays = rt.config.workdayRemindDaysBefore;
+
+  for (const profileId of listProfiles(db)) {
+    try {
+      if (todayType === "workday") {
+        const name = holidayDayName(db, today) ?? "调休";
+        await publishProfile(db, rt.config, profileId, {
+          kind: "holiday.workday",
+          title: `⚠️ 今天要补班（${name}调休）`,
+          blocks: { notes: [`${today} 属${name}调休上班日`] },
+          dedupeKey: `holiday:workday:${today}`,
+        });
+      }
+
+      for (const period of periods) {
+        if (period.start <= today) continue;
+        const daysUntil = Math.round(
+          (DateTime.fromISO(period.start, { zone: TZ }).toMillis() -
+            DateTime.fromISO(today, { zone: TZ }).toMillis()) /
+            ONE_DAY_MS,
+        );
+        if (daysUntil > remindDays) continue;
+        // 只列今天及以后的调休日：已过去的调休日（早已补过班）列进提醒只是噪音。
+        // 过滤后为空时整行省略 —— 「调休日都已过完」与「本来就没有调休日」语义不同，
+        // 后者仍保留「本假期无调休上班日」，前者不再输出。
+        const upcomingWorkdays = period.workdays.filter((date) => date >= today);
+        const notes = [`${period.name}：${period.start}–${period.end}，共 ${period.days} 天`];
+        if (period.workdays.length === 0) {
+          notes.push("本假期无调休上班日");
+        } else if (upcomingWorkdays.length > 0) {
+          notes.push(`调休上班日：${upcomingWorkdays.join("、")}`);
+        }
+        await publishProfile(db, rt.config, profileId, {
+          kind: "holiday.period",
+          title: `📅 ${period.name} 放假安排`,
+          blocks: { notes },
+          dedupeKey: `holiday:period:${period.start}`,
+        });
+      }
+
+      const ending = periods.find((period) => period.end === today);
+      if (ending !== undefined) {
+        const tomorrow = DateTime.fromISO(today, { zone: TZ }).plus({ days: 1 }).toISODate();
+        await publishProfile(db, rt.config, profileId, {
+          kind: "holiday.lastday",
+          title: `${ending.name}假期最后一天`,
+          blocks: { notes: [`明天（${tomorrow}）恢复正常上班`] },
+          dedupeKey: `holiday:lastday:${today}`,
+        });
+      }
+    } catch (e) {
+      logger.warn(`调休/补班提醒失败 ${profileId}: ${errorMessage(e)}`);
+    }
+  }
+}
 
 export async function holidayTool(
   args: Record<string, unknown>,
@@ -114,6 +192,11 @@ registerModule({
         const result = await ensureYears(db, requiredYears());
         if (result.failed.length > 0) logger.warn(`节假日刷新失败: ${result.failed.join("; ")}`);
       },
+    },
+    {
+      name: "workday_watch",
+      cron: () => runtime().config.workdayWatchCron,
+      handler: runWorkdayWatch,
     },
   ],
   onStart: async () => {

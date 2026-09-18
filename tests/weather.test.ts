@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { describe, it, type TestContext } from "node:test";
 import { todayIso } from "../src/time.js";
 import { setPushRoute } from "../src/core/notify.js";
+import { importYear } from "../src/core/holiday.js";
 import { runDailyBrief, weatherTool } from "../src/modules/weather/index.js";
 import { cleanupTestEnv, makeTestEnv, SECRET, type TestEnv } from "./helpers.js";
 
@@ -475,6 +476,94 @@ describe("weather：数值与预报健壮性", () => {
       assert.match(text, /余额不足/);
     } finally {
       globalThis.fetch = original;
+      cleanupTestEnv(env);
+    }
+  });
+});
+
+describe("weather 每日简报：补班/放假提示行", () => {
+  function seedHoliday(env: TestEnv): void {
+    const days = [
+      ...[
+        "2026-10-01",
+        "2026-10-02",
+        "2026-10-03",
+        "2026-10-04",
+        "2026-10-05",
+        "2026-10-06",
+        "2026-10-07",
+      ].map((date) => ({ name: "国庆节", date, isOffDay: true })),
+      ...["2026-09-20", "2026-10-10"].map((date) => ({
+        name: "国庆节",
+        date,
+        isOffDay: false,
+      })),
+    ];
+    importYear(env.db, { year: 2026, days }, "test");
+  }
+
+  async function briefBodyAt(t: TestContext, date: string, env: TestEnv): Promise<string> {
+    t.mock.timers.enable({ apis: ["Date"], now: Date.parse(`${date}T03:00:00+08:00`) });
+    setPushRoute(env.db, "default", { url: "http://127.0.0.1:9/hook" });
+    await withMockFetch(handlerFor, async () => {
+      await runDailyBrief();
+    });
+    const row = env.db
+      .prepare("SELECT body_md FROM notifications WHERE profile_id = 'default'")
+      .get() as { body_md: string };
+    return row.body_md;
+  }
+
+  it("今天要补班 → 提示行", async (t) => {
+    const env = makeTestEnv(ENV);
+    try {
+      seedHoliday(env);
+      const body = await briefBodyAt(t, "2026-09-20", env);
+      assert.match(body, /⚠️ 今天要补班（国庆节调休）/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("明天要补班 → 提示行", async (t) => {
+    const env = makeTestEnv(ENV);
+    try {
+      seedHoliday(env);
+      const body = await briefBodyAt(t, "2026-09-19", env);
+      assert.match(body, /⚠️ 明天要补班（国庆节调休）/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("明天开始放假 → 提示行（含起止与天数）", async (t) => {
+    const env = makeTestEnv(ENV);
+    try {
+      seedHoliday(env);
+      const body = await briefBodyAt(t, "2026-09-30", env);
+      assert.match(body, /🎉 明天开始放假（国庆节，10-01–10-07，共 7 天）/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("都不命中 → 不加行", async (t) => {
+    const env = makeTestEnv(ENV);
+    try {
+      seedHoliday(env);
+      const body = await briefBodyAt(t, "2026-10-20", env);
+      assert.doesNotMatch(body, /补班|开始放假/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("节假日数据未就绪 → 不加行、不猜", async (t) => {
+    const env = makeTestEnv(ENV);
+    try {
+      const body = await briefBodyAt(t, "2026-09-20", env);
+      assert.doesNotMatch(body, /补班|开始放假/);
+    } finally {
       cleanupTestEnv(env);
     }
   });

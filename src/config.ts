@@ -15,6 +15,9 @@ const profileId = z.string().regex(PROFILE_ID_RE);
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
+/** 气象预警推送的级别阈值（含），由 ALERT_MIN_LEVEL 配置。 */
+export type AlertLevel = "blue" | "yellow" | "orange" | "red";
+
 export interface ResolvedConfig {
   dataDir: string;
   dbPath: string;
@@ -29,6 +32,14 @@ export interface ResolvedConfig {
   defaultCity: string;
   profileRouteSecrets: Record<string, string>;
   dailyBriefCron: string;
+  /** 气象预警巡检 cron（Asia/Shanghai） */
+  alertWatchCron: string;
+  /** 低于此级别的预警不主动推送 */
+  alertMinLevel: AlertLevel;
+  /** 调休/补班提醒 cron（Asia/Shanghai） */
+  workdayWatchCron: string;
+  /** 假期首日提前提醒天数（WORKDAY_REMIND_DAYS_BEFORE） */
+  workdayRemindDaysBefore: number;
   logLevel: LogLevel;
 }
 
@@ -203,6 +214,32 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
     throw new Error(`DAILY_BRIEF_CRON 不是合法 cron 表达式: ${dailyBriefCron}`);
   }
 
+  const alertWatchCron = env.ALERT_WATCH_CRON?.trim() || "*/20 * * * *";
+  if (!cron.validate(alertWatchCron)) {
+    throw new Error(`ALERT_WATCH_CRON 不是合法 cron 表达式: ${alertWatchCron}`);
+  }
+
+  const alertMinLevelRaw = env.ALERT_MIN_LEVEL?.trim() || "blue";
+  const alertMinLevel = z.enum(["blue", "yellow", "orange", "red"]).safeParse(alertMinLevelRaw);
+  if (!alertMinLevel.success) {
+    throw new Error(`ALERT_MIN_LEVEL 不合法: ${alertMinLevelRaw}（可选 blue|yellow|orange|red）`);
+  }
+
+  const workdayWatchCron = env.WORKDAY_WATCH_CRON?.trim() || "0 7 * * *";
+  if (!cron.validate(workdayWatchCron)) {
+    throw new Error(`WORKDAY_WATCH_CRON 不是合法 cron 表达式: ${workdayWatchCron}`);
+  }
+
+  const remindDaysRaw = env.WORKDAY_REMIND_DAYS_BEFORE?.trim() || "3";
+  const workdayRemindDaysBefore = Number(remindDaysRaw);
+  if (
+    !Number.isInteger(workdayRemindDaysBefore) ||
+    workdayRemindDaysBefore < 0 ||
+    workdayRemindDaysBefore > 30
+  ) {
+    throw new Error(`WORKDAY_REMIND_DAYS_BEFORE 必须是 0..30 之间的整数: ${remindDaysRaw}`);
+  }
+
   const portRaw = env.PORT?.trim() || "3080";
   const port = Number(portRaw);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -226,6 +263,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
     defaultCity: env.DEFAULT_CITY?.trim() || "北京",
     profileRouteSecrets: parseSecrets(env.PROFILE_ROUTE_SECRETS_JSON),
     dailyBriefCron,
+    alertWatchCron,
+    alertMinLevel: alertMinLevel.data,
+    workdayWatchCron,
+    workdayRemindDaysBefore,
     logLevel: logLevel.data,
   };
 }
