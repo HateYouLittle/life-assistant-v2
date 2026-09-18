@@ -107,7 +107,7 @@ registerModule({
   ],
   jobs: [
     {
-      name: "holiday_refresh",
+      name: "refresh",
       cron: "0 2 * * *",
       handler: async () => {
         const { db } = runtime();

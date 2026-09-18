@@ -248,7 +248,7 @@ registerModule({
   ],
   jobs: [
     {
-      name: "schedule.occurrence_cleanup",
+      name: "occurrence_cleanup",
       cron: "30 4 * * *",
       handler: () => {
         const { db } = runtime();
