@@ -555,6 +555,132 @@ describe("schedule 工具：更新不静默丢提醒", () => {
     }
   });
 
+  describe("强提醒（:resend）与当前排期一致", () => {
+    /**
+     * 造出「主提醒已发出、强提醒待触发」的现场：事件定在 2 小时前（必然已过期），
+     * reminder 行标 notified，:resend 行按 resendMinutes 排定。
+     */
+    function seedOverdueResend(env: TestEnv, resendMinutes: number) {
+      const at = now().minus({ hours: 2 });
+      const date = at.toISODate() as string;
+      const time = at.toFormat("HH:mm");
+      const created = createSchedule(env.db, "default", {
+        title: "强提醒任务",
+        kind: "todo",
+        calendar: "solar",
+        startDate: date,
+        time,
+        allDay: false,
+        recurrence: { freq: "daily", interval: 1 },
+        remindOffsets: [0],
+        resendMinutes,
+        workdayFilter: "any",
+      });
+      env.db.prepare("DELETE FROM occurrences WHERE schedule_id = ?").run(created.id);
+      const event = DateTime.fromISO(`${date}T${time}`, { zone: TZ }).toUTC().toISO() ?? "";
+      const insert = env.db.prepare(
+        "INSERT INTO occurrences (schedule_id, occurrence_key, event_at, due_at, status) VALUES (?, ?, ?, ?, ?)",
+      );
+      insert.run(created.id, `${date}T${time}#0`, event, event, "notified");
+      insert.run(
+        created.id,
+        `${date}T${time}#0:resend`,
+        event,
+        DateTime.fromISO(event).plus({ minutes: resendMinutes }).toUTC().toISO() ?? event,
+        "pending",
+      );
+      return { created, date, time, event, resendKey: `${date}T${time}#0:resend` };
+    }
+
+    it("改过提醒时刻后，旧强提醒作废、不按旧时间点推送", async () => {
+      const env = makeTestEnv();
+      try {
+        const { created, resendKey, date, time } = seedOverdueResend(env, 30);
+        const newTime = DateTime.fromISO(`${date}T${time}`, { zone: TZ })
+          .plus({ hours: 3 })
+          .toFormat("HH:mm");
+        updateSchedule(env.db, "default", created.id, { time: newTime });
+
+        await fireDue(env.db, envServices(env), now());
+        const row = occurrenceRows(env, created.id).find((r) => r.occurrence_key === resendKey);
+        assert.equal(row?.status, "cancelled", "旧时刻的强提醒应作废");
+        assert.ok(
+          !env.published.some((p) => p.input.dedupeKey === `sched:${created.id}:${resendKey}`),
+          "不该按旧时间点推强提醒",
+        );
+      } finally {
+        cleanupTestEnv(env);
+      }
+    });
+
+    it("resend_minutes 归零后，已排定的强提醒作废", async () => {
+      const env = makeTestEnv();
+      try {
+        const { created, resendKey } = seedOverdueResend(env, 30);
+        updateSchedule(env.db, "default", created.id, { resendMinutes: 0 });
+        await fireDue(env.db, envServices(env), now());
+        const row = occurrenceRows(env, created.id).find((r) => r.occurrence_key === resendKey);
+        assert.equal(row?.status, "cancelled");
+        assert.ok(
+          !env.published.some((p) => p.input.dedupeKey === `sched:${created.id}:${resendKey}`),
+        );
+      } finally {
+        cleanupTestEnv(env);
+      }
+    });
+
+    it("resend_minutes 调大后按新时刻触发，未到点不打扰", async () => {
+      const env = makeTestEnv();
+      try {
+        const { created, event, resendKey } = seedOverdueResend(env, 30);
+        updateSchedule(env.db, "default", created.id, { resendMinutes: 240 });
+
+        // 校正在触发前完成（fireDue 是唯一判定点）：先按 now() 走一轮
+        await fireDue(env.db, envServices(env), now());
+        const expected = DateTime.fromISO(event).plus({ minutes: 240 }).toUTC().toISO();
+        const row = occurrenceRows(env, created.id).find((r) => r.occurrence_key === resendKey);
+        assert.equal(row?.due_at, expected, "due_at 应校正为 event_at + 新的 resend_minutes");
+        assert.equal(row?.status, "pending");
+        assert.ok(
+          !env.published.some((p) => p.input.dedupeKey === `sched:${created.id}:${resendKey}`),
+          "校正后还没到点，不该提前推",
+        );
+
+        await fireDue(env.db, envServices(env), now().plus({ hours: 3 }));
+        assert.ok(
+          env.published.some((p) => p.input.dedupeKey === `sched:${created.id}:${resendKey}`),
+          "到达新时刻后应照常推送",
+        );
+      } finally {
+        cleanupTestEnv(env);
+      }
+    });
+
+    it("强提醒以事件时刻为基准，不被提醒偏移带偏", async () => {
+      const env = makeTestEnv();
+      try {
+        const { created, event, time } = seedOverdueResend(env, 30);
+        // 模拟 offsets[0] = -60：主提醒行比事件早一小时到点
+        const early = DateTime.fromISO(event).minus({ minutes: 60 }).toUTC().toISO() ?? event;
+        env.db
+          .prepare("UPDATE occurrences SET due_at = ? WHERE schedule_id = ? AND occurrence_key = ?")
+          .run(early, created.id, `${now().minus({ hours: 2 }).toISODate()}T${time}#0`);
+
+        await fireDue(env.db, envServices(env), now());
+        const resend = occurrenceRows(env, created.id).find((r) =>
+          (r.occurrence_key as string).endsWith(":resend"),
+        );
+        const gapMinutes = DateTime.fromISO(resend?.due_at as string).diff(
+          DateTime.fromISO(resend?.event_at as string),
+          "minutes",
+        ).minutes;
+        assert.equal(Math.round(gapMinutes), 30, "重发基准应是事件时刻，而不是被偏移挪过的 due_at");
+      } finally {
+        cleanupTestEnv(env);
+      }
+    });
+  });
+
   it("物化后存在 (schedule_id, status) 索引", () => {
     const env = makeTestEnv();
     try {

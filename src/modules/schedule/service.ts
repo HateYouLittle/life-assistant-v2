@@ -69,6 +69,8 @@ export const KIND_LABEL: Record<ScheduleKind, string> = {
 const CATCHUP_GRACE_MINUTES = 10;
 const NEAR_HORIZON_DAYS = 62;
 const FAR_HORIZON_DAYS = 400;
+/** 强提醒（到点重发一次）行的 occurrence_key 后缀 */
+const RESEND_SUFFIX = ":resend";
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 
@@ -422,8 +424,8 @@ export function updateSchedule(
       id,
     );
     db.prepare(
-      "DELETE FROM occurrences WHERE schedule_id = ? AND status = 'pending' AND occurrence_key NOT LIKE '%:resend'",
-    ).run(id);
+      `DELETE FROM occurrences WHERE schedule_id = ? AND status = 'pending' AND occurrence_key NOT LIKE '%' || ?`,
+    ).run(id, RESEND_SUFFIX);
   });
   const updated = getSchedule(db, profileId, id) as ScheduleRow;
   materializeSchedule(db, updated);
@@ -652,6 +654,38 @@ interface DueRow {
   due_at: string;
 }
 
+/**
+ * 强提醒行的触发前校验。update 会保留 pending 的 :resend 行（本意是别丢掉强提醒），
+ * 但用户改了时间、把 resend_minutes 调小/归零、或该事件已被重排删除之后，旧行仍会按
+ * 旧时间点打扰一次。这里按当前日程重新判定，并强制 due_at = event_at + resend_minutes。
+ * 返回 null 表示该行应作废。
+ */
+function resendDueOrNull(
+  db: DatabaseSync,
+  schedule: ScheduleRow,
+  occurrenceKey: string,
+  eventAt: string,
+): string | null {
+  if (schedule.resend_minutes <= 0) return null;
+  const eventKey = occurrenceKey.slice(0, -RESEND_SUFFIX.length);
+  // key 里带着当时的提醒时刻（`<date>T<time>#0`）：改了 time 之后旧 key 不再出现在日程上，
+  // 这条强提醒已无对应事件，必须作废，否则会用旧时间点推一条「强提醒」。
+  if (!eventKey.endsWith(`${schedule.time}#0`)) return null;
+  const parent = db
+    .prepare(
+      "SELECT 1 FROM occurrences WHERE schedule_id = ? AND occurrence_key = ? AND status != 'cancelled'",
+    )
+    .get(schedule.id, eventKey);
+  if (parent === undefined) return null;
+  return DateTime.fromISO(eventAt).plus({ minutes: schedule.resend_minutes }).toUTC().toISO();
+}
+
+function cancelOccurrence(db: DatabaseSync, occ: DueRow): void {
+  db.prepare(
+    "UPDATE occurrences SET status = 'cancelled' WHERE schedule_id = ? AND occurrence_key = ?",
+  ).run(occ.schedule_id, occ.occurrence_key);
+}
+
 /** 到点触发提醒；返回发布的条数 */
 export async function fireDue(db: DatabaseSync, services: Services, at: DateTime): Promise<number> {
   const cutoff = at.toUTC().toISO() ?? nowIso();
@@ -669,8 +703,23 @@ export async function fireDue(db: DatabaseSync, services: Services, at: DateTime
       | ScheduleRow
       | undefined;
     if (schedule === undefined) continue;
-    const isResend = occ.occurrence_key.endsWith(":resend");
-    const lateMinutes = at.diff(DateTime.fromISO(occ.due_at), "minutes").minutes;
+    const isResend = occ.occurrence_key.endsWith(RESEND_SUFFIX);
+    let dueAt = occ.due_at;
+    if (isResend) {
+      const expected = resendDueOrNull(db, schedule, occ.occurrence_key, occ.event_at);
+      if (expected === null) {
+        cancelOccurrence(db, occ);
+        continue;
+      }
+      if (expected !== occ.due_at) {
+        db.prepare(
+          "UPDATE occurrences SET due_at = ? WHERE schedule_id = ? AND occurrence_key = ?",
+        ).run(expected, occ.schedule_id, occ.occurrence_key);
+        if (expected > cutoff) continue; // 校正后尚未到点，本轮不推
+        dueAt = expected;
+      }
+    }
+    const lateMinutes = at.diff(DateTime.fromISO(dueAt), "minutes").minutes;
     const note = isResend
       ? "（强提醒：以上事项仍未完成）"
       : lateMinutes > CATCHUP_GRACE_MINUTES
@@ -692,13 +741,14 @@ export async function fireDue(db: DatabaseSync, services: Services, at: DateTime
       schedule.resend_minutes > 0 &&
       occ.occurrence_key.endsWith("#0")
     ) {
-      const resendDue = DateTime.fromISO(occ.due_at).plus({ minutes: schedule.resend_minutes });
+      // 「到点后 N 分钟重发」以事件时刻为基准：用 due_at 会被 offsets[0] 的提前量带偏
+      const resendDue = DateTime.fromISO(occ.event_at).plus({ minutes: schedule.resend_minutes });
       db.prepare(
         `INSERT OR IGNORE INTO occurrences (schedule_id, occurrence_key, event_at, due_at, status)
          VALUES (?, ?, ?, ?, 'pending')`,
       ).run(
         schedule.id,
-        `${occ.occurrence_key}:resend`,
+        `${occ.occurrence_key}${RESEND_SUFFIX}`,
         occ.event_at,
         resendDue.toUTC().toISO() ?? occ.due_at,
       );
