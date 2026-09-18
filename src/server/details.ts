@@ -142,7 +142,11 @@ export interface ScheduleDetailItem {
   created_at: string;
   next_event_at: string | null;
   next_due_at: string | null;
+  /** 事件日的本地文本（卡片显示的就是它） */
   next_local: string | null;
+  /** 提醒时刻的本地文本；与事件同日同刻时为 null */
+  remind_local: string | null;
+  /** 距事件日的天数：与 next_local 同源，避免「日期写 12-13、倒计时按 12-06 算」 */
   days_until: number | null;
 }
 
@@ -179,9 +183,15 @@ export function scheduleDetails(
               s.workday_filter, s.created_at, o.event_at AS next_event_at, o.due_at AS next_due_at
        FROM schedules s
        LEFT JOIN occurrences o ON o.schedule_id = s.id AND o.status = 'pending'
-         AND o.due_at = (SELECT MIN(o2.due_at) FROM occurrences o2 WHERE o2.schedule_id = s.id AND o2.status = 'pending')
+         AND o.occurrence_key = (
+           -- 取「最近的事件」而非「最近的提醒」：卡片显示的是事件日，倒计时与排序必须同源；
+           -- 同一事件有多个提醒偏移时按 occurrence_key 收敛成一行，避免列表重复。
+           SELECT o2.occurrence_key FROM occurrences o2
+           WHERE o2.schedule_id = s.id AND o2.status = 'pending'
+           ORDER BY o2.event_at ASC, o2.due_at ASC LIMIT 1
+         )
        WHERE s.status = 'active'
-       ORDER BY COALESCE(o.due_at, '9999') ASC, s.created_at ASC
+       ORDER BY COALESCE(o.event_at, '9999') ASC, s.created_at ASC
        LIMIT ?`,
     )
     .all(limit) as unknown as ScheduleJoinRow[];
@@ -189,7 +199,8 @@ export function scheduleDetails(
   const nowMs = Date.now();
   return rows.map((r) => {
     const allDay = r.all_day === 1;
-    const dueMs = r.next_due_at === null ? Number.NaN : Date.parse(r.next_due_at);
+    const eventMs = r.next_event_at === null ? Number.NaN : Date.parse(r.next_event_at);
+    const remindDiffers = r.next_due_at !== null && r.next_due_at !== r.next_event_at;
     return {
       id: r.id,
       profile_id: r.profile_id,
@@ -205,7 +216,8 @@ export function scheduleDetails(
       next_event_at: r.next_event_at,
       next_due_at: r.next_due_at,
       next_local: localStamp(r.next_event_at ?? r.next_due_at, allDay),
-      days_until: Number.isNaN(dueMs) ? null : Math.round((dueMs - nowMs) / 86_400_000),
+      remind_local: remindDiffers ? localStamp(r.next_due_at, false) : null,
+      days_until: Number.isNaN(eventMs) ? null : Math.round((eventMs - nowMs) / 86_400_000),
     };
   });
 }

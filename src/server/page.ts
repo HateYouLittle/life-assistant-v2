@@ -198,10 +198,41 @@ const STYLE = `
   }
 `;
 
+/**
+ * 页面凭据引导：`?token=` 取到的 token 落 localStorage 后复用，后续 fetch 只走
+ * Authorization 头（凭据不再出现在每次请求的 URL 里）。
+ *
+ * 该函数会被 toString 内联进浏览器脚本，因此必须保持纯 JS 语法、不引用任何外部符号；
+ * 单独导出是为了能直接单测 —— 字符串层面的「页面里有没有这行代码」断言证明不了行为。
+ */
+export function resolveToken(
+  search: string,
+  store: { getItem(key: string): string | null; setItem(key: string, value: string): void },
+): string | null {
+  const fromUrl = new URLSearchParams(search).get("token");
+  if (fromUrl !== null && fromUrl !== "") {
+    try {
+      store.setItem("web_api_token", fromUrl);
+    } catch {
+      // 隐私模式下 storage 可能不可写；本次仍用 URL 里的凭据，不影响使用
+    }
+    return fromUrl;
+  }
+  try {
+    return store.getItem("web_api_token");
+  } catch {
+    return null;
+  }
+}
+
 const SCRIPT = `
   var COLORS = ['#5eead4','#38bdf8','#818cf8','#c084fc','#f472b6'];
   var REST_COLOR = '#475569';
-  var token = localStorage.getItem('web_api_token');
+  var token = (${resolveToken.toString()})(location.search, localStorage);
+  if (location.search.indexOf('token=') >= 0 && typeof history !== 'undefined' && history.replaceState) {
+    // 凭据已落到 localStorage，立刻从地址栏抹掉：否则会留在浏览器历史、Referer 与截图里
+    history.replaceState(null, '', location.pathname);
+  }
   var drawer = document.getElementById('drawer');
   var scrim = document.getElementById('scrim');
   var drawerBody = document.getElementById('drawer-body');
@@ -212,7 +243,7 @@ const SCRIPT = `
 
   function api(path) {
     return fetch(path, token ? { headers: { Authorization: 'Bearer ' + token } } : {}).then(function (r) {
-      if (!r.ok) throw new Error(r.status === 401 ? '未授权：URL 加 ?token=<WEB_API_TOKEN> 重试' : 'HTTP ' + r.status);
+      if (!r.ok) throw new Error(r.status === 401 ? '未授权：在地址栏给本页加上 ?token=<WEB_API_TOKEN> 刷新一次（本页会记住）' : 'HTTP ' + r.status);
       return r.json();
     });
   }
@@ -453,6 +484,7 @@ const SCRIPT = `
           return '<li><div class="top"><span class="t">' + esc(s.title) + '</span>' +
             '<span class="chip' + (soon ? ' teal' : '') + '">' + icon(s.kind) + '</span></div>' +
             '<div class="meta"><span>' + esc(s.next_local || '未排期') + '</span>' +
+            (s.remind_local ? '<span>提醒 ' + esc(s.remind_local) + '</span>' : '') +
             (s.calendar === 'lunar' ? '<span class="chip">农历</span>' : '') +
             (s.all_day ? '<span>全天</span>' : '<span>' + esc(s.time) + '</span>') +
             (s.workday_filter === 'workday' ? '<span>仅工作日</span>' : s.workday_filter === 'holiday' ? '<span>仅节假日</span>' : '') +

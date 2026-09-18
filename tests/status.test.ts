@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import * as vm from "node:vm";
 import { DateTime } from "luxon";
+import { resolveToken, statusPage } from "../src/server/page.js";
 import { createStatusApp, statusPayload } from "../src/server/status.js";
 import { TZ, todayIso } from "../src/time.js";
 import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
@@ -8,6 +10,92 @@ import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
 function app(env: TestEnv) {
   return createStatusApp(env.config, env.db);
 }
+
+describe("看板 token 引导", () => {
+  interface Store {
+    raw: Map<string, string>;
+    getItem(key: string): string | null;
+    setItem(key: string, value: string): void;
+  }
+
+  function memoryStore(): Store {
+    const raw = new Map<string, string>();
+    return {
+      raw,
+      getItem: (key) => raw.get(key) ?? null,
+      setItem: (key, value) => {
+        raw.set(key, value);
+      },
+    };
+  }
+
+  it("?token= 落到 localStorage 并在后续访问复用", () => {
+    const store = memoryStore();
+    assert.equal(resolveToken("?token=abc123", store), "abc123");
+    assert.equal(
+      store.getItem("web_api_token"),
+      "abc123",
+      "token 必须落盘，否则下一次刷新又变 401",
+    );
+    assert.equal(resolveToken("", store), "abc123", "无 URL 参数时应回落到已存凭据");
+    assert.equal(resolveToken("?month=2026-09", store), "abc123");
+  });
+
+  it("空 token 不写存储（否则会把可用凭据覆盖成空串）", () => {
+    const store = memoryStore();
+    store.setItem("web_api_token", "keep");
+    assert.equal(resolveToken("?token=", store), "keep");
+    assert.equal(store.getItem("web_api_token"), "keep");
+  });
+
+  it("页面内联的引导脚本可直接执行（插值写坏会让整屏加载不出来）", () => {
+    const html = statusPage("2.0.0");
+    const source = /var token = \(([\s\S]*)\)\(location\.search,\s*localStorage\)/.exec(html)?.[1];
+    assert.ok(source !== undefined, "页面脚本应内联 token 引导");
+    const bootstrap = vm.runInNewContext(`(${source})`, { URLSearchParams }) as (
+      search: string,
+      store: Store,
+    ) => string | null;
+    const store = memoryStore();
+    assert.equal(bootstrap("?token=xyz", store), "xyz");
+    assert.equal(store.getItem("web_api_token"), "xyz");
+  });
+
+  it("地址栏里的 token 用完即抹", () => {
+    assert.match(statusPage("2.0.0"), /history\.replaceState/);
+  });
+
+  it("端到端：开着 token 时 /?token=X 打开页面 → 页面拿到凭据 → 数据接口放行", async () => {
+    const secret = "t".repeat(16);
+    const env = makeTestEnv({ WEB_API_TOKEN: secret, HOST: "0.0.0.0" });
+    try {
+      const a = app(env);
+      assert.equal((await a.request("/api/status")).status, 401, "无凭据时数据接口必须拒绝");
+
+      const search = `?token=${secret}`;
+      const page = await a.request(`/${search}`);
+      assert.equal(page.status, 200, "静态页不鉴权，靠页面脚本用凭据换数据");
+      const source = /var token = \(([\s\S]*)\)\(location\.search,\s*localStorage\)/.exec(
+        await page.text(),
+      )?.[1];
+      assert.ok(source !== undefined, "页面脚本应内联 token 引导");
+      const token = (
+        vm.runInNewContext(`(${source})`, { URLSearchParams }) as (
+          s: string,
+          st: Store,
+        ) => string | null
+      )(search, memoryStore());
+      assert.equal(token, secret);
+
+      const status = await a.request("/api/status", {
+        headers: { Authorization: `Bearer ${token ?? ""}` },
+      });
+      assert.equal(status.status, 200, "页面引导出的凭据必须能取到数据");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
 
 describe("状态接口", () => {
   it("/api/status 输出关键计数", () => {
@@ -212,6 +300,44 @@ describe("看板明细接口", () => {
       assert.equal(body.items[0]?.kind_label, "待办");
       assert.equal(body.items[0]?.next_local, "2026-09-20");
       assert.equal(typeof body.items[0]?.days_until, "number");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("/api/schedules：带提前提醒时，日期与倒计时同按事件日，提醒时刻单独给出", async () => {
+    const env = makeTestEnv();
+    try {
+      const event = DateTime.now()
+        .setZone(TZ)
+        .plus({ days: 10 })
+        .set({ hour: 9, minute: 0, second: 0, millisecond: 0 });
+      env.db
+        .prepare(
+          `INSERT INTO schedules (id, profile_id, title, kind, calendar, start_date, time, all_day, created_at, updated_at)
+           VALUES ('s9','default','生日','birthday','solar',?,'09:00',0,'2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')`,
+        )
+        .run(event.toISODate());
+      const eventIso = event.toUTC().toISO() as string;
+      const remindIso = event.minus({ days: 7 }).toUTC().toISO() as string;
+      const insert = env.db.prepare(
+        `INSERT INTO occurrences (schedule_id, occurrence_key, event_at, due_at, status)
+         VALUES ('s9', ?, ?, ?, 'pending')`,
+      );
+      insert.run(`${event.toISODate()}T09:00#0`, eventIso, remindIso);
+      insert.run(`${event.toISODate()}T09:00#1`, eventIso, eventIso);
+
+      const body = (await (await app(env).request("/api/schedules")).json()) as {
+        items: { next_local: string; remind_local: string | null; days_until: number }[];
+      };
+      assert.equal(body.items.length, 1, "同一事件的多个提醒偏移不该让日程出现两行");
+      const item = body.items[0];
+      assert.equal(item?.next_local, `${event.toISODate()} 09:00`, "显示的是事件日");
+      assert.ok(
+        (item?.days_until ?? 0) >= 8,
+        `倒计时应按事件日（约 10 天），实际 ${item?.days_until}：按提醒时刻算会变成 3 天`,
+      );
+      assert.equal(item?.remind_local, `${event.minus({ days: 7 }).toISODate()} 09:00`);
     } finally {
       cleanupTestEnv(env);
     }
