@@ -178,7 +178,7 @@ describe("schedule 工具：生命周期", () => {
     }
   });
 
-  it("农历生日：每年循环，upcoming 可见", () => {
+  it("农历生日：每年循环，重复描述正确；下一次发生受物化前瞻约束", () => {
     const env = makeTestEnv();
     try {
       const result = tool(env, {
@@ -193,10 +193,35 @@ describe("schedule 工具：生命周期", () => {
         已创建: { id: string; 重复: string };
       };
       assert.equal(payload.已创建.重复, "每年农历5月5日");
+      // 农历 5/5 的下一次发生通常落在 62 天物化窗口之外。首条豁免保证「下一条」仍可见：
+      // 该日程初始没有任何 pending，因此恰好物化 1 条（窗口内正常物化，窗口外由豁免补出），
+      // 且越过物化前瞻的至多 1 条。
+      const rows = occurrenceRows(env, payload.已创建.id);
+      const horizon = now().plus({ days: 63 });
+      assert.equal(rows.length, 1, "农历生日应恰好物化 1 条 occurrence");
+      assert.ok(
+        rows.filter((r) => DateTime.fromISO(r.event_at as string) > horizon).length <= 1,
+        "越过物化前瞻的 occurrence 至多 1 条（首条豁免）",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("生日 upcoming：窗口内的下一次发生仍可见", () => {
+    const env = makeTestEnv();
+    try {
+      tool(env, {
+        action: "add",
+        title: "朋友生日",
+        kind: "birthday",
+        date: day(30),
+        time: "09:00",
+      });
       const up = JSON.parse(
         tool(env, { action: "upcoming", limit: 5 }).content[0]?.text ?? "{}",
       ) as { 即将到来: { 标题: string }[] };
-      assert.ok(up.即将到来.some((i) => i.标题 === "妈妈生日"));
+      assert.ok(up.即将到来.some((i) => i.标题 === "朋友生日"));
     } finally {
       cleanupTestEnv(env);
     }

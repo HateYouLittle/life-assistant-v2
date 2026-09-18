@@ -11,6 +11,7 @@ import {
   errorMessage,
   type ToolContext,
 } from "../../core/registry.js";
+import { logger } from "../../core/logger.js";
 import {
   completeSchedule,
   createSchedule,
@@ -19,6 +20,7 @@ import {
   KIND_LABEL,
   listSchedules,
   parseRecurrence,
+  runOccurrenceCleanup,
   tickSchedules,
   upcoming,
   updateSchedule,
@@ -242,6 +244,18 @@ registerModule({
         occurrence_key: z.string().optional().describe("complete 时可选，只完成该次发生"),
       },
       handler: scheduleTool,
+    },
+  ],
+  jobs: [
+    {
+      name: "schedule.occurrence_cleanup",
+      cron: "30 4 * * *",
+      handler: () => {
+        const { db } = runtime();
+        const deleted = runOccurrenceCleanup(db);
+        if (deleted > 0) logger.info(`日程 occurrence 清理：删除 ${deleted} 行`);
+        else logger.debug("日程 occurrence 清理：没有到期的历史行");
+      },
     },
   ],
   tick: async (at) => {

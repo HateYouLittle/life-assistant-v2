@@ -2,14 +2,14 @@ import { randomBytes } from "node:crypto";
 import { DateTime } from "luxon";
 import type { DatabaseSync } from "node:sqlite";
 import { now, nowIso, localToInstant, instantToLocalDate, TZ } from "../../time.js";
-import { dayType } from "../../core/holiday.js";
+import { dayType, ensureYears } from "../../core/holiday.js";
 import {
   describeRecurrence,
   nextDate,
   type OccurrenceSource,
   type Recurrence,
 } from "../../core/recurrence.js";
-import type { NotifyBlock, Services } from "../../core/registry.js";
+import { errorMessage, type NotifyBlock, type Services } from "../../core/registry.js";
 import { withTransaction } from "../../core/database.js";
 import { ensureProfile } from "../../core/settings.js";
 import { logger } from "../../core/logger.js";
@@ -74,6 +74,19 @@ const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 
 /** 工作日过滤暂停时的告警去重：scheduleId → 已告警的日期，避免每分钟刷屏 */
 const pausedWarned = new Map<string, string>();
+
+/**
+ * 物化撞到「节假日数据未就绪」的年份登记表：tickSchedules 收尾对这些年份调用
+ * ensureYears 尝试补齐。重复抓取的间隔由 ensureYears 自身的 6h 冷却保证。
+ */
+const yearsNeedingBackfill = new Set<number>();
+
+/** 取出并清空待补齐年份（tickSchedules 使用；测试据此断言登记结果） */
+export function takeYearsNeedingBackfill(): number[] {
+  const years = [...yearsNeedingBackfill].sort((a, b) => a - b);
+  yearsNeedingBackfill.clear();
+  return years;
+}
 
 export function newShortId(): string {
   return randomBytes(4).toString("hex");
@@ -207,6 +220,14 @@ function countEvents(db: DatabaseSync, scheduleId: string): number {
   return row.n;
 }
 
+/** 是否存在 pending 的 occurrence；不按时间过滤（过期的 pending 也算存在）。走 (schedule_id, status) 索引 */
+function hasPendingOccurrence(db: DatabaseSync, scheduleId: string): boolean {
+  const row = db
+    .prepare("SELECT 1 FROM occurrences WHERE schedule_id = ? AND status = 'pending' LIMIT 1")
+    .get(scheduleId);
+  return row !== undefined;
+}
+
 function updateNextRunAt(db: DatabaseSync, scheduleId: string): void {
   db.prepare(
     `UPDATE schedules SET next_run_at = (SELECT MIN(due_at) FROM occurrences WHERE schedule_id = ? AND status = 'pending')
@@ -237,14 +258,25 @@ export function materializeSchedule(db: DatabaseSync, row: ScheduleRow): void {
   const horizon = now().plus({ days: FAR_HORIZON_DAYS });
   const nearHorizon = now().plus({ days: NEAR_HORIZON_DAYS });
 
+  // 首条豁免：该日程当前一条 pending 都没有时，允许越过近端地平线物化恰好 1 条，
+  // 保证「下一条」永远可见。资格取自入库状态（而非本轮是否插入过），
+  // 一旦真正补上第一条即失效，不会每分钟重新生效导致远期 occurrence creep。
+  let exemptFirst = !hasPendingOccurrence(db, row.id);
+
   for (let i = 0; i < 10; i++) {
     const date = nextDate(source, after, horizon);
     if (date === null) break;
     const dateISO = date.toISODate() ?? "";
+    // 物化前瞻：候选日期一旦越过近端地平线就停止，游标不得再前进。
+    // 该判定必须在 workday/holiday 过滤之前 —— 否则被过滤掉的候选（如周末）
+    // 会绕过它不断推动游标，物化范围最终被 FAR_HORIZON 或被未覆盖年份截断。
+    const beyondHorizon = date > nearHorizon;
+    if (beyondHorizon && !exemptFirst) break;
     if (row.workday_filter !== "any") {
       const cls = dayType(db, dateISO);
       if (cls === "unknown") {
-        // 保守暂停语义保留，但必须留痕且不能每分钟刷屏
+        // 保守暂停语义保留，但必须留痕且不能每分钟刷屏；同时登记该年份待补齐
+        yearsNeedingBackfill.add(Number(dateISO.slice(0, 4)));
         if (pausedWarned.get(row.id) !== dateISO) {
           pausedWarned.set(row.id, dateISO);
           logger.warn(
@@ -285,9 +317,11 @@ export function materializeSchedule(db: DatabaseSync, row: ScheduleRow): void {
       );
       if (Number(result.changes) > 0) insertedEvent = true;
     });
-    if (insertedEvent) existing += 1;
+    if (insertedEvent) {
+      existing += 1;
+      exemptFirst = false;
+    }
     after = date;
-    if (date > nearHorizon) break;
     if (rec?.count !== undefined && existing >= rec.count) break;
   }
   updateNextRunAt(db, row.id);
@@ -483,6 +517,115 @@ export function catchupSweep(db: DatabaseSync): void {
   }
 }
 
+const OCCURRENCE_CLEANUP_STATUSES = ["notified", "done", "cancelled"] as const;
+export const OCCURRENCE_CLEANUP_DAYS = 90;
+
+interface CleanupCondition {
+  sql: string;
+  params: string[];
+}
+
+/**
+ * 清理谓词的唯一来源：预演与 job 都经它构造 SQL，避免两处判定漂移。
+ * protectedIds 为使用 recurrence.count 的日程，其 occurrence 整条豁免。
+ */
+function cleanupCondition(protectedIds: string[], cutoff: string, prefix = ""): CleanupCondition {
+  const params: string[] = [...OCCURRENCE_CLEANUP_STATUSES];
+  const placeholders = OCCURRENCE_CLEANUP_STATUSES.map(() => "?").join(", ");
+  let sql = `${prefix}status IN (${placeholders}) AND ${prefix}event_at < ?`;
+  params.push(cutoff);
+  if (protectedIds.length > 0) {
+    const ids = protectedIds.map(() => "?").join(", ");
+    sql += ` AND ${prefix}schedule_id NOT IN (${ids})`;
+    params.push(...protectedIds);
+  }
+  return { sql, params };
+}
+
+/**
+ * 使用 recurrence.count 的日程：countEvents() 依赖历史行数执行「最多发生 N 次」，
+ * 删除历史会让已达上限的循环重新产出事件，因此这类日程的 occurrence 一律豁免。
+ */
+function countProtectedScheduleIds(db: DatabaseSync): string[] {
+  const rows = db.prepare("SELECT id, recurrence_json FROM schedules").all() as {
+    id: string;
+    recurrence_json: string | null;
+  }[];
+  return rows
+    .filter((row) => parseRecurrence(row.recurrence_json)?.count !== undefined)
+    .map((row) => row.id);
+}
+
+export interface OccurrenceCleanupPreview {
+  /** event_at 阈值（ISO）：早于它的历史行才可能被清理 */
+  cutoff: string;
+  /** 按当前规则将删除的行数 */
+  deletable: number;
+  /** 可清理行的日程明细 */
+  bySchedule: { schedule_id: string; title: string; rows: number }[];
+  /** 因 recurrence.count 被整条豁免的日程数 */
+  protectedByCount: number;
+}
+
+interface OccurrenceCleanupPlan {
+  cutoff: string;
+  protectedIds: string[];
+  deletable: number;
+  bySchedule: { schedule_id: string; title: string; rows: number }[];
+}
+
+/** 只读：算出 cutoff、豁免日程与可清理行明细；零写操作，preview 与 job 共用 */
+function occurrenceCleanupPlan(db: DatabaseSync, days: number): OccurrenceCleanupPlan {
+  const cutoff = now().minus({ days }).toUTC().toISO() ?? nowIso();
+  const protectedIds = countProtectedScheduleIds(db);
+  const direct = cleanupCondition(protectedIds, cutoff);
+  const countRow = db
+    .prepare(`SELECT COUNT(*) AS n FROM occurrences WHERE ${direct.sql}`)
+    .get(...direct.params) as { n: number };
+  const aliased = cleanupCondition(protectedIds, cutoff, "o.");
+  const bySchedule = db
+    .prepare(
+      `SELECT o.schedule_id AS schedule_id, s.title AS title, COUNT(*) AS rows
+       FROM occurrences o JOIN schedules s ON s.id = o.schedule_id
+       WHERE ${aliased.sql}
+       GROUP BY o.schedule_id, s.title
+       ORDER BY rows DESC, o.schedule_id`,
+    )
+    .all(...aliased.params) as unknown as {
+    schedule_id: string;
+    title: string;
+    rows: number;
+  }[];
+  return { cutoff, protectedIds, deletable: countRow.n, bySchedule };
+}
+
+/** 上线前预演：按 90 天保留规则当前会删除多少行、涉及哪些日程（零副作用） */
+export function previewOccurrenceCleanup(
+  db: DatabaseSync,
+  days = OCCURRENCE_CLEANUP_DAYS,
+): OccurrenceCleanupPreview {
+  const plan = occurrenceCleanupPlan(db, days);
+  return {
+    cutoff: plan.cutoff,
+    deletable: plan.deletable,
+    bySchedule: plan.bySchedule,
+    protectedByCount: plan.protectedIds.length,
+  };
+}
+
+/** 执行清理；判定与 previewOccurrenceCleanup 完全同源，返回实际删除行数 */
+export function runOccurrenceCleanup(db: DatabaseSync, days = OCCURRENCE_CLEANUP_DAYS): number {
+  const plan = occurrenceCleanupPlan(db, days);
+  if (plan.deletable === 0) return 0;
+  return withTransaction(db, () => {
+    const condition = cleanupCondition(plan.protectedIds, plan.cutoff);
+    const result = db
+      .prepare(`DELETE FROM occurrences WHERE ${condition.sql}`)
+      .run(...condition.params);
+    return Number(result.changes);
+  });
+}
+
 export function reminderBlocks(
   row: ScheduleRow,
   eventAt: string,
@@ -568,6 +711,7 @@ export async function tickSchedules(
   at: DateTime,
   services: Services,
   db: DatabaseSync,
+  fetchYear?: (url: string) => Promise<unknown>,
 ): Promise<void> {
   catchupSweep(db);
   await fireDue(db, services, at);
@@ -580,4 +724,16 @@ export async function tickSchedules(
     if (!activeIds.has(id)) pausedWarned.delete(id);
   }
   for (const row of active) materializeSchedule(db, row);
+  // 物化撞到的未就绪年份：收尾时尝试补齐。ensureYears 自带 6h 冷却
+  // （cn_holiday_years.status='failed' + last_attempt_at），失败不会每分钟重试。
+  const years = takeYearsNeedingBackfill();
+  if (years.length === 0) return;
+  try {
+    const result = await ensureYears(db, years, fetchYear);
+    if (result.failed.length > 0) {
+      logger.warn(`日程物化补齐节假日数据失败: ${result.failed.join("; ")}`);
+    }
+  } catch (e) {
+    logger.warn(`日程物化补齐节假日数据异常: ${errorMessage(e)}`);
+  }
 }
