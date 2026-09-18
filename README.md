@@ -69,7 +69,9 @@ daemon 就绪后：
 - 状态页：`http://127.0.0.1:3080/`（`/api/status` 同源）
 - `X-Hermes-Profile` 头决定 Profile；缺省为 `default`
 - 配了 `WEB_API_TOKEN` 时两者都需凭据：`/api/*` 接受 Bearer 或 `?token=`，
-  `/mcp` 只接受 `Authorization: Bearer`（避免凭据出现在 URL/日志里）
+  `/mcp` 只接受 `Authorization: Bearer`（避免凭据出现在 URL/日志里）。
+  看板只需用 `http://127.0.0.1:3080/?token=<WEB_API_TOKEN>` 打开一次：页面会把
+  凭据记进浏览器 `localStorage` 并立刻从地址栏抹掉，之后直接访问 `/` 即可
 - 状态页的 `holidays.failed` 会列出抓取失败的年份与原因（数据未就绪会让
   `workday/holiday` 过滤的日程暂停，这里能直接看出是抓取失败还是尚未发布）
 
@@ -96,6 +98,9 @@ Skill 安装：将 `skill/SKILL.md` 复制到该 Profile 的 `skills/life-assist
 2. 生成 secret：`openssl rand -hex 32`，写入 `.env` 的 `PROFILE_ROUTE_SECRETS_JSON`；
 3. 在对话中或直接调用：`notify {action: "route", url: "http://127.0.0.1:<gateway端口>/...", platform: "wechat"}`；
 4. 用一条临时日程做端到端验证。
+
+注意：路由是「从此刻起生效」，不会把配置之前已产生的通知补推一遍（那些仍可由
+`notify.pull` 取到）；配置后新产生的通知才会走 webhook。
 
 投递协议与 v1 完全兼容：`POST`（deliver-only）、`X-Webhook-Signature-V2 = hex(HMAC-SHA256(secret, "timestamp.body"))`、`X-Webhook-Timestamp`、`X-Request-ID`、10s 超时、有界重试（确认失败 ≤5 次退避 60s→1h；传输不确定 ≤3 次），at-least-once、55 分钟幂等窗口。
 
@@ -180,29 +185,30 @@ Profile / 账本数据再写入（不影响其它 Profile），失败时整体�
 
 ```bash
 npm run dev            # tsx 直接跑 daemon
-npm test               # node --test（171 个用例）
+npm test               # node --test（全部用例）
 npm run lint           # Biome lint（0 警告）
 npm run format:check   # Biome 格式检查（CI 也跑）
 npm run db:backup      # VACUUM INTO 备份，保留最近 14 份
+npm run db:cleanup:preview   # 只读预演：occurrence 清理会删掉哪些历史行
 ```
 
-结构：`src/core`（database/registry/auth/http/logger/settings/notify/render/qweather/holiday/recurrence）、`src/modules`（weather/holiday/schedule/bookkeeping/notify，经 `modules/index.ts` 注册，核心不反向依赖）、`src/server`（status/page/details，状态页与只读 API）、`src/daemon.ts`、`src/stdio.ts`、`src/import-v1.ts`、`src/backup.ts`。
+结构：`src/core`（database/registry/auth/http/logger/settings/notify/render/qweather/holiday/recurrence）、`src/modules`（weather/holiday/schedule/bookkeeping/notify，经 `modules/index.ts` 注册，核心不反向依赖）、`src/server`（status/page/details，状态页与只读 API）、`src/daemon.ts`、`src/stdio.ts`、`src/import-v1.ts`、`src/backup.ts`、`src/cleanup-preview.ts`。
 
 ## 设计要点
 
-- **单写者**：所有 SQLite 写入收敛到 daemon，WAL + 严格 schema（STRICT 表、CHECK、外键）。
+- **单写者**：所有 SQLite 写入收敛到 daemon，WAL + 严格 schema（STRICT 表、CHECK、外键）。schema 版本记在 `meta.schema_version`，启动时逐级自动升级（只做附加式加列/加表，升级失败即拒绝启动）；库版本高于程序时同样拒绝启动。
 - **模块契约**：模块注册 `tools / jobs / tick / onStart` 四个扩展点；调度保证 tick 不重叠；核心不 import 模块内部。
 - **recurrence 引擎**：自研纯函数替代 rrule，只覆盖 daily/weekly/monthly/yearly × 农历 + 工作日过滤；漏触发只补最近一次。
-- **outbox**：通知 + 投递记录同事务写入；发布即触发投递；静默时段只拦主动推送。
+- **outbox**：通知 + 投递记录同事务写入；发布即触发投递；静默时段只拦主动推送；带 `expiresAt` 的通知（气象预警）到点仍未投出即作废，不会在静默时段结束后补投一条已经失效的告警（通知本身保留，`notify.pull` 仍可取到）。
 - **时区**：全部调度固定 Asia/Shanghai，无 DST。
 - **QWeather 请求治理**：按数据类型短 TTL 缓存（`CACHE_TTL_MS`：实时 20min / 逐天 2h 且取 `min(2h, 距本地次日 00:00)` / 预警 10min / 空气质量 45min，只有成功响应才写缓存）；同进程并发上限 3；仅对 429/5xx 与网络故障做指数退避（`2^c` 秒 + 抖动，c 上限 10），**4xx 一律立即抛出** —— 官方明确反复重试错误请求会被判定为攻击并冻结账号。认证优先 JWT（EdDSA），API KEY 保留回退。**GeoAPI 结果不得落盘缓存/批量存储/建索引**（官方版权限制），只允许进程内 memo。
 - **主动推送**：定时任务组装**确定性**通知（无 LLM），走 outbox 投递：每日天气简报与调休/补班提醒 07:00、气象预警巡检每 20 分钟、月报每月 1 号 09:00；节假日数据刷新 02:00、历史 occurrence 回收 04:30。预警与补班都靠 `dedupe_key` 去重（预警按「id + 级别」，级别升级会再推一次；补班按「事件 + 日期」），静默时段在投递层统一拦截、不为任何类型开例外。
 - **物化窗口**：occurrence 只物化到 `now + 62 天`。若某日程此刻一条 `pending` 都没有（远期生日、远期一次性待办），额外豁免**恰好 1 条**越过窗口的 occurrence，保证「下一条」在 `list`/`upcoming`/状态页始终可见；豁免资格取自入库状态，补上第一条即失效，因此不会随时间累积增长。
-- **历史回收**：`schedule.occurrence_cleanup`（每日 04:30）只清理 90 天前的 `notified`/`done`/`cancelled` 行 —— `pending` 永不删；使用 `recurrence.count` 的日程整条豁免（发生次数上限依赖历史行数，删历史会让已达上限的循环复活）。上线或调参前可用 `previewOccurrenceCleanup(db, days)` 只读预演将删除的行数与涉及日程。
+- **历史回收**：`schedule.occurrence_cleanup`（每日 04:30）只清理 90 天前的 `notified`/`done`/`cancelled` 行 —— `pending` 永不删；使用 `recurrence.count` 的日程整条豁免（发生次数上限依赖历史行数，删历史会让已达上限的循环复活）。上线或调参前用 `npm run db:cleanup:preview` 只读预演将删除的行数与涉及日程（与 job 共用同一份判定）。
 
-### 已知取舍与后续优化（尚未实施）
+### 已知取舍与后续优化
 
-按收益排序，均为「已识别但未做」的项，当前实现是正确的、只是不够省：
+第 1、2 条已实施（保留划线记录）；其余为「已识别但未做」，当前实现是正确的、只是不够省：
 
 1. ~~**QWeather 天气数据无缓存/限流/退避**~~ —— **已实施（2026-09-18）**：按官方推荐值加短 TTL 缓存、并发上限 3、仅对 429/5xx 指数退避（4xx 绝不重试），并停止把 GeoAPI 结果落盘（官方版权限制）。
 2. ~~**认证方式建议迁移 JWT**~~ —— **已实施（2026-09-18）**：支持 Ed25519 JWT（`Authorization: Bearer`，URL 不再带 `key=`）并优先使用，API KEY 保留回退。官方口径：自 **2027-02-01** 起逐步限制 API KEY 的每日请求量，SDK v5+ 仅支持 JWT。
@@ -210,10 +216,14 @@ npm run db:backup      # VACUUM INTO 备份，保留最近 14 份
    （v7 是百分数），且数值包在 `{value, unit}` 里 —— 直接换路径会静默错报湿度。
 4. **`summarizeExpenses` 不是单快照**：三条独立语句，跨进程并发写入时「合计」可能与分类明细不一致；
    加 `BEGIN DEFERRED` 读事务即可。
-5. **契约测试名不副实**：`tests/registry.test.ts` 的注释声称「核心不 import 模块内部由该测试强制」，
-   但它只在运行时检查重名。若要真正强制，需加静态 import 图检查或 lint 规则。
-6. **`schedules.version` 列未参与并发控制**：每次更新 +1，但没有乐观校验；单写者下风险低，
+5. **`schedules.version` 列未参与并发控制**：每次更新 +1，但没有乐观校验；单写者下风险低，
    可删列或落实校验。
-7. **节假日刷新节奏**：`FETCH_COOLDOWN_MS` 是 6h，但主动重试点仍是每天 02:00 的 job（`requiredYears()` 到 10 月才要求下一年），实际重试间隔为 24h。物化撞到未就绪年份的路径已改为由 `tick()` 触发按需补齐、真正受 6h 冷却约束；若要提前拿到下一年数据，可把 job 改为 `0 */3 * * *`。
-8. **`status` 页面无鉴权**（`/` 只有静态 HTML，数据走受保护的 `/api/status`），
+6. **节假日刷新节奏**：`FETCH_COOLDOWN_MS` 是 6h，但主动重试点仍是每天 02:00 的 job（`requiredYears()` 到 10 月才要求下一年），实际重试间隔为 24h。物化撞到未就绪年份的路径已改为由 `tick()` 触发按需补齐、真正受 6h 冷却约束；若要提前拿到下一年数据，可把 job 改为 `0 */3 * * *`。
+7. **`status` 页面无鉴权**（`/` 只有静态 HTML，数据走受保护的 `/api/status`），
    如需对外暴露建议一并加保护。
+8. **`notifications` / `deliveries` 无保留策略**：两者只增不减（记账回执等约 13 行/天），
+   当前体量无碍，但要长期运行建议仿照 occurrence 清理加个 job，删掉 N 天前已读且
+   投递已终结（`sent`/`cancelled`/`fallback`）的行。
+9. **server 层直接引用模块的纯函数**：`src/server/details.ts` import 了
+   bookkeeping/schedule 的 `monthRange`、`KIND_LABEL` 等常量与纯函数。契约测试只强制
+   `src/core` 不依赖模块，这条方向没人管 —— 改模块内部签名时要记得同步看板。

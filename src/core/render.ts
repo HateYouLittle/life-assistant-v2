@@ -6,8 +6,9 @@ export interface Rendered {
 
 /**
  * 通知快照在发布时渲染一次，投递时不重渲染。
- * markdown：微信/企业微信的 Markdown 表格。
- * plain：对齐的文本表格；宽度超限时降级为“键: 值”逐行。
+ * markdown：微信/企业微信的 Markdown 表格 —— 当前生产只走这一种（notify.ts 固定传入）。
+ * plain：对齐的文本表格；宽度超限时降级为“键: 值”逐行。给不支持表格的渠道预留的降级实现，
+ * 目前只有测试覆盖，接入前不要以为它在生产生效。
  * 标题不在这里渲染：发布方单独传 title，避免推送与 notify.pull 各多一行重复标题。
  */
 export function renderBlocks(blocks: NotifyBlock, mode: "markdown" | "plain"): Rendered {
