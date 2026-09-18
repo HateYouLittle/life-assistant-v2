@@ -56,8 +56,11 @@ read_when:
 - 只记支出，金额单位为元（`amount: 12.34`）。
 - 账本全局共享：任何 Profile 创建/记账/汇总均可，回执与月报会推送给所有配置了路由的 Profile。
 - 记账前先 `ledger {action: "list"}` 取得账本 id；`expense` 的 `add`/`list`/`summary` 三个 action 都必须传 `ledger_id`。
+- `ledger.list` 默认不含归档账本；核账时传 `include_archived: true`。
 - 汇总用 `expense {action: "summary"}`，可按 `month`、`from/to`、`by`（记账人）过滤。
-- 记错金额/分类时用 `expense {action: "delete", id}` 删除（id 从 `list` 取）再重记；删除不可恢复，删前先向用户确认。
+- **没有编辑功能**：改金额/分类/备注只能 `expense {action: "delete", id}`（id 从 `list` 取）再重新 `add`。删除**不可恢复**，且重记后「记账人」会变成当前 Profile——动手前把这两点告知用户。用户说「改一下备注/金额」时按此处理，不要声称可以直接改。
+- 账本的改名/删除没有工具接口，须直接在服务端数据库上操作。
+- `expense {action: "list"}` 的 `month` 只覆盖当月，且默认只返回 20 条：返回里 `已返回` 与 `匹配总数` 是两个数，别把窗口当全量。
 - 每月 1 号 09:00 自动推送上月月报（表格），不要手动复算。
 
 ## 通知
