@@ -37,7 +37,10 @@ npm run build
 |---|---|---|
 | `DATA_DIR` | ✅ | 绝对路径；SQLite 与备份所在地 |
 | `HERMES_PROFILE` | stdio 壳 | stdio 壳 / CLI 使用的 Profile 名；纯 HTTP 直连的 daemon 不读该变量（Profile 走 `X-Hermes-Profile` 头） |
-| `QWEATHER_API_HOST` / `QWEATHER_KEY` | 天气需要 | QWeather 控制台获取 |
+| `QWEATHER_API_HOST` | 天气需要 | QWeather 控制台获取的自定义 API Host |
+| `QWEATHER_KEY` | | API KEY 凭据；**回退方案**（官方自 2027-02-01 起逐步限制其每日请求量） |
+| `QWEATHER_JWT_KEY_ID` / `QWEATHER_JWT_PROJECT_ID` / `QWEATHER_JWT_DEVELOPER_ID` / `QWEATHER_JWT_PRIVATE_KEY_PATH` | | **推荐**：Ed25519 JWT 认证。前三个是控制台的凭据 ID / 项目 ID / 开发者 ID，第四个是仓库外的私钥 PEM 路径（如 `~/.secrets/qweather-ed25519.pem`，权限 600）。四项**要么全配、要么全不配**：只写一半会启动报错，不会静默退回 API KEY。两者都配时优先 JWT |
+| `QWEATHER_JWT_TTL_SECONDS` | | JWT 有效期，默认 `43200`（12 小时），上限 `86400` |
 | `DEFAULT_CITY` | | Profile 未设位置时的兜底城市 |
 | `HOST` / `PORT` | | 默认 `127.0.0.1:3080`；**非回环地址必须配 `WEB_API_TOKEN`**，否则拒绝启动 |
 | `WEB_API_TOKEN` | | 非回环地址必填；保护 `/api/*`（Bearer 或 `?token=`）与 `/mcp`（仅 Bearer） |
@@ -188,6 +191,7 @@ npm run db:backup      # VACUUM INTO 备份，保留最近 14 份
 - **recurrence 引擎**：自研纯函数替代 rrule，只覆盖 daily/weekly/monthly/yearly × 农历 + 工作日过滤；漏触发只补最近一次。
 - **outbox**：通知 + 投递记录同事务写入；发布即触发投递；静默时段只拦主动推送。
 - **时区**：全部调度固定 Asia/Shanghai，无 DST。
+- **QWeather 请求治理**：按数据类型短 TTL 缓存（`CACHE_TTL_MS`：实时 20min / 逐天 2h 且取 `min(2h, 距本地次日 00:00)` / 预警 10min / 空气质量 45min，只有成功响应才写缓存）；同进程并发上限 3；仅对 429/5xx 与网络故障做指数退避（`2^c` 秒 + 抖动，c 上限 10），**4xx 一律立即抛出** —— 官方明确反复重试错误请求会被判定为攻击并冻结账号。认证优先 JWT（EdDSA），API KEY 保留回退。**GeoAPI 结果不得落盘缓存/批量存储/建索引**（官方版权限制），只允许进程内 memo。
 - **物化窗口**：occurrence 只物化到 `now + 62 天`。若某日程此刻一条 `pending` 都没有（远期生日、远期一次性待办），额外豁免**恰好 1 条**越过窗口的 occurrence，保证「下一条」在 `list`/`upcoming`/状态页始终可见；豁免资格取自入库状态，补上第一条即失效，因此不会随时间累积增长。
 - **历史回收**：`schedule.occurrence_cleanup`（每日 04:30）只清理 90 天前的 `notified`/`done`/`cancelled` 行 —— `pending` 永不删；使用 `recurrence.count` 的日程整条豁免（发生次数上限依赖历史行数，删历史会让已达上限的循环复活）。上线或调参前可用 `previewOccurrenceCleanup(db, days)` 只读预演将删除的行数与涉及日程。
 
@@ -195,11 +199,8 @@ npm run db:backup      # VACUUM INTO 备份，保留最近 14 份
 
 按收益排序，均为「已识别但未做」的项，当前实现是正确的、只是不够省：
 
-1. **QWeather 天气数据无缓存/限流/退避**：GeoAPI 结果已有 7 天缓存，但实时/预报/空气/预警每次工具调用都是实打实的请求，`daily_brief` 每个 Profile 并发 4 个。
-   建议给现成的 `cache` 表加短 TTL（实时 ≈10min、预报 ≈1–3h、空气 ≈30–60min、预警 ≈10min），
-   加并发上限，并只对 429/5xx 做指数退避（官方文档警告重复错误流量可能导致账号封禁）。
-2. **认证方式建议迁移 JWT**：目前用 `?key=` 传 API key（会进入代理日志）。官方推荐 JWT
-   （`Authorization: Bearer`，Ed25519），并支持 `X-QW-Api-Key` 头；API-KEY 方式自 2027-01-01 起会被限流。
+1. ~~**QWeather 天气数据无缓存/限流/退避**~~ —— **已实施（2026-09-18）**：按官方推荐值加短 TTL 缓存、并发上限 3、仅对 429/5xx 指数退避（4xx 绝不重试），并停止把 GeoAPI 结果落盘（官方版权限制）。
+2. ~~**认证方式建议迁移 JWT**~~ —— **已实施（2026-09-18）**：支持 Ed25519 JWT（`Authorization: Bearer`，URL 不再带 `key=`）并优先使用，API KEY 保留回退。官方口径：自 **2027-02-01** 起逐步限制 API KEY 的每日请求量，SDK v5+ 仅支持 JWT。
 3. **v7 城市版端点已宣布弃用**：迁移到 v1 `/weather/v1/...` 时注意 `humidity` 在 v1 是 0–1 小数
    （v7 是百分数），且数值包在 `{value, unit}` 里 —— 直接换路径会静默错报湿度。
 4. **`summarizeExpenses` 不是单快照**：三条独立语句，跨进程并发写入时「合计」可能与分类明细不一致；
