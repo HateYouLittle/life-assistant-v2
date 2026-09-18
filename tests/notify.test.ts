@@ -273,6 +273,48 @@ describe("outbox 投递", () => {
     }
   });
 
+  it("过期内容不再补投：静默时段拦下的预警在窗口结束后作废", async () => {
+    const env = makeTestEnv({ PROFILE_ROUTE_SECRETS_JSON: JSON.stringify({ default: SECRET }) });
+    try {
+      await withHookServer(
+        (_req, res) => {
+          res.writeHead(200);
+          res.end("ok");
+        },
+        async (url, captured) => {
+          setPushRoute(env.db, "default", { url });
+          publishProfile(env.db, env.config, "default", {
+            kind: "weather.alert",
+            title: "仍有效的预警",
+            blocks: { notes: ["a"] },
+            expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+          });
+          publishProfile(env.db, env.config, "default", {
+            kind: "weather.alert",
+            title: "已失效的预警",
+            blocks: { notes: ["b"] },
+            expiresAt: new Date(Date.now() - 60_000).toISOString(),
+          });
+
+          await drainDue(env.db, env.config);
+
+          assert.equal(captured.length, 1, "只有未过期的那条能上网");
+          const rows = deliveryRows(env.db);
+          assert.equal(rows.filter((r) => r.status === "sent").length, 1);
+          const expired = rows.find((r) => r.status === "cancelled");
+          assert.ok(expired !== undefined, "过期投递应落 cancelled，而不是无限排队");
+          assert.match(String(expired?.last_error), /expired/);
+          const unread = env.db
+            .prepare("SELECT COUNT(*) AS n FROM notifications WHERE read = 0")
+            .get() as { n: number };
+          assert.equal(unread.n, 1, "通知本身要留下，notify.pull 仍可作为兜底");
+        },
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("recoverStaleSending：超幂等窗口进 fallback，未超的复位 queued", () => {
     const env = makeTestEnv();
     try {

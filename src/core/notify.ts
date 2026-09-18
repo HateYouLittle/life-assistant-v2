@@ -41,6 +41,7 @@ interface DeliveryRow {
   generation: number;
   request_id: string | null;
   request_started_at: string | null;
+  expire_at: string | null;
   profile_id: string;
   kind: string;
   title: string;
@@ -81,6 +82,7 @@ export function setPushRoute(
   return route;
 }
 
+/** 停用路由：落一条 disabled 的空路由，投递层据此判为 route removed（notify 工具目前用 enabled=false 达到同样效果） */
 export function clearPushRoute(db: DatabaseSync, profileId: string): void {
   setSetting(db, profileId, "push_route", {
     name: `life-assistant-${profileId}`,
@@ -167,9 +169,9 @@ export function publishProfile(
 
     if (!routable || secret === undefined) return { result: { id, deduped: false }, queued: false };
     db.prepare(
-      `INSERT INTO deliveries (id, notification_id, route_name, status, next_attempt_at, created_at, updated_at)
-       VALUES (?, ?, ?, 'queued', ?, ?, ?)`,
-    ).run(newId(), id, route.name, createdAt, createdAt, createdAt);
+      `INSERT INTO deliveries (id, notification_id, route_name, status, next_attempt_at, expire_at, created_at, updated_at)
+       VALUES (?, ?, ?, 'queued', ?, ?, ?, ?)`,
+    ).run(newId(), id, route.name, createdAt, input.expiresAt ?? null, createdAt, createdAt);
     return { result: { id, deduped: false }, queued: true };
   });
 
@@ -280,6 +282,14 @@ export function drainDue(db: DatabaseSync, config: ResolvedConfig): Promise<numb
       const deliverable: DeliveryRow[] = [];
       for (const row of rows) {
         if (Date.now() > deadline) return processed;
+        // 过期内容直接作废：静默时段拦下的预警如果等到窗口结束再补投，用户收到的
+        // 是已经失效的告警。通知本身保留（pull 兜底），这里只终结投递。
+        if (row.expire_at !== null && row.expire_at <= now) {
+          db.prepare(
+            "UPDATE deliveries SET status = 'cancelled', last_error = 'expired before delivery', updated_at = ? WHERE id = ?",
+          ).run(nowIso(), row.id);
+          continue;
+        }
         const skip = skipReason(db, config, row);
         if (skip !== null) {
           if (skip !== "quiet-hours") {

@@ -22,6 +22,11 @@ export interface PublishInput {
   blocks: NotifyBlock;
   /** Profile 内去重键；相同键的后续发布被丢弃（返回 null） */
   dedupeKey?: string;
+  /**
+   * 投递截止时刻（ISO）。到点仍未投出（典型场景：静默时段拦下的气象预警）即作废，
+   * 避免把已经失效的内容补投给用户；通知本身仍保留，可由 notify.pull 兜底。
+   */
+  expiresAt?: string;
 }
 
 export interface PublishResult {

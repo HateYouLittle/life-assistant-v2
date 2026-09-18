@@ -323,6 +323,52 @@ describe("weather alert_watch：级别与时效过滤", () => {
   });
 });
 
+describe("weather alert_watch：投递截止时刻", () => {
+  function expireAtOf(env: TestEnv): string | null {
+    const row = env.db.prepare("SELECT expire_at FROM deliveries").get() as
+      | { expire_at: string | null }
+      | undefined;
+    assert.ok(row !== undefined, "配了路由 + secret 就该落投递记录");
+    return row.expire_at;
+  }
+
+  it("预警的失效时刻写入投递截止（静默时段结束后不再补投）", async () => {
+    const env = makeEnv(
+      { PROFILE_ROUTE_SECRETS_JSON: JSON.stringify({ default: SECRET }) },
+      "default",
+    );
+    try {
+      await withFetch(
+        responderFor(() => ({ body: alertBody(alert()) })),
+        async () => {
+          await runAlertWatch();
+        },
+      );
+      assert.equal(expireAtOf(env), FUTURE, "endsAt 必须落到 deliveries.expire_at 上");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("没有失效时间的预警不设截止（不误杀）", async () => {
+    const env = makeEnv(
+      { PROFILE_ROUTE_SECRETS_JSON: JSON.stringify({ default: SECRET }) },
+      "default",
+    );
+    try {
+      await withFetch(
+        responderFor(() => ({ body: alertBody(alert({ expireTime: undefined })) })),
+        async () => {
+          await runAlertWatch();
+        },
+      );
+      assert.equal(expireAtOf(env), null);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
 describe("weather alert_watch：静默与失败路径", () => {
   it("无预警：静默跳过，不产生任何通知", async () => {
     const env = makeEnv({}, "default");

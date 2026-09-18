@@ -345,6 +345,8 @@ export async function runAlertWatch(): Promise<void> {
           title: alertTitle(alert),
           blocks: alertBlocks(alert),
           dedupeKey: alertDedupeKey(alert),
+          // 预警失效时刻即投递截止：静默时段结束后不再补投已失效的预警
+          expiresAt: alert.endsAt,
         });
       }
     } catch (e) {

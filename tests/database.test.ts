@@ -6,15 +6,45 @@ import { getSchemaVersion, openDatabase, withTransaction } from "../src/core/dat
 import { getCache, pruneCache, setCache } from "../src/core/settings.js";
 import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
 
-describe("database schema v1", () => {
-  it("新库迁移到 v1 并可重复打开", () => {
+describe("database schema v2", () => {
+  it("新库迁移到最新版本并可重复打开", () => {
     const env = makeTestEnv();
     try {
-      assert.equal(getSchemaVersion(env.db), 1);
+      assert.equal(getSchemaVersion(env.db), 2);
       env.db.close();
       const reopened = openDatabase(env.config.dbPath);
-      assert.equal(getSchemaVersion(reopened), 1);
+      assert.equal(getSchemaVersion(reopened), 2);
       reopened.close();
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("v1 老库打开时补上 deliveries.expire_at 并升级版本号", () => {
+    const env = makeTestEnv();
+    try {
+      env.db.close();
+      // 还原成 v1 形状：去掉新列 + 版本号写回 1
+      const raw = new DatabaseSync(env.config.dbPath);
+      raw.exec("ALTER TABLE deliveries DROP COLUMN expire_at");
+      raw.prepare("UPDATE meta SET value = '1' WHERE key = 'schema_version'").run();
+      raw.close();
+
+      const upgraded = openDatabase(env.config.dbPath);
+      try {
+        assert.equal(getSchemaVersion(upgraded), 2, "老库必须在启动时升级版本号");
+        const columns = (
+          upgraded.prepare("PRAGMA table_info(deliveries)").all() as { name: string }[]
+        ).map((c) => c.name);
+        assert.ok(columns.includes("expire_at"), `缺列会让投递写入直接失败：${columns.join(",")}`);
+      } finally {
+        upgraded.close();
+      }
+
+      // 再次打开：已是 v2，迁移必须幂等（否则每次启动都会炸在重复 ALTER 上）
+      const again = openDatabase(env.config.dbPath);
+      assert.equal(getSchemaVersion(again), 2);
+      again.close();
     } finally {
       cleanupTestEnv(env);
     }

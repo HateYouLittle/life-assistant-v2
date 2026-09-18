@@ -1,8 +1,9 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { logger } from "./logger.js";
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -115,6 +116,8 @@ CREATE TABLE IF NOT EXISTS deliveries (
   next_attempt_at TEXT NOT NULL,
   sent_at TEXT,
   last_error TEXT,
+  /** 投递截止时刻（ISO）：到点仍未投出即作废，见 core/notify.ts 的 drainDue */
+  expire_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 ) STRICT;
@@ -155,6 +158,13 @@ export function openDatabase(dbPath: string): DatabaseSync {
   return db;
 }
 
+/** 幂等加列：老库补列时用（STRICT 表允许追加可空列） */
+function addColumnIfMissing(db: DatabaseSync, table: string, column: string, type: string): void {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  if (columns.some((c) => c.name === column)) return;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+}
+
 export function migrate(db: DatabaseSync): void {
   db.exec(DDL);
   const row = db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as
@@ -166,11 +176,23 @@ export function migrate(db: DatabaseSync): void {
     );
     return;
   }
-  const version = Number(row.value);
-  if (version > SCHEMA_VERSION) {
-    throw new Error(`数据库 schema 版本 ${version} 高于程序支持的 ${SCHEMA_VERSION}，拒绝启动`);
+  const stored = Number(row.value);
+  if (!Number.isInteger(stored) || stored < 1) {
+    throw new Error(`数据库 schema 版本不合法: ${row.value}，拒绝启动`);
   }
-  // v2 只有 v1；未来版本在此按 version 逐级升级（附加式迁移）
+  if (stored > SCHEMA_VERSION) {
+    throw new Error(`数据库 schema 版本 ${stored} 高于程序支持的 ${SCHEMA_VERSION}，拒绝启动`);
+  }
+  // 逐级升级（附加式）：只加列/加表，不动既有数据；中途失败会抛出，由调用方关库拒绝启动
+  let version = stored;
+  if (version === 1) {
+    addColumnIfMissing(db, "deliveries", "expire_at", "TEXT");
+    version = 2;
+  }
+  if (version !== stored) {
+    db.prepare("UPDATE meta SET value = ? WHERE key = 'schema_version'").run(String(version));
+    logger.info(`数据库 schema 已从 v${stored} 升级到 v${version}`);
+  }
 }
 
 export function getSchemaVersion(db: DatabaseSync): number {
