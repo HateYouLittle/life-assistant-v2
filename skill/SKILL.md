@@ -25,7 +25,7 @@ read_when:
 | 空气质量（国标 AQI） | `air_quality` |
 | 下一假期 / 某月安排 / 某日是否上班 | `holiday {view}` |
 | 待办、生日、纪念日提醒（公历+农历） | `schedule {action}` |
-| 账本管理 | `ledger {action}` |
+| 账本管理、月度预算 | `ledger {action}` |
 | 记一笔支出 / 明细 / 汇总 / 删除记错的一笔 | `expense {action}` |
 | 拉通知 / 静默时段 / 推送路由 / 取消推送 | `notify {action}` |
 
@@ -48,6 +48,7 @@ read_when:
 - 生日/纪念日默认按年循环；`calendar: "lunar"` 需给 `lunar_month/lunar_day`（1-12 / 1-30）。
 - 农历日越界（如腊月三十缺失）默认取当月最后一天（`lunar_clamp` 默认 true）。
 - `remind_offsets` 负数为提前提醒（如 [-30] 提前 30 分钟）；`resend_minutes` 是待办到点重发一次。
+- 截止型日程：给待办加 `escalation`（严格升序分钟偏移数组，**首元素固定为 0**＝截止时刻本身，如 `[0,60,360,1440]`，即截止/1h/6h/24h；仅 `kind=todo` 可设）—— 到达截止后按阶梯持续加压提醒，直到 `complete`；此时 `resend_minutes` 被忽略（`update` 传 `escalation: []` 可清除阶梯）。这类日程在列表/状态页显示为「截止」。
 - `workday_filter` 让日程只在法定工作日/节假日触发；节假日数据未覆盖时日程会暂停，如实告知用户。
 - 完成待办用 `complete`（可带 `occurrence_key` 只完成单次）；更新用 `update`；删除用 `delete`。
 - **远期日程只保留「下一条」**：occurrence 只物化到未来 62 天；若某日程此刻一条待提醒都没有（远期生日、远期一次性待办），会额外保留 1 条越过该窗口的 occurrence。因此 `upcoming` 里远期日程只出现一条，这不是数据缺失，提醒也不会漏。
@@ -60,6 +61,7 @@ read_when:
 - 记账前先 `ledger {action: "list"}` 取得账本 id；`expense` 的 `add`/`list`/`summary` 三个 action 都必须传 `ledger_id`。
 - `ledger.list` 默认不含归档账本；核账时传 `include_archived: true`。
 - 汇总用 `expense {action: "summary"}`，可按 `month`、`from/to`、`by`（记账人）过滤。
+- 预算：`ledger {action: "budget", ledger_id}` 查看该账本全部预算与本月对照；带 `amount`（元）设置/覆盖，带 `category` 为分类预算（不传为账本总额），`clear: true` 删除该范围。预算按账本每月滚动，支出**跨越** 80%/100% 时自动提醒（同一预算一笔只推跨过的最高阈值那一条，跨月重新判定，同月同阈值不重推）；设了预算的账本月报会附预算对照行。
 - **没有编辑功能**：改金额/分类/备注只能 `expense {action: "delete", id}`（id 从 `list` 取）再重新 `add`。删除**不可恢复**，且重记后「记账人」会变成当前 Profile——动手前把这两点告知用户。用户说「改一下备注/金额」时按此处理，不要声称可以直接改。
 - 账本改名用 `ledger {action: "rename", id, name}`；归档/恢复用 `action: "archive"`（`unarchive: true` 恢复）。**没有删除账本的接口**——要彻底删除只能直连服务端数据库操作。
 - `expense {action: "list"}` 的 `month` 只覆盖当月，且默认只返回 20 条：返回里 `已返回` 与 `匹配总数` 是两个数，别把窗口当全量。

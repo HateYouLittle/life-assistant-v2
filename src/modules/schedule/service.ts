@@ -32,6 +32,8 @@ export interface ScheduleInput {
   recurrence: Recurrence | null;
   remindOffsets: number[];
   resendMinutes: number;
+  /** 逾期升级阶梯（分钟偏移，升序）；null/缺省 = 不启用（此时 resend_minutes 生效） */
+  escalation?: number[] | null;
   workdayFilter: WorkdayFilter;
 }
 
@@ -52,6 +54,7 @@ export interface ScheduleRow {
   recurrence_json: string | null;
   remind_offsets_json: string;
   resend_minutes: number;
+  escalation_json: string | null;
   workday_filter: WorkdayFilter;
   status: "active" | "done" | "cancelled";
   next_run_at: string | null;
@@ -71,6 +74,10 @@ const NEAR_HORIZON_DAYS = 62;
 const FAR_HORIZON_DAYS = 400;
 /** 强提醒（到点重发一次）行的 occurrence_key 后缀 */
 const RESEND_SUFFIX = ":resend";
+/** 逾期升级行的 occurrence_key 后缀：`<eventKey>#esc:<N>`（N 从 1 起，第 0 步是截止时刻的 #0） */
+const ESCALATION_SUFFIX = "#esc:";
+export const MAX_ESCALATION_STEPS = 5;
+export const MAX_ESCALATION_MINUTES = 43200;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 
@@ -100,6 +107,72 @@ export function parseRecurrence(json: string | null): Recurrence | null {
   // 缺省 interval 必须兜底为 1，否则 recurrence 引擎会在推进日期时死循环
   const interval = typeof rec.interval === "number" && rec.interval >= 1 ? rec.interval : 1;
   return { ...rec, interval };
+}
+
+/**
+ * 校验逾期升级阶梯：1-5 个非负整数分钟、首元素固定为 0（截止时刻本身）、严格升序（不重复）、
+ * 最大值 ≤ 43200（30 天）。工具层（buildPartial）与服务层（validateScheduleInput）都走这里，规则唯一。
+ */
+export function validateEscalation(value: number[]): void {
+  if (value.length < 1 || value.length > MAX_ESCALATION_STEPS) {
+    throw new Error(`escalation 需要 1-${MAX_ESCALATION_STEPS} 个分钟偏移（升序）`);
+  }
+  if (value[0] !== 0) {
+    throw new Error(
+      "escalation 首元素必须为 0（0 表示截止时刻本身；后续元素是逾期后的分钟偏移，如 [0,60,360,1440]）",
+    );
+  }
+  for (const minutes of value) {
+    if (!Number.isInteger(minutes) || minutes < 0 || minutes > MAX_ESCALATION_MINUTES) {
+      throw new Error(
+        `escalation 偏移不合法: ${String(minutes)}（需为 0-${MAX_ESCALATION_MINUTES} 的整数分钟）`,
+      );
+    }
+  }
+  for (let i = 1; i < value.length; i++) {
+    if ((value[i] as number) <= (value[i - 1] as number)) {
+      throw new Error("escalation 必须严格升序且不允许重复值");
+    }
+  }
+}
+
+/** 读库里的阶梯；NULL/空/非法一律当作「未启用」，避免脏数据把调度带偏 */
+export function parseEscalation(json: string | null): number[] | null {
+  if (json === null || json === "") return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0) return null;
+  if (!parsed.every((v) => typeof v === "number" && Number.isInteger(v) && v >= 0)) return null;
+  return parsed as number[];
+}
+
+/** 从 occurrence_key 解析升级步骤号；非升级行返回 null */
+function escalationStepOf(occurrenceKey: string): number | null {
+  const idx = occurrenceKey.lastIndexOf(ESCALATION_SUFFIX);
+  if (idx < 0) return null;
+  const raw = occurrenceKey.slice(idx + ESCALATION_SUFFIX.length);
+  if (!/^\d+$/.test(raw)) return null;
+  return Number(raw);
+}
+
+/**
+ * 逾期时长文案：区分分 / 小时 / 天，且不输出「0 天 0 小时」这类空单位。
+ * 例：3 分 / 1 小时 3 分 / 1 天 2 小时。
+ */
+export function formatElapsed(fromIso: string, at: DateTime): string {
+  const total = Math.max(0, Math.round(at.diff(DateTime.fromISO(fromIso), "minutes").minutes));
+  const days = Math.floor(total / 1440);
+  const hours = Math.floor((total % 1440) / 60);
+  const minutes = total % 60;
+  const parts: string[] = [];
+  if (days > 0) parts.push(`${days} 天`);
+  if (hours > 0) parts.push(`${hours} 小时`);
+  if (minutes > 0) parts.push(`${minutes} 分`);
+  return parts.length > 0 ? parts.join(" ") : "不到 1 分";
 }
 
 export function sourceOf(row: ScheduleRow): OccurrenceSource {
@@ -152,6 +225,10 @@ export function validateScheduleInput(input: ScheduleInput): void {
   ) {
     if (input.recurrence.until < input.startDate) throw new Error("until 不能早于开始日期");
   }
+  if (input.escalation !== null && input.escalation !== undefined) {
+    if (input.kind !== "todo") throw new Error('escalation（截止型日程）只支持 kind="todo"');
+    validateEscalation(input.escalation);
+  }
 }
 
 function insertSchedule(
@@ -164,8 +241,8 @@ function insertSchedule(
   db.prepare(
     `INSERT INTO schedules (id, profile_id, title, note, kind, calendar, start_date, lunar_month, lunar_day,
        leap_policy, lunar_clamp, time, all_day, recurrence_json, remind_offsets_json, resend_minutes,
-       workday_filter, status, version, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?)`,
+       escalation_json, workday_filter, status, version, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?)`,
   ).run(
     id,
     profileId,
@@ -183,6 +260,9 @@ function insertSchedule(
     input.recurrence === null ? null : JSON.stringify(input.recurrence),
     JSON.stringify(input.remindOffsets),
     input.resendMinutes,
+    input.escalation === null || input.escalation === undefined
+      ? null
+      : JSON.stringify(input.escalation),
     input.workdayFilter,
     ts,
     ts,
@@ -385,6 +465,8 @@ export function updateSchedule(
       patch.recurrence !== undefined ? patch.recurrence : parseRecurrence(row.recurrence_json),
     remindOffsets: patch.remindOffsets ?? (JSON.parse(row.remind_offsets_json) as number[]),
     resendMinutes: patch.resendMinutes ?? row.resend_minutes,
+    escalation:
+      patch.escalation !== undefined ? patch.escalation : parseEscalation(row.escalation_json),
     workdayFilter: patch.workdayFilter ?? row.workday_filter,
   };
   if (patch.status !== undefined && !["active", "done", "cancelled"].includes(patch.status)) {
@@ -400,8 +482,8 @@ export function updateSchedule(
     db.prepare(
       `UPDATE schedules SET title = ?, note = ?, kind = ?, calendar = ?, start_date = ?, lunar_month = ?,
          lunar_day = ?, leap_policy = ?, lunar_clamp = ?, time = ?, all_day = ?, recurrence_json = ?,
-         remind_offsets_json = ?, resend_minutes = ?, workday_filter = ?, status = ?, version = version + 1,
-         updated_at = ?
+         remind_offsets_json = ?, resend_minutes = ?, escalation_json = ?, workday_filter = ?, status = ?,
+         version = version + 1, updated_at = ?
        WHERE id = ?`,
     ).run(
       merged.title.trim(),
@@ -418,14 +500,18 @@ export function updateSchedule(
       merged.recurrence === null ? null : JSON.stringify(merged.recurrence),
       JSON.stringify(merged.remindOffsets),
       merged.resendMinutes,
+      merged.escalation === null ? null : JSON.stringify(merged.escalation),
       merged.workdayFilter,
       status,
       ts,
       id,
     );
+    // 保留 :resend 与 #esc:* 行：它们的有效性由 fireDue 的触发前校验按当前排期判定
+    // （改了 time/escalation、父事件被删/重排时在触发前作废），不能在这里一律删掉。
     db.prepare(
-      `DELETE FROM occurrences WHERE schedule_id = ? AND status = 'pending' AND occurrence_key NOT LIKE '%' || ?`,
-    ).run(id, RESEND_SUFFIX);
+      `DELETE FROM occurrences WHERE schedule_id = ? AND status = 'pending'
+         AND occurrence_key NOT LIKE '%' || ? AND occurrence_key NOT LIKE '%' || ?`,
+    ).run(id, RESEND_SUFFIX, `${ESCALATION_SUFFIX}%`);
   });
   const updated = getSchedule(db, profileId, id) as ScheduleRow;
   materializeSchedule(db, updated);
@@ -484,12 +570,13 @@ export interface UpcomingItem {
   occurrence_key: string;
   event_at: string;
   due_at: string;
+  escalation_json: string | null;
 }
 
 export function upcoming(db: DatabaseSync, profileId: string, limit: number): UpcomingItem[] {
   return db
     .prepare(
-      `SELECT o.occurrence_key, o.event_at, o.due_at, s.id AS schedule_id, s.title, s.kind
+      `SELECT o.occurrence_key, o.event_at, o.due_at, s.id AS schedule_id, s.title, s.kind, s.escalation_json
        FROM occurrences o JOIN schedules s ON s.id = o.schedule_id
        WHERE s.profile_id = ? AND s.status = 'active' AND o.status = 'pending' AND o.due_at >= ?
        ORDER BY o.due_at LIMIT ?`,
@@ -680,6 +767,61 @@ function resendDueOrNull(
   return DateTime.fromISO(eventAt).plus({ minutes: schedule.resend_minutes }).toUTC().toISO();
 }
 
+/**
+ * 逾期升级行的触发前校验（与 resendDueOrNull 同构）。update 会保留 pending 的 #esc:* 行，
+ * 但用户改了 time、缩短/清除了 escalation、或父事件被删/重排之后，旧行仍会按旧排期打扰一次。
+ * 这里按当前日程重新判定：该步必须仍存在（1 ≤ N < escalation.length），父事件 key 必须与当前
+ * time 对得上且未被取消，due_at 强制等于 event_at + escalation[N]。返回 null 表示该行应作废。
+ */
+function escalationDueOrNull(
+  db: DatabaseSync,
+  schedule: ScheduleRow,
+  occurrenceKey: string,
+  eventAt: string,
+): string | null {
+  const step = escalationStepOf(occurrenceKey);
+  if (step === null) return null;
+  const escalation = parseEscalation(schedule.escalation_json);
+  if (escalation === null) return null;
+  // 第 0 步是截止时刻的 #0，不走此路径；#esc:N 只在第 N 个偏移仍存在时有效
+  if (step < 1 || step >= escalation.length) return null;
+  const suffix = `${ESCALATION_SUFFIX}${step}`;
+  const parentKey = occurrenceKey.slice(0, occurrenceKey.length - suffix.length);
+  // key 里带着当时的提醒时刻（`<date>T<time>#0`）：改了 time 之后旧 key 不再出现在日程上，必须作废
+  if (!parentKey.endsWith(`${schedule.time}#0`)) return null;
+  const parent = db
+    .prepare(
+      "SELECT 1 FROM occurrences WHERE schedule_id = ? AND occurrence_key = ? AND status != 'cancelled'",
+    )
+    .get(schedule.id, parentKey);
+  if (parent === undefined) return null;
+  return DateTime.fromISO(eventAt)
+    .plus({ minutes: escalation[step] as number })
+    .toUTC()
+    .toISO();
+}
+
+/** 派生一条升级行：`<parentKey>#esc:<step>`，due_at = event_at + escalation[step]；已存在则忽略 */
+function insertEscalation(
+  db: DatabaseSync,
+  scheduleId: string,
+  parentKey: string,
+  eventAt: string,
+  step: number,
+  escalation: number[],
+): void {
+  const due = DateTime.fromISO(eventAt).plus({ minutes: escalation[step] as number });
+  db.prepare(
+    `INSERT OR IGNORE INTO occurrences (schedule_id, occurrence_key, event_at, due_at, status)
+     VALUES (?, ?, ?, ?, 'pending')`,
+  ).run(
+    scheduleId,
+    `${parentKey}${ESCALATION_SUFFIX}${step}`,
+    eventAt,
+    due.toUTC().toISO() ?? eventAt,
+  );
+}
+
 function cancelOccurrence(db: DatabaseSync, occ: DueRow): void {
   db.prepare(
     "UPDATE occurrences SET status = 'cancelled' WHERE schedule_id = ? AND occurrence_key = ?",
@@ -704,6 +846,7 @@ export async function fireDue(db: DatabaseSync, services: Services, at: DateTime
       | undefined;
     if (schedule === undefined) continue;
     const isResend = occ.occurrence_key.endsWith(RESEND_SUFFIX);
+    const isEscalation = !isResend && escalationStepOf(occ.occurrence_key) !== null;
     let dueAt = occ.due_at;
     if (isResend) {
       const expected = resendDueOrNull(db, schedule, occ.occurrence_key, occ.event_at);
@@ -718,13 +861,28 @@ export async function fireDue(db: DatabaseSync, services: Services, at: DateTime
         if (expected > cutoff) continue; // 校正后尚未到点，本轮不推
         dueAt = expected;
       }
+    } else if (isEscalation) {
+      const expected = escalationDueOrNull(db, schedule, occ.occurrence_key, occ.event_at);
+      if (expected === null) {
+        cancelOccurrence(db, occ);
+        continue;
+      }
+      if (expected !== occ.due_at) {
+        db.prepare(
+          "UPDATE occurrences SET due_at = ? WHERE schedule_id = ? AND occurrence_key = ?",
+        ).run(expected, occ.schedule_id, occ.occurrence_key);
+        if (expected > cutoff) continue; // 校正后尚未到点，本轮不推
+        dueAt = expected;
+      }
     }
     const lateMinutes = at.diff(DateTime.fromISO(dueAt), "minutes").minutes;
-    const note = isResend
-      ? "（强提醒：以上事项仍未完成）"
-      : lateMinutes > CATCHUP_GRACE_MINUTES
-        ? `（补发：该提醒已错过约 ${Math.round(lateMinutes)} 分钟）`
-        : null;
+    const note = isEscalation
+      ? `（截止已过 ${formatElapsed(occ.event_at, at)}，仍未完成）`
+      : isResend
+        ? "（强提醒：以上事项仍未完成）"
+        : lateMinutes > CATCHUP_GRACE_MINUTES
+          ? `（补发：该提醒已错过约 ${Math.round(lateMinutes)} 分钟）`
+          : null;
     await services.publishProfile(schedule.profile_id, {
       kind: "schedule.reminder",
       title: schedule.title,
@@ -735,23 +893,34 @@ export async function fireDue(db: DatabaseSync, services: Services, at: DateTime
     db.prepare(
       "UPDATE occurrences SET status = 'notified' WHERE schedule_id = ? AND occurrence_key = ?",
     ).run(occ.schedule_id, occ.occurrence_key);
-    if (
-      !isResend &&
-      schedule.kind === "todo" &&
-      schedule.resend_minutes > 0 &&
-      occ.occurrence_key.endsWith("#0")
-    ) {
-      // 「到点后 N 分钟重发」以事件时刻为基准：用 due_at 会被 offsets[0] 的提前量带偏
-      const resendDue = DateTime.fromISO(occ.event_at).plus({ minutes: schedule.resend_minutes });
-      db.prepare(
-        `INSERT OR IGNORE INTO occurrences (schedule_id, occurrence_key, event_at, due_at, status)
-         VALUES (?, ?, ?, ?, 'pending')`,
-      ).run(
-        schedule.id,
-        `${occ.occurrence_key}${RESEND_SUFFIX}`,
-        occ.event_at,
-        resendDue.toUTC().toISO() ?? occ.due_at,
-      );
+    const escalation = parseEscalation(schedule.escalation_json);
+    if (isEscalation) {
+      const step = escalationStepOf(occ.occurrence_key);
+      if (escalation !== null && step !== null && step + 1 < escalation.length) {
+        const suffix = `${ESCALATION_SUFFIX}${step}`;
+        const parentKey = occ.occurrence_key.slice(0, occ.occurrence_key.length - suffix.length);
+        insertEscalation(db, schedule.id, parentKey, occ.event_at, step + 1, escalation);
+      }
+    } else if (!isResend && schedule.kind === "todo" && occ.occurrence_key.endsWith("#0")) {
+      if (escalation !== null) {
+        // 设置了阶梯：第 0 步（截止时刻）之后派生出 #esc:1；resend_minutes 被忽略
+        // （要么按阶梯加压，要么只重发一次，同一事件不该收到两条「仍未完成」）
+        if (escalation.length > 1) {
+          insertEscalation(db, schedule.id, occ.occurrence_key, occ.event_at, 1, escalation);
+        }
+      } else if (schedule.resend_minutes > 0) {
+        // 「到点后 N 分钟重发」以事件时刻为基准：用 due_at 会被 offsets[0] 的提前量带偏
+        const resendDue = DateTime.fromISO(occ.event_at).plus({ minutes: schedule.resend_minutes });
+        db.prepare(
+          `INSERT OR IGNORE INTO occurrences (schedule_id, occurrence_key, event_at, due_at, status)
+           VALUES (?, ?, ?, ?, 'pending')`,
+        ).run(
+          schedule.id,
+          `${occ.occurrence_key}${RESEND_SUFFIX}`,
+          occ.event_at,
+          resendDue.toUTC().toISO() ?? occ.due_at,
+        );
+      }
     }
   }
   return published;

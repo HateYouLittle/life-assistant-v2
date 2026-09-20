@@ -19,11 +19,13 @@ import {
   getSchedule,
   KIND_LABEL,
   listSchedules,
+  parseEscalation,
   parseRecurrence,
   runOccurrenceCleanup,
   tickSchedules,
   upcoming,
   updateSchedule,
+  validateEscalation,
   type ScheduleInput,
   type SchedulePatch,
   type ScheduleRow,
@@ -41,6 +43,19 @@ const recurrenceInput = z.object({
   count: z.number().int().min(1).max(9999).optional().describe("最多发生次数"),
 });
 
+/**
+ * MCP 入口的 escalation schema：只做「数组 / 元素范围 / 最多 5 项」的形状校验，
+ * 长度下限与首元素/升序等语义规则留给 service 层（validateEscalation），
+ * 否则 update 传 `[]`（清除阶梯）会在进入 handler 之前就被拒。
+ */
+export const scheduleEscalationInput = z
+  .array(z.number().int().min(0).max(43200))
+  .max(5)
+  .optional()
+  .describe(
+    "逾期升级阶梯（分钟偏移数组，严格升序；首元素必须为 0 = 截止时刻本身，后续为逾期后的分钟偏移，如 [0,60,360,1440] 表示截止/1h/6h/24h 各提醒一次；仅 kind=todo 可用，设置后忽略 resend_minutes）",
+  );
+
 function parseRecurrenceInput(value: unknown): Recurrence {
   const parsed = recurrenceInput.parse(value) as Recurrence;
   // 显式传空数组会让 recurrence 引擎无候选日可产出（历史上导致同步死循环），
@@ -52,7 +67,10 @@ function parseRecurrenceInput(value: unknown): Recurrence {
 }
 
 /** 只收集显式提供的字段：add 时补默认值，update 时未提供的字段保持原值 */
-function buildPartial(args: Record<string, unknown>): SchedulePatch {
+function buildPartial(
+  args: Record<string, unknown>,
+  mode: "add" | "update" = "update",
+): SchedulePatch {
   const patch: SchedulePatch = {};
   if (args.title !== undefined) patch.title = String(args.title);
   if (args.note !== undefined) patch.note = String(args.note);
@@ -70,6 +88,17 @@ function buildPartial(args: Record<string, unknown>): SchedulePatch {
     patch.remindOffsets = args.remind_offsets as number[];
   }
   if (args.resend_minutes !== undefined) patch.resendMinutes = Number(args.resend_minutes);
+  // escalation：undefined/null 视为未提供；update 传空数组 [] = 清除阶梯；add 传 [] 非法
+  if (args.escalation !== undefined && args.escalation !== null) {
+    if (!Array.isArray(args.escalation)) throw new Error("escalation 需要是分钟偏移数组");
+    const value = (args.escalation as unknown[]).map((v) => Number(v));
+    if (mode === "update" && value.length === 0) {
+      patch.escalation = null;
+    } else {
+      validateEscalation(value);
+      patch.escalation = value;
+    }
+  }
   if (args.workday_filter !== undefined) {
     patch.workdayFilter = args.workday_filter as ScheduleInput["workdayFilter"];
   }
@@ -78,10 +107,11 @@ function buildPartial(args: Record<string, unknown>): SchedulePatch {
 
 function rowToPublic(row: ScheduleRow): Record<string, unknown> {
   const rec = parseRecurrence(row.recurrence_json);
+  const escalation = parseEscalation(row.escalation_json);
   return {
     id: row.id,
     标题: row.title,
-    类型: KIND_LABEL[row.kind],
+    类型: escalation === null ? KIND_LABEL[row.kind] : "截止",
     日历: row.calendar === "lunar" ? `农历${row.lunar_month}月${row.lunar_day}日` : row.start_date,
     时间: row.all_day === 1 ? `${row.time}（全天）` : row.time,
     重复: describeRecurrence(
@@ -95,6 +125,7 @@ function rowToPublic(row: ScheduleRow): Record<string, unknown> {
       row.start_date,
     ),
     提醒: JSON.parse(row.remind_offsets_json) as number[],
+    ...(escalation === null ? {} : { 升级提醒: escalation }),
     状态: row.status,
     下次提醒: row.next_run_at,
     版本: row.version,
@@ -115,7 +146,7 @@ function scheduleToolInner(args: Record<string, unknown>, ctx: ToolContext) {
   switch (action) {
     case "add": {
       if (args.title === undefined) return fail("add 需要 title");
-      const patch = buildPartial(args);
+      const patch = buildPartial(args, "add");
       const kind = patch.kind ?? "todo";
       const input: ScheduleInput = {
         title: patch.title as string,
@@ -134,6 +165,7 @@ function scheduleToolInner(args: Record<string, unknown>, ctx: ToolContext) {
         recurrence: patch.recurrence ?? (kind === "todo" ? null : { freq: "yearly", interval: 1 }),
         remindOffsets: patch.remindOffsets ?? [0],
         resendMinutes: patch.resendMinutes ?? 0,
+        escalation: patch.escalation ?? null,
         workdayFilter: patch.workdayFilter ?? "any",
       };
       const row = createSchedule(db, ctx.profileId, input);
@@ -176,14 +208,18 @@ function scheduleToolInner(args: Record<string, unknown>, ctx: ToolContext) {
       const limit = (args.limit as number) ?? 10;
       const items = upcoming(db, ctx.profileId, limit);
       return okJson({
-        即将到来: items.map((i) => ({
-          标题: i.title,
-          类型: KIND_LABEL[i.kind],
-          id: i.schedule_id,
-          提醒时间: i.due_at,
-          事件日期: instantToLocalDate(i.event_at),
-          occurrence_key: i.occurrence_key,
-        })),
+        即将到来: items.map((i) => {
+          const escalation = parseEscalation(i.escalation_json);
+          return {
+            标题: i.title,
+            类型: escalation === null ? KIND_LABEL[i.kind] : "截止",
+            id: i.schedule_id,
+            提醒时间: i.due_at,
+            事件日期: instantToLocalDate(i.event_at),
+            occurrence_key: i.occurrence_key,
+            ...(escalation === null ? {} : { 升级提醒: escalation }),
+          };
+        }),
       });
     }
     default:
@@ -198,7 +234,8 @@ registerModule({
       name: "schedule",
       description:
         "Profile 私有日程：待办/生日/纪念日，支持公历与农历（闰月策略、腊月三十顺延）、循环（每天/每周/每月/每年 + until/count）、按法定工作日/节假日重复、多级提醒与到点重发。" +
-        "action=add 创建（calendar=lunar 时需 lunar_month/lunar_day 且按年循环；生日/纪念日默认按年循环）；list 查询；update 修改；complete 完成待办（可带 occurrence_key 只完成单次）；delete 删除；upcoming 查即将提醒。",
+        "带 escalation 的待办即「截止型日程」：到达截止时刻后按阶梯依次重发升级提醒（逾期越久提醒越频繁），直到 complete；阶梯首元素固定为 0（截止时刻本身），且仅 kind=todo 可设；设置 escalation 后 resend_minutes 被忽略（不再产生到点重发）。" +
+        "action=add 创建（calendar=lunar 时需 lunar_month/lunar_day 且按年循环；生日/纪念日默认按年循环）；list 查询；update 修改（escalation 传 [] 清除阶梯）；complete 完成待办（可带 occurrence_key 只完成单次）；delete 删除；upcoming 查即将提醒。",
       inputSchema: {
         action: z.enum(["add", "list", "update", "complete", "delete", "upcoming"]),
         id: z.string().optional().describe("update/complete/delete 时必填"),
@@ -235,7 +272,8 @@ registerModule({
           .min(0)
           .max(1440)
           .optional()
-          .describe("待办到点后 N 分钟重发一次，默认 0"),
+          .describe("待办到点后 N 分钟重发一次，默认 0；设置 escalation 时被忽略"),
+        escalation: scheduleEscalationInput,
         status: z
           .enum(["active", "done", "cancelled"])
           .optional()

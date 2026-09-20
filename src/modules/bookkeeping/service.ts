@@ -217,6 +217,180 @@ export function monthRange(ym: string): { from: string; to: string } {
   return { from, to: `${ym}-${String(lastDay).padStart(2, "0")}` };
 }
 
+export interface BudgetRow {
+  id: string;
+  ledger_id: string;
+  category: string;
+  amount_cents: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface BudgetStatus {
+  total: { budget_cents: number; spent_cents: number; ratio: number } | null;
+  categories: Array<{
+    category: string;
+    budget_cents: number;
+    spent_cents: number;
+    ratio: number;
+  }>;
+}
+
+/** 触达阈值（百分比）；跨越（而非达到）才推送，见 budgetAlertsForEntry */
+export const BUDGET_THRESHOLDS = [80, 100] as const;
+
+export interface BudgetAlert {
+  kind: string;
+  title: string;
+  blocks: NotifyBlock;
+  dedupeKey: string;
+}
+
+/** 预算范围标签：'' 是账本总额预算，其余为分类预算 */
+export function budgetScopeLabel(category: string): string {
+  return category === "" ? "总额" : category;
+}
+
+/** 预算对照的四个字段（工具回显与月报/提醒复用） */
+export function budgetComparison(
+  budgetCents: number,
+  spentCents: number,
+): { 预算: string; 已用: string; 剩余: string; 占比: string } {
+  const remaining = budgetCents - spentCents;
+  return {
+    预算: `¥${centsToYuan(budgetCents)}`,
+    已用: `¥${centsToYuan(spentCents)}`,
+    剩余: remaining < 0 ? `-¥${centsToYuan(-remaining)}` : `¥${centsToYuan(remaining)}`,
+    占比: `${((spentCents / budgetCents) * 100).toFixed(1)}%`,
+  };
+}
+
+/** upsert 预算；账本不存在抛错 */
+export function setBudget(
+  db: DatabaseSync,
+  ledgerId: string,
+  category: string,
+  amountCents: number,
+): BudgetRow {
+  const ledger = getLedger(db, ledgerId);
+  if (ledger === undefined) throw new Error(`账本不存在: ${ledgerId}`);
+  if (!Number.isInteger(amountCents) || amountCents <= 0) {
+    throw new Error(`预算金额不合法: ${String(amountCents)}（分为单位，需为正整数）`);
+  }
+  const scope = category.trim();
+  if (scope.length > 20) throw new Error("分类过长（≤20 字符）");
+  const now = nowIso();
+  db.prepare(
+    `INSERT INTO budgets (id, ledger_id, category, amount_cents, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(ledger_id, category)
+     DO UPDATE SET amount_cents = excluded.amount_cents, updated_at = excluded.updated_at`,
+  ).run(newId(), ledgerId, scope, amountCents, now, now);
+  return db
+    .prepare("SELECT * FROM budgets WHERE ledger_id = ? AND category = ?")
+    .get(ledgerId, scope) as unknown as BudgetRow;
+}
+
+export function getBudgets(db: DatabaseSync, ledgerId: string): BudgetRow[] {
+  return db
+    .prepare("SELECT * FROM budgets WHERE ledger_id = ? ORDER BY category")
+    .all(ledgerId) as unknown as BudgetRow[];
+}
+
+export function clearBudget(db: DatabaseSync, ledgerId: string, category: string): boolean {
+  const result = db
+    .prepare("DELETE FROM budgets WHERE ledger_id = ? AND category = ?")
+    .run(ledgerId, category.trim());
+  return result.changes > 0;
+}
+
+/** 该账本在 ym 当月的预算对照；复用 summarizeExpenses，不另写聚合 SQL */
+export function budgetStatus(db: DatabaseSync, ledgerId: string, ym: string): BudgetStatus {
+  const { from, to } = monthRange(ym);
+  const summary = summarizeExpenses(db, ledgerId, { from, to });
+  const spentByCategory = new Map(summary.categories.map((c) => [c.category, c.cents]));
+  let total: BudgetStatus["total"] = null;
+  const categories: BudgetStatus["categories"] = [];
+  for (const budget of getBudgets(db, ledgerId)) {
+    if (budget.category === "") {
+      total = {
+        budget_cents: budget.amount_cents,
+        spent_cents: summary.total_cents,
+        ratio: summary.total_cents / budget.amount_cents,
+      };
+    } else {
+      const spent = spentByCategory.get(budget.category) ?? 0;
+      categories.push({
+        category: budget.category,
+        budget_cents: budget.amount_cents,
+        spent_cents: spent,
+        ratio: spent / budget.amount_cents,
+      });
+    }
+  }
+  return { total, categories };
+}
+
+export function budgetAlertBlocks(status: BudgetStatus): NotifyBlock {
+  const rows: string[][] = [];
+  const add = (label: string, budgetCents: number, spentCents: number): void => {
+    const c = budgetComparison(budgetCents, spentCents);
+    rows.push([label, c.预算, c.已用, c.剩余, c.占比]);
+  };
+  if (status.total !== null) add("总额", status.total.budget_cents, status.total.spent_cents);
+  for (const cat of status.categories) add(cat.category, cat.budget_cents, cat.spent_cents);
+  return { table: { columns: ["项目", "预算", "已用", "剩余", "占比"], rows } };
+}
+
+/**
+ * 判定该笔支出「跨越」了哪个预算阈值（只推跨过的那一刻，达到即推会每笔都发）。
+ * 本笔金额已知：before = after - entry.amount_cents，不重复查库。整数比较避免浮点误差。
+ * 同一个预算（总额或某个分类）在一笔支出里只推「跨过的最高阈值」那一条：
+ * 一笔从 0% 到 150% 只推 100%，从 70% 到 90% 只推 80%。
+ * 总额与分类预算各自独立判定，都命中就各返回一条。
+ */
+export function budgetAlertsForEntry(
+  db: DatabaseSync,
+  ledger: LedgerRow,
+  entry: ExpenseRow,
+): BudgetAlert[] {
+  const budgets = getBudgets(db, ledger.id);
+  if (budgets.length === 0) return [];
+  const ym = entry.spent_on.slice(0, 7);
+  const summary = summarizeExpenses(db, ledger.id, monthRange(ym));
+  const spentByCategory = new Map(summary.categories.map((c) => [c.category, c.cents]));
+  const alerts: BudgetAlert[] = [];
+  for (const budget of budgets) {
+    const after =
+      budget.category === "" ? summary.total_cents : (spentByCategory.get(budget.category) ?? 0);
+    const before = after - entry.amount_cents;
+    const crossed = [...BUDGET_THRESHOLDS]
+      .reverse()
+      .find(
+        (threshold) =>
+          before * 100 < budget.amount_cents * threshold &&
+          after * 100 >= budget.amount_cents * threshold,
+      );
+    if (crossed === undefined) continue;
+    const item = {
+      budget_cents: budget.amount_cents,
+      spent_cents: after,
+      ratio: after / budget.amount_cents,
+    };
+    const status: BudgetStatus =
+      budget.category === ""
+        ? { total: item, categories: [] }
+        : { total: null, categories: [{ category: budget.category, ...item }] };
+    alerts.push({
+      kind: "bookkeeping.budget",
+      title: `${crossed === 80 ? "预算提醒" : "预算超支"} · ${ledger.name}`,
+      blocks: budgetAlertBlocks(status),
+      dedupeKey: `budget:${ledger.id}:${budget.category === "" ? "-" : budget.category}:${ym}:${crossed}`,
+    });
+  }
+  return alerts;
+}
+
 /** 上一个月（按 Asia/Shanghai 本地月份，避免 UTC 月初/月末错位） */
 export function previousMonth(now: Date = new Date()): string {
   const local = DateTime.fromJSDate(now, { zone: TZ });
@@ -225,7 +399,10 @@ export function previousMonth(now: Date = new Date()): string {
     : `${local.year}-${String(local.month - 1).padStart(2, "0")}`;
 }
 
-export function monthlyReportBlocks(summary: ExpenseSummary): NotifyBlock {
+export function monthlyReportBlocks(
+  summary: ExpenseSummary,
+  budget: BudgetStatus | null = null,
+): NotifyBlock {
   const rows = summary.categories.map((c) => [
     c.category,
     `¥${centsToYuan(c.cents)}`,
@@ -238,7 +415,21 @@ export function monthlyReportBlocks(summary: ExpenseSummary): NotifyBlock {
       `记账人：${summary.profiles.map((p) => `${p.profile} ¥${centsToYuan(p.cents)}`).join("、")}`,
     );
   }
+  // 只有设了预算的账本才追加预算对照，未设预算的月报保持原样（不出现空行/「未设预算」噪音）
+  if (budget !== null) {
+    if (budget.total !== null) {
+      notes.push(budgetComparisonLine("总额", budget.total.budget_cents, budget.total.spent_cents));
+    }
+    for (const cat of budget.categories) {
+      notes.push(budgetComparisonLine(cat.category, cat.budget_cents, cat.spent_cents));
+    }
+  }
   return { table: { columns: ["分类", "金额", "占比"], rows }, notes };
+}
+
+function budgetComparisonLine(label: string, budgetCents: number, spentCents: number): string {
+  const c = budgetComparison(budgetCents, spentCents);
+  return `预算对照 · ${label}：预算 ${c.预算} / 已用 ${c.已用} / 剩余 ${c.剩余} / 占比 ${c.占比}`;
 }
 
 export function entryReceiptBlocks(ledger: LedgerRow, entry: ExpenseRow): NotifyBlock {
@@ -276,10 +467,11 @@ export async function pushMonthlyReports(
   for (const ledger of listLedgers(db, true)) {
     const summary = summarizeExpenses(db, ledger.id, { from, to });
     if (summary.count === 0) continue;
+    const budget = getBudgets(db, ledger.id).length > 0 ? budgetStatus(db, ledger.id, ym) : null;
     const result = await services.publishGlobal({
       kind: "bookkeeping.monthly",
       title: `${ym} 月度账单 · ${ledger.name}`,
-      blocks: monthlyReportBlocks(summary),
+      blocks: monthlyReportBlocks(summary, budget),
       dedupeKey: `report:${ledger.id}:${ym}`,
     });
     pushed += result.materialized;

@@ -488,6 +488,7 @@ const SCRIPT = `
             (s.calendar === 'lunar' ? '<span class="chip">农历</span>' : '') +
             (s.all_day ? '<span>全天</span>' : '<span>' + esc(s.time) + '</span>') +
             (s.workday_filter === 'workday' ? '<span>仅工作日</span>' : s.workday_filter === 'holiday' ? '<span>仅节假日</span>' : '') +
+            (s.is_deadline ? '<span class="chip">截止</span>' : '') +
             '<span>' + esc(s.profile_id) + '</span></div>' +
             (s.note ? '<div class="meta"><span>' + esc(s.note) + '</span></div>' : '') + '</li>';
         }).join('') + '</ul>';

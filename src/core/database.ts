@@ -50,6 +50,17 @@ CREATE TABLE IF NOT EXISTS expenses (
 CREATE INDEX IF NOT EXISTS idx_expenses_ledger_date ON expenses(ledger_id, spent_on);
 CREATE INDEX IF NOT EXISTS idx_expenses_category ON expenses(ledger_id, category);
 
+-- 账本预算：category = '' 表示账本总额预算，否则为分类预算。每账本每月滚动（对照当月支出）。
+CREATE TABLE IF NOT EXISTS budgets (
+  id TEXT PRIMARY KEY,
+  ledger_id TEXT NOT NULL REFERENCES ledgers(id) ON DELETE CASCADE,
+  category TEXT NOT NULL DEFAULT '',
+  amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (ledger_id, category)
+) STRICT;
+
 CREATE TABLE IF NOT EXISTS schedules (
   id TEXT PRIMARY KEY,
   profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
@@ -67,6 +78,8 @@ CREATE TABLE IF NOT EXISTS schedules (
   recurrence_json TEXT,
   remind_offsets_json TEXT NOT NULL DEFAULT '[0]',
   resend_minutes INTEGER NOT NULL DEFAULT 0,
+  /** 逾期升级阶梯（分钟偏移 JSON 数组，升序）；NULL = 不启用，见 modules/schedule */
+  escalation_json TEXT,
   workday_filter TEXT NOT NULL DEFAULT 'any' CHECK (workday_filter IN ('any','workday','holiday')),
   status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','done','cancelled')),
   next_run_at TEXT,
@@ -193,6 +206,9 @@ export function migrate(db: DatabaseSync): void {
     db.prepare("UPDATE meta SET value = ? WHERE key = 'schema_version'").run(String(version));
     logger.info(`数据库 schema 已从 v${stored} 升级到 v${version}`);
   }
+  // 幂等补列：老库（含 v2）补 schedules.escalation_json；新库由 DDL 直接建出。
+  // 不提升 SCHEMA_VERSION、不重建 schedules（kind 有 CHECK，重建会牵动 occurrences 外键）。
+  addColumnIfMissing(db, "schedules", "escalation_json", "TEXT");
 }
 
 export function getSchemaVersion(db: DatabaseSync): number {

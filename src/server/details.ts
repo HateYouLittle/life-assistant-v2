@@ -1,7 +1,7 @@
 import { DateTime } from "luxon";
 import type { DatabaseSync } from "node:sqlite";
 import { monthRange } from "../modules/bookkeeping/service.js";
-import { KIND_LABEL, type ScheduleKind } from "../modules/schedule/service.js";
+import { KIND_LABEL, parseEscalation, type ScheduleKind } from "../modules/schedule/service.js";
 import { TZ, todayIso } from "../time.js";
 
 /**
@@ -148,6 +148,8 @@ export interface ScheduleDetailItem {
   remind_local: string | null;
   /** 距事件日的天数：与 next_local 同源，避免「日期写 12-13、倒计时按 12-06 算」 */
   days_until: number | null;
+  /** 是否为截止型日程（设置了逾期升级阶梯）；卡片据此显示「截止」 */
+  is_deadline: boolean;
 }
 
 interface ScheduleJoinRow {
@@ -160,6 +162,7 @@ interface ScheduleJoinRow {
   all_day: number;
   note: string | null;
   workday_filter: string;
+  escalation_json: string | null;
   created_at: string;
   next_event_at: string | null;
   next_due_at: string | null;
@@ -180,7 +183,8 @@ export function scheduleDetails(
   const rows = db
     .prepare(
       `SELECT s.id, s.profile_id, s.title, s.kind, s.calendar, s.time, s.all_day, s.note,
-              s.workday_filter, s.created_at, o.event_at AS next_event_at, o.due_at AS next_due_at
+              s.workday_filter, s.escalation_json, s.created_at,
+              o.event_at AS next_event_at, o.due_at AS next_due_at
        FROM schedules s
        LEFT JOIN occurrences o ON o.schedule_id = s.id AND o.status = 'pending'
          AND o.occurrence_key = (
@@ -201,12 +205,13 @@ export function scheduleDetails(
     const allDay = r.all_day === 1;
     const eventMs = r.next_event_at === null ? Number.NaN : Date.parse(r.next_event_at);
     const remindDiffers = r.next_due_at !== null && r.next_due_at !== r.next_event_at;
+    const isDeadline = parseEscalation(r.escalation_json) !== null;
     return {
       id: r.id,
       profile_id: r.profile_id,
       title: r.title,
       kind: r.kind,
-      kind_label: KIND_LABEL[r.kind] ?? r.kind,
+      kind_label: isDeadline ? "截止" : (KIND_LABEL[r.kind] ?? r.kind),
       calendar: r.calendar,
       time: r.time,
       all_day: allDay,
@@ -218,6 +223,7 @@ export function scheduleDetails(
       next_local: localStamp(r.next_event_at ?? r.next_due_at, allDay),
       remind_local: remindDiffers ? localStamp(r.next_due_at, false) : null,
       days_until: Number.isNaN(eventMs) ? null : Math.round((eventMs - nowMs) / 86_400_000),
+      is_deadline: isDeadline,
     };
   });
 }

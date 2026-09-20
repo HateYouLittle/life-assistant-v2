@@ -11,11 +11,17 @@ import {
 import { logger } from "../../core/logger.js";
 import {
   addExpense,
+  budgetAlertsForEntry,
+  budgetComparison,
+  budgetScopeLabel,
+  budgetStatus,
   centsToYuan,
+  clearBudget,
   createLedger,
   deleteExpense,
   entryReceiptBlocks,
   findMissingMonthlyReports,
+  getBudgets,
   getLedger,
   listExpenses,
   listLedgers,
@@ -23,9 +29,25 @@ import {
   previousMonth,
   pushMonthlyReports,
   renameLedger,
+  setBudget,
   setLedgerArchived,
   summarizeExpenses,
+  type BudgetStatus,
 } from "./service.js";
+
+/** 预算对照的可读视图（工具回显用） */
+function budgetStatusView(status: BudgetStatus) {
+  return {
+    总额:
+      status.total === null
+        ? null
+        : budgetComparison(status.total.budget_cents, status.total.spent_cents),
+    分类: status.categories.map((c) => ({
+      分类: c.category,
+      ...budgetComparison(c.budget_cents, c.spent_cents),
+    })),
+  };
+}
 
 export function bookkeepingLedgerTool(args: Record<string, unknown>, ctx: ToolContext) {
   try {
@@ -58,6 +80,46 @@ export function bookkeepingLedgerTool(args: Record<string, unknown>, ctx: ToolCo
       const unarchive = args.unarchive === true;
       const row = setLedgerArchived(db, id, !unarchive);
       return okJson({ 结果: row });
+    }
+    if (action === "budget") {
+      const ledgerId = args.ledger_id as string | undefined;
+      if (ledgerId === undefined) {
+        return fail('budget 需要 ledger_id（先调用 ledger {action:"list"} 取账本 id）');
+      }
+      const ledger = getLedger(db, ledgerId);
+      if (ledger === undefined) return fail(`账本不存在: ${ledgerId}`);
+      const category = ((args.category as string | undefined) ?? "").trim();
+      if (args.clear === true) {
+        const removed = clearBudget(db, ledgerId, category);
+        return okJson({
+          已清除: { 账本: ledger.name, 范围: budgetScopeLabel(category), 删除: removed },
+        });
+      }
+      const amount = args.amount as number | undefined;
+      if (amount !== undefined) {
+        if (!Number.isFinite(amount) || amount <= 0 || amount > 1_000_000) {
+          return fail(`金额不合法: ${String(amount)}`);
+        }
+        const row = setBudget(db, ledgerId, category, Math.round(amount * 100));
+        return okJson({
+          已设置: {
+            账本: ledger.name,
+            范围: budgetScopeLabel(row.category),
+            预算: `¥${centsToYuan(row.amount_cents)}`,
+          },
+          本月对照: budgetStatusView(budgetStatus(db, ledgerId, todayIso().slice(0, 7))),
+        });
+      }
+      const ym = todayIso().slice(0, 7);
+      return okJson({
+        账本: ledger.name,
+        月份: ym,
+        预算: getBudgets(db, ledgerId).map((b) => ({
+          范围: budgetScopeLabel(b.category),
+          预算: `¥${centsToYuan(b.amount_cents)}`,
+        })),
+        本月对照: budgetStatusView(budgetStatus(db, ledgerId, ym)),
+      });
     }
     return fail(`未知 action: ${action}`);
   } catch (e) {
@@ -95,6 +157,16 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
           dedupeKey: `entry:${entry.id}`,
         })
         .catch((e) => logger.warn(`记账回执发布失败（记账已成功）: ${errorMessage(e)}`));
+      // 预算阈值提醒：只在本笔「跨越」80%/100% 时推；失败绝不影响记账成功。
+      try {
+        for (const alert of budgetAlertsForEntry(db, ledger, entry)) {
+          void ctx.services
+            .publishGlobal(alert)
+            .catch((e) => logger.warn(`预算提醒发布失败（记账已成功）: ${errorMessage(e)}`));
+        }
+      } catch (e) {
+        logger.warn(`预算提醒判定失败（记账已成功）: ${errorMessage(e)}`);
+      }
       return okJson({
         已记账: {
           id: entry.id,
@@ -194,13 +266,25 @@ registerModule({
     {
       name: "ledger",
       description:
-        "账本管理（全局共享，所有 Profile 均可读写）：create 创建、list 列出（含归档需 include_archived）、rename 重命名、archive 归档/恢复（unarchive=true）。",
+        "账本管理（全局共享，所有 Profile 均可读写）：create 创建、list 列出（含归档需 include_archived）、rename 重命名、archive 归档/恢复（unarchive=true）、budget 月度预算（传 ledger_id 查看全部预算与本月对照；带 amount 设置/覆盖，单位元，带 category 为分类预算、缺省为账本总额；clear=true 删除该范围）。预算按账本每月滚动，跨越 80%/100% 时自动推送提醒（同一预算一笔只推跨过的最高阈值那一条）。",
       inputSchema: {
-        action: z.enum(["create", "list", "rename", "archive"]),
+        action: z.enum(["create", "list", "rename", "archive", "budget"]),
         name: z.string().min(1).max(40).optional(),
         id: z.string().optional(),
         include_archived: z.boolean().optional(),
         unarchive: z.boolean().optional(),
+        ledger_id: z
+          .string()
+          .optional()
+          .describe('budget 时的账本 id，先调用 ledger {action:"list"} 获取'),
+        amount: z
+          .number()
+          .min(0.01)
+          .max(1_000_000)
+          .optional()
+          .describe("budget 时的预算金额（元）"),
+        category: z.string().max(20).optional().describe("budget 时的分类；不传为账本总额预算"),
+        clear: z.boolean().optional().describe("budget clear=true 删除该范围预算"),
       },
       handler: bookkeepingLedgerTool,
     },
