@@ -348,7 +348,7 @@ const SCRIPT = `
     el('ops').innerHTML =
       row('Profile', s.profiles.join(' · ') || '暂无') +
       row('账本', s.ledgers.total + ' 个活跃' + (s.ledgers.archived ? ' · ' + s.ledgers.archived + ' 个归档' : ' · 无归档')) +
-      row('定时简报', '<span class="muted">每天 ' + s.daily_brief_cron.replace(/^0 (\\d+) .*$/, '$1:00').padStart(5, '0') + '</span>') +
+      row('定时简报', '<span class="muted">每天 ' + esc(cronTime(s.daily_brief_cron)) + '</span>') +
       row('天气数据源', s.qweather_configured ? '<span class="ok">QWeather 已配置</span>' : '<span class="warn">QWeather 未配置</span>') +
       (s.holidays.failed.length
         ? row('节假日抓取失败', '<span class="bad">' + s.holidays.failed.map(function (f) { return f.year + ' 年'; }).join('、') + '</span>')
@@ -359,6 +359,13 @@ const SCRIPT = `
   }
   function row(label, value) {
     return '<div class="ops-row"><span class="l">' + label + '</span><span class="v">' + value + '</span></div>';
+  }
+  /* cron 只渲染「分 时」都写死的常见形式（0 7 * * * → 07:00）；其余原样显示，不猜 */
+  function cronTime(expr) {
+    var raw = String(expr === null || expr === undefined ? '' : expr);
+    var parts = raw.trim().split(/\\s+/);
+    if (parts.length < 2 || !/^\\d+$/.test(parts[0]) || !/^\\d+$/.test(parts[1])) return raw;
+    return ('0' + parts[1]).slice(-2) + ':' + ('0' + parts[0]).slice(-2);
   }
   function sparkline(daily) {
     if (!daily.length) return '';

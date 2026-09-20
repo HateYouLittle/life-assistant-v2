@@ -23,6 +23,8 @@ const BASE_ENV = {
 };
 
 const FUTURE = "2999-01-01T00:00+08:00";
+/** 归一化后 QWeather 时间统一落 UTC ISO（Z 结尾），与 nowIso() 同格式才可比较 */
+const FUTURE_UTC = new Date(FUTURE).toISOString();
 
 function jsonResponse(body: unknown, status = 200): Response {
   return {
@@ -344,7 +346,11 @@ describe("weather alert_watch：投递截止时刻", () => {
           await runAlertWatch();
         },
       );
-      assert.equal(expireAtOf(env), FUTURE, "endsAt 必须落到 deliveries.expire_at 上");
+      assert.equal(
+        expireAtOf(env),
+        FUTURE_UTC,
+        "endsAt 必须归一化为 UTC 后落到 deliveries.expire_at 上",
+      );
     } finally {
       cleanupTestEnv(env);
     }

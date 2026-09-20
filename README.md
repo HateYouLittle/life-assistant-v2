@@ -196,7 +196,7 @@ npm run db:backup      # VACUUM INTO 备份，保留最近 14 份
 npm run db:cleanup:preview   # 只读预演：occurrence 清理会删掉哪些历史行
 ```
 
-结构：`src/core`（database/registry/auth/http/logger/settings/notify/render/qweather/holiday/recurrence）、`src/modules`（weather/holiday/schedule/bookkeeping/notify，经 `modules/index.ts` 注册，核心不反向依赖）、`src/server`（status/page/details，状态页与只读 API）、`src/daemon.ts`、`src/stdio.ts`、`src/import-v1.ts`、`src/backup.ts`、`src/cleanup-preview.ts`。
+结构：`src/core`（database/registry/auth/http/logger/settings/notify/render/qweather/qweather-jwt/holiday/recurrence）、`src/modules`（weather/holiday/schedule/bookkeeping/notify，经 `modules/index.ts` 注册，核心不反向依赖）、`src/server`（status/page/details，状态页与只读 API）、`src/daemon.ts`、`src/stdio.ts`、`src/config.ts`、`src/time.ts`、`src/import-v1.ts`、`src/backup.ts`、`src/cleanup-preview.ts`。
 
 ## 设计要点
 

@@ -315,6 +315,45 @@ describe("outbox 投递", () => {
     }
   });
 
+  it("截止时间带 +08:00 偏移（历史行）也按时间值判过期，不靠字符串比较", async () => {
+    const env = makeTestEnv({ PROFILE_ROUTE_SECRETS_JSON: JSON.stringify({ default: SECRET }) });
+    // 构造「真实时刻已过期、但 +08:00 字符串排位在 now 之后」的边界：
+    // 旧的字符串比较会把它当成未过期而补投，正是本用例要防的回归。
+    const offsetIso = (msFromNow: number): string =>
+      new Date(Date.now() + msFromNow + 8 * 3600_000).toISOString().replace("Z", "+08:00");
+    try {
+      await withHookServer(
+        (_req, res) => {
+          res.writeHead(200);
+          res.end("ok");
+        },
+        async (url, captured) => {
+          setPushRoute(env.db, "default", { url });
+          publishProfile(env.db, env.config, "default", {
+            kind: "weather.alert",
+            title: "仍有效的预警",
+            blocks: { notes: ["a"] },
+            expiresAt: offsetIso(2 * 3600_000),
+          });
+          publishProfile(env.db, env.config, "default", {
+            kind: "weather.alert",
+            title: "已失效的预警",
+            blocks: { notes: ["b"] },
+            expiresAt: offsetIso(-2 * 3600_000),
+          });
+
+          await drainDue(env.db, env.config);
+
+          assert.equal(captured.length, 1, "偏移格式不能让「已过期」的行蒙混过关");
+          const expired = deliveryRows(env.db).find((r) => r.status === "cancelled");
+          assert.ok(expired !== undefined, "带 +08:00 的已过期投递应落 cancelled");
+        },
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("recoverStaleSending：超幂等窗口进 fallback，未超的复位 queued", () => {
     const env = makeTestEnv();
     try {

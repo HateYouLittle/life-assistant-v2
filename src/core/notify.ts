@@ -284,7 +284,7 @@ export function drainDue(db: DatabaseSync, config: ResolvedConfig): Promise<numb
         if (Date.now() > deadline) return processed;
         // 过期内容直接作废：静默时段拦下的预警如果等到窗口结束再补投，用户收到的
         // 是已经失效的告警。通知本身保留（pull 兜底），这里只终结投递。
-        if (row.expire_at !== null && row.expire_at <= now) {
+        if (isExpiredAt(row.expire_at, now)) {
           db.prepare(
             "UPDATE deliveries SET status = 'cancelled', last_error = 'expired before delivery', updated_at = ? WHERE id = ?",
           ).run(nowIso(), row.id);
@@ -323,6 +323,19 @@ export function drainDue(db: DatabaseSync, config: ResolvedConfig): Promise<numb
 /** 等待在途的一轮投递结束（停机前调用，避免关库后仍在写） */
 export async function waitForDrain(): Promise<void> {
   if (currentDrain !== null) await currentDrain.catch(() => undefined);
+}
+
+/**
+ * 投递截止是否已到。按时间值比较，而不是字符串比较：历史行可能存着带偏移的时间
+ * （QWeather 早期原样落库的 `...+08:00`），与 nowIso()（Z 结尾）做字典序比较会错判过期。
+ * 无法解析的截止时间视为未过期（不误杀）。
+ */
+function isExpiredAt(expireAt: string | null, nowIsoValue: string): boolean {
+  if (expireAt === null) return false;
+  const expire = Date.parse(expireAt);
+  const current = Date.parse(nowIsoValue);
+  if (!Number.isFinite(expire) || !Number.isFinite(current)) return false;
+  return expire <= current;
 }
 
 function skipReason(db: DatabaseSync, config: ResolvedConfig, row: DeliveryRow): string | null {

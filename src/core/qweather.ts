@@ -575,9 +575,17 @@ export async function alerts(
   });
 }
 
+/**
+ * 预警时间归一化为 UTC ISO（Z 结尾）。上游 QWeather 的 effectiveTime/expireTime 是带
+ * 偏移的本地时间（如 `2026-09-21T02:00+08:00`）；若原样存入 deliveries.expire_at，
+ * 之后与 nowIso()（Z 结尾）做字符串比较会把「此刻已过期」误判成「尚未过期」，导致
+ * 静默时段结束后补投一条已经失效的预警。
+ * 解析失败返回 undefined：不设起止时间（isExpiredAlert 视为未过期），不会误杀。
+ */
 function isoOrUndefined(value: unknown): string | undefined {
   if (value === undefined || value === null || value === "") return undefined;
-  return String(value);
+  const dt = DateTime.fromISO(String(value), { zone: TZ });
+  return dt.isValid ? (dt.toUTC().toISO() ?? undefined) : undefined;
 }
 
 const CN_AQI_CATEGORIES: Array<[number, string]> = [
