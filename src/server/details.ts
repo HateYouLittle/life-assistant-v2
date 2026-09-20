@@ -200,12 +200,12 @@ export function scheduleDetails(
     )
     .all(limit) as unknown as ScheduleJoinRow[];
 
-  const nowMs = Date.now();
+  const todayStart = DateTime.fromISO(todayIso(), { zone: TZ });
   return rows.map((r) => {
     const allDay = r.all_day === 1;
-    const eventMs = r.next_event_at === null ? Number.NaN : Date.parse(r.next_event_at);
     const remindDiffers = r.next_due_at !== null && r.next_due_at !== r.next_event_at;
     const isDeadline = parseEscalation(r.escalation_json) !== null;
+    const nextLocal = localStamp(r.next_event_at ?? r.next_due_at, allDay);
     return {
       id: r.id,
       profile_id: r.profile_id,
@@ -220,9 +220,16 @@ export function scheduleDetails(
       created_at: r.created_at,
       next_event_at: r.next_event_at,
       next_due_at: r.next_due_at,
-      next_local: localStamp(r.next_event_at ?? r.next_due_at, allDay),
+      next_local: nextLocal,
       remind_local: remindDiffers ? localStamp(r.next_due_at, false) : null,
-      days_until: Number.isNaN(eventMs) ? null : Math.round((eventMs - nowMs) / 86_400_000),
+      // 按本地日历日相减，与 next_local 同源：用瞬时差会在 23:00 看「明天 09:00」时
+      // 得到 0 天（不足 24 小时），与卡片上显示的日期对不上。
+      days_until:
+        nextLocal === null
+          ? null
+          : Math.round(
+              DateTime.fromISO(nextLocal.slice(0, 10), { zone: TZ }).diff(todayStart, "days").days,
+            ),
       is_deadline: isDeadline,
     };
   });

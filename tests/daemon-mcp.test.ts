@@ -199,4 +199,27 @@ describe("/mcp 鉴权", () => {
       await harness.close();
     }
   });
+
+  it("无 session id 的非 initialize 请求：拒绝，且不留下无人持有的会话", async () => {
+    const harness = await startHarness();
+    try {
+      const orphan = await rpc(harness.port, { jsonrpc: "2.0", id: 9, method: "tools/list" });
+      assert.equal(orphan.status, 400, "缺 mcp-session-id 的非 initialize 请求应被拒");
+      await orphan.text();
+
+      // 这条路径上 daemon 会先建好一个 transport，但 transport 不会分配 session id，
+      // 因此没有任何地方持有它 —— 修复后它就地被关闭。若关闭动作误伤了响应或后续请求，
+      // 下面这段会立刻失败。
+      const sessionId = await sessionOf(await rpc(harness.port, INIT));
+      const listed = await rpc(
+        harness.port,
+        { jsonrpc: "2.0", id: 10, method: "tools/list" },
+        sessionId,
+      );
+      assert.equal(listed.status, 200);
+      assert.match(await readJson(listed), /"schedule"/);
+    } finally {
+      await harness.close();
+    }
+  });
 });

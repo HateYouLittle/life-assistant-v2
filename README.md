@@ -11,7 +11,7 @@
 | 每日简报 | 每日 07:00（可配）确定性组装，无 LLM |
 | 日程 | 待办/生日/纪念日，公历+农历（闰月策略、腊月三十顺延）、按法定工作日/节假日重复 |
 | 节假日 | 大陆法定节假日/调休日历，每日 02:00 自动抓取校验 |
-| 记账 | 全局多账本、只记支出（可改可删），账本/分类月度预算与 80%/100% 超支提醒、月度账单推送 |
+| 记账 | 全局多账本、只记支出（无编辑：改金额/分类/备注须删除后重记），账本/分类月度预算与 80%/100% 超支提醒、月度账单推送 |
 | 通知 | SQLite outbox + HMAC V2 回环 webhook、静默时段、`notify.pull` 兜底 |
 
 相对 v1 的主要变化：**单守护进程**（去掉 stdio 查询进程与 scheduler 的双进程并发防护）；**46 个工具收敛为 7 个**（域内 action 参数化）；**舍弃**油价、共享账本角色、生活指数、自动化 DSL、Open-Meteo 多源回退、React 仪表盘；通知改为 **Markdown 表格**渲染（微信/企业微信）。
@@ -181,6 +181,10 @@ npm run import:v1 -- --from /旧/DATA_DIR [--force]
 合法数据照常入库，不必因为一条脏数据重来。`--force` 会先清除**本次导入涉及**的
 Profile / 账本数据再写入（不影响其它 Profile），失败时整体回滚。
 
+例外是节假日两张表：`cn_holiday_days` / `cn_holiday_years` 始终用 `INSERT OR IGNORE`
+写入，既不参与 `--force` 的清除，也不会覆盖目标库中已由 daemon 抓取的更新数据，
+因此它们只增不改（报告里的「已导入 N 天」只统计真正写入的行，被忽略的不计入）。
+
 ## 开发
 
 ```bash
@@ -196,7 +200,7 @@ npm run db:cleanup:preview   # 只读预演：occurrence 清理会删掉哪些�
 
 ## 设计要点
 
-- **单写者**：所有 SQLite 写入收敛到 daemon，WAL + 严格 schema（STRICT 表、CHECK、外键）。schema 版本记在 `meta.schema_version`，启动时逐级自动升级（只做附加式加列/加表，升级失败即拒绝启动）；库版本高于程序时同样拒绝启动。
+- **单写者**：所有 SQLite 写入收敛到 daemon，WAL + 严格 schema（STRICT 表、CHECK、外键）。schema 版本记在 `meta.schema_version`，启动时逐级自动升级（只做附加式加列/加表，升级失败即拒绝启动）；库版本高于程序时同样拒绝启动。注意 `schedules.escalation_json` 是有意只走幂等补列、不提升版本的（重建 `schedules` 会牵动 `occurrences` 外键与 `kind` 的 CHECK），因此 `schema_version` 表示「升级阶梯走到了哪一级」，而非表结构的完整指纹。
 - **模块契约**：模块注册 `tools / jobs / tick / onStart` 四个扩展点；调度保证 tick 不重叠；核心不 import 模块内部。
 - **recurrence 引擎**：自研纯函数替代 rrule，只覆盖 daily/weekly/monthly/yearly × 农历 + 工作日过滤；漏触发只补最近一次。
 - **outbox**：通知 + 投递记录同事务写入；发布即触发投递；静默时段只拦主动推送；带 `expiresAt` 的通知（气象预警）到点仍未投出即作废，不会在静默时段结束后补投一条已经失效的告警（通知本身保留，`notify.pull` 仍可取到）。
@@ -229,3 +233,11 @@ npm run db:cleanup:preview   # 只读预演：occurrence 清理会删掉哪些�
 9. **server 层直接引用模块的纯函数**：`src/server/details.ts` import 了
    bookkeeping/schedule 的 `monthRange`、`KIND_LABEL` 等常量与纯函数。契约测试只强制
    `src/core` 不依赖模块，这条方向没人管 —— 改模块内部签名时要记得同步看板。
+10. **`notify.pull` 拦不住已经在途的投递**：pull 只把 `queued`/`failed` 的投递置为
+    `cancelled`；若某条正处于 `sending`（请求已发出、最多 10s 超时），用户 pull 读到之后
+    仍会收到那一次推送。窗口是单次请求的时长，且 webhook 侧还有 55 分钟幂等窗口兜底，
+    暂不为此引入「中断在途请求」的机制。
+11. **`schedules` 的软删行永不回收**：`delete` 只把状态置为 `cancelled` 并删掉其
+    occurrence，日程行本身保留。另外 `countProtectedScheduleIds` 会把已取消的
+    `recurrence.count` 日程一并算进豁免 —— 这是必要的（否则取消后再激活会让已达上限的
+    循环复活），但代价是这些行永久占用清理豁免。体量小，可与第 8 条一并纳入保留策略。

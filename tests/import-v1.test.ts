@@ -271,6 +271,30 @@ describe("import:v1", () => {
     }
   });
 
+  it("--force 二次导入：节假日只增不改，报告按实际写入计数而非行数", () => {
+    const env = makeTestEnv();
+    try {
+      const oldPath = `${env.dir}/old.db`;
+      buildOldDb(oldPath);
+      const first = runImport(env.db, oldPath);
+      assert.equal(first.holidayDays, 2, "首次导入应真正写入 2 天节假日");
+      assert.equal(first.holidayYears, 1);
+
+      // --force 清理 Profile / 账本数据，但 cn_holiday_days / cn_holiday_years 不参与清理，
+      // 始终 INSERT OR IGNORE：第二次导入一行都没写，报告不得再声称「已导入 2 天」。
+      const second = runImport(env.db, oldPath, true);
+      assert.equal(second.holidayDays, 0, "被 OR IGNORE 忽略的行没有写入，不得计入报告");
+      assert.equal(second.holidayYears, 0);
+
+      const days = env.db.prepare("SELECT COUNT(*) AS n FROM cn_holiday_days").get() as {
+        n: number;
+      };
+      assert.equal(days.n, 2, "数据仍在，只是没有被重写");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("completed 映射为 done，且不以 enabled=0 推导取消", () => {
     const env = makeTestEnv();
     try {

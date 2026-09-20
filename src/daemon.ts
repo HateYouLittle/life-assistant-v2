@@ -183,7 +183,11 @@ async function handleMcp(
     sessions.set(sessionId, { profileId, server, transport, lastSeen: Date.now() });
     logger.info(`MCP 会话建立: ${sessionId} (profile=${profileId})`);
     sweepSessions();
+    return;
   }
+  // 未建立会话（典型：缺 mcp-session-id 的非 initialize 请求，被 transport 直接拒绝）：
+  // 这个 server/transport 没有任何地方持有它，必须就地释放，否则每次这类请求都会泄漏一份。
+  await server.close().catch((e) => logger.debug(`关闭未建立的 MCP 会话失败: ${errorMessage(e)}`));
 }
 
 function isMcpPath(url: string): boolean {

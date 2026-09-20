@@ -341,6 +341,12 @@ async function deliverOne(
   config: ResolvedConfig,
   row: DeliveryRow,
 ): Promise<void> {
+  // 路由/secret 必须在 claim 之前判定：claim 之后才发现缺失会留下一条持久为
+  // 'sending' 的行（下一轮 recoverStaleSending 虽会复位，但先写后弃本身就是脏状态）。
+  const route = getPushRoute(db, row.profile_id);
+  const secret = routeSecret(config, row.profile_id);
+  if (route === null || secret === undefined) return;
+
   const claimId = newId();
   const claimed = db
     .prepare(
@@ -373,9 +379,6 @@ async function deliverOne(
       createdAt: row.n_created_at,
     },
   });
-  const route = getPushRoute(db, row.profile_id);
-  const secret = routeSecret(config, row.profile_id);
-  if (route === null || secret === undefined) return;
 
   const timestamp = Math.floor(Date.now() / 1000).toString();
   const signature = createHmac("sha256", secret).update(`${timestamp}.${payload}`).digest("hex");

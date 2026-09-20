@@ -559,8 +559,10 @@ export function runImport(
       for (const d of holidayDays) {
         // OR IGNORE：不覆盖目标库中由 ensureYears 抓取的更新数据（OR REPLACE 会静默覆盖）
         try {
-          insertDay.run(d.date, d.year, d.day_type, d.name, d.source, d.updated_at);
-          report.holidayDays += 1;
+          // 计数取 changes 而非行数：被 IGNORE 掉的行没有写入，计入会让报告
+          // 声称「已导入 N 天节假日数据」而实际插入 0 行（重复导入时必然发生）。
+          const result = insertDay.run(d.date, d.year, d.day_type, d.name, d.source, d.updated_at);
+          report.holidayDays += Number(result.changes);
         } catch (e) {
           problem(report, "cn_holiday_days", d.date, `节假日数据未导入：${errorText(e)}`);
         }
@@ -585,8 +587,9 @@ export function runImport(
       );
       for (const y of holidayYears) {
         try {
-          insertYear.run(y.year, y.source, y.fetched_at);
-          report.holidayYears += 1;
+          // 同上：年份元数据也是 OR IGNORE，按 changes 计数才与实际写入一致
+          const result = insertYear.run(y.year, y.source, y.fetched_at);
+          report.holidayYears += Number(result.changes);
         } catch (e) {
           problem(
             report,

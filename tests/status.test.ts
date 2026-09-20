@@ -343,6 +343,48 @@ describe("看板明细接口", () => {
     }
   });
 
+  it("/api/schedules：倒计时按本地日历日，跨到明天不算 0 天", async () => {
+    const env = makeTestEnv();
+    try {
+      const today = DateTime.now().setZone(TZ);
+      // 今天 23:59 与明天 00:01 只差 2 分钟，但分属两个日历日：按瞬时差算会把后者
+      // 圆整成 0 天，与卡片上显示的明天日期对不上。
+      const late = today.set({ hour: 23, minute: 59, second: 0, millisecond: 0 });
+      const early = today.plus({ days: 1 }).set({ hour: 0, minute: 1, second: 0, millisecond: 0 });
+
+      const insertSchedule = env.db.prepare(
+        `INSERT INTO schedules (id, profile_id, title, kind, calendar, start_date, time, all_day, created_at, updated_at)
+         VALUES (?, 'default', ?, 'todo', 'solar', ?, '09:00', 0, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`,
+      );
+      const insertOccurrence = env.db.prepare(
+        `INSERT INTO occurrences (schedule_id, occurrence_key, event_at, due_at, status)
+         VALUES (?, ?, ?, ?, 'pending')`,
+      );
+      for (const [id, title, at, time] of [
+        ["t1", "今天 23:59", late, "23:59"],
+        ["t2", "明天 00:01", early, "00:01"],
+      ] as const) {
+        insertSchedule.run(id, title, at.toISODate());
+        const eventIso = at.toUTC().toISO() as string;
+        insertOccurrence.run(id, `${at.toISODate()}T${time}#0`, eventIso, eventIso);
+      }
+
+      const body = (await (await app(env).request("/api/schedules")).json()) as {
+        items: { id: string; next_local: string; days_until: number | null }[];
+      };
+      const byId = new Map(body.items.map((item) => [item.id, item]));
+      assert.equal(byId.get("t2")?.next_local, `${early.toISODate()} 00:01`, "显示的是事件日");
+      assert.equal(byId.get("t1")?.days_until, 0, "今天的事件应是 0 天");
+      assert.equal(
+        byId.get("t2")?.days_until,
+        1,
+        "跨到明天 00:01 应是 1 天：按瞬时差会算成 0 天（不足 24 小时）",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("/api/deliveries 给出计数、近 7 天分布与记录", async () => {
     const env = makeTestEnv();
     try {

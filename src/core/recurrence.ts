@@ -214,7 +214,9 @@ export function describeRecurrence(
         .map((d) => names[d] ?? "")
         .join("、");
       const week = n === 1 ? "每周" : `每 ${n} 周 `;
-      return `${week}${days}`;
+      // 星期列表为空（脏数据兜底路径；工具入口与 validateScheduleInput 都会拦截空数组）
+      // 时不留尾随空格，避免描述拼成「每 2 周 」
+      return days === "" ? week.trimEnd() : `${week}${days}`;
     }
     case "monthly":
       return n === 1 ? `每月${startDate?.slice(8, 10) ?? ""}日` : `每 ${n} 个月`;
