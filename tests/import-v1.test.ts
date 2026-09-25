@@ -541,6 +541,8 @@ describe("import:v1", () => {
       assert.equal(second.schedules, 4, "--force 重导应成功而不是 UNIQUE 失败");
       assert.equal(second.ledgers, 2);
       assert.equal(second.expenses, 2);
+      // 计数按实际写入（changes）而不是调用次数：重导不会新增 Profile
+      assert.equal(second.profiles, 0, "重导时 INSERT OR IGNORE 没有新增行，报告不该虚高");
       const counts = env.db
         .prepare(
           "SELECT (SELECT COUNT(*) FROM schedules) AS s, (SELECT COUNT(*) FROM ledgers) AS l, (SELECT COUNT(*) FROM expenses) AS e",
@@ -671,6 +673,239 @@ describe("import:v1", () => {
       // 真正的旧库文件名仍能被识别
       writeFileSync(join(dir, "life-assistant.sqlite"), "");
       assert.equal(resolveOldDbPath(dir), join(dir, "life-assistant.sqlite"));
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("recurrence_json/reminders_json 形状异常只降级该行，不让整库回滚", () => {
+    // 回归：mapRecurrence 曾在逐行 try 之外调用且不做形态校验 —— `recurrence_json = 'null'`
+    // 或 byWeekday 是标量时抛 TypeError，异常穿出事务把整次导入回滚成 0 行。
+    const env = makeTestEnv();
+    try {
+      const oldPath = `${env.dir}/old.db`;
+      buildOldDb(oldPath);
+      const old = new DatabaseSync(oldPath);
+      const ts = "2026-01-01T00:00:00.000Z";
+      const insert = old.prepare(
+        `INSERT INTO schedules (profile_id, id, type, title, status, calendar, date, time, all_day, timezone,
+           recurrence_json, reminders_json, enabled, version, created_at, updated_at)
+         VALUES ('p1', ?, 'todo', ?, 'active', 'solar', '2026-04-01', '09:00', 0, 'Asia/Shanghai', ?, ?, 1, 1, ?, ?)`,
+      );
+      insert.run("bad-null", "规则是 JSON null", "null", "[]", ts, ts);
+      insert.run(
+        "bad-scalar",
+        "byWeekday 是标量",
+        JSON.stringify({ frequency: "weekly", byWeekday: "mo" }),
+        "[]",
+        ts,
+        ts,
+      );
+      insert.run(
+        "bad-reminders",
+        "提醒不是数组",
+        JSON.stringify({ frequency: "daily" }),
+        "{}",
+        ts,
+        ts,
+      );
+      old.close();
+
+      const report = runImport(env.db, oldPath);
+      assert.equal(report.schedules, 7, "坏形状行应降级导入（4 条正常 + 3 条降级），整库不得回滚");
+      assert.equal(report.problems.length, 0, "可降级的形状异常记 warning，不进 problems");
+      assert.ok(
+        report.scheduleWarnings.some((w) => w.includes("recurrence_json 不是对象")),
+        `应有 JSON null 的降级留痕，实际 ${JSON.stringify(report.scheduleWarnings)}`,
+      );
+      assert.ok(
+        report.scheduleWarnings.some((w) => w.includes("reminders_json 不是数组")),
+        "应有 reminders 形状的降级留痕",
+      );
+      const ids = (env.db.prepare("SELECT id FROM schedules").all() as { id: string }[]).map(
+        (r) => r.id,
+      );
+      for (const id of ["bad-null", "bad-scalar", "bad-reminders"]) {
+        assert.ok(ids.includes(id), `${id} 应已导入`);
+      }
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("读取旧库整表失败不会被伪装成「旧库没有这张表」", () => {
+    // 回归：六处 `catch { warnings("旧库没有 X 表") }` 把任何读表错误都当成表不存在，
+    // 于是整表静默跳过、problems 为空 → 退出码 0（用户看到「成功」）。
+    // 用 node:sqlite 对超出 JS 安全整数范围的 int64 抛 ERR_OUT_OF_RANGE 构造确定性的读表失败。
+    const env = makeTestEnv();
+    try {
+      const oldPath = `${env.dir}/old.db`;
+      buildOldDb(oldPath);
+      const old = new DatabaseSync(oldPath);
+      old.prepare("UPDATE schedules SET version = ? WHERE id = 's1'").run(9223372036854775807n);
+      old.close();
+
+      const report = runImport(env.db, oldPath);
+      assert.ok(
+        report.problems.some(
+          (p) => p.table === "schedules" && p.reason.includes("无法读取旧库的 schedules 表"),
+        ),
+        `读表失败必须进 problems（否则退出码 0 会谎报成功），实际 ${JSON.stringify(report.problems)}`,
+      );
+      assert.ok(
+        !report.scheduleWarnings.some((w) => w.includes("旧库没有 schedules 表")),
+        "不得把读失败报告成「表不存在」",
+      );
+      assert.equal(report.schedules, 0, "该表整表未导入");
+      assert.equal(report.ledgers, 2, "其余表不受影响，照常导入");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("--force 只覆盖会重写的行：通知/投递/预算/账本里 v2 新增的账目都保住", () => {
+    const env = makeTestEnv();
+    try {
+      const oldPath = `${env.dir}/old.db`;
+      buildOldDb(oldPath);
+      runImport(env.db, oldPath);
+
+      // 模拟「导入之后 v2 又跑了一段时间」产生的数据：这些行导入既不写入，重导也补不回来
+      const ts = "2026-06-01T00:00:00.000Z";
+      env.db
+        .prepare(
+          "INSERT INTO notifications (id, profile_id, kind, title, body_md, read, created_at) VALUES ('n1','p1','test','通知','正文',1,?)",
+        )
+        .run(ts);
+      env.db
+        .prepare(
+          `INSERT INTO deliveries (id, notification_id, route_name, next_attempt_at, created_at, updated_at)
+           VALUES ('d1','n1','life-assistant-p1',?,?,?)`,
+        )
+        .run(ts, ts, ts);
+      env.db
+        .prepare(
+          "INSERT INTO budgets (id, ledger_id, category, amount_cents, created_at, updated_at) VALUES ('b1','l1','',100000,?,?)",
+        )
+        .run(ts, ts);
+      env.db
+        .prepare(
+          `INSERT INTO expenses (id, ledger_id, amount_cents, category, spent_on, created_by_profile, created_at)
+           VALUES ('v2-e1','l1',1234,'餐饮','2026-06-01','p1',?)`,
+        )
+        .run(ts);
+      env.db
+        .prepare(
+          `INSERT INTO schedules (id, profile_id, title, kind, calendar, start_date, time, all_day, remind_offsets_json, workday_filter, status, version, created_at, updated_at)
+           VALUES ('v2-s1','p1','v2 新日程','todo','solar','2026-06-01','09:00',0,'[0]','any','active',1,?,?)`,
+        )
+        .run(ts, ts);
+
+      const second = runImport(env.db, oldPath, true);
+      assert.equal(second.schedules, 4, "旧库的日程照常重写");
+      const count = (sql: string): number => (env.db.prepare(sql).get() as { n: number }).n;
+      assert.equal(
+        count("SELECT COUNT(*) AS n FROM notifications WHERE id = 'n1'"),
+        1,
+        "通知历史必须保留",
+      );
+      assert.equal(
+        count("SELECT COUNT(*) AS n FROM deliveries WHERE id = 'd1'"),
+        1,
+        "投递历史必须保留",
+      );
+      assert.equal(
+        count("SELECT COUNT(*) AS n FROM budgets WHERE id = 'b1'"),
+        1,
+        "预算必须保留（账本改为 upsert）",
+      );
+      assert.equal(
+        count("SELECT COUNT(*) AS n FROM expenses WHERE id = 'v2-e1'"),
+        1,
+        "v2 期间新增的账目必须保留",
+      );
+      assert.equal(
+        count("SELECT COUNT(*) AS n FROM schedules WHERE id = 'v2-s1'"),
+        1,
+        "v2 期间新增的日程必须保留",
+      );
+      // 旧库的行不累积重复
+      assert.equal(count("SELECT COUNT(*) AS n FROM schedules"), 5);
+      assert.equal(count("SELECT COUNT(*) AS n FROM expenses"), 3);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("--force 重导不把同名账本改成 X (2)（自身 id 与已归档账本不算重名）", () => {
+    const env = makeTestEnv();
+    try {
+      const oldPath = `${env.dir}/old.db`;
+      buildOldDb(oldPath);
+      runImport(env.db, oldPath);
+      // 已归档的同名账本：v2 自身的唯一性规则只约束活跃账本，不该逼着导入改名
+      env.db
+        .prepare(
+          "INSERT INTO ledgers (id, name, created_at, archived_at) VALUES ('arch','家庭账本','2026-01-01T00:00:00.000Z','2026-02-01T00:00:00.000Z')",
+        )
+        .run();
+
+      runImport(env.db, oldPath, true);
+      const names = (
+        env.db.prepare("SELECT name FROM ledgers ORDER BY id").all() as { name: string }[]
+      ).map((r) => r.name);
+      assert.ok(names.includes("家庭账本"), `活跃账本应保持原名，实际 ${JSON.stringify(names)}`);
+      assert.ok(
+        !names.some((n) => n.startsWith("家庭账本 (")),
+        `不应因为重导或已归档同名账本而改名，实际 ${JSON.stringify(names)}`,
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("节假日坏行的保护键覆盖「日期所属年份」，跨年行被拒时不会留下 ready 年份", () => {
+    // 回归：此前只把行内 year 记进保护集合，而 dayType 的按星期兜底是按日期年份查表。
+    // 跨年行（如 2019.json 里的 2018-12-30/31、2023.json 里的 2022-12-31，上游确实存在）
+    // 两者不同：只记行内 year 会让真正有缺失的日期年份照样 ready，于是缺失日期退化成
+    // 「按星期猜」——调休周六被判成周末、假期里的工作日被判成普通工作日。
+    const env = makeTestEnv();
+    try {
+      const oldPath = `${env.dir}/old.db`;
+      buildOldDb(oldPath);
+      const old = new DatabaseSync(oldPath);
+      const ts = "2026-01-01T00:00:00.000Z";
+      // 数据集年份是 2026，日期落在 2025-12-31（元旦假期首日），day_type 非法会被 v2 的 CHECK 拒绝
+      old
+        .prepare(
+          "INSERT INTO cn_holiday_days VALUES ('2025-12-31', 2026, 'bogus', '元旦', 'test', ?, ?)",
+        )
+        .run(ts, ts);
+      old
+        .prepare(
+          "INSERT INTO cn_holiday_year_meta VALUES (2025, 'ready', 'test', 'hash', ?, NULL, NULL)",
+        )
+        .run(ts);
+      old.close();
+
+      const report = runImport(env.db, oldPath);
+      assert.ok(
+        report.problems.some((p) => p.table === "cn_holiday_days" && p.id === "2025-12-31"),
+        `坏行应被隔离，实际 ${JSON.stringify(report.problems)}`,
+      );
+      const years = (
+        env.db.prepare("SELECT year FROM cn_holiday_years ORDER BY year").all() as {
+          year: number;
+        }[]
+      ).map((r) => r.year);
+      assert.ok(
+        !years.includes(2025),
+        `日期所属年份 2025 有缺失行，绝不能标记 ready（会造成按星期猜），实际 ${JSON.stringify(years)}`,
+      );
+      assert.ok(
+        report.scheduleWarnings.some((w) => w.includes("2025 年有节假日行未导入")),
+        `应有 2025 的留痕，实际 ${JSON.stringify(report.scheduleWarnings)}`,
+      );
     } finally {
       cleanupTestEnv(env);
     }
