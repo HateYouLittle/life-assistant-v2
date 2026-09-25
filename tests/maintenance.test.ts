@@ -53,7 +53,9 @@ describe("保留策略", () => {
 
       const preview = retentionPreview(env.db);
       assert.equal(preview.notifications, 2, "只应预演到两条老且已读且无待投递的通知");
-      assert.equal(preview.deliveries, 2, "被删通知的投递记录会随外键级联");
+      // 投递计数必须与实删同源：n-old-read-queued 仍有待投递、不会被删，
+      // 它的投递记录也不该被计入（此前按「已读且超期」统计会虚报成 2）
+      assert.equal(preview.deliveries, 1, "只统计真会被删的通知名下的投递记录");
 
       const result = runRetention(env.db);
       assert.equal(result.notifications, 2);
@@ -192,6 +194,36 @@ describe("doctor 自检", () => {
     const report = await runDoctor({ DATA_DIR: "relative/path", LOG_LEVEL: "error" });
     assert.equal(report.failed, 1);
     assert.match(report.checks[0]?.detail ?? "", /绝对路径/);
+  });
+
+  it("--network：节假日数据源非 2xx 记为失败（此前 404/403 也报「通过」）", async () => {
+    const env = makeTestEnv();
+    const original = globalThis.fetch;
+    const calls: string[] = [];
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      calls.push(typeof input === "string" ? input : String(input));
+      return {
+        ok: false,
+        status: 404,
+        body: null,
+        text: async () => "not found",
+        json: async () => ({}),
+      } as unknown as Response;
+    }) as typeof fetch;
+    try {
+      const report = await runDoctor({ DATA_DIR: env.dir, LOG_LEVEL: "error" }, { network: true });
+      const check = report.checks.find((c) => c.name.startsWith("网络：节假日数据源"));
+      assert.equal(check?.level, "fail", JSON.stringify(report.checks));
+      // 年份取自 requiredYears()，不是写死的某一年
+      const year = todayIso().slice(0, 4);
+      assert.ok(
+        calls.some((u) => u.includes(`/${year}.json`)),
+        `应检查当年（${year}）的数据文件，实际请求 ${JSON.stringify(calls)}`,
+      );
+    } finally {
+      globalThis.fetch = original;
+      cleanupTestEnv(env);
+    }
   });
 
   it("JWT 私钥不可用：doctor 阶段就能发现（而不是等首次天气请求）", async () => {

@@ -9,9 +9,11 @@ import {
 import { OCCURRENCE_CLEANUP_DAYS, previewOccurrenceCleanup } from "./modules/schedule/service.js";
 
 /**
- * 清理预演（只读）：occurrence 与保留策略（通知/投递/已取消日程）都会删什么。
+ * 清理预演（零删除）：occurrence 与保留策略（通知/投递/已取消日程）都会删什么。
  * 判定与每日 job 共用同一份谓词（schedule/service.ts 与 core/retention.ts），
  * 因此这里的结论与 job 实际行为一致。
+ * 注意「零删除」不等于「零写入」：库经 openDatabase 打开，老库会被附加式升级 schema
+ * （与 daemon 启动同一路径），需要数据目录可写。
  */
 
 function main(): void {

@@ -9,7 +9,12 @@ import { logger } from "./core/logger.js";
 
 const config = loadConfig(process.env);
 const profile = parseProfileId(process.env.HERMES_PROFILE);
-const daemonUrl = process.env.MCP_DAEMON_URL ?? `http://127.0.0.1:${config.port}`;
+// 去掉尾斜杠：MCP_DAEMON_URL 写成 `http://127.0.0.1:3080/` 会拼出 `//mcp`，
+// 而 daemon 只认 /mcp → 每个请求 404，报错却指向「daemon 不可达」。
+const daemonUrl = (process.env.MCP_DAEMON_URL ?? `http://127.0.0.1:${config.port}`).replace(
+  /\/+$/,
+  "",
+);
 const endpoint = `${daemonUrl}/mcp`;
 /** daemon 启用 WEB_API_TOKEN 时（绑定非回环地址必填），壳必须带同一个 token */
 const daemonToken = process.env.MCP_DAEMON_TOKEN?.trim() || config.webApiToken;
@@ -82,6 +87,21 @@ async function reinitSession(): Promise<boolean> {
   }
 }
 
+/**
+ * 读取 404 的响应体（读完即弃，不转发，避免污染 stdout）。
+ * 用于判定这个 404 是不是真的「会话失效」：daemon 的会话失效体是 JSON-RPC 错误，
+ * message 含 "Session not found"；其它 404（例如 MCP_DAEMON_URL 指错路径）
+ * 若也按会话失效处理，就会把「地址写错」伪装成「自愈成功但工具全报 404」。
+ */
+async function bodyDetail(response: Response): Promise<string> {
+  try {
+    if (response.body === null) return "";
+    return (await response.text()).slice(0, 2000);
+  } catch {
+    return "";
+  }
+}
+
 async function send(raw: string): Promise<void> {
   let message: IncomingMessage = {};
   try {
@@ -97,9 +117,12 @@ async function send(raw: string): Promise<void> {
       body: raw,
       signal: AbortSignal.timeout(120_000),
     });
-    // 404 = 会话不存在，该请求并未被 daemon 执行，因此重试是安全的
+    // 只有确认是「会话不存在」时才自愈：该请求并未被 daemon 执行，重试是安全的
     if (response.status === 404) {
-      if (response.body !== null) response.body.cancel().catch(() => undefined);
+      const detail = await bodyDetail(response);
+      if (!detail.includes("Session not found")) {
+        throw new Error(`daemon 返回 HTTP 404（非会话失效）：${detail.slice(0, 200)}`);
+      }
       sessionId = null;
       if (await reinitSession()) {
         response = await fetch(endpoint, {

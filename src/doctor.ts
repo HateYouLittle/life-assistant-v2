@@ -2,6 +2,8 @@ import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } f
 import { join } from "node:path";
 import { MIN_TOKEN_LENGTH, isLoopbackHost, loadConfig, type ResolvedConfig } from "./config.js";
 import { SCHEMA_VERSION, getSchemaVersion, openDatabase } from "./core/database.js";
+import { holidaySourceUrls, requiredYears } from "./core/holiday.js";
+import { fetchJson } from "./core/http.js";
 import { loadEd25519PrivateKey } from "./core/qweather-jwt.js";
 
 /**
@@ -10,7 +12,9 @@ import { loadEd25519PrivateKey } from "./core/qweather-jwt.js";
  * 起因：JWT 私钥是**惰性加载**的（首次签发才读文件），DATA_DIR 写错要到首次写入才发现，
  * 弱 token 只在绑定非回环时拒绝……用户没有任何一处能一次看清这些。
  *
- * 只读为主：唯一会写的是数据目录可写性探针（用完即删）。
+ * 不删任何数据：唯一会写的业务动作是数据目录可写性探针（用完即删）。
+ * 注意数据库检查与 daemon 共用 openDatabase，因此会应用附加式的 schema 升级
+ * （老库会被升级到当前版本），需要数据目录可写。
  * 网络检查默认跳过（`--network` 打开），避免内网环境里 doctor 卡住。
  */
 
@@ -153,32 +157,44 @@ function checkBackups(config: ResolvedConfig): CheckResult {
 }
 
 async function checkNetwork(config: ResolvedConfig): Promise<CheckResult[]> {
-  const targets: Array<{ name: string; url: string }> = [
-    {
-      name: "节假日数据源",
-      url: "https://cdn.jsdelivr.net/gh/NateScarlet/holiday-cn@master/2026.json",
-    },
-  ];
-  if (config.qweatherHost !== undefined) {
-    targets.push({ name: "QWeather", url: `https://${config.qweatherHost}/` });
-  }
   const results: CheckResult[] = [];
-  for (const target of targets) {
+
+  // 节假日数据源：按 daemon 的同一份 URL 列表与同一套判定（fetchJson，非 2xx 一律失败）检查，
+  // 且年份取 requiredYears()（10 月起包含下一年）—— 写死某一年时，自检在 10 月后
+  // 根本覆盖不到「次年数据还没发布」这个真实故障点。
+  for (const year of requiredYears()) {
+    let lastError = "未知错误";
+    let reachable = false;
+    for (const url of holidaySourceUrls(year)) {
+      try {
+        await fetchJson(url, 8000);
+        results.push(ok(`网络：节假日数据源 ${year}`, `可获取（${new URL(url).host}）`));
+        reachable = true;
+        break;
+      } catch (e) {
+        lastError = e instanceof Error ? e.message : String(e);
+      }
+    }
+    if (!reachable) results.push(fail(`网络：节假日数据源 ${year}`, `不可用：${lastError}`));
+  }
+
+  if (config.qweatherHost !== undefined) {
+    // QWeather 只做可达性探测：真实调用会消耗当日配额，而根路径返回 4xx 属正常。
+    // 因此这里不套用 fetchJson 的「非 2xx 即失败」，只把 5xx 与网络故障当问题。
+    const url = `https://${config.qweatherHost}/`;
     try {
-      const response = await fetch(target.url, {
+      const response = await fetch(url, {
         method: "GET",
         signal: AbortSignal.timeout(8000),
         redirect: "manual",
       });
       results.push(
         response.status < 500
-          ? ok(`网络：${target.name}`, `HTTP ${response.status}`)
-          : warn(`网络：${target.name}`, `HTTP ${response.status}`),
+          ? ok("网络：QWeather", `可达（HTTP ${response.status}，未做鉴权请求）`)
+          : warn("网络：QWeather", `上游 5xx：HTTP ${response.status}`),
       );
     } catch (e) {
-      results.push(
-        fail(`网络：${target.name}`, `不可达：${e instanceof Error ? e.message : String(e)}`),
-      );
+      results.push(fail("网络：QWeather", `不可达：${e instanceof Error ? e.message : String(e)}`));
     }
   }
   return results;

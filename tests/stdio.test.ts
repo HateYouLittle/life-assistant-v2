@@ -244,4 +244,57 @@ describe("stdio 兼容壳", () => {
       child.kill();
     }
   });
+
+  it("MCP_DAEMON_URL 末尾多写斜杠也能连上（不拼出 //mcp）", async () => {
+    let requestedPath: string | undefined;
+    await withServer(
+      (req, res, body) => {
+        requestedPath = req.url;
+        const parsed = JSON.parse(body) as { id: number };
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: { ok: true } }));
+      },
+      async (port) => {
+        const child = spawnShim(port, { MCP_DAEMON_URL: `http://127.0.0.1:${port}/` });
+        try {
+          const promise = waitForLine(child);
+          child.stdin?.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" })}\n`);
+          const response = JSON.parse(await promise) as { id: number; error?: unknown };
+          assert.equal(response.id, 1);
+          assert.equal(response.error, undefined, "尾斜杠不该让所有请求变成 404");
+          assert.equal(requestedPath, "/mcp");
+        } finally {
+          child.kill();
+        }
+      },
+    );
+  });
+
+  it("404 但不是会话失效（路径写错）时如实报错，不伪装成会话自愈", async () => {
+    await withServer(
+      (_req, res) => {
+        res.writeHead(404, { "Content-Type": "text/plain" });
+        res.end("Not Found");
+      },
+      async (port) => {
+        const child = spawnShim(port);
+        try {
+          const promise = waitForLine(child);
+          child.stdin?.write(`${JSON.stringify({ jsonrpc: "2.0", id: 3, method: "ping" })}\n`);
+          const response = JSON.parse(await promise) as {
+            id: number;
+            error?: { message?: string };
+          };
+          assert.equal(response.id, 3);
+          assert.match(
+            response.error?.message ?? "",
+            /HTTP 404/,
+            "非会话失效的 404 必须原样报出，否则会把「地址写错」诊断成会话问题",
+          );
+        } finally {
+          child.kill();
+        }
+      },
+    );
+  });
 });

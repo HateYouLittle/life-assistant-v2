@@ -56,9 +56,16 @@ function main(): void {
   if (dirIndex >= 0 && args[dirIndex + 1] !== undefined) {
     env.DATA_DIR = args[dirIndex + 1] as string;
   }
-  const config = loadConfig(env);
-  const target = runBackup(config);
-  console.log(target);
+  // 与 cleanup-preview 同一口径：不抛裸堆栈，输出里带上库与目标路径，
+  // 用户才能判断是配置错、库损坏，还是留下了垃圾备份
+  try {
+    const config = loadConfig(env);
+    const target = runBackup(config);
+    console.log(target);
+  } catch (e) {
+    console.error(`备份失败：${e instanceof Error ? e.message : String(e)}`);
+    process.exitCode = 1;
+  }
 }
 
 const isDirectRun = /backup\.(?:ts|js)$/.test(process.argv[1]?.replace(/\\/g, "/") ?? "");

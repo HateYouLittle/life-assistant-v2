@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 import { DateTime } from "luxon";
 import { runBackup } from "../src/backup.js";
@@ -93,5 +95,20 @@ describe("db:backup", () => {
     } finally {
       cleanupTestEnv(env);
     }
+  });
+});
+
+describe("db:backup CLI", () => {
+  it("失败时输出「备份失败：…」并以退出码 1 结束，不抛裸堆栈", () => {
+    // 不给 DATA_DIR：loadConfig 直接报错。此前 main() 没有 try/catch，
+    // 失败会以未捕获异常 + 堆栈形式抛出，SQLite 的原始信息里也没有库/目标路径。
+    const backupPath = fileURLToPath(new URL("../src/backup.ts", import.meta.url));
+    const result = spawnSync(process.execPath, ["--import", "tsx", backupPath], {
+      env: { ...process.env, DATA_DIR: "" },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /备份失败：/);
+    assert.doesNotMatch(result.stderr, /\n\s+at /, "不应输出裸堆栈");
   });
 });

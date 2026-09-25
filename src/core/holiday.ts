@@ -27,10 +27,13 @@ const FETCH_COOLDOWN_MS = 6 * 3600 * 1000;
  */
 const WORKDAY_PROXIMITY_DAYS = 21;
 
-const SOURCES = (year: number): string[] => [
-  `https://cdn.jsdelivr.net/gh/NateScarlet/holiday-cn@master/${year}.json`,
-  `https://raw.githubusercontent.com/NateScarlet/holiday-cn/master/${year}.json`,
-];
+/** 年度数据的候选 URL（jsDelivr 优先，GitHub raw 兜底）。导出以便 doctor 与抓取共用同一份列表 */
+export function holidaySourceUrls(year: number): string[] {
+  return [
+    `https://cdn.jsdelivr.net/gh/NateScarlet/holiday-cn@master/${year}.json`,
+    `https://raw.githubusercontent.com/NateScarlet/holiday-cn/master/${year}.json`,
+  ];
+}
 
 /**
  * 日期分类。规则：
@@ -212,7 +215,7 @@ export async function fetchYearPayload(
   fetcher: (url: string) => Promise<unknown> = fetchJson,
 ): Promise<HolidayYearPayload> {
   let lastError = "";
-  for (const url of SOURCES(year)) {
+  for (const url of holidaySourceUrls(year)) {
     try {
       const payload = (await fetcher(url)) as HolidayYearPayload;
       return payload;
@@ -391,7 +394,13 @@ export function holidayDayName(db: DatabaseSync, date: string): string | null {
   return row?.name ?? null;
 }
 
-/** 下一假期（含名称/起止/天数）；无数据返回 null */
+/**
+ * 下一假期（含名称/起止/天数）；无数据返回 null。
+ * 区间口径**就是** holidayPeriods（同一函数产出，不再各自定义一遍）：此前这里按
+ * 「同名且相邻」回溯，而提醒与简报里的假期段按「日期相邻」分段，两套定义在
+ * 上游给出合并名（如「国庆节、中秋节」）或名称逐年变化的年份会算出不同的天数。
+ * 「下一假期」= 第一个 end >= today 的段（today 落在段内时就是它，且 inProgress 为真）。
+ */
 export function nextHolidayPeriod(
   db: DatabaseSync,
   today: string = todayIso(),
@@ -402,35 +411,13 @@ export function nextHolidayPeriod(
   days: number;
   inProgress: boolean;
 } | null {
-  const first = db
-    .prepare(
-      "SELECT date, name FROM cn_holiday_days WHERE day_type = 'holiday' AND date >= ? ORDER BY date LIMIT 1",
-    )
-    .get(today) as { date: string; name: string } | undefined;
-  if (first === undefined) return null;
-  const isHolidayNamed = (date: string): boolean => {
-    const row = db
-      .prepare("SELECT name FROM cn_holiday_days WHERE date = ? AND day_type = 'holiday'")
-      .get(date) as { name: string } | undefined;
-    return row !== undefined && row.name === first.name;
+  const period = holidayPeriods(db).find((candidate) => candidate.end >= today);
+  if (period === undefined) return null;
+  return {
+    name: period.name,
+    start: period.start,
+    end: period.end,
+    days: period.days,
+    inProgress: period.start <= today,
   };
-  let start = first.date;
-  for (;;) {
-    const prev = DateTime.fromISO(start, { zone: TZ }).minus({ days: 1 }).toISODate();
-    if (prev === null || !isHolidayNamed(prev)) break;
-    start = prev;
-  }
-  let end = first.date;
-  for (;;) {
-    const next = DateTime.fromISO(end, { zone: TZ }).plus({ days: 1 }).toISODate();
-    if (next === null || !isHolidayNamed(next)) break;
-    end = next;
-  }
-  const days =
-    Math.round(
-      (DateTime.fromISO(end, { zone: TZ }).toMillis() -
-        DateTime.fromISO(start, { zone: TZ }).toMillis()) /
-        86_400_000,
-    ) + 1;
-  return { name: first.name, start, end, days, inProgress: start <= today };
 }

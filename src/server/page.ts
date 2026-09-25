@@ -241,6 +241,7 @@ const SCRIPT = `
   var expMonth = null;
   var holYear = null;
   var drawerOpen = false;
+  var drawerRender = null;
   var current = null;
 
   function api(path) {
@@ -411,6 +412,7 @@ const SCRIPT = `
     drawer.setAttribute('aria-hidden', 'false');
     drawer.dataset.kind = kind;
     drawerOpen = true;
+    drawerRender = renderFn;
     renderFn();
   }
   function closeDrawer() {
@@ -419,6 +421,7 @@ const SCRIPT = `
     drawer.setAttribute('aria-hidden', 'true');
     drawer.dataset.kind = '';
     drawerOpen = false;
+    drawerRender = null;
   }
   function fail(e) {
     drawerBody.innerHTML = '<div class="empty bad">' + esc(e.message) + '</div>';
@@ -629,12 +632,11 @@ const SCRIPT = `
   refresh();
   setInterval(function () {
     refresh();
-    // 只刷新「开着的那张抽屉」：关着时重跑 HANDLERS 会白拉一次接口，
-    // 开着时也不能重走 openDrawer（那会把 body 打回「加载中…」并丢掉所选年份/月份）。
-    if (!drawerOpen) return;
-    var kind = drawer.dataset.kind;
-    if (kind === 'expenses' && expMonth) openExpenses(expMonth);
-    else if (kind && HANDLERS[kind]) HANDLERS[kind]();
+    // 只刷新「开着的那张抽屉」：关着时不重跑渲染函数（会白拉一次接口）。
+    // 必须走已保存的渲染函数，而不是 HANDLERS[kind]——后者会重走 openDrawer，
+    // 把 body 打回「加载中…」、丢掉列表滚动位置（所选的月/年由 expMonth/holYear 保留）。
+    if (!drawerOpen || drawerRender === null) return;
+    drawerRender();
   }, 30000);
 `;
 

@@ -68,6 +68,8 @@ export interface PageRun {
   replacedUrls: string[];
   /** 派发一次点击（等价于点击带 data-drawer 的卡片），会跑真正的抽屉渲染路径 */
   clickDrawer(kind: string): void;
+  /** 手动触发一次 30s 自动刷新回调（返回触发了几次） */
+  runIntervals(): number;
 }
 
 /** 在 vm 里跑一遍真实的状态页脚本；`search` 即浏览器地址栏的查询串 */
@@ -77,6 +79,7 @@ export function runPageScript(env: TestEnv, search: string): PageRun {
   const app = createStatusApp(env.config, env.db);
 
   const clickHandlers: ((ev: unknown) => void)[] = [];
+  const intervals: (() => void)[] = [];
   const elements = new Map<string, StubElement>();
   const authHeaders: (string | undefined)[] = [];
   const stored = new Map<string, string>();
@@ -107,8 +110,11 @@ export function runPageScript(env: TestEnv, search: string): PageRun {
         replacedUrls.push(url);
       },
     },
-    // 自动刷新会一直挂着，冒烟测试里不需要
-    setInterval: () => 0,
+    // 自动刷新会一直挂着：收集回调，由 runIntervals() 在用例里显式触发
+    setInterval: (fn: () => void) => {
+      intervals.push(fn);
+      return intervals.length;
+    },
     console,
     URLSearchParams,
     fetch: (path: string, init?: { headers?: Record<string, string> }) => {
@@ -127,6 +133,10 @@ export function runPageScript(env: TestEnv, search: string): PageRun {
       target.dataset.drawer = kind;
       target.setAttribute("data-drawer", kind);
       for (const handler of clickHandlers) handler({ target });
+    },
+    runIntervals() {
+      for (const fn of intervals) fn();
+      return intervals.length;
     },
   };
 }
@@ -279,6 +289,33 @@ describe("看板抽屉（点击委托 + 明细渲染）", () => {
       assert.ok(rendered);
       const html = run.elements.get("drawer-body")?.innerHTML ?? "";
       assert.match(html, /2026 年安排/, "默认展示当年");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("30s 自动刷新不把开着的抽屉打回「加载中…」（且保留所选年份）", async () => {
+    const env = makeTestEnv();
+    try {
+      env.db
+        .prepare(
+          `INSERT INTO cn_holiday_years (year, status, source, fetched_at) VALUES (2026,'ready','test','2026-01-01T00:00:00.000Z'), (2027,'ready','test','2026-01-01T00:00:00.000Z')`,
+        )
+        .run();
+      env.db
+        .prepare(
+          `INSERT INTO cn_holiday_days (date, year, day_type, name, source, updated_at) VALUES ('2026-10-01',2026,'holiday','国庆节','test','2026-01-01T00:00:00.000Z'), ('2027-01-01',2027,'holiday','元旦','test','2026-01-01T00:00:00.000Z')`,
+        )
+        .run();
+      const run = runPageScript(env, "");
+      run.clickDrawer("holidays");
+      await waitFor(() => (run.elements.get("drawer-body")?.innerHTML ?? "").includes("年安排"));
+
+      assert.equal(run.runIntervals(), 1, "应有且仅有一个 30s 定时器");
+      // 刷新走已保存的渲染函数：同步阶段不得把 body 换成加载中
+      const html = run.elements.get("drawer-body")?.innerHTML ?? "";
+      assert.doesNotMatch(html, /<div class="spin">/, "自动刷新不应把抽屉打回「加载中…」");
+      assert.match(html, /2026 年安排/, "刷新后仍显示所选年份");
     } finally {
       cleanupTestEnv(env);
     }

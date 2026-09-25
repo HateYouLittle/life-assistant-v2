@@ -315,6 +315,45 @@ describe("节假日导入与查询", () => {
       cleanupTestEnv(env);
     }
   });
+
+  it("nextHolidayPeriod 与 holidayPeriods 用同一套区间口径（段内名称不一致时不再各算一套）", () => {
+    // 上游在国庆与中秋重叠的年份会给合并名（如「国庆节、中秋节」），且同一段内逐行可能不同。
+    // 此前 nextHolidayPeriod 按「同名且相邻」回溯、holidayPeriods 按「日期相邻」分段，
+    // 两者会给出不同的起止与天数。
+    const env = makeTestEnv();
+    try {
+      importYear(
+        env.db,
+        {
+          year: 2026,
+          days: [
+            { name: "国庆节", date: "2026-10-01", isOffDay: true },
+            { name: "国庆节", date: "2026-10-02", isOffDay: true },
+            { name: "国庆节", date: "2026-10-03", isOffDay: true },
+            { name: "国庆节、中秋节", date: "2026-10-04", isOffDay: true },
+            { name: "国庆节、中秋节", date: "2026-10-05", isOffDay: true },
+          ],
+        },
+        "test",
+      );
+
+      const periods = holidayPeriods(env.db);
+      assert.equal(periods.length, 1, "日期相邻即为同一段");
+      const next = nextHolidayPeriod(env.db, "2026-09-30");
+      assert.deepEqual(
+        { start: next?.start, end: next?.end, days: next?.days },
+        { start: periods[0]?.start, end: periods[0]?.end, days: periods[0]?.days },
+        "两个入口必须给出同一段区间",
+      );
+      assert.deepEqual(
+        { name: next?.name, start: next?.start, end: next?.end, days: next?.days },
+        { name: "国庆节", start: "2026-10-01", end: "2026-10-05", days: 5 },
+        "段名取众数，天数按整段算",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
 });
 
 describe("节假日抓取", () => {
