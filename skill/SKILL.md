@@ -53,7 +53,7 @@ read_when:
 - `remind_offsets` 负数为提前提醒（如 [-30] 提前 30 分钟），**最多 5 项**；`resend_minutes` 是待办到点重发一次，取值 0-1440 分钟。
 - 截止型日程：给待办加 `escalation`（严格升序分钟偏移数组，**首元素固定为 0**＝截止时刻本身，如 `[0,60,360,1440]`，即截止/1h/6h/24h；仅 `kind=todo` 可设）—— 到达截止后按阶梯持续加压提醒，直到 `complete`；此时 `resend_minutes` 被忽略（`update` 传 `escalation: []` 可清除阶梯）。这类日程在列表/状态页显示为「截止」。
 - `workday_filter` 让日程只在法定工作日/节假日触发；节假日数据未覆盖时日程会暂停，如实告知用户。
-- 完成待办用 `complete`（可带 `occurrence_key` 只完成单次）；更新用 `update`；删除用 `delete`。
+- 完成待办用 `complete`（可带 `occurrence_key` 只完成单次——同一事件的各条提醒会一并收敛，之后不会再收到该次发生的提醒）；更新用 `update`；删除用 `delete`。
 - **远期日程只保留「下一条」**：occurrence 只物化到未来 62 天；若某日程此刻一条待提醒都没有（远期生日、远期一次性待办），会额外保留 1 条越过该窗口的 occurrence。因此 `upcoming` 里远期日程只出现一条，这不是数据缺失，提醒也不会漏。
 - `schedule {action:"list"}` 默认只列 `status: "active"`、最多 20 条（`status`/`limit` 可调）；`upcoming` 查「接下来要发生的事」。
 - `list`/`upcoming` 里的 `下次提醒`、`提醒时间` 是 **UTC ISO**；同一对象另给 `下次提醒(本地)`/`提醒时间(本地)`（Asia/Shanghai，`YYYY-MM-DD HH:mm`）—— **向用户报时间一律用「(本地)」键**，直接读 UTC 值会差 8 小时。

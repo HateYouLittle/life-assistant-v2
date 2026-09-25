@@ -224,8 +224,14 @@ npm run import:v1 -- --from /旧/DATA_DIR [--force]
 
 导入是**逐行隔离**的：单条坏数据（金额非法、日期无法解析、引用不存在的账本、主键冲突等）
 不会中断整次导入，而是被跳过并在最后以 `[表] id：原因` 列出，进程以退出码 2 结束。
-合法数据照常入库，不必因为一条脏数据重来。`--force` 会先清除**本次导入涉及**的
-Profile / 账本数据再写入（不影响其它 Profile），失败时整体回滚。
+合法数据照常入库，不必因为一条脏数据重来。若旧库的某一整张表读不出来（例如某行是超出
+JS 安全整数范围的 int64、或旧库仍被 v1 进程占用），该表会整表跳过并同样记入上面这份
+`原因` 清单 —— 不会伪装成「旧库没有这张表」的成功报告。
+
+`--force` 只覆盖**旧库里存在、本次会重新写入的那些行**（按主键删除后重插）：日程与账目按 id
+精确清除，账本按 id upsert（因此不影响其上的月度预算）。导入从不写入的数据不会被清 ——
+目标库里已有的通知/投递历史、v2 期间新增的日程与账目、以及任意账本的预算都会保留，
+失败时整体回滚。
 
 例外是节假日两张表：`cn_holiday_days` / `cn_holiday_years` 始终用 `INSERT OR IGNORE`
 写入，既不参与 `--force` 的清除，也不会覆盖目标库中已由 daemon 抓取的更新数据，
@@ -238,9 +244,9 @@ npm run dev            # tsx 直接跑 daemon
 npm test               # node --test（全部用例）
 npm run lint           # Biome lint（error 级诊断才让命令失败；warn 不会）
 npm run format:check   # Biome 格式检查（CI 也跑）
-npm run doctor         # 自检：配置/目录/库完整性/鉴权/JWT 私钥/备份（--network 加连通性）
+npm run doctor         # 自检：配置/目录/库完整性/鉴权/JWT 私钥/备份（--network 另有连通性检查：节假日数据源按 requiredYears() 逐年份、与 daemon 同一套判定，QWeather 仅探测可达）
 npm run db:backup      # VACUUM INTO 备份，保留最近 14 份
-npm run db:cleanup:preview   # 只读预演：occurrence 与保留策略会删掉哪些行
+npm run db:cleanup:preview   # 零删除预演：occurrence 与保留策略会删掉哪些行（数字与 job 同一份判定）
 ```
 
 > `db:backup` / `db:cleanup:preview` / `import:v1` 跑的是 `dist/` 里的构建产物，先
@@ -260,12 +266,12 @@ npm run db:cleanup:preview   # 只读预演：occurrence 与保留策略会删�
 - **用量与保留**：QWeather 上游请求按本地日计数（含重试、缓存命中不计），状态页「今日天气请求」与 `/api/status` 的 `qweather_usage` 可见，daemon 重启从库里的计数继续累加 —— 官方 2027-02-01 起限制 API KEY 日请求量，没有计量就无从判断余量。保留策略（每日 04:50）只删**已读且投递已终结**的通知（含级联的投递记录）与**已取消超 180 天**的日程；未读通知、仍有待投递的通知、使用 `recurrence.count` 的日程一律保留。
 - **记账预算**：账本可设**总额**或**分类**月度预算（`ledger {action:"budget"}`，单位元），按账本每月滚动（对照当月支出）。`expense add` 成功后判定该笔是否**跨越** 80%/100% —— 只推跨越那一刻（而非达到即推）；同一个预算一笔只推**跨过的最高阈值**（一笔从 0% 到 150% 只推 100%，70%→90% 只推 80%），总额与分类各自独立判定；`dedupeKey = budget:<ledger>:<category|->:<YYYY-MM>:<80|100>`，跨月自动重新判定，同月同阈值不重推。设了预算的账本，月报表格追加预算对照行；未设预算的账本行为完全不变。
 - **物化窗口**：occurrence 只物化到 `now + 62 天`。若某日程此刻一条 `pending` 都没有（远期生日、远期一次性待办），额外豁免**恰好 1 条**越过窗口的 occurrence，保证「下一条」在 `list`/`upcoming`/状态页始终可见（豁免的那条最远可达 400 天，因此远期生日会显示成明年的日期）；豁免资格取自入库状态，补上第一条即失效，因此不会随时间累积增长。
-- **截止型日程（逾期升级）**：给 `todo` 设置 `escalation`（严格升序分钟偏移数组，1-5 项、最大 43200 即 30 天，**首元素必须为 0** 表示截止时刻本身，如 `[0,60,360,1440]`）即可 —— 仅 `kind=todo` 可设，到达截止时刻后按阶梯依次重发升级提醒（第 0 步即截止时刻本身的 `#0`，第 1..n 步是逾期加压的 `<event>#0#esc:N`），直到 `complete` 才停；设置 `escalation` 时 `resend_minutes` 被忽略。每步各生成一条 occurrence，靠 `INSERT OR IGNORE` + `notified` 状态保证只推一次；改了 `time`/`escalation` 或父事件被删/重排后，残留行在触发前按当前排期校验并作废。`update` 传 `escalation: []` 清除阶梯（空数组在 MCP schema 层合法：长度下限与首元素/升序等语义规则在 service 层判定，否则经真实 MCP 的 `[]` 会在进入 handler 前被拒）。工具/状态页把这类日程的类型显示为「截止」（不新增 `kind` 枚举值，语义由字段表达）。
+- **截止型日程（逾期升级）**：给 `todo` 设置 `escalation`（严格升序分钟偏移数组，1-5 项、最大 43200 即 30 天，**首元素必须为 0** 表示截止时刻本身，如 `[0,60,360,1440]`）即可 —— 仅 `kind=todo` 可设，到达截止时刻后按阶梯依次重发升级提醒（第 0 步即截止时刻本身的 `#0`，第 1..n 步是逾期加压的 `<event>#0#esc:N`），直到 `complete` 才停；设置 `escalation` 时 `resend_minutes` 被忽略。每步各生成一条 occurrence，靠 `INSERT OR IGNORE` + `notified` 状态保证只推一次；改了 `time`/`escalation` 或父事件被删/重排后，残留行在触发前按当前排期校验并作废。`complete` 带 `occurrence_key` 时按**事件前缀**收敛：同一事件的各条提醒偏移（`#0..#4`）与它们的派生行（`:resend`、`#esc:N`）一并终结，因此用哪一条提醒去完成都不会再有同事件的后续推送。`update` 传 `escalation: []` 清除阶梯（空数组在 MCP schema 层合法：长度下限与首元素/升序等语义规则在 service 层判定，否则经真实 MCP 的 `[]` 会在进入 handler 前被拒）。工具/状态页把这类日程的类型显示为「截止」（不新增 `kind` 枚举值，语义由字段表达）。
 - **历史回收**：`schedule.occurrence_cleanup`（每日 04:30）只清理 90 天前的 `notified`/`done`/`cancelled` 行 —— `pending` 永不删；使用 `recurrence.count` 的日程整条豁免（发生次数上限依赖历史行数，删历史会让已达上限的循环复活）。上线或调参前用 `npm run db:cleanup:preview` 只读预演将删除的行数与涉及日程（与 job 共用同一份判定）。
 
 ### 已知取舍与后续优化
 
-第 1、2 条已实施（保留划线记录）；其余为「已识别但未做」，当前实现是正确的、只是不够省：
+第 1、2、8、11 条已实施（保留划线记录）；其余为「已识别但未做」，当前实现是正确的、只是不够省：
 
 1. ~~**QWeather 天气数据无缓存/限流/退避**~~ —— **已实施（2026-09-18）**：按官方推荐值加短 TTL 缓存、并发上限 3、仅对 429/5xx 指数退避（4xx 绝不重试），并停止把 GeoAPI 结果落盘（官方版权限制）。
 2. ~~**认证方式建议迁移 JWT**~~ —— **已实施（2026-09-18）**：支持 Ed25519 JWT（`Authorization: Bearer`，URL 不再带 `key=`）并优先使用，API KEY 保留回退。官方口径：自 **2027-02-01** 起逐步限制 API KEY 的每日请求量，SDK v5+ 仅支持 JWT。
@@ -278,9 +284,7 @@ npm run db:cleanup:preview   # 只读预演：occurrence 与保留策略会删�
 6. **节假日刷新节奏**：`FETCH_COOLDOWN_MS` 是 6h，但主动重试点仍是每天 02:00 的 job（`requiredYears()` 到 10 月才要求下一年），实际重试间隔为 24h。物化撞到未就绪年份的路径已改为由 `tick()` 触发按需补齐、真正受 6h 冷却约束；若要提前拿到下一年数据，可把 job 改为 `0 */3 * * *`。
 7. **`status` 页面无鉴权**（`/` 只有静态 HTML，数据走受保护的 `/api/status`），
    如需对外暴露建议一并加保护。
-8. **`notifications` / `deliveries` 无保留策略**：两者只增不减（记账回执等约 13 行/天），
-   当前体量无碍，但要长期运行建议仿照 occurrence 清理加个 job，删掉 N 天前已读且
-   投递已终结（`sent`/`cancelled`/`fallback`）的行。
+8. ~~**`notifications` / `deliveries` 无保留策略**~~ —— **已实施**：保留策略 job（每日 04:50，`src/core/retention.ts`）删除已读且投递已终结（无 `queued`/`sending`/`failed`）的 180 天前通知，投递随外键级联删除；`npm run db:cleanup:preview` 与 job 共用同一份判定，预演数字与实际删除一致。
 9. **server 层直接引用模块的纯函数**：`src/server/details.ts` import 了
    bookkeeping/schedule 的 `monthRange`、`KIND_LABEL` 等常量与纯函数。契约测试只强制
    `src/core` 不依赖模块，这条方向没人管 —— 改模块内部签名时要记得同步看板。
@@ -288,7 +292,4 @@ npm run db:cleanup:preview   # 只读预演：occurrence 与保留策略会删�
     `cancelled`；若某条正处于 `sending`（请求已发出、最多 10s 超时），用户 pull 读到之后
     仍会收到那一次推送。窗口是单次请求的时长，且 webhook 侧还有 55 分钟幂等窗口兜底，
     暂不为此引入「中断在途请求」的机制。
-11. **`schedules` 的软删行永不回收**：`delete` 只把状态置为 `cancelled` 并删掉其
-    occurrence，日程行本身保留。另外 `countProtectedScheduleIds` 会把已取消的
-    `recurrence.count` 日程一并算进豁免 —— 这是必要的（否则取消后再激活会让已达上限的
-    循环复活），但代价是这些行永久占用清理豁免。体量小，可与第 8 条一并纳入保留策略。
+11. ~~**`schedules` 的软删行永不回收**~~ —— **已实施**：`delete` 仍只把状态置为 `cancelled` 并删掉其 occurrence，但保留策略会删除已取消超 180 天的行。仍在的唯一豁免是 `countProtectedScheduleIds`：使用 `recurrence.count` 的日程（含已取消的）整条不删 —— 这是必要的（否则取消后再激活会让已达上限的循环复活），代价是这些行永久占用清理豁免。体量小，暂不再细分。
