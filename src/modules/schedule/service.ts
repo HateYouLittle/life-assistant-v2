@@ -567,7 +567,16 @@ export function completeSchedule(
          WHERE schedule_id = ? AND occurrence_key = ? AND status IN ('pending','notified')`,
       )
       .run(id, occurrenceKey);
-    if (result.changes !== 1) throw new Error(` occurrence 不存在或已结束: ${occurrenceKey}`);
+    if (result.changes !== 1) throw new Error(`occurrence 不存在或已结束: ${occurrenceKey}`);
+    // 单次完成后一并终结该事件的派生行（`<key>:resend` / `<key>#esc:N`）：
+    // 否则到点仍会追加「仍未完成」的加压/强提醒。派生 key 都以已完成行的 key 为前缀；
+    // 用 substr 前缀比较而不是 LIKE，避免 key 中的 %/_ 被当成通配符误伤。
+    db.prepare(
+      `UPDATE occurrences SET status = 'done'
+       WHERE schedule_id = ? AND status IN ('pending','notified')
+         AND (occurrence_key = ? || '${RESEND_SUFFIX}'
+              OR substr(occurrence_key, 1, length(?) + ${ESCALATION_SUFFIX.length}) = ? || '${ESCALATION_SUFFIX}')`,
+    ).run(id, occurrenceKey, occurrenceKey, occurrenceKey);
   } else {
     db.prepare(
       `UPDATE occurrences SET status = 'done'
@@ -791,9 +800,11 @@ function resendDueOrNull(
   // key 里带着当时的提醒时刻（`<date>T<time>#0`）：改了 time 之后旧 key 不再出现在日程上，
   // 这条强提醒已无对应事件，必须作废，否则会用旧时间点推一条「强提醒」。
   if (!eventKey.endsWith(`${schedule.time}#0`)) return null;
+  // 父行已完成（done）时强提醒一并失效：complete 会收敛派生行，这里是第二道防线，
+  // 挡住绕过 completeSchedule 直接改库把父行置 done 的路径。pending/notified 均视为在途。
   const parent = db
     .prepare(
-      "SELECT 1 FROM occurrences WHERE schedule_id = ? AND occurrence_key = ? AND status != 'cancelled'",
+      "SELECT 1 FROM occurrences WHERE schedule_id = ? AND occurrence_key = ? AND status IN ('pending','notified')",
     )
     .get(schedule.id, eventKey);
   if (parent === undefined) return null;
@@ -822,9 +833,10 @@ function escalationDueOrNull(
   const parentKey = occurrenceKey.slice(0, occurrenceKey.length - suffix.length);
   // key 里带着当时的提醒时刻（`<date>T<time>#0`）：改了 time 之后旧 key 不再出现在日程上，必须作废
   if (!parentKey.endsWith(`${schedule.time}#0`)) return null;
+  // 与 resendDueOrNull 同构：父行 done（已完成）时升级行一并失效，第二道防线
   const parent = db
     .prepare(
-      "SELECT 1 FROM occurrences WHERE schedule_id = ? AND occurrence_key = ? AND status != 'cancelled'",
+      "SELECT 1 FROM occurrences WHERE schedule_id = ? AND occurrence_key = ? AND status IN ('pending','notified')",
     )
     .get(schedule.id, parentKey);
   if (parent === undefined) return null;

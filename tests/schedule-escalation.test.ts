@@ -363,6 +363,160 @@ describe("schedule escalation：完成即停", () => {
   });
 });
 
+describe("schedule escalation：complete 单次（occurrence_key）收敛派生行", () => {
+  it("带 occurrence_key 完成截止型日程后，全部阶梯时刻零新增提醒", async (t) => {
+    freeze(t, "2026-09-27");
+    const env = makeTestEnv();
+    try {
+      const id = addDeadline(env, { escalation: [0, 60, 360] });
+      await fire(env, `${D}T08:00+08:00`); // 第 0 步触发，派生 esc:1
+      assert.equal(reminders(env).length, 1);
+      assert.equal(statusOf(env, id, `${EVENT}#0#esc:1`), "pending");
+
+      const done = tool(env, {
+        action: "complete",
+        id,
+        occurrence_key: `${EVENT}#0`,
+      }) as { isError?: boolean };
+      assert.notEqual(done.isError, true);
+      assert.equal(statusOf(env, id, `${EVENT}#0`), "done");
+      assert.equal(statusOf(env, id, `${EVENT}#0#esc:1`), "done", "派生升级行应一并终结");
+      assert.equal(scheduleStatus(env, id), "active", "单次完成不终结整个日程");
+
+      await fire(env, `${D}T09:00+08:00`); // +1h 阶梯时刻
+      await fire(env, `${D}T14:00+08:00`); // +6h 阶梯时刻
+      await fire(env, "2026-10-05T08:00+08:00"); // 再推一周
+      assert.equal(reminders(env).length, 1, "完成后所有阶梯时刻都不再新增提醒");
+      assert.ok(!allKeys(env, id).includes(`${EVENT}#0#esc:2`), "不应再派生下一步升级行");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("带 occurrence_key 完成后，:resend 强提醒不再发", async (t) => {
+    freeze(t, "2026-09-27");
+    const env = makeTestEnv();
+    try {
+      const result = tool(env, {
+        action: "add",
+        title: "单次完成的重发任务",
+        date: D,
+        time: "08:00",
+        resend_minutes: 60,
+      }) as { content: { text: string }[] };
+      const id = (JSON.parse(result.content[0]?.text ?? "{}") as { 已创建: { id: string } }).已创建
+        .id;
+      await fire(env, `${D}T08:00+08:00`);
+      assert.equal(reminders(env).length, 1);
+      assert.equal(statusOf(env, id, `${EVENT}#0:resend`), "pending");
+
+      tool(env, { action: "complete", id, occurrence_key: `${EVENT}#0` });
+      assert.equal(statusOf(env, id, `${EVENT}#0:resend`), "done", ":resend 行应一并终结");
+
+      await fire(env, `${D}T09:00+08:00`);
+      assert.equal(
+        reminders(env).filter((p) => (p.input.dedupeKey ?? "").includes(id)).length,
+        1,
+        "到点重发时刻不应再推强提醒",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("防御纵深：父行被置 done 后，残留 pending 的派生行在触发前作废", async (t) => {
+    freeze(t, "2026-09-27");
+    const env = makeTestEnv();
+    try {
+      // 直接改库模拟「绕过 completeSchedule 把 #0 置 done」的路径：
+      // resendDueOrNull / escalationDueOrNull 的父行校验必须挡住残留的派生行
+      const id = addDeadline(env, { escalation: [0, 60] });
+      await fire(env, `${D}T08:00+08:00`);
+      assert.equal(statusOf(env, id, `${EVENT}#0#esc:1`), "pending");
+      env.db
+        .prepare(
+          "UPDATE occurrences SET status = 'done' WHERE schedule_id = ? AND occurrence_key = ?",
+        )
+        .run(id, `${EVENT}#0`);
+      await fire(env, `${D}T09:00+08:00`);
+      assert.equal(statusOf(env, id, `${EVENT}#0#esc:1`), "cancelled");
+      assert.equal(reminders(env).length, 1, "父行已完成的派生行不得再推");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("防御纵深：父行 done 后残留 pending 的 :resend 同样在触发前作废", async (t) => {
+    freeze(t, "2026-09-27");
+    const env = makeTestEnv();
+    try {
+      const result = tool(env, {
+        action: "add",
+        title: "父行完成后的强提醒",
+        date: D,
+        time: "08:00",
+        resend_minutes: 60,
+      }) as { content: { text: string }[] };
+      const id = (JSON.parse(result.content[0]?.text ?? "{}") as { 已创建: { id: string } }).已创建
+        .id;
+      await fire(env, `${D}T08:00+08:00`);
+      assert.equal(statusOf(env, id, `${EVENT}#0:resend`), "pending");
+      env.db
+        .prepare(
+          "UPDATE occurrences SET status = 'done' WHERE schedule_id = ? AND occurrence_key = ?",
+        )
+        .run(id, `${EVENT}#0`);
+      await fire(env, `${D}T09:00+08:00`);
+      assert.equal(statusOf(env, id, `${EVENT}#0:resend`), "cancelled");
+      assert.equal(reminders(env).length, 1);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("回归：不带 occurrence_key 的整单 complete 行为不变", async (t) => {
+    freeze(t, "2026-09-27");
+    const env = makeTestEnv();
+    try {
+      const id = addDeadline(env, { escalation: [0, 60] });
+      await fire(env, `${D}T08:00+08:00`);
+      assert.equal(reminders(env).length, 1);
+
+      tool(env, { action: "complete", id });
+      assert.equal(scheduleStatus(env, id), "done");
+      assert.equal(statusOf(env, id, `${EVENT}#0`), "done");
+      assert.equal(statusOf(env, id, `${EVENT}#0#esc:1`), "done");
+
+      await fire(env, `${D}T09:00+08:00`);
+      assert.equal(reminders(env).length, 1, "整单完成后同样不再重发");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("complete 带不存在的 occurrence_key 报错，错误串不以空格开头", (t) => {
+    freeze(t, "2026-09-27");
+    const env = makeTestEnv();
+    try {
+      const id = addDeadline(env, { escalation: [0, 60] });
+      const result = tool(env, {
+        action: "complete",
+        id,
+        occurrence_key: "no-such-key",
+      }) as { isError?: boolean; content: { text: string }[] };
+      assert.equal(result.isError, true);
+      assert.match(result.content[0]?.text ?? "", /错误：occurrence 不存在或已结束/);
+      assert.doesNotMatch(
+        result.content[0]?.text ?? "",
+        /错误：\s+occurrence/,
+        "错误串不应有多余空格",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
 describe("schedule escalation：改动失效", () => {
   it("update 改事件时间后，旧 #esc 行作废、不按旧排期打扰", async (t) => {
     freeze(t, "2026-09-27");
