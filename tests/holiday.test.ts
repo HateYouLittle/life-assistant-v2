@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { DateTime } from "luxon";
 import {
   dayType,
   ensureYears,
@@ -13,6 +14,7 @@ import {
   type HolidayYearPayload,
 } from "../src/core/holiday.js";
 import { holidayTool } from "../src/modules/holiday/index.js";
+import { TZ, todayIso } from "../src/time.js";
 import { cleanupTestEnv, makeTestEnv } from "./helpers.js";
 
 /** 2026 年合成数据：7 个节日齐全、32 天放假、4 天周末调休 */
@@ -449,6 +451,69 @@ describe("holiday 工具：日期校验", () => {
       const good = await holidayTool({ view: "is_workday", date: "2026-01-01" }, ctx);
       assert.equal(good.isError, undefined);
       assert.match(good.content[0]?.text ?? "", /休息日/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
+describe("holiday 工具：view=next 的进行中标志", () => {
+  function toolCtx(env: ReturnType<typeof makeTestEnv>) {
+    return {
+      profileId: "default",
+      db: env.db,
+      config: env.config,
+      services: {
+        publishProfile: async () => ({ id: "x", deduped: false }),
+        publishGlobal: async () => ({ materialized: 0 }),
+      },
+    };
+  }
+
+  /** 在今天前后铺一段连续假期；offsets 为相对今天的日期偏移（均为假期日） */
+  function seedHoliday(env: ReturnType<typeof makeTestEnv>, offsets: number[]): void {
+    const today = todayIso();
+    const ts = new Date().toISOString();
+    const insert = env.db.prepare(
+      "INSERT INTO cn_holiday_days (date, year, day_type, name, source, updated_at) VALUES (?, ?, 'holiday', '测试假期', 'test', ?)",
+    );
+    const years = new Set<number>();
+    for (const offset of offsets) {
+      // 本地日历日（Asia/Shanghai），与 nextHolidayPeriod 的 today 口径一致
+      const date =
+        DateTime.fromISO(today, { zone: TZ }).plus({ days: offset }).toISODate() ?? today;
+      years.add(Number(date.slice(0, 4)));
+      insert.run(date, Number(date.slice(0, 4)), ts);
+    }
+    const yearMeta = env.db.prepare(
+      "INSERT INTO cn_holiday_years (year, status, source, fetched_at) VALUES (?, 'ready', 'test', ?)",
+    );
+    for (const year of years) yearMeta.run(year, ts);
+  }
+
+  it("假期进行中时输出「进行中: true」，不让用户以为假期还没开始", async () => {
+    const env = makeTestEnv();
+    try {
+      seedHoliday(env, [-1, 0, 1]); // 昨天开始放假，今天正处假期中
+      const out = await holidayTool({ view: "next" }, toolCtx(env));
+      const parsed = JSON.parse(out.content[0]?.text ?? "{}") as {
+        下一假期: string;
+        进行中?: boolean;
+      };
+      assert.equal(parsed.下一假期, "测试假期");
+      assert.equal(parsed.进行中, true, "今天在假期内，必须带上进行中标志");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("假期尚未开始时「进行中: false」", async () => {
+    const env = makeTestEnv();
+    try {
+      seedHoliday(env, [1, 2]); // 明天才开始
+      const out = await holidayTool({ view: "next" }, toolCtx(env));
+      const parsed = JSON.parse(out.content[0]?.text ?? "{}") as { 进行中?: boolean };
+      assert.equal(parsed.进行中, false);
     } finally {
       cleanupTestEnv(env);
     }

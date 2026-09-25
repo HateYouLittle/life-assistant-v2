@@ -123,6 +123,7 @@ export async function holidayTool(
       开始: period.start,
       结束: period.end,
       天数: period.days,
+      进行中: period.inProgress,
       数据覆盖年份: holidayYearsReady(db),
     });
   }

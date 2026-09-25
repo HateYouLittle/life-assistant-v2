@@ -1,5 +1,6 @@
 import { z } from "zod";
-import { DATE_RE, TIME_RE, instantToLocalDate } from "../../time.js";
+import { DateTime } from "luxon";
+import { DATE_RE, TIME_RE, TZ, instantToLocalDate } from "../../time.js";
 import { describeRecurrence } from "../../core/recurrence.js";
 import type { Recurrence } from "../../core/recurrence.js";
 import {
@@ -106,6 +107,13 @@ function buildPartial(
   return patch;
 }
 
+/** UTC 瞬间的本地时区文本（yyyy-LL-dd HH:mm，Asia/Shanghai）；无效/空值返回 null */
+function localStampText(iso: string | null): string | null {
+  if (iso === null) return null;
+  const dt = DateTime.fromISO(iso, { zone: TZ });
+  return dt.isValid ? dt.toFormat("yyyy-LL-dd HH:mm") : null;
+}
+
 function rowToPublic(row: ScheduleRow): Record<string, unknown> {
   // 逐行容错：一条损坏的 recurrence_json 只应让该行显示「规则损坏」，
   // 而不是让整个 list/upcoming 工具报错（脏数据由导入或手改库引入）。
@@ -139,6 +147,8 @@ function rowToPublic(row: ScheduleRow): Record<string, unknown> {
     ...(escalation === null ? {} : { 升级提醒: escalation }),
     状态: row.status,
     下次提醒: row.next_run_at,
+    // 原「下次提醒」是 UTC ISO（差 8 小时易误读），补本地时区文本；原键保留不动
+    "下次提醒(本地)": localStampText(row.next_run_at),
     版本: row.version,
   };
 }
@@ -226,6 +236,8 @@ function scheduleToolInner(args: Record<string, unknown>, ctx: ToolContext) {
             类型: escalation === null ? KIND_LABEL[i.kind] : "截止",
             id: i.schedule_id,
             提醒时间: i.due_at,
+            // 原「提醒时间」是 UTC ISO（差 8 小时易误读），补本地时区文本；原键保留不动
+            "提醒时间(本地)": localStampText(i.due_at),
             事件日期: instantToLocalDate(i.event_at),
             occurrence_key: i.occurrence_key,
             ...(escalation === null ? {} : { 升级提醒: escalation }),

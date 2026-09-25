@@ -226,6 +226,36 @@ describe("schedule 工具：生命周期", () => {
       cleanupTestEnv(env);
     }
   });
+
+  it("list/upcoming 提醒时刻附本地时区文本，原 UTC ISO 键保留不动", () => {
+    const env = makeTestEnv();
+    try {
+      const d = day(1);
+      const created = JSON.parse(
+        tool(env, { action: "add", title: "本地时刻", date: d, time: "08:00" }).content[0]?.text ??
+          "{}",
+      ) as { 已创建: { 下次提醒: string | null; "下次提醒(本地)": string | null } };
+      assert.ok((created.已创建.下次提醒 ?? "").endsWith("Z"), "原 UTC ISO 键不得改动");
+      assert.equal(
+        created.已创建["下次提醒(本地)"],
+        `${d} 08:00`,
+        "本地文本应为 Asia/Shanghai 时刻",
+      );
+
+      const list = JSON.parse(tool(env, { action: "list" }).content[0]?.text ?? "{}") as {
+        日程: { 下次提醒: string | null; "下次提醒(本地)": string | null }[];
+      };
+      assert.equal(list.日程[0]?.["下次提醒(本地)"], `${d} 08:00`);
+
+      const up = JSON.parse(tool(env, { action: "upcoming" }).content[0]?.text ?? "{}") as {
+        即将到来: { 提醒时间: string; "提醒时间(本地)": string }[];
+      };
+      assert.ok((up.即将到来[0]?.提醒时间 ?? "").endsWith("Z"), "原 UTC ISO 键不得改动");
+      assert.equal(up.即将到来[0]?.["提醒时间(本地)"], `${d} 08:00`);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
 });
 
 describe("schedule 提醒触发", () => {
