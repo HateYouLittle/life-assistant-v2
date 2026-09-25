@@ -1,9 +1,9 @@
 import type { DatabaseSync } from "node:sqlite";
 import { DateTime } from "luxon";
 import { TZ, todayIso } from "../time.js";
-import { HttpError, fetchJson } from "./http.js";
+import { HttpError, fetchJson, isTransientNetworkError } from "./http.js";
 import type { JwtSigner } from "./qweather-jwt.js";
-import { getCache, getSetting, setCache, setSetting } from "./settings.js";
+import { getCache, getSetting, setCache, setCacheUntil, setSetting } from "./settings.js";
 
 /**
  * QWeather 客户端（v2 唯一天气数据源）。
@@ -243,6 +243,7 @@ export function resetQweatherStateForTests(): void {
   backoffExponent = 0;
   activeAuth = null;
   geoMemo.clear();
+  inflightByKey.clear();
 }
 
 export class QweatherApiError extends Error {
@@ -275,11 +276,9 @@ function isRetryableStatus(status: number | string): boolean {
 function isRetryableError(e: unknown): boolean {
   if (e instanceof HttpError) return isRetryableStatus(e.status);
   if (e instanceof QweatherApiError) return isRetryableStatus(e.code);
-  // fetch 自身的网络失败：undici 抛 TypeError；超时被中止时抛 DOMException
-  return (
-    e instanceof TypeError ||
-    (e instanceof DOMException && (e.name === "AbortError" || e.name === "TimeoutError"))
-  );
+  // fetch 自身的网络失败：只重试瞬时故障。3xx（redirect: "error" 产生的 TypeError）
+  // 与非法 URL 属确定性失败，重试只会白耗配额
+  return isTransientNetworkError(e);
 }
 
 /** 第 c 次退避的等待毫秒数：2^c 秒 + [0, 2^c - 1] 秒抖动，再受 maxWaitMs 约束。 */
@@ -371,6 +370,20 @@ async function gateFetch(req: QwRequest): Promise<Record<string, unknown>> {
 }
 
 /**
+ * v1 端点的失败契约是 HTTP 200 + `body.error{status,title}`（不是 `body.code`）。
+ * 必须显式判定：否则错误响应会以「缺字段」的形态进入解析，被兜底成空结果 ——
+ * 典型后果是气象预警被判成「当前无生效预警」并缓存 10 分钟，漏报且无人察觉。
+ * 仍按 status 判定是否可重试：429/5xx 退避，其余（401/403/404…）立即抛出。
+ */
+function assertNoErrorBody(body: Record<string, unknown>, api: string): void {
+  if (body.error === undefined) return;
+  const err = body.error as { status?: unknown; title?: unknown };
+  const status = Number(err.status);
+  if (isRetryableStatus(status)) throw new QweatherApiError(api, String(err.status));
+  throw new Error(`QWeather ${api} error ${String(err.status ?? "")}: ${String(err.title ?? "")}`);
+}
+
+/**
  * 取 JSON 并校验 QWeather 业务码。业务码校验必须在重试循环内 —— 否则 HTTP 200 +
  * body.code=429 这类限流会被当成不可重试，白白绕过退避直接失败。
  */
@@ -383,6 +396,7 @@ async function requestQw(
     return await withRetry(async () => {
       const body = await gateFetch(req);
       assertQwCode(body.code, api);
+      assertNoErrorBody(body, api);
       return body;
     });
   } catch (e) {
@@ -390,10 +404,7 @@ async function requestQw(
   }
 }
 
-/**
- * 空气质量 v1 的失败契约是 HTTP 200 + body.error{status,title}（不是 body.code）。
- * 仍按 status 判定是否可重试：429/5xx 退避，其余（401/403/404…）立即抛出。
- */
+/** 空气质量走 v1：失败契约同上，额外按 status 判定可重试性 */
 async function requestAirQuality(
   req: QwRequest,
   auth: QweatherAuth,
@@ -401,14 +412,7 @@ async function requestAirQuality(
   try {
     return await withRetry(async () => {
       const body = await gateFetch(req);
-      if (body.error !== undefined) {
-        const err = body.error as { status?: unknown; title?: unknown };
-        const status = Number(err.status);
-        if (isRetryableStatus(status)) throw new QweatherApiError("airquality", String(err.status));
-        throw new Error(
-          `QWeather airquality error ${String(err.status ?? "")}: ${String(err.title ?? "")}`,
-        );
-      }
+      assertNoErrorBody(body, "airquality");
       return body;
     });
   } catch (e) {
@@ -416,21 +420,43 @@ async function requestAirQuality(
   }
 }
 
+/** 在途的缓存请求（cacheKey → Promise），用于合并同一 key 的并发上游请求 */
+const inflightByKey = new Map<string, Promise<unknown>>();
+
 /**
  * 读缓存 → 未命中则请求 → 仅成功结果写缓存。
  * produce 抛错时不会写缓存（错误被固化会让故障长期自愈不了）。
+ * 并发同一 key 的调用合并为一次上游请求（single-flight）：否则并发的重复查询
+ * 会各自打一次上游，白白消耗配额。
  */
 async function cached<T>(
   db: DatabaseSync,
   cacheKey: string,
   ttlMs: number,
   produce: () => Promise<T>,
+  /**
+   * 可选：由调用方给出绝对过期时刻。TTL 必须在**写入时**换算 —— 在调用时算好再等响应
+   * （重试时可达数十秒）会让「次日 00:00 失效」推迟到零点之后，
+   * 那段时间里逐天预报的首行已经是昨天。
+   */
+  expiresAtOf?: () => string,
 ): Promise<T> {
   const hit = getCache<T>(db, cacheKey);
   if (hit !== undefined) return hit;
-  const value = await produce();
-  setCache(db, cacheKey, value, ttlMs);
-  return value;
+  const inflight = inflightByKey.get(cacheKey);
+  if (inflight !== undefined) return inflight as Promise<T>;
+  const task = (async (): Promise<T> => {
+    const value = await produce();
+    if (expiresAtOf === undefined) setCache(db, cacheKey, value, ttlMs);
+    else setCacheUntil(db, cacheKey, value, expiresAtOf());
+    return value;
+  })();
+  inflightByKey.set(cacheKey, task);
+  try {
+    return await task;
+  } finally {
+    inflightByKey.delete(cacheKey);
+  }
 }
 
 function num(value: unknown, field: string): number {
@@ -551,13 +577,19 @@ export async function currentWeather(
 }
 
 /**
- * 逐天预报的跨日陷阱：23:00 取到的 7 天预报若沿用 2 小时 TTL，过了 00:00 首日
- * 会变成「昨天」。因此 TTL 取 min(2h, 距本地次日 00:00 的剩余时间)。
+ * 逐天预报的过期时刻：min(写入时刻 + 2h, 下一个本地零点)。
+ * 逐天预报的跨日陷阱 —— 23:00 取到的 7 天预报若沿用 2 小时 TTL，过了 00:00 首日
+ * 会变成「昨天」。所以必须在**写入时刻**换算绝对过期时刻（见 cached 的 expiresAtOf）。
  */
-export function dailyForecastTtlMs(nowMs: number): number {
+export function dailyForecastExpiresAt(nowMs: number): string {
   const dt = DateTime.fromMillis(nowMs, { zone: TZ });
   const nextMidnight = dt.startOf("day").plus({ days: 1 });
-  return Math.max(0, Math.min(CACHE_TTL_MS.daily, nextMidnight.toMillis() - nowMs));
+  return new Date(Math.min(nowMs + CACHE_TTL_MS.daily, nextMidnight.toMillis())).toISOString();
+}
+
+/** 同上，返回剩余毫秒数（测试与展示用） */
+export function dailyForecastTtlMs(nowMs: number): number {
+  return Math.max(0, Date.parse(dailyForecastExpiresAt(nowMs)) - nowMs);
 }
 
 export async function forecast(
@@ -568,38 +600,53 @@ export async function forecast(
   days: 3 | 7,
 ): Promise<ForecastDay[]> {
   const path = days <= 3 ? "3d" : "7d";
-  const ttl = dailyForecastTtlMs(Date.now());
   const auth = resolveAuth(key);
-  return cached(db, `qweather:daily:${days}:${loc.cityId}`, ttl, async () => {
-    const body = (await requestQw(
-      buildRequest(host, `/v7/weather/${path}`, { location: loc.cityId }, auth),
-      auth,
-      `weather/${path}`,
-    )) as { code?: unknown; daily?: Array<Record<string, unknown>> };
-    // 缺失 daily 说明响应不完整；静默变成空预报会让简报得出「适宜出行」的错误结论。
-    if (!Array.isArray(body.daily) || body.daily.length === 0) {
-      throw new Error(`QWeather weather/${path} 响应缺少有效的 daily 数组`);
-    }
-    const daily = body.daily;
-    // 用本地日历日过滤：UTC 日期在 00:00–08:00（Asia/Shanghai）会落在前一天，放行已过期的预报行
-    const today = todayIso();
-    return daily
-      .map((d) => {
-        // 上游把「无降水」写作 "0.0"（而非 "0"），必须按数值判断
-        const precip =
-          d.precip === undefined || d.precip === null || d.precip === ""
-            ? 0
-            : num(d.precip, "precip");
-        return {
-          date: String(d.fxDate ?? ""),
-          tMax: num(d.tempMax, "tempMax"),
-          tMin: num(d.tempMin, "tempMin"),
-          textDay: String(d.textDay ?? "").trim(),
-          precipMm: precip > 0 ? precip : undefined,
-        };
-      })
-      .filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d.date) && d.date >= today);
-  });
+  // 过期时刻按「请求发起时刻」换算成绝对值，但等响应回来（重试时可达数十秒）才写入：
+  // 若按发起时刻算好「剩余毫秒」再延迟写入，过期时刻会被顺延到零点之后；
+  // 若按写入时刻算，23:59 发起、00:00 返回的响应会活到**下一个**零点，首行仍是昨天。
+  const requestedAt = Date.now();
+  return cached(
+    db,
+    `qweather:daily:${days}:${loc.cityId}`,
+    CACHE_TTL_MS.daily,
+    async () => {
+      const body = (await requestQw(
+        buildRequest(host, `/v7/weather/${path}`, { location: loc.cityId }, auth),
+        auth,
+        `weather/${path}`,
+      )) as { code?: unknown; daily?: Array<Record<string, unknown>> };
+      // 缺失 daily 说明响应不完整；静默变成空预报会让简报得出「适宜出行」的错误结论。
+      if (!Array.isArray(body.daily) || body.daily.length === 0) {
+        throw new Error(`QWeather weather/${path} 响应缺少有效的 daily 数组`);
+      }
+      const daily = body.daily;
+      // 用本地日历日过滤：UTC 日期在 00:00–08:00（Asia/Shanghai）会落在前一天，放行已过期的预报行
+      const today = todayIso();
+      const rows = daily
+        .map((d) => {
+          // 上游把「无降水」写作 "0.0"（而非 "0"），必须按数值判断
+          const precip =
+            d.precip === undefined || d.precip === null || d.precip === ""
+              ? 0
+              : num(d.precip, "precip");
+          return {
+            date: String(d.fxDate ?? ""),
+            tMax: num(d.tempMax, "tempMax"),
+            tMin: num(d.tempMin, "tempMin"),
+            textDay: String(d.textDay ?? "").trim(),
+            precipMm: precip > 0 ? precip : undefined,
+          };
+        })
+        .filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d.date) && d.date >= today);
+      // 全部行都不可用（日期格式坏 / 全是过期日）时抛错：返回空数组会被当成「有预报」
+      // 缓存 2 小时，简报照发但缺「今日气温」，且「天气与预报全失败则不发送」的兜底失效。
+      if (rows.length === 0) {
+        throw new Error(`QWeather weather/${path} 响应没有可用的预报日（本地今天 ${today}）`);
+      }
+      return rows;
+    },
+    () => dailyForecastExpiresAt(requestedAt),
+  );
 }
 
 /** v1 预警的 color.code 即国标预警级别；也兼容少数返回英文色名的实现 */
@@ -634,11 +681,19 @@ export async function alerts(
       buildRequest(host, `/weatheralert/v1/current/${lat}/${lon}`, {}, auth),
       auth,
       "weatheralert",
-    )) as { code?: unknown; alerts?: Array<Record<string, unknown>> };
+    )) as { code?: unknown; metadata?: unknown; alerts?: Array<Record<string, unknown>> };
     // v1 预警结构为 { id, eventType{name,code}, color{code}, severity, effectiveTime,
     // onsetTime, expireTime, headline, description }：没有 level/startsAt/endsAt/title。
     // 此前按已废弃的 v7 结构读取，导致级别恒为空、起止时间恒为 undefined。
-    return (body.alerts ?? []).map((a) => ({
+    //
+    // alerts 缺失时不能一律当成「无预警」：结构异常（如错误响应体）会被静默成空结果，
+    // 「无预警」是安全相关的结论，宁可抛错让调用方显示「未知」。
+    // 只有看起来正常的「零结果」响应（带 metadata 或业务码）才当空处理。
+    if (!Array.isArray(body.alerts)) {
+      if (body.metadata !== undefined || body.code !== undefined) return [];
+      throw new Error("QWeather weatheralert 响应结构不合法：既无 alerts 也无 metadata/code");
+    }
+    return body.alerts.map((a) => ({
       id: String(a.id ?? ""),
       title: String(a.headline ?? a.title ?? "天气预警"),
       level: alertLevelOf(a.color, a.severity),
@@ -712,10 +767,15 @@ export async function airQuality(
       const unit = String(concentration?.unit ?? "")
         .replace(/µ|μ/g, "u")
         .replace(/\s/g, "");
-      if (concentration?.value === undefined || !Number.isFinite(Number(concentration.value)))
-        continue;
       if (unit !== "ug/m3" && unit !== "ug/m³") continue;
-      pollutants[code] = Number(concentration.value);
+      const raw = concentration?.value;
+      // 与 num() 同一口径：Number(null)/Number("")/Number([]) 都是 0，会把「没有数据」
+      // 伪装成实测的 0（页面上显示「PM2.5 0 μg/m³」）；而 0 是合法读数，不能靠数值判断。
+      if (typeof raw !== "number" && typeof raw !== "string") continue;
+      if (typeof raw === "string" && raw.trim() === "") continue;
+      const value = Number(raw);
+      if (!Number.isFinite(value)) continue;
+      pollutants[code] = value;
     }
     return {
       aqi,

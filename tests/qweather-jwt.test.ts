@@ -378,6 +378,41 @@ describe("config：QWeather 认证判定", () => {
     assert.equal(ok.qweatherHost, HOST);
   });
 
+  it("TTL ≤ iat 回拨量（30s）→ 启动即报错，不签「出生即过期」的 token", () => {
+    // exp = iat + TTL 且 iat 回拨 30 秒：TTL=30 时 exp = now，所有天气请求都会 401，
+    // 而错误提示把排查引向 kid / 项目 ID
+    for (const bad of ["30", "10", "1"]) {
+      assert.throws(
+        () =>
+          loadConfig({
+            ...BASE,
+            QWEATHER_API_HOST: HOST,
+            QWEATHER_KEY: "k",
+            QWEATHER_JWT_TTL_SECONDS: bad,
+          }),
+        /QWEATHER_JWT_TTL_SECONDS/,
+      );
+    }
+    const ok = loadConfig({
+      ...BASE,
+      QWEATHER_API_HOST: HOST,
+      QWEATHER_KEY: "k",
+      QWEATHER_JWT_TTL_SECONDS: "31",
+    });
+    assert.equal(ok.qweatherHost, HOST);
+  });
+
+  it("createJwtSigner 自身也拒绝过小的 TTL（不依赖调用方先拦住）", () => {
+    assert.throws(
+      () => createJwtSigner({ ...BASE_OPTS, privateKeyPath: keyPath, ttlSeconds: 30 }),
+      /回拨量/,
+    );
+    assert.throws(
+      () => createJwtSigner({ ...BASE_OPTS, privateKeyPath: keyPath, ttlSeconds: 86_401 }),
+      /上限/,
+    );
+  });
+
   it("两者都配：loadConfig 注入的 JWT 被客户端实际使用（URL 无 key、带 Authorization）", async () => {
     const db = makeDb();
     loadConfig({ ...BASE, QWEATHER_API_HOST: HOST, QWEATHER_KEY: "api-key", ...JWT_ENV });

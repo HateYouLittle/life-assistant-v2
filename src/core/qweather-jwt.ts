@@ -79,6 +79,17 @@ export function loadEd25519PrivateKey(privateKeyPath: string): KeyObject {
 }
 
 export function createJwtSigner(opts: JwtSignerOptions): JwtSigner {
+  // exp = iat + ttl，而 iat 回拨了 JWT_IAT_SKEW_SECONDS：ttl ≤ 回拨量时签出的 token
+  // 出生即过期，所有请求 401，排查提示却指向 kid / 项目 ID。校验放在最靠近签名的地方，
+  // 不依赖调用方（config）先拦住。
+  if (!Number.isInteger(opts.ttlSeconds) || opts.ttlSeconds <= JWT_IAT_SKEW_SECONDS) {
+    throw new Error(
+      `JWT TTL 必须大于 iat 回拨量 ${JWT_IAT_SKEW_SECONDS} 秒（当前 ${opts.ttlSeconds}），否则签出的 token 立即过期`,
+    );
+  }
+  if (opts.ttlSeconds > JWT_MAX_TTL_SECONDS) {
+    throw new Error(`JWT TTL 超过官方上限 ${JWT_MAX_TTL_SECONDS} 秒: ${opts.ttlSeconds}`);
+  }
   const nowMs = opts.nowMs ?? Date.now;
   const signFn = opts.signFn ?? ((data: Buffer, key: KeyObject) => sign(null, data, key));
   let privateKey: KeyObject | null = null;

@@ -2,11 +2,12 @@ import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { nowIso } from "../time.js";
 
-export function ensureProfile(db: DatabaseSync, profileId: string): void {
-  db.prepare("INSERT OR IGNORE INTO profiles (id, created_at) VALUES (?, ?)").run(
-    profileId,
-    nowIso(),
-  );
+/** 返回是否真的新建了 Profile（false = 已存在）。调用方可用它统计「实际写入」而非调用次数 */
+export function ensureProfile(db: DatabaseSync, profileId: string): boolean {
+  const result = db
+    .prepare("INSERT OR IGNORE INTO profiles (id, created_at) VALUES (?, ?)")
+    .run(profileId, nowIso());
+  return Number(result.changes) > 0;
 }
 
 export function listProfiles(db: DatabaseSync): string[] {
@@ -48,7 +49,21 @@ export function getCache<T>(db: DatabaseSync, key: string): T | undefined {
 }
 
 export function setCache(db: DatabaseSync, key: string, value: unknown, ttlMs: number): void {
-  const expiresAt = new Date(Date.now() + ttlMs).toISOString();
+  setCacheUntil(db, key, value, new Date(Date.now() + ttlMs).toISOString());
+}
+
+/**
+ * 同 setCache，但由调用方给出绝对过期时刻。
+ * 需要「必须在某个本地时刻失效」的缓存（如逐天预报跨零点）必须用这个：
+ * 若在调用时把 TTL 换算成毫秒、等响应回来才写入（重试时可达数十秒），
+ * 过期时刻会被顺延到目标时刻之后。
+ */
+export function setCacheUntil(
+  db: DatabaseSync,
+  key: string,
+  value: unknown,
+  expiresAt: string,
+): void {
   db.prepare(
     `INSERT INTO cache (key, value_json, expires_at) VALUES (?, ?, ?)
      ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json, expires_at = excluded.expires_at`,

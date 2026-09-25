@@ -449,3 +449,182 @@ describe("QWeather：GeoAPI 合规（不落盘）", () => {
     db.close();
   });
 });
+
+const AIR_BODY = {
+  indexes: [{ code: "cn-mee", aqi: 42, category: "优", primaryPollutant: { name: "NA" } }],
+};
+
+describe("QWeather：v1 错误体（HTTP 200 + body.error）不被当成空结果", () => {
+  it("预警端点返回错误体时抛错，而不是答「无生效预警」并把空结果缓存 10 分钟", async () => {
+    const db = makeDb();
+    await withFetch(
+      () => jsonResponse({ error: { status: 401, title: "UNAUTHORIZED" } }),
+      async (calls) => {
+        await assert.rejects(() => alerts(db, HOST, KEY, LOC), /UNAUTHORIZED|401/);
+        assert.equal(countCache(db, "qweather:alerts:%"), 0, "错误结果绝不能写缓存");
+        assert.equal(calls.length, 1, "401 不可重试");
+      },
+    );
+    db.close();
+  });
+
+  it("预警响应结构不合法（既无 alerts 也无 metadata/code）时抛错", async () => {
+    const db = makeDb();
+    await withFetch(
+      () => jsonResponse({ unexpected: true }),
+      async () => {
+        await assert.rejects(() => alerts(db, HOST, KEY, LOC), /结构不合法/);
+      },
+    );
+    db.close();
+  });
+
+  it("正常的零结果（带 metadata）仍视为无预警", async () => {
+    const db = makeDb();
+    await withFetch(
+      () => jsonResponse({ metadata: { zeroResult: true } }),
+      async () => {
+        assert.deepEqual(await alerts(db, HOST, KEY, LOC), []);
+      },
+    );
+    db.close();
+  });
+
+  it("空气质量污染物为 null/空串时不产出 0（0 会被当成实测值展示）", async () => {
+    const db = makeDb();
+    await withFetch(
+      () =>
+        jsonResponse({
+          ...AIR_BODY,
+          pollutants: [
+            { code: "pm2p5", concentration: { value: null, unit: "μg/m³" } },
+            { code: "pm10", concentration: { value: "", unit: "μg/m³" } },
+          ],
+        }),
+      async () => {
+        const air = await airQuality(db, HOST, KEY, LOC);
+        assert.equal(air.pm25, undefined, "null 不得被读成 0");
+        assert.equal(air.pm10, undefined, "空串不得被读成 0");
+      },
+    );
+    db.close();
+  });
+
+  it("污染物为 0 时仍如实保留（0 是合法读数）", async () => {
+    const db = makeDb();
+    await withFetch(
+      () =>
+        jsonResponse({
+          ...AIR_BODY,
+          pollutants: [
+            { code: "pm2p5", concentration: { value: 0, unit: "μg/m³" } },
+            { code: "pm10", concentration: { value: "0", unit: "μg/m³" } },
+          ],
+        }),
+      async () => {
+        const air = await airQuality(db, HOST, KEY, LOC);
+        assert.equal(air.pm25, 0);
+        assert.equal(air.pm10, 0);
+      },
+    );
+    db.close();
+  });
+});
+
+describe("QWeather：逐天预报的跨日边界", () => {
+  it("过滤后没有可用预报日时抛错且不写缓存（避免简报缺今日气温却照发）", async () => {
+    const db = makeDb();
+    await withFetch(
+      () =>
+        jsonResponse({
+          code: "200",
+          daily: [{ fxDate: "2020-01-01", tempMax: "30", tempMin: "24", textDay: "晴" }],
+        }),
+      async () => {
+        await assert.rejects(() => forecast(db, HOST, KEY, LOC, 7), /没有可用的预报日/);
+        assert.equal(countCache(db, "qweather:daily:%"), 0);
+      },
+    );
+    db.close();
+  });
+
+  it("零点前发起的预报在零点后即失效（过期时刻按请求发起时刻换算，不随响应延迟顺延）", async (t) => {
+    // 23:59 +08 发起，响应在 00:00:30 +08 才回来
+    t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-09-18T15:59:00.000Z") });
+    const db = makeDb();
+    await withFetch(
+      () => {
+        t.mock.timers.setTime(Date.parse("2026-09-18T16:00:30.000Z"));
+        return jsonResponse({
+          code: "200",
+          daily: [{ fxDate: todayIso(), tempMax: "30", tempMin: "24", textDay: "晴" }],
+        });
+      },
+      async (calls) => {
+        await forecast(db, HOST, KEY, LOC, 7);
+        assert.equal(calls.length, 1);
+        // 旧实现把 ttl 在调用时算成 60s、到写入时才加，过期时刻会变成 00:01:30，
+        // 于是零点后仍命中「昨天」的预报
+        await forecast(db, HOST, KEY, LOC, 7);
+        assert.equal(calls.length, 2, "零点前发起的预报过了零点必须重新请求");
+      },
+    );
+    db.close();
+  });
+
+  it("并发同一查询只打一次上游（single-flight，省配额）", async () => {
+    const db = makeDb();
+    await withFetch(
+      () => jsonResponse(NOW_BODY),
+      async (calls) => {
+        const [a, b, c] = await Promise.all([
+          currentWeather(db, HOST, KEY, LOC),
+          currentWeather(db, HOST, KEY, LOC),
+          currentWeather(db, HOST, KEY, LOC),
+        ]);
+        assert.equal(calls.length, 1, "并发相同 key 应合并为一次上游请求");
+        assert.deepEqual(b, a);
+        assert.deepEqual(c, a);
+      },
+    );
+    db.close();
+  });
+});
+
+describe("QWeather：确定性失败不重试（账号冻结红线）", () => {
+  it("3xx 重定向（redirect: error 产生的 TypeError）只请求一次，不白耗配额", async () => {
+    const db = makeDb();
+    const sleeps = captureSleeps();
+    await withFetch(
+      () => {
+        const err = new TypeError("fetch failed");
+        (err as { cause?: unknown }).cause = new Error("unexpected redirect");
+        throw err;
+      },
+      async (calls) => {
+        await assert.rejects(() => currentWeather(db, HOST, KEY, LOC), /fetch failed/);
+        assert.equal(calls.length, 1, "重定向重试多少次都是同一结果，必须立即抛出");
+        assert.deepEqual(sleeps, [], "不应发生退避等待");
+      },
+    );
+    db.close();
+  });
+
+  it("瞬时网络故障（连接被拒）仍然重试 3 次", async () => {
+    const db = makeDb();
+    const sleeps = captureSleeps();
+    await withFetch(
+      () => {
+        const err = new TypeError("fetch failed");
+        (err as { cause?: unknown }).cause = new Error("connect ECONNREFUSED 127.0.0.1:443");
+        throw err;
+      },
+      async (calls) => {
+        await assert.rejects(() => currentWeather(db, HOST, KEY, LOC), /fetch failed/);
+        assert.equal(calls.length, 3, "瞬时故障应退避重试到上限");
+        assert.equal(sleeps.length, 2);
+      },
+    );
+    db.close();
+  });
+});

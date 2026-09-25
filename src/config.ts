@@ -4,6 +4,7 @@ import cron from "node-cron";
 import { logger } from "./core/logger.js";
 import {
   JWT_DEFAULT_TTL_SECONDS,
+  JWT_IAT_SKEW_SECONDS,
   JWT_MAX_TTL_SECONDS,
   createJwtSigner,
 } from "./core/qweather-jwt.js";
@@ -149,9 +150,16 @@ function resolveQweather(env: NodeJS.ProcessEnv): QweatherResolution {
   let ttlSeconds = JWT_DEFAULT_TTL_SECONDS;
   if (ttlRaw !== undefined && ttlRaw !== "") {
     const parsed = Number(ttlRaw);
-    if (!Number.isInteger(parsed) || parsed <= 0 || parsed > JWT_MAX_TTL_SECONDS) {
+    // 下界不是洁癖：exp = iat + TTL 且 iat 回拨 30 秒，TTL ≤ 30 会签出「出生即过期」的
+    // token（所有天气请求 401，而错误提示把排查引向 kid/项目 ID）；
+    // 小于 回拨量 + 复用余量 时 token 缓存永不命中，每个请求都重签。
+    if (
+      !Number.isInteger(parsed) ||
+      parsed <= JWT_IAT_SKEW_SECONDS ||
+      parsed > JWT_MAX_TTL_SECONDS
+    ) {
       throw new Error(
-        `QWEATHER_JWT_TTL_SECONDS 必须是 1..${JWT_MAX_TTL_SECONDS} 之间的整数: ${ttlRaw}`,
+        `QWEATHER_JWT_TTL_SECONDS 必须是 ${JWT_IAT_SKEW_SECONDS + 1}..${JWT_MAX_TTL_SECONDS} 之间的整数: ${ttlRaw}`,
       );
     }
     ttlSeconds = parsed;

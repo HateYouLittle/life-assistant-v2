@@ -38,6 +38,23 @@ export async function fetchJson(
   return response.json();
 }
 
+/**
+ * fetch 层的失败统一是 `TypeError("fetch failed")`，真实原因在 `cause` 里；
+ * 超时被中止时是 `DOMException(AbortError/TimeoutError)`。
+ *
+ * 用于区分「瞬时网络故障」（值得退避重试）与「确定性失败」（重试只是白耗配额）：
+ * `redirect: "error"` 把 3xx 也变成 TypeError，但重定向重试多少次都是同一个结果 ——
+ * QWeather 的账号冻结红线正来自「反复重试错误的请求」。返回 true 表示值得重试。
+ */
+export function isTransientNetworkError(e: unknown): boolean {
+  if (e instanceof DOMException) return e.name === "AbortError" || e.name === "TimeoutError";
+  if (!(e instanceof TypeError)) return false;
+  const cause = (e as { cause?: unknown }).cause;
+  const message = cause instanceof Error ? cause.message : "";
+  // 重定向、非法 URL 等确定性失败不重试
+  return !/redirect|invalid url/i.test(message);
+}
+
 async function readErrorDetail(response: Response): Promise<string> {
   let text = "";
   try {
