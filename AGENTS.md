@@ -75,6 +75,8 @@ CI（`.github/workflows/ci.yml`）在 Node 22 和 24 上按此顺序运行：
 ## 注意
 
 - QWeather 的 GeoAPI 结果不得缓存/落盘/批量建索引（版权限制）——只允许进程内 memo。
+  例外：用户经 `weather locate` 显式选定的位置会作为该 Profile 的配置长期保存，属用户
+  主动设置而非缓存/批量索引。
   HTTP 错误只对 429/5xx/网络故障重试；**4xx 必须立即抛出**（反复重试错误请求会导致
   账号被冻结）。API KEY 是回退；优先 Ed25519 JWT，且四个 `QWEATHER_JWT_*` 变量必须
   同时配置，否则启动失败。

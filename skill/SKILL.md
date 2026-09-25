@@ -33,6 +33,7 @@ read_when:
 
 - 不要用 LLM cron 或其它机制伪造定时任务；所有确定性提醒走 `schedule`。
 - `holiday` 数据未覆盖的日期返回"未知"，绝不按星期猜测调休。
+- `holiday {view:"next"}` 输出带「进行中」布尔：假期期间为 `true` —— 别只看「开始/结束」日期就告诉用户"假期还没到"。
 - 不要虚构工具之外的能力（油价、共享账本角色、快递等 v1 能力已移除）。
 - 只操作当前 Profile 的日程与通知；账本为所有 Profile 共享。
 
@@ -55,6 +56,7 @@ read_when:
 - 完成待办用 `complete`（可带 `occurrence_key` 只完成单次）；更新用 `update`；删除用 `delete`。
 - **远期日程只保留「下一条」**：occurrence 只物化到未来 62 天；若某日程此刻一条待提醒都没有（远期生日、远期一次性待办），会额外保留 1 条越过该窗口的 occurrence。因此 `upcoming` 里远期日程只出现一条，这不是数据缺失，提醒也不会漏。
 - `schedule {action:"list"}` 默认只列 `status: "active"`、最多 20 条（`status`/`limit` 可调）；`upcoming` 查「接下来要发生的事」。
+- `list`/`upcoming` 里的 `下次提醒`、`提醒时间` 是 **UTC ISO**；同一对象另给 `下次提醒(本地)`/`提醒时间(本地)`（Asia/Shanghai，`YYYY-MM-DD HH:mm`）—— **向用户报时间一律用「(本地)」键**，直接读 UTC 值会差 8 小时。
 - 历史 occurrence 超 90 天由服务端自动清理（只清**已提醒/已完成/已取消**的行；`pending` 永不删）。用户问「很久以前的提醒怎么查不到」时按此解释。
 
 ## 记账
