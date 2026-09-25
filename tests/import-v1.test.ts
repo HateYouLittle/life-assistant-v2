@@ -210,6 +210,125 @@ describe("import:v1 旧库路径解析", () => {
 });
 
 describe("import:v1", () => {
+  it("profile_settings 里的非法 Profile 名被逐行隔离，不落库（状态页注入入口的回归）", () => {
+    const env = makeTestEnv();
+    try {
+      const oldPath = `${env.dir}/old-invalid-profile.db`;
+      const old = new DatabaseSync(oldPath);
+      old.exec(`
+        CREATE TABLE profiles (profile_id TEXT PRIMARY KEY, created_at TEXT NOT NULL);
+        CREATE TABLE profile_settings (profile_id TEXT PRIMARY KEY, quiet_start TEXT, quiet_end TEXT,
+          timezone TEXT, updated_at TEXT NOT NULL);
+      `);
+      const ts = "2026-01-01T00:00:00.000Z";
+      old.prepare("INSERT INTO profiles VALUES ('p1', ?)").run(ts);
+      old
+        .prepare("INSERT INTO profile_settings VALUES ('p1','22:00','07:00','Asia/Shanghai',?)")
+        .run(ts);
+      old
+        .prepare("INSERT INTO profile_settings VALUES (?,'22:00','07:00','Asia/Shanghai',?)")
+        .run("<img src=x onerror=alert(1)>", ts);
+      old.close();
+
+      const report = runImport(env.db, oldPath);
+      assert.ok(
+        report.problems.some(
+          (p) => p.table === "profile_settings" && p.reason.includes("Profile 名不合法"),
+        ),
+        `非法 Profile 名应被隔离并记入报告，实际 ${JSON.stringify(report.problems)}`,
+      );
+      const ids = (env.db.prepare("SELECT id FROM profiles").all() as { id: string }[]).map(
+        (r) => r.id,
+      );
+      assert.ok(
+        !ids.some((id) => id.includes("<")),
+        `非法 Profile 名进了库：${JSON.stringify(ids)}`,
+      );
+      assert.ok(ids.includes("p1"), "合法的 Profile 仍应正常导入");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("星期名命中原型链（constructor）不会产出 null（Object.hasOwn 回归）", () => {
+    const env = makeTestEnv();
+    try {
+      const oldPath = `${env.dir}/old.db`;
+      buildOldDb(oldPath);
+      const old = new DatabaseSync(oldPath);
+      const ts = "2026-01-01T00:00:00.000Z";
+      old
+        .prepare(
+          `INSERT INTO schedules (profile_id, id, type, title, status, calendar, date, time, all_day, timezone,
+             recurrence_json, reminders_json, enabled, version, created_at, updated_at)
+           VALUES ('p1', 'w2', 'todo', '原型链星期', 'active', 'solar', '2026-01-05', '09:00', 0, 'Asia/Shanghai', ?, '[]', 1, 1, ?, ?)`,
+        )
+        .run(
+          JSON.stringify({ frequency: "weekly", interval: 1, byWeekday: ["constructor"] }),
+          ts,
+          ts,
+        );
+      old.close();
+
+      runImport(env.db, oldPath);
+      const row = env.db.prepare("SELECT recurrence_json FROM schedules WHERE id = 'w2'").get() as {
+        recurrence_json: string;
+      };
+      const rec = JSON.parse(row.recurrence_json) as { byweekday: unknown[] };
+      assert.ok(
+        rec.byweekday.every((d) => Number.isInteger(d)),
+        `byweekday 只能装整数（null 会被 luxon 当成 no-op 静默落到周一）：${JSON.stringify(rec.byweekday)}`,
+      );
+      assert.deepEqual(rec.byweekday, [0], "认不出星期应回退到开始日期的星期（2026-01-05 是周一）");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("节假日行被约束静默拒绝时，该年份不得标记 ready（避免按星期猜工作日）", () => {
+    const env = makeTestEnv();
+    try {
+      const oldPath = `${env.dir}/old-bad-holiday.db`;
+      const old = new DatabaseSync(oldPath);
+      old.exec(`
+        CREATE TABLE profiles (profile_id TEXT PRIMARY KEY, created_at TEXT NOT NULL);
+        CREATE TABLE cn_holiday_days (date TEXT PRIMARY KEY, year INTEGER NOT NULL, day_type TEXT NOT NULL,
+          name TEXT NOT NULL, source TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE cn_holiday_year_meta (year INTEGER PRIMARY KEY, status TEXT NOT NULL DEFAULT 'ready',
+          source TEXT NOT NULL, payload_hash TEXT NOT NULL, fetched_at TEXT NOT NULL,
+          last_attempt_at TEXT, last_error TEXT);
+      `);
+      const ts = "2026-01-01T00:00:00.000Z";
+      // day_type 非法：目标库有 CHECK 约束，而 INSERT OR IGNORE 不会为此抛错（changes=0）
+      old
+        .prepare(
+          "INSERT INTO cn_holiday_days VALUES ('2026-10-01', 2026, 'bogus', '国庆节', 'src', ?, ?)",
+        )
+        .run(ts, ts);
+      old
+        .prepare("INSERT INTO cn_holiday_year_meta VALUES (2026,'ready','src','hash',?,NULL,NULL)")
+        .run(ts);
+      old.close();
+
+      const report = runImport(env.db, oldPath);
+      assert.ok(
+        report.problems.some((p) => p.table === "cn_holiday_days" && p.id === "2026-10-01"),
+        `被约束拒绝的行必须进报告：${JSON.stringify(report.problems)}`,
+      );
+      assert.equal(
+        env.db.prepare("SELECT 1 FROM cn_holiday_years WHERE year = 2026").get(),
+        undefined,
+        "有坏行的年份标记 ready 会让 dayType 对缺失日期按星期猜（调休日静默错判）",
+      );
+      assert.ok(
+        report.scheduleWarnings.some((w) => w.includes("未标记为 ready")),
+        "降级必须留痕",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("完整映射旧库并输出报告", () => {
     const env = makeTestEnv();
     try {

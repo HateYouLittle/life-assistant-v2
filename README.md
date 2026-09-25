@@ -10,7 +10,7 @@
 | 空气质量 | QWeather 国标 AQI（cn-mee）、PM2.5/PM10 |
 | 每日简报 | 每日 07:00（可配）确定性组装，无 LLM |
 | 日程 | 待办/生日/纪念日，公历+农历（闰月策略、腊月三十顺延）、按法定工作日/节假日重复 |
-| 节假日 | 大陆法定节假日/调休日历，每日 02:00 自动抓取校验 |
+| 节假日 | 大陆法定节假日/调休日历，每日 02:00 自动抓取校验（数据源 `NateScarlet/holiday-cn` 的 jsDelivr / GitHub raw；无外网时 `workday/holiday` 过滤的日程会暂停并在状态页 `holidays.failed` 显示原因） |
 | 记账 | 全局多账本、只记支出（无编辑：改金额/分类/备注须删除后重记），账本/分类月度预算与 80%/100% 超支提醒、月度账单推送 |
 | 通知 | SQLite outbox + HMAC V2 回环 webhook、静默时段、`notify.pull` 兜底 |
 
@@ -27,9 +27,10 @@ npm run typecheck && npm test
 npm run build
 ```
 
-`npm start` / `npm run dev` / `npm run db:backup` / `npm run import:v1` 会用 Node 的
-`--env-file-if-exists=.env` 自动读取同目录 `.env`（已存在的环境变量优先，systemd 的
-`EnvironmentFile` 不受影响）。手工执行其他命令时可 `set -a; source .env; set +a`。
+`npm start` / `npm run dev` / `npm run db:backup` / `npm run db:cleanup:preview` /
+`npm run import:v1` 会用 Node 的 `--env-file-if-exists=.env` 自动读取同目录 `.env`
+（已存在的环境变量优先，systemd 的 `EnvironmentFile` 不受影响）。手工执行其他命令时可
+`set -a; source .env; set +a`。
 
 ### 配置（.env）
 
@@ -39,13 +40,13 @@ npm run build
 | `HERMES_PROFILE` | stdio 壳 | stdio 壳 / CLI 使用的 Profile 名；纯 HTTP 直连的 daemon 不读该变量（Profile 走 `X-Hermes-Profile` 头） |
 | `QWEATHER_API_HOST` | 天气需要 | QWeather 控制台获取的自定义 API Host |
 | `QWEATHER_KEY` | | API KEY 凭据；**回退方案**（官方自 2027-02-01 起逐步限制其每日请求量） |
-| `QWEATHER_JWT_KEY_ID` / `QWEATHER_JWT_PROJECT_ID` / `QWEATHER_JWT_DEVELOPER_ID` / `QWEATHER_JWT_PRIVATE_KEY_PATH` | | **推荐**：Ed25519 JWT 认证。前三个是控制台的凭据 ID / 项目 ID / 开发者 ID，第四个是仓库外的私钥 PEM 路径（如 `~/.secrets/qweather-ed25519.pem`，权限 600）。四项**要么全配、要么全不配**：只写一半会启动报错，不会静默退回 API KEY。两者都配时优先 JWT |
+| `QWEATHER_JWT_KEY_ID` / `QWEATHER_JWT_PROJECT_ID` / `QWEATHER_JWT_DEVELOPER_ID` / `QWEATHER_JWT_PRIVATE_KEY_PATH` | | **推荐**：Ed25519 JWT 认证。前三个是控制台的凭据 ID / 项目 ID / 开发者 ID，第四个是仓库外的私钥 PEM **绝对路径**（如 `/home/you/.secrets/qweather-ed25519.pem`，权限 600；`~` 不会被展开）。四项**要么全配、要么全不配**：只写一半会启动报错，不会静默退回 API KEY。注意启动阶段只校验"四项是否齐全"——私钥文件不存在/不可读/非 Ed25519 PKCS8 时报错发生在**第一次天气请求**，不在启动时。两者都配时优先 JWT |
 | `QWEATHER_JWT_TTL_SECONDS` | | JWT 有效期，默认 `43200`（12 小时），上限 `86400` |
-| `DEFAULT_CITY` | | Profile 未设位置时的兜底城市 |
+| `DEFAULT_CITY` | | Profile 未设位置时的兜底城市，默认 `北京` |
 | `HOST` / `PORT` | | 默认 `127.0.0.1:3080`；**非回环地址必须配 `WEB_API_TOKEN`**，否则拒绝启动 |
-| `WEB_API_TOKEN` | | 非回环地址必填；保护 `/api/*`（Bearer 或 `?token=`）与 `/mcp`（仅 Bearer） |
+| `WEB_API_TOKEN` | | 非回环地址必填且**至少 32 字符**（回环地址下短 token 只告警不拦截）；保护 `/api/*`（Bearer 或 `?token=`）与 `/mcp`（仅 Bearer） |
 | `MCP_DAEMON_TOKEN` | | stdio 壳访问 daemon 用的 token；缺省复用 `WEB_API_TOKEN` |
-| `PROFILE_ROUTE_SECRETS_JSON` | 主动推送需要 | `'{"default":"<openssl rand -hex 32>"}'`（整段用单引号包裹） |
+| `PROFILE_ROUTE_SECRETS_JSON` | 主动推送需要 | `'{"default":"<openssl rand -hex 32>"}'`（整段用单引号包裹；每个 secret **至少 32 字符**） |
 | `DAILY_BRIEF_CRON` | | 每日简报时间，默认 `'0 7 * * *'`（含空格需单引号，Asia/Shanghai） |
 | `ALERT_WATCH_CRON` | | 气象预警巡检时间，默认 `'*/20 * * * *'` |
 | `ALERT_MIN_LEVEL` | | 低于此级别的预警不主动推送，`blue|yellow|orange|red`，默认 `blue`（=全部级别都推） |
@@ -67,7 +68,21 @@ daemon 就绪后：
 
 - MCP 端点：`http://127.0.0.1:3080/mcp`（Streamable HTTP）
 - 状态页：`http://127.0.0.1:3080/`（`/api/status` 同源）
+- 存活探针：`http://127.0.0.1:3080/healthz`（**不鉴权**，只回 `{ok, version, uptime_s}`，库打不开时 503）——给 systemd / uptime 监控用，别用需要 token 的 `/api/status`
+- 只读 API（同样受 `WEB_API_TOKEN` 保护；`/api/*` 一律 `Cache-Control: no-store`）：
+
+  | 端点 | 参数 | 内容 |
+  |---|---|---|
+  | `/api/status` | — | 概览（首屏数据源） |
+  | `/api/expenses` | `month`（YYYY-MM）、`limit` | 分类/按天/逐笔支出 |
+  | `/api/schedules` | `limit` | 跨 Profile 的活跃日程与下次触发 |
+  | `/api/deliveries` | `limit` | 投递计数、近 7 天分布与记录 |
+  | `/api/holidays` | `year` | 假期/调休安排与接下来的假期 |
+
 - `X-Hermes-Profile` 头决定 Profile；缺省为 `default`
+- MCP 会话：空闲 2 小时回收、最多 200 个；daemon 重启后旧 `mcp-session-id` 一律返回 404，
+  调用方需重新 `initialize`（stdio 壳会自动重连重试，HTTP 直连的客户端要自行处理）
+- 状态页带 CSP（`script-src 'nonce-…'`），页面脚本每次请求一个新 nonce
 - 配了 `WEB_API_TOKEN` 时两者都需凭据：`/api/*` 接受 Bearer 或 `?token=`，
   `/mcp` 只接受 `Authorization: Bearer`（避免凭据出现在 URL/日志里）。
   看板只需用 `http://127.0.0.1:3080/?token=<WEB_API_TOKEN>` 打开一次：页面会把
@@ -168,6 +183,37 @@ systemctl daemon-reload && systemctl enable --now life-assistant-backup.timer
 
 备份落在 `$DATA_DIR/backups`，与数据库同盘：重要数据建议再同步到别的机器/盘（如 `rsync` 到 NAS）。
 
+### 恢复备份
+
+daemon 正在跑时**不要**直接覆盖数据库文件（WAL 里可能还有未合并的数据）。
+
+```bash
+systemctl stop life-assistant                     # 1. 先停 daemon
+cp $DATA_DIR/life-assistant.db $DATA_DIR/life-assistant.db.broken   # 2. 留一份现场
+rm -f $DATA_DIR/life-assistant.db-wal $DATA_DIR/life-assistant.db-shm  # 3. 清掉 WAL/SHM
+cp $DATA_DIR/backups/life-assistant-<时间戳>.db $DATA_DIR/life-assistant.db
+systemctl start life-assistant                    # 4. 启动并打开状态页确认
+```
+
+备份文件是 `VACUUM INTO` 产物，可直接用 `sqlite3 <备份> "PRAGMA integrity_check;"`
+自检，也可以只从里面捞单条数据（`ATTACH` 后 `INSERT ... SELECT`）而不整库回滚。
+
+### 故障排查
+
+| 症状 | 原因与处置 |
+|---|---|
+| 启动即退出，日志 `DATA_DIR 未设置/必须是绝对路径` | `.env` 没被读到（换过工作目录？）或写成了相对路径 |
+| 启动即退出，`schema 版本 N 高于程序支持的 M` | 用旧程序打开了新库：升级到对应版本的程序，不要改 `meta.schema_version` |
+| 状态页一直「未授权」 | 用 `http://127.0.0.1:3080/?token=<WEB_API_TOKEN>` 打开一次（页面会把凭据记进 localStorage 并抹掉地址栏） |
+| 状态页 `date-line` 变红报错 | 与上面同源：浏览器里存的凭据失效（换过 token），重新用 `?token=` 引导一次 |
+| stdio 壳报 `daemon 不可达` | daemon 没起或 `MCP_DAEMON_URL` 指错；壳只连 daemon、不自己开库 |
+| MCP 直连报 `Session not found` | daemon 重启过：重新 `initialize`（stdio 壳会自动做） |
+| 收不到主动推送 | 依次查：`notify {action:"quiet_hours"}`（静默时段）→ `notify {action:"route"}`（路由与 `secretConfigured`）→ 状态页「投递」卡片的 queued/failed/fallback 计数 |
+| 天气工具报 `UNAUTHORIZED` / `NO CREDIT` | JWT 私钥或 API KEY 问题：换 JWT 前请确认私钥是 Ed25519 PKCS8、路径为绝对路径（首次请求才校验） |
+| `holidays.failed` 列出年份 | 抓取失败（无外网/CDN 不可达/数据校验不通过），原因就在该行；期间 `workday/holiday` 过滤的日程会暂停而不是猜 |
+| 通知明明发出但用户说没收到 | 先 `notify.pull`（静默时段与投递失败都只影响主动推送，通知本身保留） |
+
+
 ## 从 v1 迁移
 
 ```bash
@@ -190,11 +236,15 @@ Profile / 账本数据再写入（不影响其它 Profile），失败时整体�
 ```bash
 npm run dev            # tsx 直接跑 daemon
 npm test               # node --test（全部用例）
-npm run lint           # Biome lint（0 警告）
+npm run lint           # Biome lint（error 级诊断才让命令失败；warn 不会）
 npm run format:check   # Biome 格式检查（CI 也跑）
+npm run doctor         # 自检：配置/目录/库完整性/鉴权/JWT 私钥/备份（--network 加连通性）
 npm run db:backup      # VACUUM INTO 备份，保留最近 14 份
-npm run db:cleanup:preview   # 只读预演：occurrence 清理会删掉哪些历史行
+npm run db:cleanup:preview   # 只读预演：occurrence 与保留策略会删掉哪些行
 ```
+
+> `db:backup` / `db:cleanup:preview` / `import:v1` 跑的是 `dist/` 里的构建产物，先
+> `npm run build`（或改用对应的 `dev:*` 变体直接跑源码）。
 
 结构：`src/core`（database/registry/auth/http/logger/settings/notify/render/qweather/qweather-jwt/holiday/recurrence）、`src/modules`（weather/holiday/schedule/bookkeeping/notify，经 `modules/index.ts` 注册，核心不反向依赖）、`src/server`（status/page/details，状态页与只读 API）、`src/daemon.ts`、`src/stdio.ts`、`src/config.ts`、`src/time.ts`、`src/import-v1.ts`、`src/backup.ts`、`src/cleanup-preview.ts`。
 
@@ -205,10 +255,11 @@ npm run db:cleanup:preview   # 只读预演：occurrence 清理会删掉哪些�
 - **recurrence 引擎**：自研纯函数替代 rrule，只覆盖 daily/weekly/monthly/yearly × 农历 + 工作日过滤；漏触发只补最近一次。
 - **outbox**：通知 + 投递记录同事务写入；发布即触发投递；静默时段只拦主动推送；带 `expiresAt` 的通知（气象预警）到点仍未投出即作废，不会在静默时段结束后补投一条已经失效的告警（通知本身保留，`notify.pull` 仍可取到）。
 - **时区**：全部调度固定 Asia/Shanghai，无 DST。
-- **QWeather 请求治理**：按数据类型短 TTL 缓存（`CACHE_TTL_MS`：实时 20min / 逐天 2h 且取 `min(2h, 距本地次日 00:00)` / 预警 10min / 空气质量 45min，只有成功响应才写缓存）；同进程并发上限 3；仅对 429/5xx 与网络故障做指数退避（`2^c` 秒 + 抖动，c 上限 10），**4xx 一律立即抛出** —— 官方明确反复重试错误请求会被判定为攻击并冻结账号。认证优先 JWT（EdDSA），API KEY 保留回退。**GeoAPI 结果不得落盘缓存/批量存储/建索引**（官方版权限制），只允许进程内 memo。
-- **主动推送**：定时任务组装**确定性**通知（无 LLM），走 outbox 投递：每日天气简报与调休/补班提醒 07:00、气象预警巡检每 20 分钟、月报每月 1 号 09:00；节假日数据刷新 02:00、历史 occurrence 回收 04:30。预警与补班都靠 `dedupe_key` 去重（预警按「id + 级别」，级别升级会再推一次；补班按「事件 + 日期」），静默时段在投递层统一拦截、不为任何类型开例外。
+- **QWeather 请求治理**：按数据类型短 TTL 缓存（`CACHE_TTL_MS`：实时 20min / 逐天 2h 且取 `min(2h, 距本地次日 00:00)` / 预警 10min / 空气质量 45min，只有成功响应才写缓存）；同进程并发上限 3；仅对 429/5xx 与网络故障做指数退避（`2^c` 秒 + 抖动，c 上限 10），**4xx 一律立即抛出** —— 官方明确反复重试错误请求会被判定为攻击并冻结账号。认证优先 JWT（EdDSA），API KEY 保留回退。**GeoAPI 结果不得落盘缓存/批量存储/建索引**（官方版权限制），只允许进程内 memo —— 唯一例外是用户显式 `weather {view:"locate"}` 确认的位置，会作为 Profile 设置（`settings.location`）持久化，供后续查询与每日简报复用。
+- **主动推送**：定时任务组装**确定性**通知（无 LLM），走 outbox 投递：每日天气简报与调休/补班提醒 07:00、气象预警巡检每 20 分钟、月报每月 1 号 09:00；节假日数据刷新 02:00、历史 occurrence 回收 04:30、保留策略清理 04:50。预警与补班都靠 `dedupe_key` 去重（预警按「id + 级别」，级别升级会再推一次；补班按「事件 + 日期」），静默时段在投递层统一拦截、不为任何类型开例外。
+- **用量与保留**：QWeather 上游请求按本地日计数（含重试、缓存命中不计），状态页「今日天气请求」与 `/api/status` 的 `qweather_usage` 可见，daemon 重启从库里的计数继续累加 —— 官方 2027-02-01 起限制 API KEY 日请求量，没有计量就无从判断余量。保留策略（每日 04:50）只删**已读且投递已终结**的通知（含级联的投递记录）与**已取消超 180 天**的日程；未读通知、仍有待投递的通知、使用 `recurrence.count` 的日程一律保留。
 - **记账预算**：账本可设**总额**或**分类**月度预算（`ledger {action:"budget"}`，单位元），按账本每月滚动（对照当月支出）。`expense add` 成功后判定该笔是否**跨越** 80%/100% —— 只推跨越那一刻（而非达到即推）；同一个预算一笔只推**跨过的最高阈值**（一笔从 0% 到 150% 只推 100%，70%→90% 只推 80%），总额与分类各自独立判定；`dedupeKey = budget:<ledger>:<category|->:<YYYY-MM>:<80|100>`，跨月自动重新判定，同月同阈值不重推。设了预算的账本，月报表格追加预算对照行；未设预算的账本行为完全不变。
-- **物化窗口**：occurrence 只物化到 `now + 62 天`。若某日程此刻一条 `pending` 都没有（远期生日、远期一次性待办），额外豁免**恰好 1 条**越过窗口的 occurrence，保证「下一条」在 `list`/`upcoming`/状态页始终可见；豁免资格取自入库状态，补上第一条即失效，因此不会随时间累积增长。
+- **物化窗口**：occurrence 只物化到 `now + 62 天`。若某日程此刻一条 `pending` 都没有（远期生日、远期一次性待办），额外豁免**恰好 1 条**越过窗口的 occurrence，保证「下一条」在 `list`/`upcoming`/状态页始终可见（豁免的那条最远可达 400 天，因此远期生日会显示成明年的日期）；豁免资格取自入库状态，补上第一条即失效，因此不会随时间累积增长。
 - **截止型日程（逾期升级）**：给 `todo` 设置 `escalation`（严格升序分钟偏移数组，1-5 项、最大 43200 即 30 天，**首元素必须为 0** 表示截止时刻本身，如 `[0,60,360,1440]`）即可 —— 仅 `kind=todo` 可设，到达截止时刻后按阶梯依次重发升级提醒（第 0 步即截止时刻本身的 `#0`，第 1..n 步是逾期加压的 `<event>#0#esc:N`），直到 `complete` 才停；设置 `escalation` 时 `resend_minutes` 被忽略。每步各生成一条 occurrence，靠 `INSERT OR IGNORE` + `notified` 状态保证只推一次；改了 `time`/`escalation` 或父事件被删/重排后，残留行在触发前按当前排期校验并作废。`update` 传 `escalation: []` 清除阶梯（空数组在 MCP schema 层合法：长度下限与首元素/升序等语义规则在 service 层判定，否则经真实 MCP 的 `[]` 会在进入 handler 前被拒）。工具/状态页把这类日程的类型显示为「截止」（不新增 `kind` 枚举值，语义由字段表达）。
 - **历史回收**：`schedule.occurrence_cleanup`（每日 04:30）只清理 90 天前的 `notified`/`done`/`cancelled` 行 —— `pending` 永不删；使用 `recurrence.count` 的日程整条豁免（发生次数上限依赖历史行数，删历史会让已达上限的循环复活）。上线或调参前用 `npm run db:cleanup:preview` 只读预演将删除的行数与涉及日程（与 job 共用同一份判定）。
 

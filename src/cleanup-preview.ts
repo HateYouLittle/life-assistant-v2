@@ -1,12 +1,17 @@
 import { existsSync } from "node:fs";
 import { loadConfig } from "./config.js";
 import { openDatabase } from "./core/database.js";
+import {
+  CANCELLED_SCHEDULE_RETENTION_DAYS,
+  NOTIFICATION_RETENTION_DAYS,
+  retentionPreview,
+} from "./core/retention.js";
 import { OCCURRENCE_CLEANUP_DAYS, previewOccurrenceCleanup } from "./modules/schedule/service.js";
 
 /**
- * occurrence 清理预演（只读）：调参或首次上线前先看会删掉什么。
- * 判定与每日 04:30 的 job 共用同一份谓词（service.ts 的 occurrenceCleanupPlan），
- * 因此这里的结论与 job 实际行为一定一致。
+ * 清理预演（只读）：occurrence 与保留策略（通知/投递/已取消日程）都会删什么。
+ * 判定与每日 job 共用同一份谓词（schedule/service.ts 与 core/retention.ts），
+ * 因此这里的结论与 job 实际行为一致。
  */
 
 function main(): void {
@@ -28,6 +33,17 @@ function main(): void {
       console.log(`  - ${row.title}（${row.schedule_id}）：${row.rows} 行`);
     }
     if (preview.deletable === 0) console.log("当前没有可清理的历史行。");
+
+    const retention = retentionPreview(db);
+    console.log("");
+    console.log(
+      `保留策略（通知 ${NOTIFICATION_RETENTION_DAYS} 天 / 已取消日程 ${CANCELLED_SCHEDULE_RETENTION_DAYS} 天）：`,
+    );
+    console.log(
+      `将删除已读通知 ${retention.notifications} 条（其中投递记录 ${retention.deliveries} 条随外键级联）、` +
+        `已取消日程 ${retention.cancelledSchedules} 条`,
+    );
+    console.log("未读通知与仍有待投递的通知不会删；使用 recurrence.count 的日程不删。");
   } finally {
     db.close();
   }

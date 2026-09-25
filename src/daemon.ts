@@ -21,6 +21,12 @@ import {
   type ToolContext,
 } from "./core/registry.js";
 import { cancelPendingDrain, createServices, drainDue, waitForDrain } from "./core/notify.js";
+import {
+  bumpQweatherUsage,
+  readQweatherUsage,
+  seedQweatherUsage,
+  setQweatherUsageSink,
+} from "./core/qweather.js";
 import { pruneCache } from "./core/settings.js";
 import { logger, setLogLevel } from "./core/logger.js";
 import { TZ, now } from "./time.js";
@@ -229,6 +235,9 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
   setLogLevel(config.logLevel);
   mkdirSync(config.dataDir, { recursive: true });
   const db = openDatabase(config.dbPath);
+  // QWeather 用量计量：先把今天的计数读回内存（重启不清零），之后每次出网自增并落库
+  seedQweatherUsage(readQweatherUsage(db));
+  setQweatherUsageSink((day) => bumpQweatherUsage(db, day));
   initRuntime({ db, config, services: createServices(db, config) });
   registerAllModules();
 
@@ -261,10 +270,26 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
     }
   }
 
-  const tasks: cron.ScheduledTask[] = [];
-  for (const { module, def } of allJobs()) {
+  // 先把所有 cron 表达式校验完（纯计算，不注册定时器）：配置错误必须在监听之前暴露。
+  const jobSpecs = allJobs().map(({ module, def }) => {
     const expr = typeof def.cron === "function" ? def.cron() : def.cron;
     if (!cron.validate(expr)) throw new Error(`Job ${def.name} 的 cron 不合法: ${expr}`);
+    return { module, def, expr };
+  });
+
+  // 监听成功之前不得装配任何定时器（信号处理同理）：端口被占 —— systemd Restart=always
+  // 重启时的常见情形 —— 会让旧实现留下一个「启动失败但不退出」的僵尸实例，它的 20s drain
+  // 会把在跑实例正处于 sending 的投递复位重投（recoverStaleSending），同一条通知推两次。
+  await new Promise<void>((resolve, reject) => {
+    httpServer.once("error", reject);
+    httpServer.listen(config.port, config.host, () => resolve());
+  }).catch((e: unknown) => {
+    db.close();
+    throw e;
+  });
+
+  const tasks: cron.ScheduledTask[] = [];
+  for (const { module, def, expr } of jobSpecs) {
     tasks.push(
       cron.schedule(expr, () => void runExclusive(`job:${def.name}`, () => def.handler(now())), {
         timezone: TZ,
@@ -287,11 +312,6 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
     }
     sweepSessions();
   }, 20_000);
-
-  await new Promise<void>((resolve, reject) => {
-    httpServer.once("error", reject);
-    httpServer.listen(config.port, config.host, () => resolve());
-  });
 
   logger.info(`life-assistant daemon v${VERSION} 就绪: http://${config.host}:${config.port}`);
   logger.info(`MCP 端点: http://${config.host}:${config.port}/mcp  数据目录: ${config.dataDir}`);
@@ -317,40 +337,56 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
   const stop = async (): Promise<void> => {
     if (stopped) return;
     stopped = true;
-    for (const task of tasks) task.stop();
-    clearInterval(drainTimer);
-    cancelPendingDrain();
-    // 在途的 outbox 投递也有 10s 级网络超时：不等它收敛就会在关库后继续写。
-    // 与 onStart 一样给个上界（这里 10s），避免停机被长时间拖住。
-    await Promise.race([
-      waitForDrain(),
-      new Promise<void>((resolve) => setTimeout(resolve, 10_000).unref()),
-    ]);
-    // 给 onStart 一点时间收尾（多为网络抓取），避免关库后仍在写
-    if (onStartTasks.length > 0) {
+    try {
+      for (const task of tasks) task.stop();
+      clearInterval(drainTimer);
+      cancelPendingDrain();
+      // 在途的 outbox 投递也有 10s 级网络超时：不等它收敛就会在关库后继续写。
+      // 与 onStart 一样给个上界（这里 10s），避免停机被长时间拖住。
       await Promise.race([
-        Promise.allSettled(onStartTasks),
-        new Promise<void>((resolve) => setTimeout(resolve, 3000).unref()),
+        waitForDrain(),
+        new Promise<void>((resolve) => setTimeout(resolve, 10_000).unref()),
       ]);
+      // 给 onStart 一点时间收尾（多为网络抓取），避免关库后仍在写
+      if (onStartTasks.length > 0) {
+        await Promise.race([
+          Promise.allSettled(onStartTasks),
+          new Promise<void>((resolve) => setTimeout(resolve, 3000).unref()),
+        ]);
+      }
+      for (const [id, session] of [...sessions]) dropSession(id, session);
+      httpServer.closeAllConnections();
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      db.close();
+    } finally {
+      // 无论收尾是否失败都要摘掉信号监听：否则同进程内多次 startDaemon/stop
+      // 会不断累积监听器（测试里尤其明显）。
+      process.off("SIGINT", onSigint);
+      process.off("SIGTERM", onSigterm);
     }
-    for (const [id, session] of [...sessions]) dropSession(id, session);
-    httpServer.closeAllConnections();
-    await new Promise<void>((resolve) => httpServer.close(() => resolve()));
-    db.close();
   };
 
   const shutdown = (signal: string): void => {
     logger.info(`收到 ${signal}，正在关闭…`);
-    void stop().then(() => {
-      logger.info("已退出");
-      process.exit(0);
-    });
+    // stop() 里 db.close() 等步骤失败会 reject：必须接住，否则变成 unhandled rejection
+    // 且进程按退出码 0 结束（丢掉了"关库失败"这个信号）。
+    void stop()
+      .then(() => {
+        logger.info("已退出");
+        process.exit(0);
+      })
+      .catch((e: unknown) => {
+        logger.error(`关闭失败: ${errorMessage(e)}`);
+        process.exit(1);
+      });
     // 兜底硬退：必须大于 stop() 内部的等待上界（drain ≤10s + onStart ≤3s + 其余收尾），
     // 否则在途投递的收敛等待会被这里提前打断，db.close() 也不会执行。
     setTimeout(() => process.exit(0), 15_000).unref();
   };
-  process.on("SIGINT", () => shutdown("SIGINT"));
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  const onSigint = (): void => shutdown("SIGINT");
+  const onSigterm = (): void => shutdown("SIGTERM");
+  process.on("SIGINT", onSigint);
+  process.on("SIGTERM", onSigterm);
 
   return { stop };
 }

@@ -26,12 +26,84 @@ export interface LocationInfo {
   lon: number;
 }
 
+/**
+ * 上游请求计量（按本地日历日）。官方自 2027-02-01 起限制 API KEY 的每日请求量，
+ * 没有计量就无法判断「今天还剩多少额度」，也无法发现缓存/退避被绕过导致的放大。
+ *
+ * 语义：只统计**真正发出去的 HTTP 请求**（重试各算一次），缓存命中不计。
+ * 进程内存是实时真值；daemon 启动时从库里读回当天计数（重启不清零），
+ * 每次自增通过 sink 落库（仅当 sink 被 daemon 注入；测试里只走内存）。
+ */
+export interface QweatherUsage {
+  day: string;
+  requests: number;
+}
+
+let usage: QweatherUsage = { day: todayIso(), requests: 0 };
+let usageSink: ((day: string) => void) | null = null;
+
+/** daemon 启动时注入落库函数；传 null 只走内存（测试/CLI） */
+export function setQweatherUsageSink(sink: ((day: string) => void) | null): void {
+  usageSink = sink;
+}
+
+/** 从持久化的计数继续累加（daemon 启动时调用一次，避免重启把当天用量清零） */
+export function seedQweatherUsage(requests: number, day: string = todayIso()): void {
+  usage = { day, requests: Math.max(0, Math.trunc(requests)) };
+}
+
+export function qweatherUsage(): QweatherUsage {
+  rollUsageDay();
+  return { ...usage };
+}
+
+function rollUsageDay(): void {
+  const today = todayIso();
+  if (usage.day !== today) usage = { day: today, requests: 0 };
+}
+
+function recordUpstreamRequest(): void {
+  rollUsageDay();
+  usage.requests += 1;
+  usageSink?.(usage.day);
+}
+
+/** 落库：`cache` 表里按天存一个裸数字，过期时间给足（当天绝不会被 pruneCache 清掉） */
+export function bumpQweatherUsage(db: DatabaseSync, day: string): void {
+  const expiresAt = new Date(Date.now() + 400 * 24 * 3600 * 1000).toISOString();
+  try {
+    db.prepare(
+      `INSERT INTO cache (key, value_json, expires_at) VALUES (?, '1', ?)
+       ON CONFLICT (key) DO UPDATE SET
+         value_json = CAST(CAST(cache.value_json AS INTEGER) + 1 AS TEXT),
+         expires_at = excluded.expires_at`,
+    ).run(`qweather:usage:${day}`, expiresAt);
+  } catch {
+    // 计量是旁路：失败绝不能影响天气请求本身
+  }
+}
+
+/** 读回某天的计数（缺失=0） */
+export function readQweatherUsage(db: DatabaseSync, day: string = todayIso()): number {
+  const row = db
+    .prepare("SELECT value_json FROM cache WHERE key = ?")
+    .get(`qweather:usage:${day}`) as { value_json: string } | undefined;
+  const value = Number(row?.value_json ?? 0);
+  return Number.isFinite(value) && value > 0 ? Math.trunc(value) : 0;
+}
+
 export interface CurrentWeather {
   temp: number;
   feelsLike: number;
   humidity: number;
   windSpeed: number;
   text: string;
+  /**
+   * 观测时刻（上游 `now.obsTime`，ISO 字符串）。SKILL.md 要求"标注数据来源时间"，
+   * 而有 20 分钟缓存，所以必须把上游观测时间透出来，否则 agent 只能省略或编造。
+   * 上游缺失时为 undefined（不猜）。
+   */
+  obsTime?: string;
 }
 
 export interface ForecastDay {
@@ -291,6 +363,8 @@ function withAuthHint(e: unknown, auth: QweatherAuth): unknown {
 }
 
 async function gateFetch(req: QwRequest): Promise<Record<string, unknown>> {
+  // 唯一的出网点：在这里计数，重试的每一次都算一次真实配额消耗
+  recordUpstreamRequest();
   return gate.run(
     async () => (await fetchJson(req.url, undefined, req.headers)) as Record<string, unknown>,
   );
@@ -471,6 +545,7 @@ export async function currentWeather(
       humidity: num(now.humidity, "humidity"),
       windSpeed: num(now.windSpeed, "windSpeed"),
       text: String(now.text ?? ""),
+      obsTime: typeof now.obsTime === "string" && now.obsTime !== "" ? now.obsTime : undefined,
     };
   });
 }

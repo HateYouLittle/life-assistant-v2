@@ -21,6 +21,8 @@
     "dev:db:backup": "tsx --env-file-if-exists=.env src/backup.ts",
     "db:cleanup:preview": "node --env-file-if-exists=.env dist/cleanup-preview.js",
     "dev:db:cleanup:preview": "tsx --env-file-if-exists=.env src/cleanup-preview.ts",
+    "doctor": "node --env-file-if-exists=.env dist/doctor.js",
+    "dev:doctor": "tsx --env-file-if-exists=.env src/doctor.ts",
     "import:v1": "node --env-file-if-exists=.env dist/import-v1.js",
     "dev:import:v1": "tsx --env-file-if-exists=.env src/import-v1.ts"
   },

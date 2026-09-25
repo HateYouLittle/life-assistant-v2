@@ -41,6 +41,12 @@ async function resolveLocation(ctx: ToolContext, city: string | undefined): Prom
   return geoLookup(ctx.db, host, key, ctx.config.defaultCity);
 }
 
+/** 观测时刻 → 本地「yyyy-MM-dd HH:mm」；解析不了就原样返回（不编造） */
+function obsTimeText(obsTime: string): string {
+  const dt = DateTime.fromISO(obsTime, { zone: TZ });
+  return dt.isValid ? dt.toFormat("yyyy-LL-dd HH:mm") : obsTime;
+}
+
 function weatherTable(cur: CurrentWeather): { columns: string[]; rows: string[][] } {
   return {
     columns: ["项目", "内容"],
@@ -49,6 +55,8 @@ function weatherTable(cur: CurrentWeather): { columns: string[]; rows: string[][
       ["气温", `${cur.temp}°C（体感 ${cur.feelsLike}°C）`],
       ["湿度", `${cur.humidity}%`],
       ["风速", `${cur.windSpeed} km/h`],
+      // 「数据来源时间」：让 agent 能如实标注，而不是省略或编造（见 skill/SKILL.md）
+      ...(cur.obsTime === undefined ? [] : [["更新时间", obsTimeText(cur.obsTime)]]),
     ],
   };
 }

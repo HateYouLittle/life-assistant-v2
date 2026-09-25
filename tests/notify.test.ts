@@ -10,9 +10,11 @@ import {
   publishGlobal,
   publishProfile,
   recoverStaleSending,
+  routeSecret,
   setPushRoute,
   waitForDrain,
 } from "../src/core/notify.js";
+import { notifyTool } from "../src/modules/notify/index.js";
 import { setSetting } from "../src/core/settings.js";
 import { cleanupTestEnv, makeTestEnv, SECRET, type TestEnv } from "./helpers.js";
 
@@ -414,6 +416,120 @@ describe("outbox 投递", () => {
       const recovered = row2();
       assert.equal(recovered?.status, "queued");
       assert.equal(recovered?.generation, 1);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("route enabled 切换必须重新入队，不再用裸 setSetting 绕过 requeue", async () => {
+    const env = makeTestEnv({ PROFILE_ROUTE_SECRETS_JSON: JSON.stringify({ default: SECRET }) });
+    try {
+      setPushRoute(env.db, "default", { url: "http://127.0.0.1:9/hook", name: "route-a" });
+      const pub = publishProfile(env.db, env.config, "default", {
+        kind: "k",
+        title: "t",
+        blocks: {},
+      });
+      const row = (): Record<string, unknown> | undefined =>
+        deliveryRows(env.db).find((r) => r.notification_id === pub.id);
+      assert.equal(row()?.status, "queued");
+
+      // 用工具路径停用 → drain 把待投递行打成 fallback
+      const ctx = {
+        profileId: "default",
+        db: env.db,
+        config: env.config,
+        services: {
+          publishProfile: async () => ({ id: "x", deduped: false }),
+          publishGlobal: async () => ({ materialized: 0 }),
+        },
+      };
+      notifyTool({ action: "route", enabled: false }, ctx);
+      forceDue(env.db);
+      await drainDue(env.db, env.config);
+      assert.equal(row()?.status, "fallback");
+
+      // 再用工具路径启用：必须重新入队（曾经这里直接 setSetting，行永远停在 fallback）
+      notifyTool({ action: "route", enabled: true }, ctx);
+      assert.equal(row()?.status, "queued", "重新启用路由后，停用期间未投出的通知必须重新入队");
+      assert.equal(row()?.generation, 1, "重新入队应递增 generation（用于区分新的投递尝试）");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("profile 名为 constructor 时不得命中 Object.prototype（routeSecret 回归）", () => {
+    const env = makeTestEnv({ PROFILE_ROUTE_SECRETS_JSON: JSON.stringify({ default: SECRET }) });
+    try {
+      assert.equal(
+        routeSecret(env.config, "constructor"),
+        undefined,
+        "未配置的 profile 必须是 undefined",
+      );
+      const pub = publishProfile(env.db, env.config, "constructor", {
+        kind: "k",
+        title: "t",
+        blocks: {},
+      });
+      // 误判"有 secret"会落一条投递行，随后 createHmac 抛错并让每轮 drain 中断
+      const rows = deliveryRows(env.db).filter((r) => r.notification_id === pub.id);
+      assert.equal(rows.length, 0, "没有 secret 就不该落投递行（否则 drain 每轮都会抛错）");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("投递遇 4xx：直接终结为 fallback，不做 5 次退避重试", async () => {
+    const env = makeTestEnv({ PROFILE_ROUTE_SECRETS_JSON: JSON.stringify({ default: SECRET }) });
+    try {
+      await withHookServer(
+        (_req, res) => {
+          res.writeHead(404);
+          res.end("not found");
+        },
+        async (url) => {
+          setPushRoute(env.db, "default", { url });
+          const pub = publishProfile(env.db, env.config, "default", {
+            kind: "k",
+            title: "t",
+            blocks: {},
+          });
+          forceDue(env.db);
+          await drainDue(env.db, env.config);
+          const row = deliveryRows(env.db).find((r) => r.notification_id === pub.id);
+          assert.equal(row?.status, "fallback", "4xx 是确定性拒绝，必须直接终结");
+          assert.equal(row?.attempts, 1, "不该重试");
+          assert.equal(row?.confirmed_failures, 0, "4xx 不该计入退避阶梯");
+          assert.equal(row?.last_error, "HTTP 404");
+        },
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("投递遇 429：仍按可重试处理（限流是暂时性的）", async () => {
+    const env = makeTestEnv({ PROFILE_ROUTE_SECRETS_JSON: JSON.stringify({ default: SECRET }) });
+    try {
+      await withHookServer(
+        (_req, res) => {
+          res.writeHead(429);
+          res.end("slow down");
+        },
+        async (url) => {
+          setPushRoute(env.db, "default", { url });
+          const pub = publishProfile(env.db, env.config, "default", {
+            kind: "k",
+            title: "t",
+            blocks: {},
+          });
+          forceDue(env.db);
+          await drainDue(env.db, env.config);
+          const row = deliveryRows(env.db).find((r) => r.notification_id === pub.id);
+          assert.equal(row?.status, "failed", "429 应进入退避重试而不是终结");
+          assert.equal(row?.confirmed_failures, 1);
+        },
+      );
     } finally {
       cleanupTestEnv(env);
     }

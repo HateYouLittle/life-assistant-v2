@@ -21,6 +21,11 @@ export interface HolidayYearPayload {
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const FESTIVALS = ["元旦", "春节", "清明节", "劳动节", "端午节", "中秋节", "国庆节"];
 const FETCH_COOLDOWN_MS = 6 * 3600 * 1000;
+/**
+ * 调休上班日与假期的最大间隔（天）。用于把同名假期（年年都有「国庆节」）的调休日
+ * 归属到正确的年份：落在假期首尾 3 周内才算这一段。实际数据里调休最多提前/推后约两周。
+ */
+const WORKDAY_PROXIMITY_DAYS = 21;
 
 const SOURCES = (year: number): string[] => [
   `https://cdn.jsdelivr.net/gh/NateScarlet/holiday-cn@master/${year}.json`,
@@ -196,7 +201,9 @@ function recordFailure(db: DatabaseSync, year: number, error: string): void {
   db.prepare(
     `INSERT INTO cn_holiday_years (year, status, source, fetched_at, last_attempt_at, last_error)
      VALUES (?, 'failed', '', ?, ?, ?)
-     ON CONFLICT (year) DO UPDATE SET status = 'failed', last_attempt_at = excluded.last_attempt_at, last_error = excluded.last_error`,
+     ON CONFLICT (year) DO UPDATE SET status = 'failed', last_attempt_at = excluded.last_attempt_at,
+       last_error = excluded.last_error
+     WHERE cn_holiday_years.status != 'ready'`,
   ).run(year, now, now, error);
 }
 
@@ -216,6 +223,9 @@ export async function fetchYearPayload(
   throw new Error(`年度数据抓取失败 ${year}: ${lastError}`);
 }
 
+/** 正在抓取的年份：同一进程内避免 refresh job 与 schedule tick 并发抓同一年 */
+const inflightYears = new Set<number>();
+
 /** 确保指定年份就绪：ready 跳过；失败后 6 小时冷却；返回本次更新的年份 */
 export async function ensureYears(
   db: DatabaseSync,
@@ -226,6 +236,14 @@ export async function ensureYears(
   const skipped: number[] = [];
   const failed: string[] = [];
   for (const year of years) {
+    // 并发路径：节假日 refresh job（02:00）与 schedule tick 的按需补齐都会调这里。
+    // 不加这道闸，两方会同时抓同一年；更糟的是一方 importYear 置 ready 后，
+    // 另一方的失败回写会把状态改回 failed —— 数据其实可用，`dayType` 却返回 unknown，
+    // 所有 workday/holiday 过滤的日程集体暂停。
+    if (inflightYears.has(year)) {
+      skipped.push(year);
+      continue;
+    }
     const meta = db
       .prepare("SELECT status, last_attempt_at FROM cn_holiday_years WHERE year = ?")
       .get(year) as { status: string; last_attempt_at: string | null } | undefined;
@@ -240,6 +258,7 @@ export async function ensureYears(
         continue;
       }
     }
+    inflightYears.add(year);
     try {
       const payload = await fetchYearPayload(year, fetcher);
       // CDN 可能返回缓存/错配的文件；若不比对，会把错误年份「导入成功」，
@@ -256,8 +275,11 @@ export async function ensureYears(
       logger.info(`节假日数据导入 ${year} 年 ${count} 天`);
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
+      // recordFailure 带 status != 'ready' 守卫：失败不能覆盖已经就绪的年份
       recordFailure(db, year, message);
       failed.push(`${year}: ${message}`);
+    } finally {
+      inflightYears.delete(year);
     }
   }
   return { updated, skipped, failed };
@@ -327,6 +349,24 @@ export function holidayPeriods(db: DatabaseSync): HolidayPeriodInfo[] {
     const tokens = nameTokens(name);
     const workdays = workdayRows
       .filter((row) => {
+        // 只按名字匹配是不够的：两年的「国庆节」共享同一个名字，2027 年的调休日
+        // 会被算进 2026 年的假期，提醒里就会多出明年 9/10 月的日期。
+        // 调休日总是紧贴假期（前后 3 周内），据此把归属限定在本段附近。
+        const delta = Math.abs(
+          DateTime.fromISO(row.date, { zone: TZ }).diff(
+            DateTime.fromISO(group.dates[0] as string, { zone: TZ }),
+            "days",
+          ).days,
+        );
+        const nearStart = delta <= WORKDAY_PROXIMITY_DAYS;
+        const nearEnd =
+          Math.abs(
+            DateTime.fromISO(row.date, { zone: TZ }).diff(
+              DateTime.fromISO(group.dates[group.dates.length - 1] as string, { zone: TZ }),
+              "days",
+            ).days,
+          ) <= WORKDAY_PROXIMITY_DAYS;
+        if (!nearStart && !nearEnd) return false;
         for (const token of nameTokens(row.name)) {
           if (tokens.has(token)) return true;
         }

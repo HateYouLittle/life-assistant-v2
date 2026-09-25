@@ -82,7 +82,9 @@ const WEEKDAY_MAP: Record<string, number> = {
 
 function mapWeekday(raw: string): number | null {
   const key = String(raw).trim().toLowerCase();
-  if (key in WEEKDAY_MAP) return WEEKDAY_MAP[key] ?? null;
+  // 必须用 Object.hasOwn：`"constructor" in WEEKDAY_MAP` 为真，会取到 Object 构造函数，
+  // 序列化后变成 null 混进 byweekday（再由 recurrence 的过滤逻辑静默落到周一）。
+  if (Object.hasOwn(WEEKDAY_MAP, key)) return WEEKDAY_MAP[key] ?? null;
   const n = Number(key);
   if (Number.isInteger(n) && n >= 0 && n <= 6) return n;
   return null;
@@ -346,6 +348,17 @@ export function runImport(
       }
       for (const s of settings) {
         if (s.quiet_start === null || s.quiet_end === null) continue;
+        // 与上面的 profiles 主循环同样必须校验：setSetting → ensureProfile 会直接建 Profile 行，
+        // 非法名（含 HTML）一旦入库，状态页把它拼进 innerHTML 就是存储型 XSS。
+        if (!PROFILE_ID_RE.test(s.profile_id)) {
+          problem(
+            report,
+            "profile_settings",
+            s.profile_id,
+            `Profile 名不合法（需匹配 ${PROFILE_ID_RE}），静默时段未导入`,
+          );
+          continue;
+        }
         try {
           setSetting(target, s.profile_id, "quiet_hours", {
             start: s.quiet_start,
@@ -556,15 +569,37 @@ export function runImport(
       const insertDay = target.prepare(
         "INSERT OR IGNORE INTO cn_holiday_days (date, year, day_type, name, source, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
       );
+      // 导入失败过的年份不能标记 ready：年份一旦 ready，dayType 对缺失日期会退化成
+      // 「按星期猜」（周六日=weekend，其余=weekday），调休周六会被判成周末、
+      // 假期里的工作日会被判成普通工作日 —— 日程静默错触发，且没有任何提示。
+      const yearsWithBrokenDays = new Set<number>();
+      // OR IGNORE 会把 CHECK 违规（例如 day_type 非法）也静默吞掉：changes=0 且不抛错。
+      // 所以「真的没写进去」必须靠「导入前该日期是否已存在」来区分，否则坏行会被当成正常跳过。
+      const existingDates = new Set(
+        (target.prepare("SELECT date FROM cn_holiday_days").all() as { date: string }[]).map(
+          (r) => r.date,
+        ),
+      );
       for (const d of holidayDays) {
         // OR IGNORE：不覆盖目标库中由 ensureYears 抓取的更新数据（OR REPLACE 会静默覆盖）
         try {
           // 计数取 changes 而非行数：被 IGNORE 掉的行没有写入，计入会让报告
           // 声称「已导入 N 天节假日数据」而实际插入 0 行（重复导入时必然发生）。
           const result = insertDay.run(d.date, d.year, d.day_type, d.name, d.source, d.updated_at);
-          report.holidayDays += Number(result.changes);
+          const changes = Number(result.changes);
+          report.holidayDays += changes;
+          if (changes === 0 && !existingDates.has(d.date)) {
+            problem(
+              report,
+              "cn_holiday_days",
+              d.date,
+              "节假日数据未导入：被约束拒绝（如 day_type 非法）",
+            );
+            yearsWithBrokenDays.add(Number(d.year));
+          }
         } catch (e) {
           problem(report, "cn_holiday_days", d.date, `节假日数据未导入：${errorText(e)}`);
+          yearsWithBrokenDays.add(Number(d.year));
         }
       }
       let holidayYears: Array<{
@@ -586,6 +621,13 @@ export function runImport(
         `INSERT OR IGNORE INTO cn_holiday_years (year, status, source, fetched_at) VALUES (?, 'ready', ?, ?)`,
       );
       for (const y of holidayYears) {
+        if (yearsWithBrokenDays.has(y.year)) {
+          warnings(
+            report,
+            `${y.year} 年有节假日行未导入，未标记为 ready（避免在缺失日期上按星期猜）`,
+          );
+          continue;
+        }
         try {
           // 同上：年份元数据也是 OR IGNORE，按 changes 计数才与实际写入一致
           const result = insertYear.run(y.year, y.source, y.fetched_at);

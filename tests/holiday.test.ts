@@ -4,6 +4,7 @@ import {
   dayType,
   ensureYears,
   fetchYearPayload,
+  holidayPeriods,
   holidayYearsReady,
   importYear,
   nextHolidayPeriod,
@@ -202,6 +203,34 @@ describe("节假日跨年条目归属", () => {
     env.db.prepare("DELETE FROM cn_holiday_years").run();
   };
 
+  it("同名假期（两年国庆节）的调休日不会互相串台", () => {
+    const env = makeTestEnv();
+    try {
+      const nationalDay = (year: number, workdayDates: string[]): HolidayYearPayload => ({
+        year,
+        days: [
+          ...Array.from({ length: 7 }, (_, i) => ({
+            name: "国庆节",
+            date: `${year}-10-${String(i + 1).padStart(2, "0")}`,
+            isOffDay: true,
+          })),
+          ...workdayDates.map((date) => ({ name: "国庆节", date, isOffDay: false })),
+        ],
+      });
+      importYear(env.db, nationalDay(2026, ["2026-09-27", "2026-10-10"]), "test");
+      importYear(env.db, nationalDay(2027, ["2027-09-26", "2027-10-09"]), "test");
+
+      const periods = holidayPeriods(env.db);
+      const p2026 = periods.find((p) => p.start === "2026-10-01");
+      const p2027 = periods.find((p) => p.start === "2027-10-01");
+      // 只按假期名匹配时，两年的「国庆节」共享 token，2027 的调休日会被算进 2026 的提醒里
+      assert.deepEqual(p2026?.workdays, ["2026-09-27", "2026-10-10"]);
+      assert.deepEqual(p2027?.workdays, ["2027-09-26", "2027-10-09"]);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("跨年条目与导入顺序无关（结果确定）", () => {
     const env = makeTestEnv();
     try {
@@ -306,6 +335,35 @@ describe("节假日抓取", () => {
 
       const cooldown = await ensureYears(env.db, [2027], fetcher);
       assert.deepEqual(cooldown.skipped, [2027], "6 小时冷却内不重试");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("并发 ensureYears 同一年只抓一次：失败回写不得覆盖已就绪状态", async () => {
+    const env = makeTestEnv();
+    try {
+      let calls = 0;
+      const slowOk = async (): Promise<unknown> => {
+        calls += 1;
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        return payload2026();
+      };
+      const [a, b] = await Promise.all([
+        ensureYears(env.db, [2026], slowOk),
+        ensureYears(env.db, [2026], slowOk),
+      ]);
+      assert.equal(calls, 1, "同一年在途时第二次调用必须跳过，不能重复抓取");
+      assert.equal(a.updated.length + b.updated.length, 1);
+      assert.equal(a.skipped.length + b.skipped.length, 1);
+
+      // 关键：数据其实可用时状态必须停在 ready（过去失败回写会把它改回 failed，
+      // 于是 dayType 返回 unknown，所有 workday/holiday 过滤的日程集体暂停）
+      const meta = env.db
+        .prepare("SELECT status FROM cn_holiday_years WHERE year = 2026")
+        .get() as { status: string };
+      assert.equal(meta.status, "ready");
+      assert.deepEqual(holidayYearsReady(env.db), [2026]);
     } finally {
       cleanupTestEnv(env);
     }

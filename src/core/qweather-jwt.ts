@@ -49,6 +49,35 @@ function base64Url(input: string): string {
   return Buffer.from(input, "utf8").toString("base64url");
 }
 
+/**
+ * 读取并校验 Ed25519 私钥（PKCS8 PEM）。
+ * 抽成独立导出是为了让 `npm run doctor` 的预检与真实签发走**同一段代码** ——
+ * 否则「自检通过、首次请求才炸」的老问题会换个地方重演。
+ */
+export function loadEd25519PrivateKey(privateKeyPath: string): KeyObject {
+  let pem: string;
+  try {
+    pem = readFileSync(privateKeyPath, "utf8");
+  } catch {
+    // 不回显文件内容；异常原因（不存在/无权限）由路径即可推断
+    throw new Error(
+      `无法读取 QWeather JWT 私钥文件：${privateKeyPath}（请检查路径是否存在、权限是否可读）`,
+    );
+  }
+  let key: KeyObject;
+  try {
+    key = createPrivateKey({ key: pem, format: "pem" });
+  } catch {
+    throw new Error(`QWeather JWT 私钥不是合法的 PKCS8 PEM（需 Ed25519 私钥）：${privateKeyPath}`);
+  }
+  if (key.asymmetricKeyType !== "ed25519") {
+    throw new Error(
+      `QWeather JWT 私钥必须是 Ed25519（当前为 ${key.asymmetricKeyType ?? "未知"}）：${privateKeyPath}`,
+    );
+  }
+  return key;
+}
+
 export function createJwtSigner(opts: JwtSignerOptions): JwtSigner {
   const nowMs = opts.nowMs ?? Date.now;
   const signFn = opts.signFn ?? ((data: Buffer, key: KeyObject) => sign(null, data, key));
@@ -57,30 +86,8 @@ export function createJwtSigner(opts: JwtSignerOptions): JwtSigner {
 
   function loadPrivateKey(): KeyObject {
     if (privateKey !== null) return privateKey;
-    let pem: string;
-    try {
-      pem = readFileSync(opts.privateKeyPath, "utf8");
-    } catch {
-      // 不回显文件内容；异常原因（不存在/无权限）由路径即可推断
-      throw new Error(
-        `无法读取 QWeather JWT 私钥文件：${opts.privateKeyPath}（请检查路径是否存在、权限是否可读）`,
-      );
-    }
-    let key: KeyObject;
-    try {
-      key = createPrivateKey({ key: pem, format: "pem" });
-    } catch {
-      throw new Error(
-        `QWeather JWT 私钥不是合法的 PKCS8 PEM（需 Ed25519 私钥）：${opts.privateKeyPath}`,
-      );
-    }
-    if (key.asymmetricKeyType !== "ed25519") {
-      throw new Error(
-        `QWeather JWT 私钥必须是 Ed25519（当前为 ${key.asymmetricKeyType ?? "未知"}）：${opts.privateKeyPath}`,
-      );
-    }
-    privateKey = key;
-    return key;
+    privateKey = loadEd25519PrivateKey(opts.privateKeyPath);
+    return privateKey;
   }
 
   function issue(): string {

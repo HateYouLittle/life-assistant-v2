@@ -103,10 +103,36 @@ export function newShortId(): string {
 
 export function parseRecurrence(json: string | null): Recurrence | null {
   if (json === null) return null;
-  const rec = JSON.parse(json) as Recurrence;
+  let rec: Recurrence;
+  try {
+    rec = JSON.parse(json) as Recurrence;
+  } catch (e) {
+    // 裸 JSON.parse 的报错看不出是哪条数据坏了；这里给出可定位的信息，
+    // 由调用方逐行隔离（tickSchedules / rowToPublic），不让一条脏行带走整批。
+    throw new Error(`循环规则不是合法 JSON（数据损坏，需修复该行）: ${json.slice(0, 80)}`, {
+      cause: e,
+    });
+  }
   // 缺省 interval 必须兜底为 1，否则 recurrence 引擎会在推进日期时死循环
   const interval = typeof rec.interval === "number" && rec.interval >= 1 ? rec.interval : 1;
   return { ...rec, interval };
+}
+
+/**
+ * 提醒偏移的安全解析：非法/空/非数组一律退化为 `[0]`（= 事件时刻提醒一次）。
+ * 与 recurrence_json 不同，偏移坏掉不该让日程从列表里消失，兜底比抛错更有用。
+ */
+export function parseOffsets(json: string | null): number[] {
+  if (json === null || json === "") return [0];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return [0];
+  }
+  if (!Array.isArray(parsed)) return [0];
+  const offsets = parsed.filter((v): v is number => typeof v === "number" && Number.isInteger(v));
+  return offsets.length > 0 ? offsets : [0];
 }
 
 /**
@@ -147,7 +173,14 @@ export function parseEscalation(json: string | null): number[] | null {
   }
   if (!Array.isArray(parsed) || parsed.length === 0) return null;
   if (!parsed.every((v) => typeof v === "number" && Number.isInteger(v) && v >= 0)) return null;
-  return parsed as number[];
+  const steps = parsed as number[];
+  // 与写入路径（validateEscalation）同口径：必须首元素为 0 且严格升序。
+  // 脏库里乱序/非零首元素的阶梯会让「第 N 步」的语义错位，直接当作未启用。
+  if (steps[0] !== 0) return null;
+  for (let i = 1; i < steps.length; i++) {
+    if ((steps[i] as number) <= (steps[i - 1] as number)) return null;
+  }
+  return steps;
 }
 
 /** 从 occurrence_key 解析升级步骤号；非升级行返回 null */
@@ -327,7 +360,7 @@ export function materializeSchedule(db: DatabaseSync, row: ScheduleRow): void {
     return;
   }
   const source = sourceOf(row);
-  const offsets = JSON.parse(row.remind_offsets_json) as number[];
+  const offsets = parseOffsets(row.remind_offsets_json);
   const last = db
     .prepare(
       "SELECT MAX(event_at) AS m FROM occurrences WHERE schedule_id = ? AND status != 'cancelled'",
@@ -463,7 +496,7 @@ export function updateSchedule(
     allDay: patch.allDay !== undefined ? patch.allDay : row.all_day === 1,
     recurrence:
       patch.recurrence !== undefined ? patch.recurrence : parseRecurrence(row.recurrence_json),
-    remindOffsets: patch.remindOffsets ?? (JSON.parse(row.remind_offsets_json) as number[]),
+    remindOffsets: patch.remindOffsets ?? parseOffsets(row.remind_offsets_json),
     resendMinutes: patch.resendMinutes ?? row.resend_minutes,
     escalation:
       patch.escalation !== undefined ? patch.escalation : parseEscalation(row.escalation_json),
@@ -942,7 +975,16 @@ export async function tickSchedules(
   for (const id of [...pausedWarned.keys()]) {
     if (!activeIds.has(id)) pausedWarned.delete(id);
   }
-  for (const row of active) materializeSchedule(db, row);
+  for (const row of active) {
+    // 逐行隔离：一条脏数据（如 recurrence_json 非法）不能带走整批物化。
+    // 曾经这里直接抛出，结果是该行之后的**所有**日程都不再产生 occurrence，
+    // 且每分钟重复抛错，直到有人手改数据库。
+    try {
+      materializeSchedule(db, row);
+    } catch (e) {
+      logger.warn(`日程「${row.title}」(${row.id}) 物化失败，已跳过: ${errorMessage(e)}`);
+    }
+  }
   // 物化撞到的未就绪年份：收尾时尝试补齐。ensureYears 自带 6h 冷却
   // （cn_holiday_years.status='failed' + last_attempt_at），失败不会每分钟重试。
   const years = takeYearsNeedingBackfill();

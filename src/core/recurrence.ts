@@ -127,7 +127,9 @@ function* iterate(source: OccurrenceSource, afterDay: DateTime): Generator<DateT
     case "yearly": {
       const month = start.month;
       const day = start.day;
-      for (let year = start.year; ; year++) {
+      // interval 必须参与推进：漏乘会让「每 2 年」变成每年都触发，
+      // 而 describeRecurrence 仍显示「每 2 年」——回显与实际排期互相矛盾。
+      for (let year = start.year; ; year += interval) {
         tick();
         const d = clampDay(year, month, day);
         if (d >= start && d > afterDay) yield d;
@@ -187,7 +189,11 @@ function clampDay(year: number, month: number, day: number): DateTime {
 }
 
 function uniqSorted(values: number[]): number[] {
-  return [...new Set(values)].filter((v) => v >= 0 && v <= 6).sort((a, b) => a - b);
+  // 必须用 Number.isInteger：`null >= 0 && null <= 6` 为真，会让 null 混进星期集合，
+  // 经 luxon.plus({days:null}) 静默变成 no-op，最终把 weekly 落到周一而不是报错/兜底。
+  return [...new Set(values)]
+    .filter((v) => Number.isInteger(v) && v >= 0 && v <= 6)
+    .sort((a, b) => a - b);
 }
 
 /** 供通知/列表展示的循环规则人话描述 */

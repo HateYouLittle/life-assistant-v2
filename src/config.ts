@@ -11,6 +11,13 @@ import { type QweatherAuth, setQweatherAuth } from "./core/qweather.js";
 
 export const PROFILE_ID_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 
+/**
+ * 共享凭据（WEB_API_TOKEN / MCP_DAEMON_TOKEN）的最小长度。
+ * 与 PROFILE_ROUTE_SECRETS_JSON 的 secret 同一口径（openssl rand -hex 32 = 64 字符）：
+ * 绑定非回环地址时，弱 token 等于没有鉴权。
+ */
+export const MIN_TOKEN_LENGTH = 32;
+
 const profileId = z.string().regex(PROFILE_ID_RE);
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
@@ -194,8 +201,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
 
   const webApiToken = env.WEB_API_TOKEN?.trim() || undefined;
   const host = env.HOST?.trim() || "127.0.0.1";
-  if (!isLoopbackHost(host) && !webApiToken) {
+  const loopback = isLoopbackHost(host);
+  if (!loopback && !webApiToken) {
     throw new Error(`HOST=${host} 非回环地址且未设置 WEB_API_TOKEN，拒绝启动`);
+  }
+  if (webApiToken !== undefined && webApiToken.length < MIN_TOKEN_LENGTH) {
+    // 非回环：弱 token 会被直接爆破，拒绝启动；回环：只告警，不打断本地零配置使用
+    if (!loopback) {
+      throw new Error(
+        `WEB_API_TOKEN 至少 ${MIN_TOKEN_LENGTH} 字符（当前 ${webApiToken.length}）：HOST=${host} 暴露在网络上，弱 token 等于没有鉴权`,
+      );
+    }
+    logger.warn(
+      `WEB_API_TOKEN 只有 ${webApiToken.length} 字符，建议至少 ${MIN_TOKEN_LENGTH}（openssl rand -hex 32）`,
+    );
   }
 
   const { host: qweatherHost, key: qweatherKey, auth: qweatherAuth } = resolveQweather(env);

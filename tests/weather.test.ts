@@ -50,7 +50,14 @@ function handlerFor(url: string): unknown {
   if (url.includes("/v7/weather/now")) {
     return {
       code: "200",
-      now: { temp: "26", feelsLike: "28", humidity: "70", windSpeed: "12", text: "多云" },
+      now: {
+        temp: "26",
+        feelsLike: "28",
+        humidity: "70",
+        windSpeed: "12",
+        text: "多云",
+        obsTime: "2026-09-25T08:00+08:00",
+      },
     };
   }
   if (url.includes("/v7/weather/7d") || url.includes("/v7/weather/3d")) {
@@ -101,6 +108,11 @@ describe("weather / air_quality", () => {
         };
         assert.equal(payload.城市, "上海");
         assert.deepEqual(payload.天气.rows[0], ["天气", "多云"]);
+        // SKILL.md 要求「标注数据来源时间」：上游 obsTime 必须透出为本地时间
+        assert.deepEqual(
+          payload.天气.rows.find((r) => r[0] === "更新时间"),
+          ["更新时间", "2026-09-25 08:00"],
+        );
         assert.ok(
           calls.some((c) => c.url.includes("/v7/weather/now?location=101020100&key=test-key")),
         );

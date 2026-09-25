@@ -33,7 +33,7 @@ CI（`.github/workflows/ci.yml`）在 Node 22 和 24 上按此顺序运行：
 ## 架构
 
 - `src/core/` 是框架层：database/registry/auth/http/logger/settings/notify/render/
-  qweather/holiday/recurrence。`src/modules/`（weather/holiday/schedule/bookkeeping/notify）
+  qweather/qweather-jwt/holiday/recurrence。`src/modules/`（weather/holiday/schedule/bookkeeping/notify）
   通过 `src/modules/index.ts` 的副作用 import 接入，遵循 `tools / jobs / tick / onStart`
   四个契约扩展点。
 - **核心层不得 import 模块内部。** 这一点由 `tests/registry.test.ts` 的静态 import 扫描强制，

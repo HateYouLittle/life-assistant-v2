@@ -15,6 +15,7 @@ import {
   runtime,
 } from "../src/core/registry.js";
 import { cleanupTestEnv, makeTestEnv } from "./helpers.js";
+import { registerAllModules } from "../src/modules/index.js";
 
 const noopHandler = () => ok("noop");
 
@@ -62,10 +63,43 @@ describe("registry 契约", () => {
     );
   });
 
-  it("allTools/allJobs/getModules 汇总", () => {
-    assert.ok(allTools().length >= 2);
-    assert.ok(allJobs().length >= 1);
-    assert.ok(getModules().length >= 3);
+  it("汇总接口读到的是真实模块（registerAllModules 之后的工具/job 清单）", () => {
+    // 回归：此处曾经只断言 length >= N，而那个下限由本文件前面自己 registerModule 的
+    // 测试模块满足 —— 真实模块注册整个坏掉也照样绿，且全程没人调用 registerAllModules。
+    registerAllModules();
+    const realModules = new Set(["bookkeeping", "holiday", "notify", "schedule", "weather"]);
+    const tools = allTools()
+      .filter((t) => realModules.has(t.module))
+      .map((t) => t.def.name)
+      .sort();
+    // 工具清单是面向 agent 的契约：改名/增删必须同步 README 与 skill/SKILL.md
+    assert.deepEqual(tools, [
+      "air_quality",
+      "expense",
+      "holiday",
+      "ledger",
+      "notify",
+      "schedule",
+      "weather",
+    ]);
+    const jobs = allJobs()
+      .filter((j) => realModules.has(j.module))
+      .map((j) => `${j.module}.${j.def.name}`)
+      .sort();
+    assert.deepEqual(jobs, [
+      "bookkeeping.monthly_report",
+      "holiday.refresh",
+      "holiday.workday_watch",
+      "notify.retention",
+      "schedule.occurrence_cleanup",
+      "weather.alert_watch",
+      "weather.daily_brief",
+    ]);
+    // 本文件前面注册过测试模块（m1/m2/m5…），因此只断言真实模块都在
+    const moduleNames = new Set(getModules().map((m) => m.name));
+    for (const name of realModules) {
+      assert.ok(moduleNames.has(name), `registerAllModules 之后缺少模块 ${name}`);
+    }
   });
 
   it("runtime 未初始化抛错，初始化后可用，可重置", () => {

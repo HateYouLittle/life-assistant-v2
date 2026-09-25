@@ -26,6 +26,9 @@ function previousMonthOf(ym: string): string {
 }
 
 function clampLimit(raw: string | undefined, fallback: number, max = 200): number {
+  // 空串与纯空白按「未提供」处理：Number("") === 0 会被夹成 1，
+  // 于是 /api/expenses?limit= 静默只返回 1 条，而不是走 fallback。
+  if (raw === undefined || raw.trim() === "") return fallback;
   const value = Number(raw);
   if (!Number.isFinite(value)) return fallback;
   return Math.max(1, Math.min(Math.trunc(value), max));
@@ -344,10 +347,18 @@ export function holidayDetails(db: DatabaseSync, rawYear: string | undefined): H
   ).map((r) => r.year);
   const today = todayIso();
   const currentYear = Number(today.slice(0, 4));
-  // 默认看「还有假期的年份」：当年没排完就用当年，当年的假期已经过完则顺延到下一年
-  const fallbackYear = years.includes(currentYear)
-    ? currentYear
-    : (years.find((y) => y > currentYear) ?? years[years.length - 1] ?? currentYear);
+  // 默认看「还有假期的年份」：当年的假期已经过完（年末那几天）就顺延到下一年 ——
+  // 只判断「年份存在」会让年末的卡片显示「暂无数据」，而不是次年元旦。
+  const currentYearHasUpcoming =
+    (db
+      .prepare(
+        "SELECT 1 FROM cn_holiday_days WHERE day_type = 'holiday' AND date >= ? AND substr(date, 1, 4) = ? LIMIT 1",
+      )
+      .get(today, String(currentYear)) as unknown) !== undefined;
+  const fallbackYear =
+    years.includes(currentYear) && currentYearHasUpcoming
+      ? currentYear
+      : (years.find((y) => y > currentYear) ?? years[years.length - 1] ?? currentYear);
   const parsedYear = Number(rawYear);
   const year =
     Number.isInteger(parsedYear) && parsedYear >= 2000 && parsedYear <= 2100

@@ -6,13 +6,16 @@ import {
   ok,
   okJson,
   registerModule,
+  runtime,
   type ToolContext,
 } from "../../core/registry.js";
+import { runRetention } from "../../core/retention.js";
 import {
   cancelPendingDeliveries,
   getPushRoute,
   routeSecret,
   setPushRoute,
+  setPushRouteEnabled,
 } from "../../core/notify.js";
 import { deleteSetting, getSetting, setSetting } from "../../core/settings.js";
 
@@ -103,10 +106,16 @@ function notifyToolInner(args: Record<string, unknown>, ctx: ToolContext) {
       return okJson({ 推送路由: route, 说明: "URL 仅允许回环地址；secret 来自环境变量" });
     }
     if (enabled !== undefined) {
-      const current = getPushRoute(db, profileId);
-      if (current === null) return fail("尚未配置推送路由，请先提供 url");
-      setSetting(db, profileId, "push_route", { ...current, enabled });
-      return okJson({ 推送路由: { ...current, enabled } });
+      // 必须走 core 的 setPushRouteEnabled：它在启用时会调 requeueRoute，
+      // 把路由停用期间落入 fallback 的投递重新入队。直接 setSetting 会让
+      // 那批通知永远停在 fallback（状态页只显示计数，用户无从补救）。
+      const route = setPushRouteEnabled(db, profileId, enabled);
+      return okJson({
+        推送路由: route,
+        说明: enabled
+          ? "已启用；停用期间未投出的通知已重新入队"
+          : "已停用（待投递行保留，重新启用会再投）",
+      });
     }
     const current = getPushRoute(db, profileId);
     if (current === null)
@@ -158,6 +167,17 @@ registerModule({
         id: z.string().optional().describe("cancel 的通知 id"),
       },
       handler: notifyTool,
+    },
+  ],
+  jobs: [
+    {
+      name: "retention",
+      // 04:50（occurrence 清理 04:30 之后）：收敛只增不减的 notifications/deliveries
+      // 与永不回收的已取消日程，避免长期运行后库无限增长
+      cron: "50 4 * * *",
+      handler: () => {
+        runRetention(runtime().db);
+      },
     },
   ],
 });

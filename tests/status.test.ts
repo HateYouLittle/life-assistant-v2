@@ -66,7 +66,7 @@ describe("看板 token 引导", () => {
   });
 
   it("端到端：开着 token 时 /?token=X 打开页面 → 页面拿到凭据 → 数据接口放行", async () => {
-    const secret = "t".repeat(16);
+    const secret = "t".repeat(32);
     const env = makeTestEnv({ WEB_API_TOKEN: secret, HOST: "0.0.0.0" });
     try {
       const a = app(env);
@@ -123,14 +123,53 @@ describe("状态接口", () => {
     }
   });
 
+  it("安全响应头：nosniff / no-referrer / 禁内嵌，/api/* 一律不可缓存", async () => {
+    const token = "t".repeat(32);
+    const env = makeTestEnv({ WEB_API_TOKEN: token, HOST: "0.0.0.0" });
+    try {
+      const a = app(env);
+      const api = await a.request("/api/status", {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      assert.equal(api.status, 200);
+      assert.equal(api.headers.get("cache-control"), "no-store", "个人数据不得进浏览器/代理缓存");
+      assert.equal(api.headers.get("x-content-type-options"), "nosniff");
+      assert.equal(api.headers.get("referrer-policy"), "no-referrer");
+      assert.equal(api.headers.get("x-frame-options"), "DENY");
+
+      const denied = await a.request("/api/status");
+      assert.equal(denied.status, 401);
+      assert.equal(denied.headers.get("x-content-type-options"), "nosniff", "401 也要带安全头");
+
+      const page = await a.request("/");
+      assert.equal(page.status, 200);
+      assert.equal(page.headers.get("x-frame-options"), "DENY", "状态页不得被其它站点内嵌");
+
+      // CSP：脚本只认 nonce，注入的 <img onerror=…> 之类内联处理器会被浏览器拒绝
+      const csp = page.headers.get("content-security-policy") ?? "";
+      const nonce = /'nonce-([^']+)'/.exec(csp)?.[1];
+      assert.ok(nonce !== undefined, `页面必须带 CSP nonce：${csp}`);
+      assert.match(csp, /default-src 'none'/);
+      assert.doesNotMatch(csp, /script-src[^;]*unsafe-inline/, "script-src 不得放开 unsafe-inline");
+      assert.match(csp, /frame-ancestors 'none'/);
+      const html = await page.text();
+      assert.ok(
+        html.includes(`<script nonce="${nonce}">`),
+        "内联脚本必须带上响应头里的同一个 nonce，否则整屏脚本不会执行",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("设置 WEB_API_TOKEN 后需要鉴权", async () => {
-    const env = makeTestEnv({ WEB_API_TOKEN: "t".repeat(16), HOST: "0.0.0.0" });
+    const env = makeTestEnv({ WEB_API_TOKEN: "t".repeat(32), HOST: "0.0.0.0" });
     try {
       const a = app(env);
       assert.equal((await a.request("/api/status")).status, 401);
-      assert.equal((await a.request(`/api/status?token=${"t".repeat(16)}`)).status, 200);
+      assert.equal((await a.request(`/api/status?token=${"t".repeat(32)}`)).status, 200);
       const withBearer = await a.request("/api/status", {
-        headers: { Authorization: `Bearer ${"t".repeat(16)}` },
+        headers: { Authorization: `Bearer ${"t".repeat(32)}` },
       });
       assert.equal(withBearer.status, 200);
       assert.equal((await a.request("/")).status, 200);
@@ -260,6 +299,19 @@ describe("看板明细接口", () => {
       };
       assert.equal(body.month, todayIso().slice(0, 7), "非法月份不能落到空数据上");
       assert.ok(body.entries.length <= 200);
+
+      // ?limit=（空串）必须走 fallback，而不是被 Number("") === 0 夹成 1 条
+      const empty = (await (await app(env).request("/api/expenses?limit=")).json()) as {
+        entries: unknown[];
+      };
+      const omitted = (await (await app(env).request("/api/expenses")).json()) as {
+        entries: unknown[];
+      };
+      assert.equal(
+        empty.entries.length,
+        omitted.entries.length,
+        "空串 limit 应与不传等价（历史上会被夹成 1 条）",
+      );
     } finally {
       cleanupTestEnv(env);
     }
@@ -469,13 +521,13 @@ describe("看板明细接口", () => {
   });
 
   it("明细端点同样受 token 保护", async () => {
-    const env = makeTestEnv({ WEB_API_TOKEN: "t".repeat(16), HOST: "0.0.0.0" });
+    const env = makeTestEnv({ WEB_API_TOKEN: "t".repeat(32), HOST: "0.0.0.0" });
     try {
       const a = app(env);
       for (const path of ["/api/expenses", "/api/schedules", "/api/deliveries", "/api/holidays"]) {
         assert.equal((await a.request(path)).status, 401, `${path} 漏了鉴权`);
         assert.equal(
-          (await a.request(`${path}?token=${"t".repeat(16)}`)).status,
+          (await a.request(`${path}?token=${"t".repeat(32)}`)).status,
           200,
           `${path} 带 token 应放行`,
         );

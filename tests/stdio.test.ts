@@ -1,21 +1,33 @@
 import assert from "node:assert/strict";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
+import { after, describe, it } from "node:test";
 
 interface CapturedRequest {
   profile: string | undefined;
+  session: string | undefined;
   body: string;
 }
 
+/** 每个用例都会起一个壳进程、各自一个临时 DATA_DIR；统一在收尾时删除 */
+const tempDirs: string[] = [];
+after(() => {
+  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
+});
+
 function spawnShim(port: number, extraEnv: Record<string, string> = {}): ReturnType<typeof spawn> {
-  return spawn(process.execPath, ["--import", "tsx", join(process.cwd(), "src", "stdio.ts")], {
+  const dataDir = mkdtempSync(join(tmpdir(), "stdio-test-"));
+  tempDirs.push(dataDir);
+  // 用 import.meta.url 定位 src/stdio.ts：依赖 process.cwd() 会让测试换个工作目录就失败
+  const shimPath = fileURLToPath(new URL("../src/stdio.ts", import.meta.url));
+  return spawn(process.execPath, ["--import", "tsx", shimPath], {
     env: {
       ...process.env,
-      DATA_DIR: mkdtempSync(join(tmpdir(), "stdio-test-")),
+      DATA_DIR: dataDir,
       HERMES_PROFILE: "default",
       MCP_DAEMON_URL: `http://127.0.0.1:${port}`,
       ...extraEnv,
@@ -24,25 +36,32 @@ function spawnShim(port: number, extraEnv: Record<string, string> = {}): ReturnT
   });
 }
 
+/** 读一行 JSON-RPC 响应：跨 chunk 缓冲，超时/命中后都摘掉监听器（否则会在用例间累积） */
 function waitForLine(child: ReturnType<typeof spawn>, timeoutMs = 5000): Promise<string> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("等待 stdio 响应超时")), timeoutMs);
-    child.stdout?.on("data", (chunk: Buffer) => {
-      const lines = chunk
-        .toString()
-        .split("\n")
-        .filter((l) => l.trim() !== "");
-      if (lines.length > 0) {
-        clearTimeout(timer);
-        resolve(lines[0] as string);
-      }
-    });
+    let buffer = "";
+    const onData = (chunk: Buffer): void => {
+      buffer += chunk.toString();
+      const newline = buffer.indexOf("\n");
+      if (newline < 0) return;
+      cleanup();
+      resolve(buffer.slice(0, newline));
+    };
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      child.stdout?.off("data", onData);
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("等待 stdio 响应超时"));
+    }, timeoutMs);
+    child.stdout?.on("data", onData);
   });
 }
 
 function withServer(
   handler: (req: IncomingMessage, res: ServerResponse, body: string) => void,
-  fn: (port: number) => Promise<void>,
+  fn: (port: number, captured: CapturedRequest[]) => Promise<void>,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const captured: CapturedRequest[] = [];
@@ -51,7 +70,11 @@ function withServer(
       req.on("data", (c: Buffer) => chunks.push(c));
       req.on("end", () => {
         const body = Buffer.concat(chunks).toString();
-        captured.push({ profile: req.headers["x-hermes-profile"] as string | undefined, body });
+        captured.push({
+          profile: req.headers["x-hermes-profile"] as string | undefined,
+          session: req.headers["mcp-session-id"] as string | undefined,
+          body,
+        });
         handler(req, res, body);
       });
     });
@@ -60,7 +83,7 @@ function withServer(
       const addr = server.address();
       const port = typeof addr === "object" && addr !== null ? addr.port : 0;
       try {
-        await fn(port);
+        await fn(port, captured);
         server.close(() => resolve());
       } catch (e) {
         server.close(() => reject(e));
@@ -78,7 +101,7 @@ describe("stdio 兼容壳", () => {
         const parsed = JSON.parse(body) as { id: number };
         res.end(JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: { ok: true } }));
       },
-      async (port) => {
+      async (port, captured) => {
         const child = spawnShim(port);
         try {
           const request = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" });
@@ -88,6 +111,18 @@ describe("stdio 兼容壳", () => {
           const response = JSON.parse(line) as { id: number; result: { ok: boolean } };
           assert.equal(response.id, 1);
           assert.equal(response.result.ok, true);
+          // 用例名声称覆盖「携带 profile 头」：这里真的断言它（此前 captured 收集后从未使用）
+          assert.equal(captured.length, 1, "壳必须把请求转发给 daemon");
+          assert.equal(
+            captured[0]?.profile,
+            "default",
+            "HERMES_PROFILE 必须转成 X-Hermes-Profile 头",
+          );
+          assert.equal(
+            (JSON.parse(captured[0]?.body ?? "{}") as { method?: string }).method,
+            "tools/list",
+            "正文必须原样转发",
+          );
         } finally {
           child.kill();
         }

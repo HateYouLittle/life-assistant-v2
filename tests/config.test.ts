@@ -29,8 +29,18 @@ describe("config", () => {
 
   it("非回环 HOST 无 token 拒绝启动，有 token 允许", () => {
     assert.throws(() => loadConfig({ ...BASE, HOST: "0.0.0.0" }), /WEB_API_TOKEN/);
-    const config = loadConfig({ ...BASE, HOST: "0.0.0.0", WEB_API_TOKEN: "t".repeat(16) });
-    assert.equal(config.webApiToken, "t".repeat(16));
+    const config = loadConfig({ ...BASE, HOST: "0.0.0.0", WEB_API_TOKEN: SECRET });
+    assert.equal(config.webApiToken, SECRET);
+  });
+
+  it("非回环 HOST 配弱 token 拒绝启动；回环只告警不打断", () => {
+    assert.throws(
+      () => loadConfig({ ...BASE, HOST: "0.0.0.0", WEB_API_TOKEN: "t".repeat(16) }),
+      /至少 32 字符/,
+    );
+    // 回环地址是本地零配置场景，短 token 不该让进程起不来
+    const local = loadConfig({ ...BASE, WEB_API_TOKEN: "t".repeat(8) });
+    assert.equal(local.webApiToken, "t".repeat(8));
   });
 
   it("QWeather 必须成对配置", () => {

@@ -87,6 +87,26 @@ describe("recurrence：公历", () => {
     assert.equal(ymd(nextDate(src, at("2028-03-01"), HORIZON)), "2029-02-28");
   });
 
+  it("yearly 按间隔跳年（曾忽略 interval，每 2 年变成每年都触发）", () => {
+    const src = solarSource("2026-03-15", { freq: "yearly", interval: 2 });
+    const horizon = at("2035-01-01");
+    assert.equal(ymd(nextDate(src, at("2026-03-15T12:00"), horizon)), "2028-03-15");
+    assert.equal(ymd(nextDate(src, at("2028-03-15T12:00"), horizon)), "2030-03-15");
+    // 回显必须与实际排期一致
+    assert.equal(describeRecurrence(src, "2026-03-15"), "每 2 年");
+  });
+
+  it("weekly 的 byweekday 含 null 时不会被静默当成周一", () => {
+    // null >= 0 为真，旧的过滤条件放行了 null；luxon.plus({days:null}) 是 no-op，
+    // 于是 weekly 会悄悄落到周一而不是回退到开始日期的星期。
+    const src = solarSource("2026-01-05", {
+      freq: "weekly",
+      interval: 1,
+      byweekday: [null as unknown as number, 4],
+    });
+    assert.equal(ymd(nextDate(src, at("2026-01-05T12:00"), HORIZON)), "2026-01-09", "周五");
+  });
+
   it("until 边界（含当天）", () => {
     const src = solarSource("2026-01-01", { freq: "daily", interval: 1, until: "2026-01-03" });
     assert.equal(ymd(nextDate(src, at("2026-01-02T12:00"), HORIZON)), "2026-01-03");

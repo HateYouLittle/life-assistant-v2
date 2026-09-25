@@ -239,6 +239,8 @@ const SCRIPT = `
   var drawerTitle = document.getElementById('drawer-title');
   var drawerSub = document.getElementById('drawer-sub');
   var expMonth = null;
+  var holYear = null;
+  var drawerOpen = false;
   var current = null;
 
   function api(path) {
@@ -270,6 +272,7 @@ const SCRIPT = `
   /* ── 首屏 ── */
   function render(s) {
     current = s;
+    el('date-line').className = 'date';
     el('date-line').textContent = s.today.label + ' · 已运行 ' + mins(s.uptime_s);
     var alerts = s.notifications.failed + s.notifications.fallback;
     var health = el('health');
@@ -346,10 +349,13 @@ const SCRIPT = `
     el('spark-to').textContent = daily.length ? daily[daily.length - 1].label + ' 今天' : '';
 
     el('ops').innerHTML =
-      row('Profile', s.profiles.join(' · ') || '暂无') +
+      row('Profile', esc(s.profiles.join(' · ') || '暂无')) +
       row('账本', s.ledgers.total + ' 个活跃' + (s.ledgers.archived ? ' · ' + s.ledgers.archived + ' 个归档' : ' · 无归档')) +
       row('定时简报', '<span class="muted">每天 ' + esc(cronTime(s.daily_brief_cron)) + '</span>') +
       row('天气数据源', s.qweather_configured ? '<span class="ok">QWeather 已配置</span>' : '<span class="warn">QWeather 未配置</span>') +
+      (s.qweather_usage
+        ? row('今日天气请求', s.qweather_usage.requests + ' 次 <span class="muted">（' + esc(s.qweather_usage.day) + '，含重试）</span>')
+        : '') +
       (s.holidays.failed.length
         ? row('节假日抓取失败', '<span class="bad">' + s.holidays.failed.map(function (f) { return f.year + ' 年'; }).join('、') + '</span>')
         : '');
@@ -404,6 +410,7 @@ const SCRIPT = `
     scrim.classList.add('on');
     drawer.setAttribute('aria-hidden', 'false');
     drawer.dataset.kind = kind;
+    drawerOpen = true;
     renderFn();
   }
   function closeDrawer() {
@@ -411,6 +418,7 @@ const SCRIPT = `
     scrim.classList.remove('on');
     drawer.setAttribute('aria-hidden', 'true');
     drawer.dataset.kind = '';
+    drawerOpen = false;
   }
   function fail(e) {
     drawerBody.innerHTML = '<div class="empty bad">' + esc(e.message) + '</div>';
@@ -443,10 +451,10 @@ const SCRIPT = `
           var dmax = Math.max.apply(null, d.daily.map(function (x) { return x.cents; }));
           html += '<div class="sect"><h3>按天</h3><div class="bars">' +
             d.daily.map(function (x) {
-              return '<div style="height:' + Math.max(4, (x.cents / dmax) * 100) + '%" title="' + x.date + ' ' + yuan(x.cents) + '"></div>';
+              return '<div style="height:' + Math.max(4, (x.cents / dmax) * 100) + '%" title="' + esc(x.date) + ' ' + yuan(x.cents) + '"></div>';
             }).join('') + '</div>' +
-            '<div class="spark-axis"><span>' + d.daily[0].date.slice(5) + '</span><span>' +
-            d.daily[d.daily.length - 1].date.slice(5) + '</span></div>' +
+            '<div class="spark-axis"><span>' + esc(d.daily[0].date.slice(5)) + '</span><span>' +
+            esc(d.daily[d.daily.length - 1].date.slice(5)) + '</span></div>' +
             '<div class="muted" style="font-size:11.5px;margin-top:10px">柱高为该日金额 · ' + d.daily.length + ' 天有记账</div></div>';
         }
 
@@ -462,7 +470,7 @@ const SCRIPT = `
             ? '<ul class="rowlist">' + d.entries.map(function (e) {
                 return '<li><div class="top"><span class="t">' + esc(e.note || e.category) + '</span>' +
                   '<span style="flex:none">' + yuan(e.amount_cents) + '</span></div>' +
-                  '<div class="meta"><span>' + e.spent_on.slice(5) + '</span><span class="chip">' + esc(e.category) + '</span>' +
+                  '<div class="meta"><span>' + esc(e.spent_on.slice(5)) + '</span><span class="chip">' + esc(e.category) + '</span>' +
                   '<span>' + esc(e.ledger_name) + '</span><span>' + esc(e.created_by_profile) + '</span></div></li>';
               }).join('') + '</ul>'
             : '<div class="empty">没有记录</div>') + '</div>';
@@ -511,8 +519,8 @@ const SCRIPT = `
         var max = Math.max.apply(null, d.daily.map(function (x) { return x.sent; }).concat([1]));
         var html = '<div class="sect"><h3>近 7 天</h3><div class="bars">' +
           d.daily.map(function (x) {
-            return '<div style="height:' + Math.max(4, (x.sent / max) * 100) + '%" title="' + x.date + ' ' + x.sent + ' 条">' +
-              '<span>' + x.label + '</span></div>';
+            return '<div style="height:' + Math.max(4, (x.sent / max) * 100) + '%" title="' + esc(x.date) + ' ' + x.sent + ' 条">' +
+              '<span>' + esc(x.label) + '</span></div>';
           }).join('') + '</div><div style="height:16px"></div>' +
           '<table><tbody>' +
           '<tr><td>待投递</td><td class="num ' + (c.queued ? 'warn' : '') + '">' + c.queued + '</td></tr>' +
@@ -541,24 +549,25 @@ const SCRIPT = `
     openDrawer('holidays', '节假日明细', function () {
       api('/api/holidays').then(function (d) {
         var render = function (year) {
+          holYear = year;
           api('/api/holidays?year=' + year).then(function (h) {
             drawerSub.textContent = h.year + ' 年';
             var html = '<div class="monthnav">' +
               '<select class="sel" id="hol-year">' + h.years.map(function (y) {
-                return '<option' + (y === h.year ? ' selected' : '') + '>' + y + '</option>';
+                return '<option' + (y === h.year ? ' selected' : '') + '>' + esc(y) + '</option>';
               }).join('') + '</select>' +
               '<span class="muted">' + h.days.filter(function (x) { return x.day_type === 'holiday'; }).length + ' 天假期 · ' +
               h.days.filter(function (x) { return x.day_type === 'workday'; }).length + ' 天调休</span></div>';
             if (h.upcoming.length) {
               html += '<div class="sect"><h3>接下来的假期</h3><table><tbody>' + h.upcoming.map(function (u) {
-                return '<tr><td>' + esc(u.name) + '</td><td class="muted">' + u.date + '</td>' +
+                return '<tr><td>' + esc(u.name) + '</td><td class="muted">' + esc(u.date) + '</td>' +
                   '<td class="num">' + (u.days_until === 0 ? '<span class="chip teal">今天</span>' : u.days_until + ' 天后') + '</td></tr>';
               }).join('') + '</tbody></table></div>';
             }
             html += '<div class="sect"><h3>' + h.year + ' 年安排</h3>' + (h.days.length
               ? '<table><thead><tr><th>日期</th><th>星期</th><th>名称</th><th class="num">类型</th></tr></thead><tbody>' +
                 h.days.map(function (x) {
-                  return '<tr><td>' + x.date.slice(5) + '</td><td class="muted">' + esc(x.weekday) + '</td><td>' + esc(x.name) + '</td>' +
+                  return '<tr><td>' + esc(x.date.slice(5)) + '</td><td class="muted">' + esc(x.weekday) + '</td><td>' + esc(x.name) + '</td>' +
                     '<td class="num">' + (x.day_type === 'holiday' ? '<span class="chip green">休</span>' : '<span class="chip amber">班</span>') + '</td></tr>';
                 }).join('') + '</tbody></table>'
               : '<div class="empty">该年份暂无数据</div>') + '</div>';
@@ -567,7 +576,7 @@ const SCRIPT = `
             if (sel) sel.addEventListener('change', function () { render(sel.value); });
           }).catch(fail);
         };
-        render(d.year);
+        render(holYear || d.year);
       }).catch(fail);
     });
   }
@@ -620,13 +629,19 @@ const SCRIPT = `
   refresh();
   setInterval(function () {
     refresh();
+    // 只刷新「开着的那张抽屉」：关着时重跑 HANDLERS 会白拉一次接口，
+    // 开着时也不能重走 openDrawer（那会把 body 打回「加载中…」并丢掉所选年份/月份）。
+    if (!drawerOpen) return;
     var kind = drawer.dataset.kind;
-    if (kind && kind !== 'expenses' && HANDLERS[kind]) HANDLERS[kind]();
     if (kind === 'expenses' && expMonth) openExpenses(expMonth);
+    else if (kind && HANDLERS[kind]) HANDLERS[kind]();
   }, 30000);
 `;
 
-export function statusPage(version: string): string {
+export function statusPage(version: string, nonce?: string): string {
+  // nonce 由调用方（server/status.ts）每次请求生成，配合 CSP 的 script-src 'nonce-…'：
+  // 即使有人往库里塞了 <img onerror=…>，注入的内联事件处理器也会被浏览器拒绝执行。
+  const nonceAttr = nonce === undefined ? "" : ` nonce="${nonce}"`;
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -634,7 +649,7 @@ export function statusPage(version: string): string {
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="color-scheme" content="dark" />
 <title>Life Assistant v${version}</title>
-<style>${STYLE}</style>
+<style${nonceAttr}>${STYLE}</style>
 </head>
 <body>
 <div class="wrap">
@@ -706,7 +721,7 @@ export function statusPage(version: string): string {
   <div class="drawer-body" id="drawer-body"></div>
 </aside>
 <div class="scrim" id="scrim"></div>
-<script>${SCRIPT}</script>
+<script${nonceAttr}>${SCRIPT}</script>
 </body>
 </html>`;
 }

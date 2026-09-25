@@ -20,6 +20,7 @@ import {
   KIND_LABEL,
   listSchedules,
   parseEscalation,
+  parseOffsets,
   parseRecurrence,
   runOccurrenceCleanup,
   tickSchedules,
@@ -106,7 +107,15 @@ function buildPartial(
 }
 
 function rowToPublic(row: ScheduleRow): Record<string, unknown> {
-  const rec = parseRecurrence(row.recurrence_json);
+  // 逐行容错：一条损坏的 recurrence_json 只应让该行显示「规则损坏」，
+  // 而不是让整个 list/upcoming 工具报错（脏数据由导入或手改库引入）。
+  let rec: ReturnType<typeof parseRecurrence> = null;
+  let recurrenceBroken = false;
+  try {
+    rec = parseRecurrence(row.recurrence_json);
+  } catch {
+    recurrenceBroken = true;
+  }
   const escalation = parseEscalation(row.escalation_json);
   return {
     id: row.id,
@@ -114,17 +123,19 @@ function rowToPublic(row: ScheduleRow): Record<string, unknown> {
     类型: escalation === null ? KIND_LABEL[row.kind] : "截止",
     日历: row.calendar === "lunar" ? `农历${row.lunar_month}月${row.lunar_day}日` : row.start_date,
     时间: row.all_day === 1 ? `${row.time}（全天）` : row.time,
-    重复: describeRecurrence(
-      {
-        calendar: row.calendar,
-        recurrence: rec,
-        lunarMonth: row.lunar_month,
-        lunarDay: row.lunar_day,
-        leapPolicy: (row.leap_policy ?? "follow") as "follow" | "regular",
-      },
-      row.start_date,
-    ),
-    提醒: JSON.parse(row.remind_offsets_json) as number[],
+    重复: recurrenceBroken
+      ? "（循环规则损坏，需修复）"
+      : describeRecurrence(
+          {
+            calendar: row.calendar,
+            recurrence: rec,
+            lunarMonth: row.lunar_month,
+            lunarDay: row.lunar_day,
+            leapPolicy: (row.leap_policy ?? "follow") as "follow" | "regular",
+          },
+          row.start_date,
+        ),
+    提醒: parseOffsets(row.remind_offsets_json),
     ...(escalation === null ? {} : { 升级提醒: escalation }),
     状态: row.status,
     下次提醒: row.next_run_at,

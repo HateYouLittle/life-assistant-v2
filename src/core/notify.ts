@@ -82,6 +82,24 @@ export function setPushRoute(
   return route;
 }
 
+/**
+ * 启用/停用已有路由（不改 URL、不换名）。启用时必须走这里而不是裸 setSetting：
+ * 路由停用期间进入 fallback 的投递行只有靠 requeueRoute 才会重新入队，
+ * 否则它们会永远停在 fallback（用户看到"通知没发出去"却没有任何补救入口）。
+ */
+export function setPushRouteEnabled(
+  db: DatabaseSync,
+  profileId: string,
+  enabled: boolean,
+): PushRoute {
+  const current = getPushRoute(db, profileId);
+  if (current === null) throw new Error("尚未配置推送路由，请先提供 url");
+  const route: PushRoute = { ...current, enabled };
+  setSetting(db, profileId, "push_route", route);
+  if (enabled) requeueRoute(db, profileId, route.name);
+  return route;
+}
+
 /** 停用路由：落一条 disabled 的空路由，投递层据此判为 route removed（notify 工具目前用 enabled=false 达到同样效果） */
 export function clearPushRoute(db: DatabaseSync, profileId: string): void {
   setSetting(db, profileId, "push_route", {
@@ -93,7 +111,13 @@ export function clearPushRoute(db: DatabaseSync, profileId: string): void {
 }
 
 export function routeSecret(config: ResolvedConfig, profileId: string): string | undefined {
-  return config.profileRouteSecrets[profileId];
+  // 必须用 Object.hasOwn：profileRouteSecrets 是普通字面量对象，而 PROFILE_ID_RE 允许
+  // "constructor"。直接取值会命中 Object.prototype.constructor（非 undefined），
+  // 于是 publishProfile 误判"有 secret"并落投递行，随后 createHmac 抛
+  // ERR_INVALID_ARG_TYPE —— 每轮 drain 都断在这一行，排在其后的通知永久投不出去。
+  return Object.hasOwn(config.profileRouteSecrets, profileId)
+    ? config.profileRouteSecrets[profileId]
+    : undefined;
 }
 
 export function routedProfiles(db: DatabaseSync): string[] {
@@ -414,7 +438,14 @@ async function deliverOne(
       markSent(db, row);
       return;
     }
-    markConfirmedFailure(db, row, `HTTP ${response.status}`);
+    // 4xx（408/429 除外）是确定性拒绝：重试改不了结果，只会在阶梯上耗到 1 小时并
+    // 把「已确认失败」计数刷高。与 QWeather 客户端的「4xx 一律不重试」保持同一口径。
+    const status = response.status;
+    if (status >= 400 && status < 500 && status !== 408 && status !== 429) {
+      markTerminalFallback(db, row, `HTTP ${status}`);
+      return;
+    }
+    markConfirmedFailure(db, row, `HTTP ${status}`);
   } catch (e) {
     markTransportFailure(db, row, e instanceof Error ? e.message : String(e));
   }
@@ -434,6 +465,18 @@ function markSent(db: DatabaseSync, row: DeliveryRow): void {
     tx.exec("ROLLBACK");
     throw e;
   }
+}
+
+/**
+ * 终态失败：不再重试。`request_started_at` 必须清空 —— requeueRoute 只重新入队
+ * 「从未发出不确定请求」的行，清空它才能让路由恢复后重新投递。
+ */
+function markTerminalFallback(db: DatabaseSync, row: DeliveryRow, error: string): void {
+  db.prepare(
+    `UPDATE deliveries SET status = 'fallback', attempts = attempts + 1,
+       request_started_at = NULL, last_error = ?, updated_at = ?
+     WHERE id = ?`,
+  ).run(error, nowIso(), row.id);
 }
 
 function markConfirmedFailure(db: DatabaseSync, row: DeliveryRow, error: string): void {

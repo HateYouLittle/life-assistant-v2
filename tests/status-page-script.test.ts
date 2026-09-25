@@ -20,23 +20,36 @@ interface StubElement {
   textContent: string;
   className: string;
   dataset: Record<string, string>;
+  attrs: Record<string, string>;
   classList: { add(): void; remove(): void };
-  setAttribute(): void;
+  setAttribute(name: string, value: string): void;
+  getAttribute(name: string): string | null;
+  closest(selector: string): StubElement | null;
   addEventListener(): void;
   querySelectorAll(): StubElement[];
 }
 
 function stubElement(): StubElement {
-  return {
+  const element: StubElement = {
     innerHTML: "",
     textContent: "",
     className: "",
     dataset: {},
+    attrs: {},
     classList: { add() {}, remove() {} },
-    setAttribute() {},
+    setAttribute(name: string, value: string) {
+      element.attrs[name] = value;
+    },
+    getAttribute(name: string) {
+      return element.attrs[name] ?? null;
+    },
+    closest(selector: string) {
+      return selector === "[data-drawer]" && element.dataset.drawer !== undefined ? element : null;
+    },
     addEventListener() {},
     querySelectorAll: () => [],
   };
+  return element;
 }
 
 async function waitFor(cond: () => boolean, timeoutMs = 3000): Promise<boolean> {
@@ -53,14 +66,17 @@ export interface PageRun {
   authHeaders: (string | undefined)[];
   stored: Map<string, string>;
   replacedUrls: string[];
+  /** 派发一次点击（等价于点击带 data-drawer 的卡片），会跑真正的抽屉渲染路径 */
+  clickDrawer(kind: string): void;
 }
 
 /** 在 vm 里跑一遍真实的状态页脚本；`search` 即浏览器地址栏的查询串 */
 export function runPageScript(env: TestEnv, search: string): PageRun {
-  const matched = /<script>([\s\S]*)<\/script>/.exec(statusPage("2.0.0"));
+  const matched = /<script[^>]*>([\s\S]*)<\/script>/.exec(statusPage("2.0.0"));
   assert.ok(matched?.[1] !== undefined, "状态页应内联一段脚本");
   const app = createStatusApp(env.config, env.db);
 
+  const clickHandlers: ((ev: unknown) => void)[] = [];
   const elements = new Map<string, StubElement>();
   const authHeaders: (string | undefined)[] = [];
   const stored = new Map<string, string>();
@@ -75,7 +91,9 @@ export function runPageScript(env: TestEnv, search: string): PageRun {
         }
         return element;
       },
-      addEventListener() {},
+      addEventListener(type: string, handler: (ev: unknown) => void) {
+        if (type === "click") clickHandlers.push(handler);
+      },
     },
     localStorage: {
       getItem: (key: string) => stored.get(key) ?? null,
@@ -99,9 +117,19 @@ export function runPageScript(env: TestEnv, search: string): PageRun {
     },
   };
   vm.runInNewContext(matched[1], sandbox);
-  return { elements, authHeaders, stored, replacedUrls };
+  return {
+    elements,
+    authHeaders,
+    stored,
+    replacedUrls,
+    clickDrawer(kind: string) {
+      const target = stubElement();
+      target.dataset.drawer = kind;
+      target.setAttribute("data-drawer", kind);
+      for (const handler of clickHandlers) handler({ target });
+    },
+  };
 }
-
 function seedExpense(env: TestEnv): void {
   env.db
     .prepare(
@@ -118,7 +146,7 @@ function seedExpense(env: TestEnv): void {
 
 describe("看板页面脚本（vm 桩 + 真实 /api）", () => {
   it("开着 token：?token= 取凭据 → 请求带 Bearer → 渲染出真实数据 → 地址栏抹掉 token", async () => {
-    const token = "t".repeat(20);
+    const token = "t".repeat(32);
     const env = makeTestEnv({ WEB_API_TOKEN: token, HOST: "0.0.0.0" });
     try {
       seedExpense(env);
@@ -162,6 +190,95 @@ describe("看板页面脚本（vm 桩 + 真实 /api）", () => {
       assert.ok(rendered);
       assert.deepEqual(run.authHeaders, [undefined], "无 token 时不该凭空造凭据");
       assert.deepEqual(run.replacedUrls, [], "没有 URL 凭据就无需清理地址栏");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("Profile 名里的 HTML 被转义（旧库导入注入路径的回归）", async () => {
+    const env = makeTestEnv();
+    try {
+      // 直接写库以模拟「非法 profile_id 已经落库」的现场：入口校验是第一道防线，
+      // 这里守住第二道 —— 无论库里有什么，拼进 innerHTML 前必须转义。
+      env.db
+        .prepare("INSERT INTO profiles (id, created_at) VALUES (?, ?)")
+        .run("<img src=x onerror=alert(1)>", new Date().toISOString());
+      const run = runPageScript(env, "");
+      const rendered = await waitFor(() =>
+        (run.elements.get("ops")?.innerHTML ?? "").includes("Profile"),
+      );
+      assert.ok(rendered, "ops 行没有渲染出来");
+      const html = run.elements.get("ops")?.innerHTML ?? "";
+      assert.ok(!html.includes("<img"), `未转义的 Profile 名进了 innerHTML：${html}`);
+      assert.match(html, /&lt;img/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
+describe("状态页转义（静态断言）", () => {
+  it("首屏 ops 行确实走了 esc（防止有人把转义改回去）", () => {
+    assert.match(statusPage("2.0.0"), /row\('Profile', esc\(/);
+  });
+});
+
+describe("看板抽屉（点击委托 + 明细渲染）", () => {
+  it("点击「系统信息」卡片会真的拉 /api/status 并渲染表格", async () => {
+    const env = makeTestEnv();
+    try {
+      seedExpense(env);
+      const run = runPageScript(env, "");
+      await waitFor(() => (run.elements.get("ops")?.innerHTML ?? "").includes("Profile"));
+      run.clickDrawer("system");
+      const rendered = await waitFor(() =>
+        (run.elements.get("drawer-body")?.innerHTML ?? "").includes("运行时长"),
+      );
+      assert.ok(rendered, `抽屉没有渲染出内容：${run.elements.get("drawer-body")?.innerHTML}`);
+      assert.match(run.elements.get("drawer-body")?.innerHTML ?? "", /Profile/);
+      assert.equal(run.elements.get("drawer")?.attrs["aria-hidden"], "false", "抽屉应被打开");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("明细接口 401 时抽屉显示错误提示，而不是空白", async () => {
+    const env = makeTestEnv({ WEB_API_TOKEN: "t".repeat(32), HOST: "0.0.0.0" });
+    try {
+      // 页面没有凭据（地址栏无 token、localStorage 为空）→ 每个 /api 都是 401
+      const run = runPageScript(env, "");
+      run.clickDrawer("schedules");
+      const rendered = await waitFor(() =>
+        (run.elements.get("drawer-body")?.innerHTML ?? "").includes("未授权"),
+      );
+      assert.ok(rendered, `失败路径应显示错误：${run.elements.get("drawer-body")?.innerHTML}`);
+      assert.match(run.elements.get("drawer-body")?.innerHTML ?? "", /empty bad/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("节假日抽屉翻年后保留所选年份（30s 自动刷新不再打回当年）", async () => {
+    const env = makeTestEnv();
+    try {
+      env.db
+        .prepare(
+          `INSERT INTO cn_holiday_years (year, status, source, fetched_at) VALUES (2026,'ready','test','2026-01-01T00:00:00.000Z'), (2027,'ready','test','2026-01-01T00:00:00.000Z')`,
+        )
+        .run();
+      env.db
+        .prepare(
+          `INSERT INTO cn_holiday_days (date, year, day_type, name, source, updated_at) VALUES ('2026-10-01',2026,'holiday','国庆节','test','2026-01-01T00:00:00.000Z'), ('2027-01-01',2027,'holiday','元旦','test','2026-01-01T00:00:00.000Z')`,
+        )
+        .run();
+      const run = runPageScript(env, "");
+      run.clickDrawer("holidays");
+      const rendered = await waitFor(() =>
+        (run.elements.get("drawer-body")?.innerHTML ?? "").includes("年安排"),
+      );
+      assert.ok(rendered);
+      const html = run.elements.get("drawer-body")?.innerHTML ?? "";
+      assert.match(html, /2026 年安排/, "默认展示当年");
     } finally {
       cleanupTestEnv(env);
     }
