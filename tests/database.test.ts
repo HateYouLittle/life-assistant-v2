@@ -2,7 +2,12 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { bearerToken, isRequestAuthorized } from "../src/core/auth.js";
-import { getSchemaVersion, openDatabase, withTransaction } from "../src/core/database.js";
+import {
+  getSchemaVersion,
+  openDatabase,
+  withReadTransaction,
+  withTransaction,
+} from "../src/core/database.js";
 import { getCache, pruneCache, setCache } from "../src/core/settings.js";
 import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
 
@@ -148,6 +153,64 @@ describe("database schema v2", () => {
         n: number;
       };
       assert.equal(row.n, 0);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("withReadTransaction 提供一致快照：事务内其它连接的写入不影响已读到的数据", () => {
+    const env = makeTestEnv();
+    // 第二个连接扮演「并发写入方」：单写者架构下就是相邻 job/tick 的写入
+    const writer = new DatabaseSync(env.config.dbPath);
+    try {
+      env.db
+        .prepare(
+          "INSERT INTO ledgers (id, name, created_at) VALUES ('l1', '账本', '2026-01-01T00:00:00.000Z')",
+        )
+        .run();
+      const insert = env.db.prepare(
+        `INSERT INTO expenses (id, ledger_id, amount_cents, category, spent_on, created_by_profile, created_at)
+         VALUES (?, 'l1', 100, '餐饮', '2026-01-05', 'default', '2026-01-05T00:00:00.000Z')`,
+      );
+      insert.run("e1");
+
+      const count = (): number =>
+        (env.db.prepare("SELECT COUNT(*) AS n FROM expenses").get() as { n: number }).n;
+      const seen = withReadTransaction(env.db, () => {
+        const before = count();
+        // 另一个连接在事务进行中写入
+        writer
+          .prepare(
+            `INSERT INTO expenses (id, ledger_id, amount_cents, category, spent_on, created_by_profile, created_at)
+             VALUES ('e2', 'l1', 200, '交通', '2026-01-06', 'default', '2026-01-06T00:00:00.000Z')`,
+          )
+          .run();
+        return [before, count()];
+      });
+
+      assert.deepEqual(seen, [1, 1], "同一读事务内两次 SELECT 必须读到同一快照");
+      assert.equal(count(), 2, "事务结束后应能看到新写入");
+      assert.equal(env.db.isTransaction, false, "读事务必须正常提交，不留在事务状态");
+    } finally {
+      writer.close();
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("withReadTransaction 异常时回滚；已在事务内则复用外层快照", () => {
+    const env = makeTestEnv();
+    try {
+      assert.throws(() =>
+        withReadTransaction(env.db, () => {
+          throw new Error("boom");
+        }),
+      );
+      assert.equal(env.db.isTransaction, false);
+
+      // 嵌套在写事务里不能再 BEGIN：必须复用外层（SQLite 会拒绝嵌套 BEGIN）
+      const value = withTransaction(env.db, () => withReadTransaction(env.db, () => 42));
+      assert.equal(value, 42);
+      assert.equal(env.db.isTransaction, false);
     } finally {
       cleanupTestEnv(env);
     }

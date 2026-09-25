@@ -229,3 +229,23 @@ export function withTransaction<T>(db: DatabaseSync, fn: () => T): T {
     throw e;
   }
 }
+
+/**
+ * 读事务（BEGIN DEFERRED）：一份报表里的多条 SELECT 需要一个一致的快照。
+ * 单条语句在 SQLite 里本身就是原子的，但「合计 + 分类明细 + 按人汇总」这类
+ * 三条独立语句之间若有写入落库，就会出现合计与明细对不上的结果。
+ * 已是事务状态时直接复用外层快照，不嵌套 BEGIN（SQLite 会报「cannot start a
+ * transaction within a transaction」）。
+ */
+export function withReadTransaction<T>(db: DatabaseSync, fn: () => T): T {
+  if (db.isTransaction) return fn();
+  db.exec("BEGIN DEFERRED");
+  try {
+    const result = fn();
+    db.exec("COMMIT");
+    return result;
+  } catch (e) {
+    db.exec("ROLLBACK");
+    throw e;
+  }
+}

@@ -1,6 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { DateTime } from "luxon";
 import { nowIso, todayIso, TZ } from "../../time.js";
+import { withReadTransaction } from "../../core/database.js";
 import type { NotifyBlock } from "../../core/registry.js";
 import { newId } from "../../core/settings.js";
 
@@ -180,31 +181,35 @@ export function summarizeExpenses(
     params.push(opts.by);
   }
   const where = conditions.join(" AND ");
-  const range = db
-    .prepare(
-      `SELECT COALESCE(SUM(amount_cents), 0) AS total, COUNT(*) AS count FROM expenses WHERE ${where}`,
-    )
-    .get(...params) as { total: number; count: number };
-  const categories = db
-    .prepare(
-      `SELECT category, SUM(amount_cents) AS cents FROM expenses WHERE ${where} GROUP BY category ORDER BY cents DESC`,
-    )
-    .all(...params) as { category: string; cents: number }[];
-  const profiles = db
-    .prepare(
-      `SELECT created_by_profile AS profile, SUM(amount_cents) AS cents FROM expenses WHERE ${where} GROUP BY created_by_profile ORDER BY cents DESC`,
-    )
-    .all(...params) as { profile: string; cents: number }[];
-  return {
-    total_cents: range.total,
-    count: range.count,
-    categories: categories.map((c) => ({
-      category: c.category,
-      cents: c.cents,
-      share: range.total > 0 ? c.cents / range.total : 0,
-    })),
-    profiles: profiles.map((p) => ({ profile: p.profile, cents: p.cents })),
-  };
+  // 三条独立语句必须读同一快照：否则并发的记账写入落在两者之间时，
+  // 「合计」会与「分类明细」对不上（share 也随之失真）。
+  return withReadTransaction(db, () => {
+    const range = db
+      .prepare(
+        `SELECT COALESCE(SUM(amount_cents), 0) AS total, COUNT(*) AS count FROM expenses WHERE ${where}`,
+      )
+      .get(...params) as { total: number; count: number };
+    const categories = db
+      .prepare(
+        `SELECT category, SUM(amount_cents) AS cents FROM expenses WHERE ${where} GROUP BY category ORDER BY cents DESC`,
+      )
+      .all(...params) as { category: string; cents: number }[];
+    const profiles = db
+      .prepare(
+        `SELECT created_by_profile AS profile, SUM(amount_cents) AS cents FROM expenses WHERE ${where} GROUP BY created_by_profile ORDER BY cents DESC`,
+      )
+      .all(...params) as { profile: string; cents: number }[];
+    return {
+      total_cents: range.total,
+      count: range.count,
+      categories: categories.map((c) => ({
+        category: c.category,
+        cents: c.cents,
+        share: range.total > 0 ? c.cents / range.total : 0,
+      })),
+      profiles: profiles.map((p) => ({ profile: p.profile, cents: p.cents })),
+    };
+  });
 }
 
 export function monthRange(ym: string): { from: string; to: string } {
