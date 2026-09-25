@@ -494,6 +494,70 @@ describe("schedule escalation：complete 单次（occurrence_key）收敛派生�
     }
   });
 
+  it("回归：用较早的提醒偏移完成后，同事件其余偏移不再推", async (t) => {
+    freeze(t, "2026-09-27");
+    const env = makeTestEnv();
+    try {
+      // remind_offsets [-30, 0]：同一事件有两行提醒（提前 30 分钟 / 正点）
+      const result = tool(env, {
+        action: "add",
+        title: "多偏移待办",
+        date: D,
+        time: "08:00",
+        remind_offsets: [-30, 0],
+      }) as { content: { text: string }[] };
+      const id = (JSON.parse(result.content[0]?.text ?? "{}") as { 已创建: { id: string } }).已创建
+        .id;
+      assert.equal(statusOf(env, id, `${EVENT}#1`), "pending", "正点那条应先排定");
+
+      await fire(env, `${D}T07:30+08:00`); // 提前那条触发
+      assert.equal(reminders(env).length, 1);
+
+      tool(env, { action: "complete", id, occurrence_key: `${EVENT}#0` });
+      assert.equal(
+        statusOf(env, id, `${EVENT}#1`),
+        "done",
+        "完成一次发生应终结同一事件的全部提醒行（此前只收敛 :resend / #esc，正点仍会再推）",
+      );
+
+      await fire(env, `${D}T08:00:30+08:00`); // 正点时刻
+      assert.equal(reminders(env).length, 1, "完成后同事件的其它偏移不得再推");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("回归：用较晚的偏移完成时，锚在 #0 的升级链一并终结", async (t) => {
+    freeze(t, "2026-09-27");
+    const env = makeTestEnv();
+    try {
+      const result = tool(env, {
+        action: "add",
+        title: "多偏移截止",
+        date: D,
+        time: "08:00",
+        remind_offsets: [-30, 0],
+        escalation: [0, 60],
+      }) as { content: { text: string }[] };
+      const id = (JSON.parse(result.content[0]?.text ?? "{}") as { 已创建: { id: string } }).已创建
+        .id;
+
+      await fire(env, `${D}T07:30+08:00`); // #0 触发并派生 #esc:1
+      assert.equal(statusOf(env, id, `${EVENT}#0#esc:1`), "pending");
+
+      // 用正点那条（#1）完成：以 #0 为锚点的升级行必须一并终结，
+      // 否则 09:00 仍会推「截止已过 X 仍未完成」
+      tool(env, { action: "complete", id, occurrence_key: `${EVENT}#1` });
+      assert.equal(statusOf(env, id, `${EVENT}#0`), "done");
+      assert.equal(statusOf(env, id, `${EVENT}#0#esc:1`), "done");
+
+      await fire(env, `${D}T09:00:30+08:00`); // +1h 阶梯时刻
+      assert.equal(reminders(env).length, 1, "完成后升级链不得继续加压");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("complete 带不存在的 occurrence_key 报错，错误串不以空格开头", (t) => {
     freeze(t, "2026-09-27");
     const env = makeTestEnv();

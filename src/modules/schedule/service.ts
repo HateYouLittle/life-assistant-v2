@@ -193,6 +193,23 @@ function escalationStepOf(occurrenceKey: string): number | null {
 }
 
 /**
+ * 反解任意提醒行 key 所属的「事件前缀」`<本地日期>T<时刻>`：
+ * 依次剥掉派生后缀（`#esc:N` / `:resend`）与偏移序号（`#N`）。
+ * 这样 `…T09:00#0`、`…T09:00#1`、`…T09:00#0#esc:1`、`…T09:00#1:resend`
+ * 都归到同一个事件。形态不符（脏 key）返回 null，由调用方退化处理。
+ */
+export function eventPrefixOf(occurrenceKey: string): string | null {
+  let key = occurrenceKey;
+  if (escalationStepOf(key) !== null) {
+    key = key.slice(0, key.lastIndexOf(ESCALATION_SUFFIX));
+  } else if (key.endsWith(RESEND_SUFFIX)) {
+    key = key.slice(0, -RESEND_SUFFIX.length);
+  }
+  const matched = /^(.*)#\d+$/.exec(key);
+  return matched === null ? null : (matched[1] as string);
+}
+
+/**
  * 逾期时长文案：区分分 / 小时 / 天，且不输出「0 天 0 小时」这类空单位。
  * 例：3 分 / 1 小时 3 分 / 1 天 2 小时。
  */
@@ -568,15 +585,28 @@ export function completeSchedule(
       )
       .run(id, occurrenceKey);
     if (result.changes !== 1) throw new Error(`occurrence 不存在或已结束: ${occurrenceKey}`);
-    // 单次完成后一并终结该事件的派生行（`<key>:resend` / `<key>#esc:N`）：
-    // 否则到点仍会追加「仍未完成」的加压/强提醒。派生 key 都以已完成行的 key 为前缀；
-    // 用 substr 前缀比较而不是 LIKE，避免 key 中的 %/_ 被当成通配符误伤。
-    db.prepare(
-      `UPDATE occurrences SET status = 'done'
-       WHERE schedule_id = ? AND status IN ('pending','notified')
-         AND (occurrence_key = ? || '${RESEND_SUFFIX}'
-              OR substr(occurrence_key, 1, length(?) + ${ESCALATION_SUFFIX.length}) = ? || '${ESCALATION_SUFFIX}')`,
-    ).run(id, occurrenceKey, occurrenceKey, occurrenceKey);
+    // 同一事件的所有提醒行一并终结：`<前缀>#0..#4` 每个偏移一行，另有派生行
+    // `:resend` 与 `#esc:N`。只按给定 key 收敛派生行会漏掉兄弟偏移 ——
+    // 用提前 30 分钟那条（#0）完成后，正点那条（#1）仍会再推一次；
+    // 反过来用 #1 完成时，锚在 #0 上的升级阶梯会继续推「仍未完成」。
+    const eventPrefix = eventPrefixOf(occurrenceKey);
+    if (eventPrefix === null) {
+      // 脏 key（不符合 `<前缀>#<序号>` 形态）：退化为只收敛以该 key 为前缀的派生行
+      db.prepare(
+        `UPDATE occurrences SET status = 'done'
+         WHERE schedule_id = ? AND status IN ('pending','notified')
+           AND (occurrence_key = ? || '${RESEND_SUFFIX}'
+                OR substr(occurrence_key, 1, length(?) + ${ESCALATION_SUFFIX.length}) = ? || '${ESCALATION_SUFFIX}')`,
+      ).run(id, occurrenceKey, occurrenceKey, occurrenceKey);
+    } else {
+      // 派生 key 都以事件前缀开头；用 substr 前缀比较而不是 LIKE，
+      // 避免 key 中的 %/_ 被当成通配符误伤
+      db.prepare(
+        `UPDATE occurrences SET status = 'done'
+         WHERE schedule_id = ? AND status IN ('pending','notified')
+           AND substr(occurrence_key, 1, ?) = ?`,
+      ).run(id, eventPrefix.length + 1, `${eventPrefix}#`);
+    }
   } else {
     db.prepare(
       `UPDATE occurrences SET status = 'done'
