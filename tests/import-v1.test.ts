@@ -763,6 +763,38 @@ describe("import:v1", () => {
     }
   });
 
+  it("ledger_entries 读表失败同样进 problems，不伪装成「旧库没有这张表」", () => {
+    // 回归：账目表此前用 `catch { warnings("旧库没有 ledger_entries 表") }` 兜底，
+    // 一条 int64 越界行会让整表账目静默丢失、problems 为空 → 退出码 0。
+    const env = makeTestEnv();
+    try {
+      const oldPath = `${env.dir}/old.db`;
+      buildOldDb(oldPath);
+      const old = new DatabaseSync(oldPath);
+      old
+        .prepare("UPDATE ledger_entries SET amount_cents = ? WHERE id = 'e1'")
+        .run(9223372036854775807n);
+      old.close();
+
+      const report = runImport(env.db, oldPath);
+      assert.ok(
+        report.problems.some(
+          (p) =>
+            p.table === "ledger_entries" && p.reason.includes("无法读取旧库的 ledger_entries 表"),
+        ),
+        `读表失败必须进 problems，实际 ${JSON.stringify(report.problems)}`,
+      );
+      assert.ok(
+        !report.scheduleWarnings.some((w) => w.includes("旧库没有 ledger_entries 表")),
+        "不得把读失败报告成「表不存在」",
+      );
+      assert.equal(report.expenses, 0, "该表整表未导入");
+      assert.equal(report.ledgers, 2, "其余表不受影响，照常导入");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("--force 只覆盖会重写的行：通知/投递/预算/账本里 v2 新增的账目都保住", () => {
     const env = makeTestEnv();
     try {

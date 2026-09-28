@@ -527,22 +527,25 @@ export function runImport(
         );
       }
 
-      let entries: Array<{
-        id: string;
-        ledger_id: string;
-        type: string;
-        amount_cents: number;
-        category: string | null;
-        note: string | null;
-        occurred_at: string;
-        profile_id: string;
-        created_at: string;
-      }> = [];
-      try {
-        entries = old.prepare("SELECT * FROM ledger_entries").all() as unknown as typeof entries;
-      } catch {
-        warnings(report, "旧库没有 ledger_entries 表，跳过账目");
-      }
+      // 与其它表同口径：只有「表不存在」可以静默跳过；读失败（int64 越界、库被占用等）
+      // 必须记入 problems，否则整表账目丢失而报告是成功。
+      const entries = readOldTable(
+        report,
+        "ledger_entries",
+        "跳过账目",
+        () =>
+          old.prepare("SELECT * FROM ledger_entries").all() as unknown as Array<{
+            id: string;
+            ledger_id: string;
+            type: string;
+            amount_cents: number;
+            category: string | null;
+            note: string | null;
+            occurred_at: string;
+            profile_id: string;
+            created_at: string;
+          }>,
+      );
       const insertExpense = target.prepare(
         `INSERT INTO expenses (id, ledger_id, amount_cents, category, note, spent_on, created_by_profile, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
