@@ -84,6 +84,38 @@ describe("schedule 脏数据隔离", () => {
     }
   });
 
+  it("损坏规则的到点提醒降级发送，不拖垮同批其它提醒", async () => {
+    const env = makeTestEnv();
+    try {
+      const published: string[] = [];
+      const services: Services = {
+        publishProfile: async (_profileId, input) => {
+          published.push(input.title);
+          return { id: `n-${published.length}`, deduped: false };
+        },
+        publishGlobal: async () => ({ materialized: 0 }),
+      };
+      insertSchedule(env, "aaaa1111", "损坏日程", '{"freq":"daily"');
+      insertSchedule(env, "bbbb2222", "正常日程", '{"freq":"daily","interval":1}');
+      const past = new Date(Date.now() - 3_600_000).toISOString();
+      const insertOcc = env.db.prepare(
+        "INSERT INTO occurrences (schedule_id, occurrence_key, event_at, due_at, status) VALUES (?, ?, ?, ?, 'pending')",
+      );
+      insertOcc.run("aaaa1111", "2026-09-01T09:00#0", past, past);
+      insertOcc.run("bbbb2222", "2026-09-01T09:00#0", past, past);
+
+      await tickSchedules(DateTime.now().setZone(TZ), services, env.db);
+
+      assert.deepEqual(
+        published.sort(),
+        ["损坏日程", "正常日程"],
+        "坏行应降级发送（重复栏显示损坏），且不能吞掉同批的其它提醒",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("list 遇到损坏的循环规则：该行显示「规则损坏」而不是整批报错", () => {
     const env = makeTestEnv();
     try {

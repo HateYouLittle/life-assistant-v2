@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { DateTime } from "luxon";
-import { TZ, todayIso, now } from "../src/time.js";
+import { TZ, todayIso, now, instantToLocalDate } from "../src/time.js";
 import { importYear, type HolidayYearPayload } from "../src/core/holiday.js";
 import {
   catchupSweep,
+  completeSchedule,
   createSchedule,
   fireDue,
   getSchedule,
@@ -431,6 +432,53 @@ describe("schedule 提醒触发", () => {
       cleanupTestEnv(env);
     }
   });
+
+  it("count 是硬上限：漏触发被取消的 occurrence 仍占次数", () => {
+    const env = makeTestEnv();
+    try {
+      const created = createSchedule(env.db, "default", {
+        title: "限次任务",
+        kind: "todo",
+        calendar: "solar",
+        startDate: todayIso(),
+        time: "09:00",
+        allDay: false,
+        recurrence: { freq: "daily", interval: 1, count: 3 },
+        remindOffsets: [0],
+        resendMinutes: 0,
+        workdayFilter: "any",
+      });
+      const rows = occurrenceRows(env, created.id);
+      assert.equal(new Set(rows.map((r) => r.event_at)).size, 3);
+      // 模拟多日停机：3 条 pending 全部过期且 due_at 互不相同
+      rows.forEach((r, i) => {
+        const due = now()
+          .minus({ days: 10 - i })
+          .toUTC()
+          .toISO();
+        env.db
+          .prepare("UPDATE occurrences SET due_at = ? WHERE schedule_id = ? AND occurrence_key = ?")
+          .run(due, created.id, r.occurrence_key as string);
+      });
+      catchupSweep(env.db);
+      const cancelled = env.db
+        .prepare(
+          "SELECT COUNT(*) AS n FROM occurrences WHERE schedule_id = ? AND status = 'cancelled'",
+        )
+        .get(created.id) as { n: number };
+      assert.ok(cancelled.n > 0, "构造前提：catchupSweep 应取消部分漏触发行");
+
+      materializeSchedule(env.db, getSchedule(env.db, "default", created.id) as never);
+      const after = occurrenceRows(env, created.id);
+      assert.equal(
+        new Set(after.map((r) => r.event_at)).size,
+        3,
+        "count=3 是硬上限：被取消的漏触发事件也占次数，不得补出第 4 个事件",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
 });
 
 describe("schedule 工具：weekly 空 byweekday 防护", () => {
@@ -550,6 +598,48 @@ describe("schedule 工具：更新不静默丢提醒", () => {
       assert.ok(before.length > 0);
       updateSchedule(env.db, "default", created.id, { title: "改个名字" });
       assert.deepEqual(keysOf(env, created.id), before, "改标题不应删除任何 pending 提醒");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("同事件部分提醒已发出：更新不丢尚未触发的那条，新增偏移也补到当前事件", async () => {
+    const env = makeTestEnv();
+    try {
+      const event = now().plus({ minutes: 20 });
+      const keyBase = `${event.toISODate()}T${event.toFormat("HH:mm")}`;
+      const created = createSchedule(env.db, "default", {
+        title: "部分触发",
+        kind: "todo",
+        calendar: "solar",
+        startDate: event.toISODate() as string,
+        time: event.toFormat("HH:mm"),
+        allDay: false,
+        recurrence: null,
+        remindOffsets: [-30, 0],
+        resendMinutes: 0,
+        workdayFilter: "any",
+      });
+      // 提前 30 分钟那条已过（#0 已发出），正点那条未到（#1 pending）
+      await fireDue(env.db, envServices(env), now());
+      const statusOf = (key: string): unknown =>
+        occurrenceRows(env, created.id).find((r) => r.occurrence_key === key)?.status;
+      assert.equal(statusOf(`${keyBase}#0`), "notified");
+      assert.equal(statusOf(`${keyBase}#1`), "pending");
+
+      updateSchedule(env.db, "default", created.id, { title: "改标题" });
+      assert.equal(
+        statusOf(`${keyBase}#1`),
+        "pending",
+        "同事件尚未触发的提醒不能因 update 被删除（曾整条丢失）",
+      );
+
+      updateSchedule(env.db, "default", created.id, { remindOffsets: [-30, 0, 30] });
+      assert.equal(
+        statusOf(`${keyBase}#2`),
+        "pending",
+        "新增偏移应补到当前事件，而不是只从下一次发生开始",
+      );
     } finally {
       cleanupTestEnv(env);
     }
@@ -725,6 +815,216 @@ describe("schedule 工具：更新不静默丢提醒", () => {
         )
         .get();
       assert.ok(idx !== undefined, "应创建 idx_occurrences_schedule_status");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
+describe("schedule update：rewind 只作用于进行中的最近事件", () => {
+  function onceInput(time: string) {
+    return {
+      title: "时点任务",
+      kind: "todo" as const,
+      calendar: "solar" as const,
+      startDate: todayIso(),
+      time,
+      allDay: false,
+      recurrence: null,
+      remindOffsets: [0],
+      resendMinutes: 0,
+      workdayFilter: "any" as const,
+    };
+  }
+
+  it("count 已耗尽：改 time 不会造出新事件", () => {
+    const env = makeTestEnv();
+    try {
+      const created = createSchedule(env.db, "default", {
+        ...onceInput("09:00"),
+        recurrence: { freq: "daily", interval: 1, count: 3 },
+      });
+      env.db
+        .prepare("UPDATE occurrences SET status = 'notified' WHERE schedule_id = ?")
+        .run(created.id);
+      const before = new Set(occurrenceRows(env, created.id).map((r) => r.event_at));
+      assert.equal(before.size, 3);
+
+      updateSchedule(env.db, "default", created.id, { time: "10:00" });
+      const after = new Set(occurrenceRows(env, created.id).map((r) => r.event_at));
+      assert.equal(after.size, 3, "已耗尽 count 的日程不得因改时间多出第 4 个事件");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("用 occurrence_key 完成的事件：改 time 不会复活提醒", () => {
+    const env = makeTestEnv();
+    try {
+      const created = createSchedule(env.db, "default", onceInput("09:00"));
+      const key = occurrenceRows(env, created.id)[0]?.occurrence_key as string;
+      completeSchedule(env.db, "default", created.id, key);
+      const before = occurrenceRows(env, created.id);
+
+      updateSchedule(env.db, "default", created.id, { time: "10:00" });
+      const after = occurrenceRows(env, created.id);
+      assert.equal(after.length, before.length, "不得为已完成的事件重建新 key");
+      assert.ok(
+        after.every((r) => r.status === "done"),
+        `已完成的事件不得被重新物化，实际 ${JSON.stringify(after)}`,
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("已全部提醒的事件：新增偏移不会为过去的事件补发", () => {
+    const env = makeTestEnv();
+    try {
+      const past = now().minus({ hours: 2 });
+      const created = createSchedule(env.db, "default", {
+        ...onceInput(past.toFormat("HH:mm")),
+        startDate: past.toISODate() as string,
+      });
+      env.db
+        .prepare("UPDATE occurrences SET status = 'notified' WHERE schedule_id = ?")
+        .run(created.id);
+      const before = occurrenceRows(env, created.id).map((r) => r.occurrence_key);
+
+      updateSchedule(env.db, "default", created.id, { remindOffsets: [-30, 0] });
+      const after = occurrenceRows(env, created.id).map((r) => r.occurrence_key);
+      assert.deepEqual(after, before, "全通知的事件不得因新增偏移被重新物化");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  /** count=3 daily：前两个事件全 notified，最近事件 #0 notified + #1 pending（进行中） */
+  function seedLiveLastEvent(env: TestEnv) {
+    const created = createSchedule(env.db, "default", {
+      ...onceInput("09:00"),
+      recurrence: { freq: "daily", interval: 1, count: 3 },
+      remindOffsets: [-30, 0],
+    });
+    env.db
+      .prepare("UPDATE occurrences SET status = 'notified' WHERE schedule_id = ?")
+      .run(created.id);
+    const lastAt = (
+      env.db
+        .prepare("SELECT MAX(event_at) AS m FROM occurrences WHERE schedule_id = ?")
+        .get(created.id) as { m: string }
+    ).m;
+    env.db
+      .prepare(
+        "UPDATE occurrences SET status = 'pending' WHERE schedule_id = ? AND event_at = ? AND substr(occurrence_key, -2) = '#1'",
+      )
+      .run(created.id, lastAt);
+    return { created };
+  }
+
+  it("count 已达上限：改规则不会借 rewind 多出第 4 个日期", () => {
+    const env = makeTestEnv();
+    try {
+      const { created } = seedLiveLastEvent(env);
+      updateSchedule(env.db, "default", created.id, {
+        recurrence: { freq: "weekly", interval: 1, count: 3 },
+      });
+      const dates = new Set(
+        occurrenceRows(env, created.id).map((r) => instantToLocalDate(String(r.event_at))),
+      );
+      assert.equal(dates.size, 3, "count=3 是硬上限，改规则不得新增第 4 个日期");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("count 日程改 time：同一日历日不计成新事件，也不会多出下一天", () => {
+    const env = makeTestEnv();
+    try {
+      const { created } = seedLiveLastEvent(env);
+      // 有意行为：进行中的事件允许当天改点——新时刻的提醒会为当天重建，
+      // 但同一日历日不算新事件，也不会借 rewind 推出第 4 个日期。
+      updateSchedule(env.db, "default", created.id, { time: "10:00" });
+      const dates = (): Set<string> =>
+        new Set(occurrenceRows(env, created.id).map((r) => instantToLocalDate(String(r.event_at))));
+      assert.equal(dates().size, 3, "同一日历日改 time 不得计成新事件");
+      materializeSchedule(env.db, getSchedule(env.db, "default", created.id) as never);
+      assert.equal(dates().size, 3, "后续物化也不得推出第 4 个日期");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("只有派生行 pending：update 不触发回退重物化（不为已通知事件补行）", async () => {
+    const env = makeTestEnv();
+    try {
+      const event = now().minus({ minutes: 5 });
+      const created = createSchedule(env.db, "default", {
+        ...onceInput(event.toFormat("HH:mm")),
+        startDate: event.toISODate() as string,
+        resendMinutes: 30,
+      });
+      // #0 触发 → 派生 :resend（事件 +30 分钟，尚未到点）
+      await fireDue(env.db, envServices(env), now());
+      const before = occurrenceRows(env, created.id).map((r) => r.occurrence_key);
+      assert.equal(
+        before.filter((k) => String(k).endsWith(":resend")).length,
+        1,
+        "构造前提：存在一条 pending 的派生行",
+      );
+
+      updateSchedule(env.db, "default", created.id, { remindOffsets: [-30, 0] });
+      const after = occurrenceRows(env, created.id).map((r) => r.occurrence_key);
+      assert.deepEqual(after, before, "派生行 pending 不该触发 rewind，不得为已通知事件补行");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
+describe("schedule 创建/更新的原子性", () => {
+  function dailyInput(title: string) {
+    return {
+      title,
+      kind: "todo" as const,
+      calendar: "solar" as const,
+      startDate: todayIso(),
+      time: "09:00",
+      allDay: false,
+      recurrence: { freq: "daily" as const, interval: 1 },
+      remindOffsets: [0],
+      resendMinutes: 0,
+      workdayFilter: "any" as const,
+    };
+  }
+
+  const blockOccurrenceInserts = (env: TestEnv): void => {
+    env.db.exec(
+      "CREATE TRIGGER boom BEFORE INSERT ON occurrences BEGIN SELECT RAISE(ABORT, 'boom'); END",
+    );
+  };
+
+  it("物化失败时创建整体回滚，不留半成品日程", () => {
+    const env = makeTestEnv();
+    try {
+      blockOccurrenceInserts(env);
+      assert.throws(() => createSchedule(env.db, "default", dailyInput("半成品")), /boom/);
+      const count = env.db
+        .prepare("SELECT COUNT(*) AS n FROM schedules WHERE title = ?")
+        .get("半成品") as { n: number };
+      assert.equal(count.n, 0, "物化失败必须回滚插入，否则用户重试会造出第二条同名日程");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("物化失败时更新整体回滚，不留「报错但改动已生效」", () => {
+    const env = makeTestEnv();
+    try {
+      const created = createSchedule(env.db, "default", dailyInput("原标题"));
+      blockOccurrenceInserts(env);
+      assert.throws(() => updateSchedule(env.db, "default", created.id, { title: "改坏" }), /boom/);
+      assert.equal(getSchedule(env.db, "default", created.id)?.title, "原标题");
     } finally {
       cleanupTestEnv(env);
     }

@@ -1,5 +1,5 @@
 import { DateTime } from "luxon";
-import { Lunar, LunarYear } from "lunar-javascript";
+import { Lunar, LunarYear, Solar } from "lunar-javascript";
 import { TZ } from "../time.js";
 
 /**
@@ -74,17 +74,20 @@ function* iterate(source: OccurrenceSource, afterDay: DateTime): Generator<DateT
   const tick = (): void => {
     if (++steps > MAX_ITERATIONS) {
       throw new Error(
-        `recurrence 规则无法产生日期（freq=${rec.freq}，已迭代 ${MAX_ITERATIONS} 次）——请检查 byweekday 等参数`,
+        `recurrence 规则无法产生日期（freq=${rec.freq}，已迭代 ${MAX_ITERATIONS} 次）——请检查该循环的日期/间隔参数`,
       );
     }
   };
   switch (rec.freq) {
     case "daily": {
-      let d = start;
-      while (d <= afterDay) {
-        tick();
-        d = d.plus({ days: interval });
-      }
+      // 直接跳算到 afterDay 附近，而不是从 start 逐日推进：start 早于约 5000 天时
+      // 逐日 while 会耗尽迭代预算（曾把「2011 年起的每日提醒」误报为规则无法产生日期，
+      // 而规则完全合法；任何 13.7 年以上的 daily 都会中招）。
+      // 步数下限为 0：start 在未来时绝不能把游标推到 start 之前（会越过起始边界）。
+      const gapDays = Math.floor(afterDay.diff(start, "days").days);
+      const skipped = Math.max(0, Math.floor(gapDays / interval));
+      let d = start.plus({ days: skipped * interval });
+      while (d <= afterDay) d = d.plus({ days: interval });
       yield d;
       for (;;) {
         tick();
@@ -143,7 +146,10 @@ function* iterateLunar(source: OccurrenceSource, afterDay: DateTime): Generator<
   const day = source.lunarDay ?? 0;
   if (month < 1 || month > 12 || day < 1 || day > 30) return;
   if (source.recurrence === null) return; // 农历事件必须循环（每年）
-  let lunarYear = Lunar.fromYmd(afterDay.year, afterDay.month, afterDay.day).getYear();
+  // 起点必须是「包含该公历日的农历年」，不能把公历年直接当农历年：
+  // 元旦到春节之间的公历日仍属上一农历年（如 2026-01-10 属农历 2025 年腊月），
+  // 直接用 2026 会跳过本农历年内尚未发生的日期，整段（如腊月十八）漏提醒。
+  let lunarYear = Solar.fromYmd(afterDay.year, afterDay.month, afterDay.day).getLunar().getYear();
   for (let i = 0; i < 200; i++, lunarYear++) {
     const d = lunarToSolar(lunarYear, month, day, source.leapPolicy, source.lunarClamp);
     if (d === null) continue;

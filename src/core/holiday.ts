@@ -137,10 +137,10 @@ export function validateYearPayload(payload: unknown): string[] {
   if (workdays.length > 12) {
     errors.push(`调休上班天数 ${workdays.length} 超过 12`);
   }
-  for (const wd of workdays) {
-    const weekday = DateTime.fromISO(wd.date, { zone: TZ }).weekday; // 6=周六 7=周日
-    if (weekday < 6) errors.push(`调休上班日 ${wd.date} 不是周末`);
-  }
+  // 不校验「调休上班日必须是周末」：上游真实数据存在非周末的 isOffDay:false 行
+  // （2020-02-03 周一，疫情顺延除夕假期后明确 2 月 3 日复工），整年拒收会让该年
+  // dayType 全部 unknown、workday/holiday 过滤的日程整年暂停且每天重试。
+  // 非周末的「上班日」行本身无害：dayType 对它返回 workday，与普通工作日同义。
   for (const festival of new Set(offDays.map((d) => d.name))) {
     const dates = offDays
       .filter((d) => d.name === festival)

@@ -78,11 +78,14 @@ describe("节假日数据校验", () => {
     assert.deepEqual(validateYearPayload(payload), []);
   });
 
-  it("调休上班日不是周末报错", () => {
+  it("调休上班日允许非周末（上游真实格式：2020-02-03 周一为疫情顺延后的复工日）", () => {
     const payload = payload2026();
     payload.days.push({ name: "调休", date: "2026-03-02", isOffDay: false }); // 周一
-    const errors = validateYearPayload(payload);
-    assert.ok(errors.some((e) => e.includes("2026-03-02")));
+    assert.deepEqual(
+      validateYearPayload(payload),
+      [],
+      "非周末的上班日不应让整年数据被拒收（否则该年日程整年暂停）",
+    );
   });
 
   it("放假天数超出合理范围报错", () => {

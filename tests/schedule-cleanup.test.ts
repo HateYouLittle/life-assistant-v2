@@ -128,6 +128,31 @@ describe("schedule occurrence 保留策略", () => {
     }
   });
 
+  it("损坏的 recurrence_json 不打挂清理：该日程保守豁免，其余照常清理", () => {
+    const env = makeTestEnv();
+    try {
+      const broken = addSchedule(env, { title: "损坏日程" });
+      const healthy = addSchedule(env, { title: "正常日程" });
+      env.db
+        .prepare("UPDATE schedules SET recurrence_json = ? WHERE id = ?")
+        .run('{"freq":"daily"', broken.id);
+      resetOccurrences(env, broken.id);
+      resetOccurrences(env, healthy.id);
+      insertOccurrence(env, broken.id, "old#0", 100, "notified");
+      insertOccurrence(env, healthy.id, "old#0", 100, "notified");
+
+      const preview = previewOccurrenceCleanup(env.db);
+      assert.equal(preview.protectedByCount, 1, "无法确认是否用 count 的损坏行保守豁免");
+      assert.equal(preview.deletable, 1, "正常日程的历史行仍应可清理");
+
+      assert.equal(runOccurrenceCleanup(env.db), 1);
+      assert.deepEqual(keysOf(env, broken.id), ["old#0"], "损坏行保守豁免，不再让清理整段失败");
+      assert.deepEqual(keysOf(env, healthy.id), []);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("preview 与实际删除一致，且预演零副作用", () => {
     const env = makeTestEnv();
     try {

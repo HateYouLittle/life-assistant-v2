@@ -3,6 +3,7 @@ import { describe, it, type TestContext } from "node:test";
 import { DateTime } from "luxon";
 import { TZ } from "../src/time.js";
 import {
+  catchupSweep,
   fireDue,
   formatElapsed,
   getSchedule,
@@ -306,6 +307,57 @@ describe("schedule escalation：阶梯按时触发", () => {
       assert.equal(reminders(env).length, 2);
       // 靠 occurrence 行状态（notified）保证，而不是只依赖 dedupeKey
       assert.equal(statusOf(env, id, `${EVENT}#0#esc:1`), "notified");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
+describe("schedule escalation：锚点不依赖 #0 行", () => {
+  function addWithOffsets(env: TestEnv, offsets: number[]): string {
+    const result = tool(env, {
+      action: "add",
+      title: "晚录入截止",
+      date: D,
+      time: "08:00",
+      remind_offsets: offsets,
+      escalation: [0, 60, 360],
+    }) as { content: { text: string }[]; isError?: boolean };
+    assert.notEqual(result.isError, true, result.content[0]?.text);
+    return (JSON.parse(result.content[0]?.text ?? "{}") as { 已创建: { id: string } }).已创建.id;
+  }
+
+  it("晚录入：#0 被 catchupSweep 取消后，阶梯仍从保留的偏移行启动", async (t) => {
+    // 冻结在事件之后（晚录入：两条偏移都已过期，sweep 只保留 due 更晚的 #1）
+    t.mock.timers.enable({ apis: ["Date"], now: Date.parse(`${D}T10:00:00+08:00`) });
+    const env = makeTestEnv();
+    try {
+      const id = addWithOffsets(env, [-30, 0]);
+      catchupSweep(env.db);
+      assert.equal(statusOf(env, id, `${EVENT}#0`), "cancelled", "构造前提：#0 已被收敛");
+      assert.equal(statusOf(env, id, `${EVENT}#1`), "pending");
+
+      await fire(env, `${D}T10:00+08:00`); // #1（正点）触发 → 派生 #esc:1（09:00，已过期）
+      await fire(env, `${D}T10:00+08:00`); // #esc:1 触发 → 派生 #esc:2
+      assert.equal(statusOf(env, id, `${EVENT}#1#esc:1`), "notified");
+      assert.equal(dueOf(env, id, `${EVENT}#1#esc:2`), iso(`${D}T14:00+08:00`));
+      assert.ok(
+        reminders(env).some((p) => JSON.stringify(p.input.blocks).includes("仍未完成")),
+        "晚录入也必须进入「截止已过、仍未完成」的加压提醒",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("同一事件多个偏移行先后触发：只派生一条升级链（不重复）", async (t) => {
+    freeze(t, D);
+    const env = makeTestEnv();
+    try {
+      const id = addWithOffsets(env, [-30, 0]);
+      await fire(env, `${D}T08:01+08:00`); // 两条都已到点，先后触发
+      const escKeys = allKeys(env, id).filter((k) => k.includes("#esc:"));
+      assert.deepEqual(escKeys, [`${EVENT}#0#esc:1`], "同一事件只允许一条升级链");
     } finally {
       cleanupTestEnv(env);
     }
@@ -712,6 +764,48 @@ describe("schedule escalation：与 resend_minutes 互斥", () => {
       await fire(env, `${D}T09:00+08:00`);
       assert.equal(reminders(env).length, 2);
       assert.ok(!allKeys(env, id).some((k) => k.endsWith(":resend")));
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("先有 :resend、后补 escalation：旧强提醒行作废，同一事件不再收到两条「未完成」", async (t) => {
+    freeze(t, "2026-09-27");
+    const env = makeTestEnv();
+    try {
+      const added = tool(env, {
+        action: "add",
+        title: "先重发后加阶梯",
+        date: D,
+        time: "08:00",
+        remind_offsets: [-30, 0],
+        resend_minutes: 30,
+      }) as { content: { text: string }[] };
+      const id = (JSON.parse(added.content[0]?.text ?? "{}") as { 已创建: { id: string } }).已创建
+        .id;
+
+      await fire(env, `${D}T07:30+08:00`); // #0（提前 30 分）触发 → 派生 :resend（08:30）
+      assert.ok(allKeys(env, id).some((k) => k.endsWith(":resend")));
+
+      const updated = tool(env, { action: "update", id, escalation: [0, 60] }) as {
+        content: { text: string }[];
+        isError?: boolean;
+      };
+      assert.notEqual(updated.isError, true, updated.content[0]?.text);
+
+      await fire(env, `${D}T08:00+08:00`); // #1（正点）触发 → 派生 #1#esc:1（09:00）
+      await fire(env, `${D}T08:30+08:00`); // 旧 :resend 的时点：应作废而不是再推强提醒
+      assert.equal(occRow(env, id, `${EVENT}#0:resend`)?.status, "cancelled");
+      assert.ok(
+        !reminders(env).some((p) => JSON.stringify(p.input.blocks).includes("强提醒")),
+        "补上 escalation 后，遗留 :resend 不得再发强提醒",
+      );
+
+      await fire(env, `${D}T09:00+08:00`); // #esc:1 触发
+      assert.ok(
+        reminders(env).some((p) => JSON.stringify(p.input.blocks).includes("仍未完成")),
+        "应走升级链的「仍未完成」提醒",
+      );
     } finally {
       cleanupTestEnv(env);
     }

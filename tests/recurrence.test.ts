@@ -48,6 +48,19 @@ describe("recurrence：公历", () => {
     assert.equal(ymd(nextDate(src, at("2026-01-03T10:00"), HORIZON)), "2026-01-05");
   });
 
+  it("daily 起始日远在过去也能推进（不再耗尽迭代预算）", () => {
+    // 回归：daily 曾从 start 逐日 while，start 早于约 5000 天时误报「规则无法产生日期」，
+    // 任何 13.7 年以上的每日日程都会中招（创建报错但已落库）。
+    const src = solarSource("2011-09-27", { freq: "daily", interval: 1 });
+    assert.equal(ymd(nextDate(src, at("2026-09-28T10:00"), HORIZON)), "2026-09-29");
+
+    const every3 = solarSource("2011-09-27", { freq: "daily", interval: 3 });
+    const afterDay = at("2026-09-28T10:00");
+    let expected = at("2011-09-27");
+    while (expected <= afterDay) expected = expected.plus({ days: 3 });
+    assert.equal(ymd(nextDate(every3, afterDay, HORIZON)), ymd(expected));
+  });
+
   it("weekly 指定星期（周一/周五）", () => {
     const src = solarSource("2026-01-05", { freq: "weekly", interval: 1, byweekday: [0, 4] });
     assert.equal(ymd(nextDate(src, at("2026-01-05T12:00"), HORIZON)), "2026-01-09");
@@ -146,6 +159,15 @@ describe("recurrence：农历", () => {
       "regular 应落在平六月",
     );
     assert.notEqual(ymd(follow), ymd(regular));
+  });
+
+  it("元旦至春节之间：农历年必须按公历日所属农历年取，不能漏掉整段", () => {
+    // 2026 年春节为 2026-02-17，2026-01-10 仍属农历 2025 年（腊月）。
+    // 回归：iterateLunar 曾用 Lunar.fromYmd(公历年, ...).getYear() 取到 2026，
+    // 于是跳过农历 2025 年腊月十八（2026-02-05），直接报出 2027-01-25。
+    const expected = Lunar.fromYmd(2025, 12, 18).getSolar().toYmd();
+    assert.equal(expected, "2026-02-05", "测试假设：农历 2025 腊月十八 = 2026-02-05");
+    assert.equal(ymd(nextDate(lunarSource(12, 18), at("2026-01-10"), HORIZON)), expected);
   });
 
   it("腊月三十：正常 30 天年份直接命中，缺失年份按 clamp/skip", () => {

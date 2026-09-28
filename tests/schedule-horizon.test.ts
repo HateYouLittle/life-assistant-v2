@@ -108,6 +108,45 @@ describe("schedule 物化前瞻（NEAR_HORIZON_DAYS）", () => {
     }
   });
 
+  it("稀疏过滤日程的豁免：下一条节假日隔着 10 个以上候选也必须可见", () => {
+    const env = makeTestEnv();
+    try {
+      takeYearsNeedingBackfill();
+      // 对齐到 80 天后的周二（间隔 ≥11 个候选），只把它标成节假日
+      let target = now().plus({ days: 80 }).startOf("day");
+      while (target.weekday !== 2) target = target.plus({ days: 1 });
+      const targetISO = target.toISODate() as string;
+      setYearStatus(env, target.year, "ready");
+      setYearStatus(env, now().year, "ready");
+      env.db
+        .prepare(
+          "INSERT INTO cn_holiday_days (date, year, day_type, name, source, updated_at) VALUES (?, ?, 'holiday', '测试节', 'test', ?)",
+        )
+        .run(targetISO, target.year, new Date().toISOString());
+
+      const created = createSchedule(env.db, "default", {
+        title: "节假日周会",
+        kind: "todo",
+        calendar: "solar",
+        startDate: now().toISODate() as string,
+        time: "09:00",
+        allDay: false,
+        recurrence: { freq: "weekly", interval: 1, byweekday: [1] }, // 1 = 周二
+        remindOffsets: [0],
+        resendMinutes: 0,
+        workdayFilter: "holiday",
+      });
+
+      assert.deepEqual(
+        occurrenceKeys(env, created.id),
+        [`${targetISO}T09:00#0`],
+        "稀疏过滤日程必须扫过中间候选，物化出唯一可见的下一条（首条豁免契约）",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("未就绪年份：不物化该日期、登记待补齐、tick 不抛错，且失败后 6h 冷却内不重试", async () => {
     const env = makeTestEnv();
     try {

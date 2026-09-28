@@ -342,16 +342,6 @@ export function listSchedules(
     .all(profileId, status, limit) as unknown as ScheduleRow[];
 }
 
-/** 已物化的「事件」数（同一事件的多个提醒偏移共用 event_at，只算一次） */
-function countEvents(db: DatabaseSync, scheduleId: string): number {
-  const row = db
-    .prepare(
-      "SELECT COUNT(DISTINCT event_at) AS n FROM occurrences WHERE schedule_id = ? AND status != 'cancelled'",
-    )
-    .get(scheduleId) as { n: number };
-  return row.n;
-}
-
 /** 是否存在 pending 的 occurrence；不按时间过滤（过期的 pending 也算存在）。走 (schedule_id, status) 索引 */
 function hasPendingOccurrence(db: DatabaseSync, scheduleId: string): boolean {
   const row = db
@@ -367,12 +357,74 @@ function updateNextRunAt(db: DatabaseSync, scheduleId: string): void {
   ).run(scheduleId, scheduleId);
 }
 
+/** 单轮物化的候选扫描上限（正常路径；插入 10 个事件后下一轮继续，避免长任务卡 tick） */
+const MATERIALIZE_ITERATIONS = 10;
+/**
+ * 首条豁免（该日程当前没有任何 pending）时的扫描预算：可能是稀疏过滤日程
+ * （如「每周二 + 仅节假日」），下一个匹配日隔着几十个候选。预算仍被 FAR_HORIZON 截断。
+ */
+const EXEMPT_SCAN_ITERATIONS = 500;
+
+/**
+ * update 时是否需要回退重物化（rewind）。只有「最近一个事件处于进行中」才需要：
+ * - 全 pending：删除后游标自然回退，前向物化即可重建；
+ * - 全 notified / 已被 occurrence_key 完成：事件已结束，rewind 会按新排期重复补发，
+ *   甚至为 count 日程造出额外事件（本轮复核发现的回归）；
+ * - 既有 notified 又有 pending：删除会丢掉 pending 兄弟行，而游标停在 notified 行上，
+ *   只有 rewind 才能把该事件的提醒补回来（本轮修复的目标场景）。
+ */
+function latestEventNeedsRewind(db: DatabaseSync, scheduleId: string): boolean {
+  const last = db
+    .prepare(
+      "SELECT MAX(event_at) AS m FROM occurrences WHERE schedule_id = ? AND status != 'cancelled'",
+    )
+    .get(scheduleId) as { m: string | null };
+  if (last.m === null) return false;
+  const rows = db
+    .prepare(
+      "SELECT occurrence_key, status FROM occurrences WHERE schedule_id = ? AND event_at = ?",
+    )
+    .all(scheduleId, last.m) as { occurrence_key: string; status: string }[];
+  const hasNotified = rows.some((r) => r.status === "notified");
+  // 只统计「正常提醒行」（key 以 #数字 结尾）：update 的 DELETE 只删这些行，
+  // :resend / #esc:N 会被保留，不该触发回退重物化（否则全通知的事件会因派生行被补发）。
+  const hasPendingNormal = rows.some(
+    (r) => r.status === "pending" && /#\d+$/.test(r.occurrence_key),
+  );
+  return hasNotified && hasPendingNormal;
+}
+
+export interface MaterializeOptions {
+  /**
+   * true：从「最近一个事件」本身开始产出（而不是严格晚于它）。
+   * update 会删掉所有 pending 的正常提醒行并立即重物化；若不回退，最近事件里已提醒的
+   * 兄弟偏移（如 #0 已 notified、#1 仍 pending）不会重现，用户永久丢失该次提醒。
+   * INSERT OR IGNORE 保证回退不会重复既有行；调用方必须先经 latestEventNeedsRewind 判定。
+   */
+  rewind?: boolean;
+}
+
 /** 物化接下来一段时间的 occurrence（含提醒偏移）；节假日数据缺失时暂停在该日期之前 */
-export function materializeSchedule(db: DatabaseSync, row: ScheduleRow): void {
+export function materializeSchedule(
+  db: DatabaseSync,
+  row: ScheduleRow,
+  opts: MaterializeOptions = {},
+): void {
   if (row.status !== "active") return;
   const rec = parseRecurrence(row.recurrence_json);
-  let existing = countEvents(db, row.id);
-  if (rec?.count !== undefined && existing >= rec.count) {
+  // 已有事件按**本地日历日**去重：同一事件改 time 后 event_at 变化，但仍是同一天、
+  // 同一次发生，不能计成新事件（否则 count 会凭空多出一次）。
+  const existingDates = new Set(
+    (
+      db.prepare("SELECT DISTINCT event_at FROM occurrences WHERE schedule_id = ?").all(row.id) as {
+        event_at: string;
+      }[]
+    ).map((r) => instantToLocalDate(r.event_at)),
+  );
+  let existing = existingDates.size;
+  // 回退重物化（rewind）针对的是最近一个事件：改 time 时新 event_at 与原值不同，
+  // 但仍是同一个日历日，不会新增日历日数量；因此这里不能因「已有事件数达上限」提前返回。
+  if (rec?.count !== undefined && existing >= rec.count && opts.rewind !== true) {
     updateNextRunAt(db, row.id);
     return;
   }
@@ -387,6 +439,11 @@ export function materializeSchedule(db: DatabaseSync, row: ScheduleRow): void {
     last.m !== null
       ? DateTime.fromISO(last.m, { zone: TZ })
       : now().minus({ days: 1 }).startOf("day");
+  if (opts.rewind === true && last.m !== null) {
+    // 回退一天：nextDate 会把「最近一个事件」本身再次产出（若它在当前规则下成立），
+    // 既有行被 INSERT OR IGNORE 吸收，缺失的偏移行被补回。
+    after = DateTime.fromISO(last.m, { zone: TZ }).minus({ days: 1 });
+  }
   const horizon = now().plus({ days: FAR_HORIZON_DAYS });
   const nearHorizon = now().plus({ days: NEAR_HORIZON_DAYS });
 
@@ -394,11 +451,16 @@ export function materializeSchedule(db: DatabaseSync, row: ScheduleRow): void {
   // 保证「下一条」永远可见。资格取自入库状态（而非本轮是否插入过），
   // 一旦真正补上第一条即失效，不会每分钟重新生效导致远期 occurrence creep。
   let exemptFirst = !hasPendingOccurrence(db, row.id);
+  const budget = exemptFirst ? EXEMPT_SCAN_ITERATIONS : MATERIALIZE_ITERATIONS;
 
-  for (let i = 0; i < 10; i++) {
+  for (let i = 0; i < budget; i++) {
     const date = nextDate(source, after, horizon);
     if (date === null) break;
     const dateISO = date.toISODate() ?? "";
+    const eventAt = localToInstant(dateISO, row.time);
+    // count 已达上限时，rewind 只允许补齐既有日历日的事件（改 time 重建同一天）；
+    // 换 freq/相位/起始日会产出新日期，绝不能借 rewind 绕过上限（复核发现的回归）。
+    if (rec?.count !== undefined && existing >= rec.count && !existingDates.has(dateISO)) break;
     // 物化前瞻：候选日期一旦越过近端地平线就停止，游标不得再前进。
     // 该判定必须在 workday/holiday 过滤之前 —— 否则被过滤掉的候选（如周末）
     // 会绕过它不断推动游标，物化范围最终被 FAR_HORIZON 或被未覆盖年份截断。
@@ -430,7 +492,6 @@ export function materializeSchedule(db: DatabaseSync, row: ScheduleRow): void {
       }
     }
     const prefix = `${dateISO}T${row.time}`;
-    const eventAt = localToInstant(dateISO, row.time);
     const insert = db.prepare(
       `INSERT OR IGNORE INTO occurrences (schedule_id, occurrence_key, event_at, due_at, status)
        VALUES (?, ?, ?, ?, 'pending')`,
@@ -450,7 +511,11 @@ export function materializeSchedule(db: DatabaseSync, row: ScheduleRow): void {
       if (Number(result.changes) > 0) insertedEvent = true;
     });
     if (insertedEvent) {
-      existing += 1;
+      // 既有日历日补偏移行不算新事件（否则 count 日程会被补齐动作提前耗尽上限）
+      if (!existingDates.has(dateISO)) {
+        existingDates.add(dateISO);
+        existing += 1;
+      }
       exemptFirst = false;
     }
     after = date;
@@ -470,10 +535,14 @@ export function createSchedule(
   for (let attempt = 0; attempt < 3; attempt++) {
     const id = newShortId();
     try {
-      withTransaction(db, () => insertSchedule(db, profileId, input, id));
-      const created = getSchedule(db, profileId, id);
-      if (created === undefined) throw new Error("日程创建后读取失败");
-      materializeSchedule(db, created);
+      // 插入与首次物化同事务：物化失败（规则不可满足等）时整体回滚，
+      // 不留「报错但日程已入库」的半成品 —— 用户重试会造出第二条同名日程。
+      withTransaction(db, () => {
+        insertSchedule(db, profileId, input, id);
+        const created = getSchedule(db, profileId, id);
+        if (created === undefined) throw new Error("日程创建后读取失败");
+        materializeSchedule(db, created);
+      });
       return getSchedule(db, profileId, id) as ScheduleRow;
     } catch (e) {
       if (e instanceof Error && e.message.includes("UNIQUE")) {
@@ -529,6 +598,9 @@ export function updateSchedule(
   validateScheduleInput(merged);
   const ts = nowIso();
   withTransaction(db, () => {
+    // 必须在 DELETE 之前判定：删除 pending 行后「最近事件是否进行中」的信息就没了。
+    // 只有进行中的最近事件才允许回退重物化（否则全通知/已完成的事件会被重复补发）。
+    const rewind = latestEventNeedsRewind(db, id);
     db.prepare(
       `UPDATE schedules SET title = ?, note = ?, kind = ?, calendar = ?, start_date = ?, lunar_month = ?,
          lunar_day = ?, leap_policy = ?, lunar_clamp = ?, time = ?, all_day = ?, recurrence_json = ?,
@@ -562,9 +634,11 @@ export function updateSchedule(
       `DELETE FROM occurrences WHERE schedule_id = ? AND status = 'pending'
          AND occurrence_key NOT LIKE '%' || ? AND occurrence_key NOT LIKE '%' || ?`,
     ).run(id, RESEND_SUFFIX, `${ESCALATION_SUFFIX}%`);
+    // 更新与重物化同事务：物化失败整体回滚，不留「报错但改动已生效」；
+    // rewind 让最近一个事件缺失的偏移行（如已 notified 的 #0 之外那条）补回来。
+    const updated = getSchedule(db, profileId, id) as ScheduleRow;
+    materializeSchedule(db, updated, { rewind });
   });
-  const updated = getSchedule(db, profileId, id) as ScheduleRow;
-  materializeSchedule(db, updated);
   return getSchedule(db, profileId, id) as ScheduleRow;
 }
 
@@ -704,8 +778,11 @@ function cleanupCondition(protectedIds: string[], cutoff: string, prefix = ""): 
 }
 
 /**
- * 使用 recurrence.count 的日程：countEvents() 依赖历史行数执行「最多发生 N 次」，
- * 删除历史会让已达上限的循环重新产出事件，因此这类日程的 occurrence 一律豁免。
+ * 使用 recurrence.count 的日程：次数上限按**已物化的事件历史（本地日历日）**执行
+ * （见 materializeSchedule 的 existingDates，cancelled 也计入），删除历史会让已达上限的
+ * 循环重新产出事件，因此这类日程的 occurrence 一律豁免。
+ * 规则损坏时无法确认它是否用了 count —— 保守豁免（宁可少删，不可让上限复活）；
+ * 这也保证一条脏数据不会让清理 job 与 db:cleanup:preview 整段失败。
  */
 function countProtectedScheduleIds(db: DatabaseSync): string[] {
   const rows = db.prepare("SELECT id, recurrence_json FROM schedules").all() as {
@@ -713,7 +790,13 @@ function countProtectedScheduleIds(db: DatabaseSync): string[] {
     recurrence_json: string | null;
   }[];
   return rows
-    .filter((row) => parseRecurrence(row.recurrence_json)?.count !== undefined)
+    .filter((row) => {
+      try {
+        return parseRecurrence(row.recurrence_json)?.count !== undefined;
+      } catch {
+        return true;
+      }
+    })
     .map((row) => row.id);
 }
 
@@ -800,10 +883,23 @@ export function reminderBlocks(
         : `${instantToLocalDate(eventAt)} ${row.time}`,
     ],
     ["类型", KIND_LABEL[row.kind]],
-    ["重复", describeRecurrence(sourceOf(row), row.start_date)],
+    ["重复", repeatTextOf(row)],
   ];
   if (row.note !== null && row.note !== "") rows.push(["备注", row.note]);
   return { table: { columns: ["项目", "内容"], rows }, notes: note === null ? undefined : [note] };
+}
+
+/**
+ * 提醒里的循环描述：规则损坏时退化为占位文本。
+ * 若在这里抛出，fireDue 的整批处理会被带走（一条脏数据冻结所有日程的提醒），
+ * 而提醒本身仍然有效（时间/类型/备注都在），损失一次提醒毫无必要。
+ */
+function repeatTextOf(row: ScheduleRow): string {
+  try {
+    return describeRecurrence(sourceOf(row), row.start_date);
+  } catch {
+    return "（循环规则损坏，需修复）";
+  }
 }
 
 interface DueRow {
@@ -811,6 +907,16 @@ interface DueRow {
   occurrence_key: string;
   event_at: string;
   due_at: string;
+}
+
+/**
+ * 正常提醒行的 key 形如 `<date>T<HH:MM>#<序号>`；校验其时刻是否与当前排期一致。
+ * 派生行的父行不再限定 #0（见 fireDue 的派生逻辑），但仍要挡住在改 time 之后残留的旧行：
+ * 旧 key 里的时刻与新排期对不上。
+ */
+function parentMatchesScheduleTime(key: string, time: string): boolean {
+  const matched = /T(\d{2}:\d{2})#\d+$/.exec(key);
+  return matched !== null && matched[1] === time;
 }
 
 /**
@@ -826,10 +932,16 @@ function resendDueOrNull(
   eventAt: string,
 ): string | null {
   if (schedule.resend_minutes <= 0) return null;
+  // 当前日程已设置 escalation：resend_minutes 被忽略，遗留的 :resend 行一并作废。
+  // 否则同一事件会同时收到「强提醒」与「升级链」两条「仍未完成」提醒
+  // （先建 resend、后补 escalation 即可触发，复核发现的回归）。
+  // 作废是终局的：之后即使再清除 escalation，本次发生的强提醒也不会复活
+  // （主键已被 cancelled 行占用）——换取同一事件绝不双通知，属已知取舍。
+  if (parseEscalation(schedule.escalation_json) !== null) return null;
   const eventKey = occurrenceKey.slice(0, -RESEND_SUFFIX.length);
-  // key 里带着当时的提醒时刻（`<date>T<time>#0`）：改了 time 之后旧 key 不再出现在日程上，
-  // 这条强提醒已无对应事件，必须作废，否则会用旧时间点推一条「强提醒」。
-  if (!eventKey.endsWith(`${schedule.time}#0`)) return null;
+  // key 里带着当时的提醒时刻：改了 time 之后旧 key 与新排期对不上，必须作废，
+  // 否则会用旧时间点推一条「强提醒」。
+  if (!parentMatchesScheduleTime(eventKey, schedule.time)) return null;
   // 父行已完成（done）时强提醒一并失效：complete 会收敛派生行，这里是第二道防线，
   // 挡住绕过 completeSchedule 直接改库把父行置 done 的路径。pending/notified 均视为在途。
   const parent = db
@@ -861,8 +973,9 @@ function escalationDueOrNull(
   if (step < 1 || step >= escalation.length) return null;
   const suffix = `${ESCALATION_SUFFIX}${step}`;
   const parentKey = occurrenceKey.slice(0, occurrenceKey.length - suffix.length);
-  // key 里带着当时的提醒时刻（`<date>T<time>#0`）：改了 time 之后旧 key 不再出现在日程上，必须作废
-  if (!parentKey.endsWith(`${schedule.time}#0`)) return null;
+  // key 里带着当时的提醒时刻：改了 time 之后旧 key 与新排期对不上，必须作废
+  // （父行不限定 #0，见 fireDue 的派生逻辑）。
+  if (!parentMatchesScheduleTime(parentKey, schedule.time)) return null;
   // 与 resendDueOrNull 同构：父行 done（已完成）时升级行一并失效，第二道防线
   const parent = db
     .prepare(
@@ -903,6 +1016,23 @@ function cancelOccurrence(db: DatabaseSync, occ: DueRow): void {
   ).run(occ.schedule_id, occ.occurrence_key);
 }
 
+/**
+ * 该事件前缀下是否已存在某类派生行（`:resend` 或 `#esc:N`）。
+ * 用 JS 前缀匹配而不是 LIKE：数据损坏时 key 里可能混入 %/_（LIKE 通配符）误伤。
+ */
+function hasDerivedRow(
+  db: DatabaseSync,
+  scheduleId: string,
+  eventPrefix: string,
+  suffix: string,
+): boolean {
+  const head = `${eventPrefix}#`;
+  const rows = db
+    .prepare("SELECT occurrence_key FROM occurrences WHERE schedule_id = ?")
+    .all(scheduleId) as { occurrence_key: string }[];
+  return rows.some((r) => r.occurrence_key.startsWith(head) && r.occurrence_key.includes(suffix));
+}
+
 /** 到点触发提醒；返回发布的条数 */
 export async function fireDue(db: DatabaseSync, services: Services, at: DateTime): Promise<number> {
   const cutoff = at.toUTC().toISO() ?? nowIso();
@@ -916,86 +1046,110 @@ export async function fireDue(db: DatabaseSync, services: Services, at: DateTime
     .all(cutoff) as unknown as DueRow[];
   let published = 0;
   for (const occ of due) {
-    const schedule = db.prepare("SELECT * FROM schedules WHERE id = ?").get(occ.schedule_id) as
-      | ScheduleRow
-      | undefined;
-    if (schedule === undefined) continue;
-    const isResend = occ.occurrence_key.endsWith(RESEND_SUFFIX);
-    const isEscalation = !isResend && escalationStepOf(occ.occurrence_key) !== null;
-    let dueAt = occ.due_at;
-    if (isResend) {
-      const expected = resendDueOrNull(db, schedule, occ.occurrence_key, occ.event_at);
-      if (expected === null) {
-        cancelOccurrence(db, occ);
-        continue;
-      }
-      if (expected !== occ.due_at) {
-        db.prepare(
-          "UPDATE occurrences SET due_at = ? WHERE schedule_id = ? AND occurrence_key = ?",
-        ).run(expected, occ.schedule_id, occ.occurrence_key);
-        if (expected > cutoff) continue; // 校正后尚未到点，本轮不推
-        dueAt = expected;
-      }
-    } else if (isEscalation) {
-      const expected = escalationDueOrNull(db, schedule, occ.occurrence_key, occ.event_at);
-      if (expected === null) {
-        cancelOccurrence(db, occ);
-        continue;
-      }
-      if (expected !== occ.due_at) {
-        db.prepare(
-          "UPDATE occurrences SET due_at = ? WHERE schedule_id = ? AND occurrence_key = ?",
-        ).run(expected, occ.schedule_id, occ.occurrence_key);
-        if (expected > cutoff) continue; // 校正后尚未到点，本轮不推
-        dueAt = expected;
-      }
-    }
-    const lateMinutes = at.diff(DateTime.fromISO(dueAt), "minutes").minutes;
-    const note = isEscalation
-      ? `（截止已过 ${formatElapsed(occ.event_at, at)}，仍未完成）`
-      : isResend
-        ? "（强提醒：以上事项仍未完成）"
-        : lateMinutes > CATCHUP_GRACE_MINUTES
-          ? `（补发：该提醒已错过约 ${Math.round(lateMinutes)} 分钟）`
-          : null;
-    await services.publishProfile(schedule.profile_id, {
-      kind: "schedule.reminder",
-      title: schedule.title,
-      blocks: reminderBlocks(schedule, occ.event_at, note),
-      dedupeKey: `sched:${schedule.id}:${occ.occurrence_key}`,
-    });
-    published += 1;
-    db.prepare(
-      "UPDATE occurrences SET status = 'notified' WHERE schedule_id = ? AND occurrence_key = ?",
-    ).run(occ.schedule_id, occ.occurrence_key);
-    const escalation = parseEscalation(schedule.escalation_json);
-    if (isEscalation) {
-      const step = escalationStepOf(occ.occurrence_key);
-      if (escalation !== null && step !== null && step + 1 < escalation.length) {
-        const suffix = `${ESCALATION_SUFFIX}${step}`;
-        const parentKey = occ.occurrence_key.slice(0, occ.occurrence_key.length - suffix.length);
-        insertEscalation(db, schedule.id, parentKey, occ.event_at, step + 1, escalation);
-      }
-    } else if (!isResend && schedule.kind === "todo" && occ.occurrence_key.endsWith("#0")) {
-      if (escalation !== null) {
-        // 设置了阶梯：第 0 步（截止时刻）之后派生出 #esc:1；resend_minutes 被忽略
-        // （要么按阶梯加压，要么只重发一次，同一事件不该收到两条「仍未完成」）
-        if (escalation.length > 1) {
-          insertEscalation(db, schedule.id, occ.occurrence_key, occ.event_at, 1, escalation);
+    try {
+      const schedule = db.prepare("SELECT * FROM schedules WHERE id = ?").get(occ.schedule_id) as
+        | ScheduleRow
+        | undefined;
+      if (schedule === undefined) continue;
+      const isResend = occ.occurrence_key.endsWith(RESEND_SUFFIX);
+      const isEscalation = !isResend && escalationStepOf(occ.occurrence_key) !== null;
+      let dueAt = occ.due_at;
+      if (isResend) {
+        const expected = resendDueOrNull(db, schedule, occ.occurrence_key, occ.event_at);
+        if (expected === null) {
+          cancelOccurrence(db, occ);
+          continue;
         }
-      } else if (schedule.resend_minutes > 0) {
-        // 「到点后 N 分钟重发」以事件时刻为基准：用 due_at 会被 offsets[0] 的提前量带偏
-        const resendDue = DateTime.fromISO(occ.event_at).plus({ minutes: schedule.resend_minutes });
-        db.prepare(
-          `INSERT OR IGNORE INTO occurrences (schedule_id, occurrence_key, event_at, due_at, status)
-           VALUES (?, ?, ?, ?, 'pending')`,
-        ).run(
-          schedule.id,
-          `${occ.occurrence_key}${RESEND_SUFFIX}`,
-          occ.event_at,
-          resendDue.toUTC().toISO() ?? occ.due_at,
-        );
+        if (expected !== occ.due_at) {
+          db.prepare(
+            "UPDATE occurrences SET due_at = ? WHERE schedule_id = ? AND occurrence_key = ?",
+          ).run(expected, occ.schedule_id, occ.occurrence_key);
+          if (expected > cutoff) continue; // 校正后尚未到点，本轮不推
+          dueAt = expected;
+        }
+      } else if (isEscalation) {
+        const expected = escalationDueOrNull(db, schedule, occ.occurrence_key, occ.event_at);
+        if (expected === null) {
+          cancelOccurrence(db, occ);
+          continue;
+        }
+        if (expected !== occ.due_at) {
+          db.prepare(
+            "UPDATE occurrences SET due_at = ? WHERE schedule_id = ? AND occurrence_key = ?",
+          ).run(expected, occ.schedule_id, occ.occurrence_key);
+          if (expected > cutoff) continue; // 校正后尚未到点，本轮不推
+          dueAt = expected;
+        }
       }
+      const lateMinutes = at.diff(DateTime.fromISO(dueAt), "minutes").minutes;
+      const note = isEscalation
+        ? `（截止已过 ${formatElapsed(occ.event_at, at)}，仍未完成）`
+        : isResend
+          ? "（强提醒：以上事项仍未完成）"
+          : lateMinutes > CATCHUP_GRACE_MINUTES
+            ? `（补发：该提醒已错过约 ${Math.round(lateMinutes)} 分钟）`
+            : null;
+      await services.publishProfile(schedule.profile_id, {
+        kind: "schedule.reminder",
+        title: schedule.title,
+        blocks: reminderBlocks(schedule, occ.event_at, note),
+        dedupeKey: `sched:${schedule.id}:${occ.occurrence_key}`,
+      });
+      published += 1;
+      db.prepare(
+        "UPDATE occurrences SET status = 'notified' WHERE schedule_id = ? AND occurrence_key = ?",
+      ).run(occ.schedule_id, occ.occurrence_key);
+      const escalation = parseEscalation(schedule.escalation_json);
+      if (isEscalation) {
+        const step = escalationStepOf(occ.occurrence_key);
+        if (escalation !== null && step !== null && step + 1 < escalation.length) {
+          const suffix = `${ESCALATION_SUFFIX}${step}`;
+          const parentKey = occ.occurrence_key.slice(0, occ.occurrence_key.length - suffix.length);
+          insertEscalation(db, schedule.id, parentKey, occ.event_at, step + 1, escalation);
+        }
+      } else if (!isResend && schedule.kind === "todo") {
+        // 派生「未完成加压」行：升级阶梯下一步 / 到点重发。
+        // 锚点从固定的 #0 放宽为「该事件的任意正常提醒行」：晚录入或停机跨过事件时刻时，
+        // catchupSweep 会取消 #0、只保留更晚的偏移行，死守 #0 会让阶梯/重发永不启动
+        // （README 承诺「到达截止时刻后按阶梯依次重发……直到 complete 才停」）。
+        // 同一事件只允许一条链条：hasDerivedRow 去重，避免 #1 再派生一份。
+        const eventPrefix = eventPrefixOf(occ.occurrence_key);
+        if (eventPrefix !== null) {
+          if (escalation !== null) {
+            // 设置了阶梯：派生出 #esc:1；resend_minutes 被忽略
+            // （要么按阶梯加压，要么只重发一次，同一事件不该收到两条「仍未完成」）
+            if (
+              escalation.length > 1 &&
+              !hasDerivedRow(db, schedule.id, eventPrefix, ESCALATION_SUFFIX)
+            ) {
+              insertEscalation(db, schedule.id, occ.occurrence_key, occ.event_at, 1, escalation);
+            }
+          } else if (
+            schedule.resend_minutes > 0 &&
+            !hasDerivedRow(db, schedule.id, eventPrefix, RESEND_SUFFIX)
+          ) {
+            // 「到点后 N 分钟重发」以事件时刻为基准：用 due_at 会被偏移的提前量带偏
+            const resendDue = DateTime.fromISO(occ.event_at).plus({
+              minutes: schedule.resend_minutes,
+            });
+            db.prepare(
+              `INSERT OR IGNORE INTO occurrences (schedule_id, occurrence_key, event_at, due_at, status)
+               VALUES (?, ?, ?, ?, 'pending')`,
+            ).run(
+              schedule.id,
+              `${occ.occurrence_key}${RESEND_SUFFIX}`,
+              occ.event_at,
+              resendDue.toUTC().toISO() ?? occ.due_at,
+            );
+          }
+        }
+      }
+    } catch (e) {
+      // 逐行隔离：一条脏数据/一次意外失败只影响该行（occurrence 保持 pending，下一轮重试），
+      // 不能让整个 tick 停摆 —— 否则所有日程的提醒与物化都会一起冻结。
+      logger.warn(
+        `日程提醒处理失败（该行保留 pending，下轮重试）: ${occ.schedule_id}/${occ.occurrence_key}: ${errorMessage(e)}`,
+      );
     }
   }
   return published;

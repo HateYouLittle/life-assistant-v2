@@ -34,13 +34,14 @@ function occurrences(env: TestEnv, id: string): OccurrenceRow[] {
     .all(id) as unknown as OccurrenceRow[];
 }
 
-/** 与实现一致的事件计数口径：同一 event_at 的多个偏移只算一次，cancelled 不计 */
+/**
+ * 与实现一致的事件计数口径：同一 event_at 的多个偏移只算一次。
+ * 实现（materializeSchedule 的 existingEvents）把 cancelled 也计入次数上限，这里保持一致。
+ */
 function eventCount(env: TestEnv, id: string): number {
   return (
     env.db
-      .prepare(
-        "SELECT COUNT(DISTINCT event_at) AS n FROM occurrences WHERE schedule_id = ? AND status != 'cancelled'",
-      )
+      .prepare("SELECT COUNT(DISTINCT event_at) AS n FROM occurrences WHERE schedule_id = ?")
       .get(id) as { n: number }
   ).n;
 }
