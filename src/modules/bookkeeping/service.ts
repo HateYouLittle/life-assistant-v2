@@ -386,11 +386,15 @@ export function budgetAlertsForEntry(
       budget.category === ""
         ? { total: item, categories: [] }
         : { total: null, categories: [{ category: budget.category, ...item }] };
+    // dedupeKey 的范围编码：总额用空串、分类用原分类名（setBudget 把空分类归一成总额，
+    // 因此二者不歧义）。刻意不改分类的编码：既有分类提醒的键保持连续、升级后不会重推；
+    // 总额键从旧编码的 `-` 变为空串，升级当月同一总额阈值最多多推一次。
+    const scopeKey = budget.category === "" ? "" : budget.category;
     alerts.push({
       kind: "bookkeeping.budget",
       title: `${crossed === 80 ? "预算提醒" : "预算超支"} · ${ledger.name}`,
       blocks: budgetAlertBlocks(status),
-      dedupeKey: `budget:${ledger.id}:${budget.category === "" ? "-" : budget.category}:${ym}:${crossed}`,
+      dedupeKey: `budget:${ledger.id}:${scopeKey}:${ym}:${crossed}`,
     });
   }
   return alerts;

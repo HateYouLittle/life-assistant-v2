@@ -67,6 +67,11 @@ export function setPushRoute(
   } catch {
     throw new Error(`推送 URL 不合法: ${input.url}`);
   }
+  // 只允许 http/https：ftp/file 等协议主机名也能过回环检查，但 fetch 对它们一律失败，
+  // 每次都会走满传输重试再进 fallback（用户看到「已配置」却永远收不到推送）。
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(`推送 URL 仅支持 http/https: ${input.url}`);
+  }
   const hostname = parsed.hostname.replace(/^\[/, "").replace(/\]$/, "");
   if (!LOOPBACK_HOSTS.has(hostname.toLowerCase())) {
     throw new Error(`推送 URL 仅接受 127.0.0.1 / localhost / [::1] 主机名，收到: ${hostname}`);
@@ -438,10 +443,12 @@ async function deliverOne(
       markSent(db, row);
       return;
     }
-    // 4xx（408/429 除外）是确定性拒绝：重试改不了结果，只会在阶梯上耗到 1 小时并
-    // 把「已确认失败」计数刷高。与 QWeather 客户端的「4xx 一律不重试」保持同一口径。
+    // 确定性拒绝不重试：4xx（408/429 除外）与 3xx 重定向改不了结果，只会在阶梯上耗到
+    // 1 小时。3xx 尤其如此：redirect: "manual" 下投递请求根本没有被 webhook 处理，
+    // 重试多少次都是同一个重定向。与 QWeather 客户端的「4xx 不重试」保持同一口径。
     const status = response.status;
-    if (status >= 400 && status < 500 && status !== 408 && status !== 429) {
+    const retryable = status === 408 || status === 429 || (status >= 500 && status <= 599);
+    if (!retryable) {
       markTerminalFallback(db, row, `HTTP ${status}`);
       return;
     }

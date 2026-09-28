@@ -662,7 +662,13 @@ function alertLevelOf(color: unknown, severity: unknown): string {
   const fromObject =
     typeof color === "object" && color !== null ? (color as { code?: unknown }).code : undefined;
   const raw = String(fromObject ?? code ?? "").trim();
-  if (raw !== "") return ALERT_LEVEL_NAMES[raw.toLowerCase()] ?? raw;
+  if (raw !== "") {
+    const key = raw.toLowerCase();
+    // 必须用 Object.hasOwn：ALERT_LEVEL_NAMES 是普通字面量对象，color.code 若为
+    // "constructor"/"__proto__" 会命中 Object.prototype（函数），?? 不回退，
+    // 级别变成非字符串 → 后续 level.trim() 抛错并让整批预警丢失、简报正文被污染。
+    return Object.hasOwn(ALERT_LEVEL_NAMES, key) ? (ALERT_LEVEL_NAMES[key] as string) : raw;
+  }
   const sev = String(severity ?? "").trim();
   return sev === "unknown" ? "" : sev;
 }

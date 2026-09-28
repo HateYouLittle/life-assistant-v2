@@ -189,6 +189,28 @@ describe("看板页面脚本（vm 桩 + 真实 /api）", () => {
     }
   });
 
+  it("节假日抓取失败：状态页同时显示年份与原因（README 承诺「年份与原因」）", async () => {
+    const env = makeTestEnv();
+    try {
+      env.db
+        .prepare(
+          `INSERT INTO cn_holiday_years (year, status, source, fetched_at, last_attempt_at, last_error)
+           VALUES (2027, 'failed', '', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', 'HTTP 404: not found')`,
+        )
+        .run();
+      const run = runPageScript(env, "");
+      const rendered = await waitFor(() =>
+        (run.elements.get("ops")?.innerHTML ?? "").includes("节假日抓取失败"),
+      );
+      assert.ok(rendered, "失败年份应出现在 ops 行");
+      const html = run.elements.get("ops")?.innerHTML ?? "";
+      assert.match(html, /2027 年/, "显示年份");
+      assert.match(html, /HTTP 404: not found/, "同时显示可操作的原因");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("未配 token：零配置直接渲染（本地默认路径不能被改坏）", async () => {
     const env = makeTestEnv();
     try {

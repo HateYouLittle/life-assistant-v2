@@ -535,12 +535,45 @@ describe("outbox 投递", () => {
     }
   });
 
+  it("投递遇 3xx：重定向是确定性失败，直接终结为 fallback", async () => {
+    const env = makeTestEnv({ PROFILE_ROUTE_SECRETS_JSON: JSON.stringify({ default: SECRET }) });
+    try {
+      await withHookServer(
+        (_req, res) => {
+          res.writeHead(302, { Location: "/elsewhere" });
+          res.end();
+        },
+        async (url) => {
+          setPushRoute(env.db, "default", { url });
+          const pub = publishProfile(env.db, env.config, "default", {
+            kind: "k",
+            title: "t",
+            blocks: {},
+          });
+          forceDue(env.db);
+          await drainDue(env.db, env.config);
+          const row = deliveryRows(env.db).find((r) => r.notification_id === pub.id);
+          assert.equal(row?.status, "fallback", "3xx 未被处理，重试只会在阶梯上白耗一小时");
+          assert.equal(row?.attempts, 1, "不该重试");
+          assert.equal(row?.last_error, "HTTP 302");
+        },
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("setPushRoute 只接受回环 URL", () => {
     const env = makeTestEnv();
     try {
       assert.throws(
         () => setPushRoute(env.db, "default", { url: "http://example.com/hook" }),
         /主机名/,
+      );
+      // 非 http(s) 协议主机名也能过回环检查，但 fetch 必然失败：必须在入口拒绝
+      assert.throws(
+        () => setPushRoute(env.db, "default", { url: "ftp://127.0.0.1/hook" }),
+        /http\/https/,
       );
       const route = setPushRoute(env.db, "default", { url: "http://localhost:12345/hook" });
       assert.equal(route.platform, null);

@@ -358,7 +358,9 @@ const SCRIPT = `
         ? row('今日天气请求', s.qweather_usage.requests + ' 次 <span class="muted">（' + esc(s.qweather_usage.day) + '，含重试）</span>')
         : '') +
       (s.holidays.failed.length
-        ? row('节假日抓取失败', '<span class="bad">' + s.holidays.failed.map(function (f) { return f.year + ' 年'; }).join('、') + '</span>')
+        ? row('节假日抓取失败', '<span class="bad">' + s.holidays.failed.map(function (f) {
+            return f.year + ' 年（' + esc(String(f.error || '未知原因').slice(0, 80)) + '）';
+          }).join('、') + '</span>')
         : '');
   }
   function shortWhen(stamp) {

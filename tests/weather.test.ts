@@ -321,7 +321,7 @@ describe("weather：v1 预警字段映射", () => {
     }
   });
 
-  it("英文色名转为中文，未知取值原样保留", async () => {
+  it("英文色名转为中文，未知取值原样保留（含 constructor 这类原型链键）", async () => {
     const env = makeTestEnv(ENV);
     try {
       await withMockFetch(
@@ -333,6 +333,12 @@ describe("weather：v1 预警字段映射", () => {
               alerts: [
                 { id: "1", eventType: { name: "高温" }, color: { code: "yellow" }, headline: "h1" },
                 { id: "2", eventType: { name: "暴雨" }, color: { code: "紫色" }, headline: "h2" },
+                {
+                  id: "3",
+                  eventType: { name: "雷电" },
+                  color: { code: "constructor" },
+                  headline: "h3",
+                },
               ],
             };
           }
@@ -345,6 +351,8 @@ describe("weather：v1 预警字段映射", () => {
           };
           assert.equal(payload.预警.rows[0]?.[0], "黄色");
           assert.equal(payload.预警.rows[1]?.[0], "紫色");
+          // 回归：裸索引会命中 Object.prototype.constructor（函数），级别经 JSON 输出成 null
+          assert.equal(payload.预警.rows[2]?.[0], "constructor", "原型链键必须按未知值原样保留");
         },
       );
     } finally {

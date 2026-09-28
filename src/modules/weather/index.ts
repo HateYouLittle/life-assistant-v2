@@ -276,7 +276,11 @@ const UNKNOWN_LEVEL_RANK = 5;
 function levelRank(level: string): number {
   const key = level.trim().toLowerCase();
   if (key === "") return UNKNOWN_LEVEL_RANK;
-  return ALERT_LEVEL_RANK[key] ?? UNKNOWN_LEVEL_RANK;
+  // 同 alertLevelOf：不能用裸索引，`constructor` 会取到 Object 构造函数（非 number），
+  // 阈值比较恒为 false，会让级别过滤静默失效。
+  return Object.hasOwn(ALERT_LEVEL_RANK, key)
+    ? (ALERT_LEVEL_RANK[key] as number)
+    : UNKNOWN_LEVEL_RANK;
 }
 
 /** endsAt 已早于当前时刻的预警不再推送；无 endsAt 或解析失败时保留（不误杀）。 */
@@ -346,16 +350,21 @@ export async function runAlertWatch(): Promise<void> {
       }
       const list = await alerts(rt.db, host, key, loc);
       for (const alert of list) {
-        if (isExpiredAlert(alert, nowMs)) continue;
-        if (levelRank(alert.level) < minRank) continue;
-        await publishProfile(rt.db, rt.config, profileId, {
-          kind: "weather.alert",
-          title: alertTitle(alert),
-          blocks: alertBlocks(alert),
-          dedupeKey: alertDedupeKey(alert),
-          // 预警失效时刻即投递截止：静默时段结束后不再补投已失效的预警
-          expiresAt: alert.endsAt,
-        });
+        try {
+          if (isExpiredAlert(alert, nowMs)) continue;
+          if (levelRank(alert.level) < minRank) continue;
+          await publishProfile(rt.db, rt.config, profileId, {
+            kind: "weather.alert",
+            title: alertTitle(alert),
+            blocks: alertBlocks(alert),
+            dedupeKey: alertDedupeKey(alert),
+            // 预警失效时刻即投递截止：静默时段结束后不再补投已失效的预警
+            expiresAt: alert.endsAt,
+          });
+        } catch (e) {
+          // 逐条隔离：一条坏预警只损失它自己，不能让同批其余预警一起丢
+          logger.warn(`气象预警处理失败（跳过该条，不影响其余）: ${errorMessage(e)}`);
+        }
       }
     } catch (e) {
       logger.warn(`气象预警巡检失败 ${profileId}: ${errorMessage(e)}`);

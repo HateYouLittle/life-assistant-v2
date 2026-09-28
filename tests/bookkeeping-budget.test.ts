@@ -10,6 +10,7 @@ import {
   setBudget,
 } from "../src/modules/bookkeeping/service.js";
 import { bookkeepingExpenseTool, bookkeepingLedgerTool } from "../src/modules/bookkeeping/index.js";
+import { todayIso } from "../src/time.js";
 import { cleanupTestEnv, makeTestEnv, type Published, type TestEnv } from "./helpers.js";
 
 /** 固定到某个北京时间的 10:00 */
@@ -122,6 +123,39 @@ describe("bookkeeping 预算：服务层 CRUD 与对照", () => {
 });
 
 describe("bookkeeping 预算：阈值触达提醒", () => {
+  it("总额预算与名为 - 的分类预算各自提醒：dedupeKey 不撞车（总额用空串）", () => {
+    const env = makeTestEnv();
+    const tool = makeTools(env);
+    try {
+      const ledger = JSON.parse(text(tool.ledger({ action: "create", name: "撞键" }))) as {
+        已创建: { id: string };
+      };
+      const ledgerId = ledger.已创建.id;
+      tool.ledger({ action: "budget", ledger_id: ledgerId, amount: 10 }); // 总额 ¥10
+      tool.ledger({ action: "budget", ledger_id: ledgerId, amount: 5, category: "-" }); // 分类 "-" ¥5
+
+      tool.expense({ action: "add", ledger_id: ledgerId, amount: 3.5, category: "-" }); // 总额 35%/分类 70%
+      tool.expense({ action: "add", ledger_id: ledgerId, amount: 3.5, category: "餐饮" }); // 总额 70%/分类 70%
+      assert.equal(tool.budgetAlerts().length, 0, "均未跨阈值");
+
+      tool.expense({ action: "add", ledger_id: ledgerId, amount: 1, category: "-" }); // 总额 80%/分类 90%
+      const alerts = tool.budgetAlerts();
+      assert.equal(alerts.length, 2, "总额与分类各跨 80%，两条都必须物化");
+      const ym = todayIso().slice(0, 7);
+      const keys = alerts.map((a) => a.input.dedupeKey ?? "");
+      assert.ok(
+        keys.some((k) => k.endsWith(`::${ym}:80`)),
+        `总额键的分类位应为空串：${keys.join(" / ")}`,
+      );
+      assert.ok(
+        keys.some((k) => k.endsWith(`:-:${ym}:80`)),
+        `分类 "-" 的键应保留原分类名：${keys.join(" / ")}`,
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("总额预算：跨 80% 推一条、跨 100% 推一条，同阈值不重推（dedupeKey）", () => {
     const env = makeTestEnv();
     const tool = makeTools(env);
@@ -141,7 +175,7 @@ describe("bookkeeping 预算：阈值触达提醒", () => {
       assert.equal(at80.length, 1);
       assert.equal(at80[0]?.input.kind, "bookkeeping.budget");
       assert.match(at80[0]?.input.title ?? "", /预算提醒/);
-      assert.match(at80[0]?.input.dedupeKey ?? "", /budget:.*:-:\d{4}-\d{2}:80$/);
+      assert.match(at80[0]?.input.dedupeKey ?? "", /budget:.*::\d{4}-\d{2}:80$/);
 
       tool.expense({ action: "add", ledger_id: ledgerId, amount: 200, category: "餐饮" }); // 100%
       const at100 = tool.budgetAlerts().filter((p) => /:100$/.test(p.input.dedupeKey ?? ""));
@@ -227,12 +261,12 @@ describe("bookkeeping 预算：阈值触达提醒", () => {
       const at100 = tool.budgetAlerts().filter((p) => /:100$/.test(p.input.dedupeKey ?? ""));
       assert.equal(at100.length, 2, "总额与分类各推一条 100%");
       assert.ok(
-        at100.some((p) => p.input.dedupeKey?.includes(":餐饮:")),
-        "应含分类预算的超支提醒",
+        at100.some((p) => /budget:.*:餐饮:\d{4}-\d{2}:100$/.test(p.input.dedupeKey ?? "")),
+        "应含分类预算的超支提醒（分类键与旧编码逐字节一致）",
       );
       assert.ok(
-        at100.some((p) => p.input.dedupeKey?.includes(":-:")),
-        "应含总额预算的超支提醒",
+        at100.some((p) => /budget:.*::\d{4}-\d{2}:100$/.test(p.input.dedupeKey ?? "")),
+        "应含总额预算的超支提醒（分类位为空串）",
       );
     } finally {
       cleanupTestEnv(env);
