@@ -49,7 +49,9 @@ read_when:
 
 - 生日/纪念日默认按年循环（`schedule {action:"add"}` 省略 `recurrence` 时：`kind=todo` 为一次性，生日/纪念日为每年一次）；`calendar: "lunar"` 需给 `lunar_month/lunar_day`（1-12 / 1-30）。
 - `add` 的默认值：`time` 为 `09:00`、`all_day` 为 `false`（显式传了 `time` 就不会被当成全天；要全天请传 `all_day: true`）。
-- 农历日越界（如腊月三十缺失）默认取当月最后一天（`lunar_clamp` 默认 true）。
+- 农历日越界（如腊月三十缺失）默认取当月最后一天（`lunar_clamp` 默认 true）。**传 false 后遇到小月（如腊月三十）会整年跳过、不产生提醒** —— 如实告知用户，不要说成「每年都会提醒」。
+- **农历日程只支持按年循环**：`calendar: "lunar"` 时 `recurrence.freq` 必须是 `yearly` 且 `interval` 必须是 `1`（省略即 1）；不要拿 interval 表达「几年一次」——农历循环不按间隔跳年。实际口径分三种，别一概说成「填了会报错」：① 显式传 `recurrence: {interval: 2}`（`add` 或 `update`）会**直接报错**；② `update` 把公历日程转成农历（`calendar: "lunar"`）但**不传** `recurrence` 时**不报错**，继承来的 interval 按 1 落库（`import:v1` 导入农历 interval>1 的旧数据同样按 1 落库，并在导入报告里给一条 warning）；③ **旧数据**（回显带「interval=N 不生效」的农历行）仍可正常编辑——改标题/备注不会被拒，也不会被顺手改写成 1，要改正循环请显式传 `recurrence`。
+- **旧数据里的农历 + 非 yearly 频率**：`import:v1` 遇到 v1 农历行的 `frequency` 是 `daily`/`weekly`/`monthly` 时，因为农历引擎对任何 freq 都按农历年触发，会**改写成每年循环并给一条 warning**（文案含「无法在 v2 表达/已按每年循环导入」）——agent 读到这类 warning 必须转述给用户「原本的每日/每周/每月已变成每年」，不能只说「导入成功」。同一批里 `once`/`{}`/缺月日的农历行是**永不触发的死行**（导入报告含「不会产生任何提醒」），要么如实告知用户该日程不会提醒，要么用 `update` 显式传 `recurrence: {freq:"yearly", interval:1}` 与 `lunar_month`/`lunar_day` 把它补成能触发的日程。这些畸形行的 `update` 只改标题/备注**不会被拒**（与 ③ 同款宽容），但归一值不落库 —— 想改循环必须显式传 `recurrence`。
 - `remind_offsets` 负数为提前提醒（如 [-30] 提前 30 分钟），**最多 5 项**；`resend_minutes` 是待办到点重发一次，取值 0-1440 分钟。
 - 截止型日程：给待办加 `escalation`（严格升序分钟偏移数组，**首元素固定为 0**＝截止时刻本身，如 `[0,60,360,1440]`，即截止/1h/6h/24h；仅 `kind=todo` 可设）—— 到达截止后按阶梯持续加压提醒，直到 `complete`；此时 `resend_minutes` 被忽略（`update` 传 `escalation: []` 可清除阶梯）。这类日程在列表/状态页显示为「截止」。
 - `workday_filter` 让日程只在法定工作日/节假日触发；节假日数据未覆盖时日程会暂停，如实告知用户。
@@ -65,11 +67,12 @@ read_when:
 - 账本全局共享：任何 Profile 创建/记账/汇总均可，回执与月报会推送给所有配置了路由的 Profile。
 - 记账前先 `ledger {action: "list"}` 取得账本 id（**创建账本 `ledger {action:"create"}` 必须给 `name`**）；`expense` 的 `add`/`list`/`summary` 三个 action 都必须传 `ledger_id`。
 - `ledger.list` 默认不含归档账本；核账时传 `include_archived: true`。
-- 汇总用 `expense {action: "summary"}`，可按 `month`、`from/to`、`by`（记账人）过滤。
+- 汇总用 `expense {action: "summary"}`，可按 `month`、`from/to`、`by`（记账人）过滤。`month`（自然月整月，含该月内已录入但尚未到来的日期）与 `from`/`to` **互斥**，同时传会报错；`from > to` 也报错。`from`/`to` **只给一边就是半边区间**（只给 `from` = `[from, 将来)` 不限上界；只给 `to` = `(过去, to]` 不限下界），与 `list` 完全一致 —— 别为了「凑一个区间」自己补另一端。只有 `month`/`from`/`to` **都不传**时才套默认区间：`summary` 是「月初 → 今天」（不含月内未来日），`list` 是不限区间。
+- **「本月」有两个口径，别混**：状态页看板、预算对照、月报里的「本月」是**自然月全月**（含月内未来日 —— `spent_on` 是已录入事实，不因日历没到那天就从数字里消失）；只有 `expense summary` 不传区间时的默认值是「本月至今」。向用户报「本月花了多少」以看板/月报为准。
 - 预算：`ledger {action: "budget", ledger_id}` 查看该账本全部预算与本月对照；带 `amount`（元）设置/覆盖，带 `category` 为分类预算（不传为账本总额），`clear: true` 删除该范围。预算按账本每月滚动，支出**跨越** 80%/100% 时自动提醒（同一预算一笔只推跨过的最高阈值那一条，跨月重新判定，同月同阈值不重推）；设了预算的账本月报会附预算对照行。
 - **没有编辑功能**：改金额/分类/备注只能 `expense {action: "delete", id}`（id 从 `list` 取）再重新 `add`。删除**不可恢复**，且重记后「记账人」会变成当前 Profile——动手前把这两点告知用户。用户说「改一下备注/金额」时按此处理，不要声称可以直接改。
 - 账本改名用 `ledger {action: "rename", id, name}`；归档/恢复用 `action: "archive"`（`unarchive: true` 恢复）。**没有删除账本的接口**——要彻底删除只能直连服务端数据库操作。
-- `expense {action: "list"}` 的 `month` 只覆盖当月，且默认只返回 20 条：返回里 `已返回` 与 `匹配总数` 是两个数，别把窗口当全量。
+- `expense {action: "list"}` 不传 `month`/`from`/`to` 时不限区间（只受 `limit` 限制），且默认只返回 20 条：返回里 `已返回` 与 `匹配总数` 是两个数，别把窗口当全量。
 - 每月 1 号 09:00 自动推送上月月报（表格），不要手动复算。
 
 ## 通知

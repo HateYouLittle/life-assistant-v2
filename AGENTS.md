@@ -25,8 +25,8 @@ CI（`.github/workflows/ci.yml`）在 Node 22 和 24 上按此顺序运行：
 - `npm run dev` 用 tsx 跑 `src/daemon.ts`；`npm start` 跑构建产物 `dist/daemon.js`
   （需先 `npm run build`）。`db:backup` / `db:cleanup:preview` / `import:v1` 同理：
   无前缀脚本依赖 `dist/`，`dev:*` 变体直接跑 TS 源码。
-- `.env` 只会被 `start` / `dev` / `db:backup` / `db:cleanup:preview` / `import:v1`
-  及其 `dev:*` 变体通过 `--env-file-if-exists` 自动读取。其他命令需手动
+- `.env` 只会被 `start` / `dev` / `db:backup` / `db:cleanup:preview` / `doctor` /
+  `import:v1` 及其 `dev:*` 变体通过 `--env-file-if-exists` 自动读取。其他命令需手动
   `set -a; source .env; set +a`。
 - 首次运行会创建 `$DATA_DIR/life-assistant.db`；测试使用一次性临时目录。
 
