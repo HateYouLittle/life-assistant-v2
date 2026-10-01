@@ -41,6 +41,7 @@ interface DeliveryRow {
   generation: number;
   request_id: string | null;
   request_started_at: string | null;
+  next_attempt_at: string;
   expire_at: string | null;
   profile_id: string;
   kind: string;
@@ -83,7 +84,7 @@ export function setPushRoute(
     enabled: input.enabled ?? true,
   };
   setSetting(db, profileId, "push_route", route);
-  requeueRoute(db, profileId, route.name);
+  requeueRoute(db, profileId);
   return route;
 }
 
@@ -101,7 +102,7 @@ export function setPushRouteEnabled(
   if (current === null) throw new Error("尚未配置推送路由，请先提供 url");
   const route: PushRoute = { ...current, enabled };
   setSetting(db, profileId, "push_route", route);
-  if (enabled) requeueRoute(db, profileId, route.name);
+  if (enabled) requeueRoute(db, profileId);
   return route;
 }
 
@@ -256,13 +257,26 @@ export function recoverStaleSending(db: DatabaseSync): void {
   ).run(nowIso());
 }
 
-/** 路由恢复：仅从未发出不确定请求的行重新入队（generation 递增） */
-function requeueRoute(db: DatabaseSync, profileId: string, routeName: string): void {
+/**
+ * 路由恢复：仅「从未发出不确定请求」且「未被确定性拒绝」的行重新入队（generation 递增）。
+ *
+ * 按 profile 而不是 route_name 匹配：每个 Profile 只有一条生效路由，行的 route_name
+ * 只是「入队时用的名字」。一旦用户改过名（setPushRoute）或清空后换名重建，按名匹配就再也
+ * 匹配不到那些行 —— 它们会永远停在 fallback，而用户侧没有任何补救入口。
+ *
+ * 三个条件缺一不可：
+ * - `request_started_at IS NULL`：已发出过请求的行（无论结果确定与否）不盲重发。
+ * - `deterministic_reject = 0`：被 4xx/3xx 确定性拒绝的行不重投 —— 换路由也还是同一个
+ *   webhook 在拒，重发只会再被拒一次，还会在用户侧凭空多出一条「本不该有的」推送。
+ *   走到 markTerminalFallback 的都是这类，与「从未发出过」曾共用 request_started_at 这一位，
+ *   按 profile 捞行后就再也无法区分了。
+ */
+function requeueRoute(db: DatabaseSync, profileId: string): void {
   db.prepare(
     `UPDATE deliveries SET status = 'queued', generation = generation + 1, next_attempt_at = ?, updated_at = ?
-     WHERE status = 'fallback' AND route_name = ? AND request_started_at IS NULL
+     WHERE status = 'fallback' AND request_started_at IS NULL AND deterministic_reject = 0
        AND notification_id IN (SELECT id FROM notifications WHERE profile_id = ?)`,
-  ).run(nowIso(), nowIso(), routeName, profileId);
+  ).run(nowIso(), nowIso(), profileId);
 }
 
 let drainTimer: ReturnType<typeof setTimeout> | null = null;
@@ -288,14 +302,31 @@ export function cancelPendingDrain(): void {
   drainTimer = null;
 }
 
-/** 投递到期的 outbox 行；返回处理的行数。调度器每 20s 调一次，发布时也会即时触发 */
-export function drainDue(db: DatabaseSync, config: ResolvedConfig): Promise<number> {
+/**
+ * 投递到期的 outbox 行；返回处理的行数。调度器每 20s 调一次，发布时也会即时触发。
+ *
+ * `budgetMs` 只为测试存在（45s 的默认预算无法在用例里等出来）；生产调用一律走默认值。
+ */
+export function drainDue(
+  db: DatabaseSync,
+  config: ResolvedConfig,
+  budgetMs = DRAIN_BUDGET_MS,
+): Promise<number> {
   if (draining) return Promise.resolve(0);
   draining = true;
   const run = (async (): Promise<number> => {
     recoverStaleSending(db);
-    const deadline = Date.now() + DRAIN_BUDGET_MS;
+    const deadline = Date.now() + budgetMs;
     let processed = 0;
+    // 扫描游标（keyset 分页）：窗口按 (next_attempt_at, id) **只向前**推进。
+    // 静止的 `ORDER BY d.next_attempt_at LIMIT 100` 每轮都取回同一批最靠前的行 ——
+    // 静默时段（唯一不落库终态的 skip）让某个 Profile 的行原地不动时，它们会永久
+    // 占满窗口，排在后面的**其它 Profile** 的到期行整轮一次都轮不到。游标把「已考察
+    // 过的行」让出窗口，窗口于是能扫到整批到期行，而不是只扫前 100 条。
+    // 必须带上 `d.id` 作次序键：next_attempt_at 大量重复（forceDue 与同批发布都会
+    // 刷成同一值），只按它排序时并列行的次序不确定，游标会漏行。
+    let cursorAt = "";
+    let cursorId = "";
     for (;;) {
       const now = nowIso();
       const rows = db
@@ -303,12 +334,22 @@ export function drainDue(db: DatabaseSync, config: ResolvedConfig): Promise<numb
           `SELECT d.*, n.profile_id, n.kind, n.title, n.body_md, n.created_at AS n_created_at
            FROM deliveries d JOIN notifications n ON n.id = d.notification_id
            WHERE d.status IN ('queued','failed') AND d.next_attempt_at <= ?
-           ORDER BY d.next_attempt_at LIMIT ?`,
+             AND (d.next_attempt_at > ? OR (d.next_attempt_at = ? AND d.id > ?))
+           ORDER BY d.next_attempt_at, d.id LIMIT ?`,
         )
-        .all(now, BATCH_LIMIT) as unknown as DeliveryRow[];
+        .all(now, cursorAt, cursorAt, cursorId, BATCH_LIMIT) as unknown as DeliveryRow[];
       if (rows.length === 0) break;
+      const last = rows[rows.length - 1] as DeliveryRow;
+      cursorAt = last.next_attempt_at;
+      cursorId = last.id;
 
       const deliverable: DeliveryRow[] = [];
+      // 本轮是否有任何状态推进。**不能**用 `deliverable.length === 0` 当退出判据：
+      // quiet-hours 是唯一不落库终态的 skip（既不改 status 也不推进 next_attempt_at），
+      // 而它是 per-Profile 的设置。某个 Profile 的 100+ 条静默行占满 LIMIT 窗口时，
+      // 排在窗口之外的**其它 Profile** 的到期行会被整批跳过 —— A 用户的静默时段
+      // 静默压掉 B 用户的推送。改判据 + 游标（见上）后，窗口能扫过整批到期行。
+      let advanced = false;
       for (const row of rows) {
         if (Date.now() > deadline) return processed;
         // 过期内容直接作废：静默时段拦下的预警如果等到窗口结束再补投，用户收到的
@@ -317,26 +358,62 @@ export function drainDue(db: DatabaseSync, config: ResolvedConfig): Promise<numb
           db.prepare(
             "UPDATE deliveries SET status = 'cancelled', last_error = 'expired before delivery', updated_at = ? WHERE id = ?",
           ).run(nowIso(), row.id);
+          advanced = true;
           continue;
         }
         const skip = skipReason(db, config, row);
         if (skip !== null) {
+          if (skip === "route drift") {
+            // 路由改名只是「同一个 Profile 换了条路由」，不是投递失败：把行上的旧名改写为
+            // 当前名并留在队列，本轮就投出去。置 fallback 会让这些行永久卡住（改个名丢掉
+            // 待投通知，而用户侧没有任何补救入口），routeName 也只用于生成幂等请求 id。
+            const current = getPushRoute(db, row.profile_id);
+            if (current !== null) {
+              db.prepare("UPDATE deliveries SET route_name = ?, updated_at = ? WHERE id = ?").run(
+                current.name,
+                nowIso(),
+                row.id,
+              );
+              advanced = true;
+              deliverable.push({ ...row, route_name: current.name });
+            }
+            continue;
+          }
           if (skip !== "quiet-hours") {
             db.prepare(
               "UPDATE deliveries SET status = 'fallback', last_error = ?, updated_at = ? WHERE id = ?",
             ).run(skip, nowIso(), row.id);
+            advanced = true;
           }
+          // quiet-hours：行原样留在待投集合里，等窗口结束后的下一轮 drain。
           continue;
         }
         deliverable.push(row);
       }
 
       for (let i = 0; i < deliverable.length; i += CONCURRENCY) {
+        // 投递段也必须看预算（曾只查行扫描循环）：单个请求最长 10s
+        // （deliverOne 的 AbortSignal.timeout），满窗口 100 行 / 并发 5 = 20 批，
+        // 最坏 200s —— 是 45s 预算的 4.4 倍，而那 200s 全花在下面这个 await 里，
+        // 行扫描循环的 deadline 检查（:346）对它完全无感知。后果不是「慢一点」而是
+        // 单进程投递被卡住：`draining` 一直为 true，调度器每 20s 的 drainDue 全部
+        // 重入返回 0（:307），新通知只能等这一轮结束才有机会投出。
+        // 超预算即返回：未 claim 的行状态仍是 queued，下一轮重新取回，不丢不重。
+        if (Date.now() > deadline) return processed;
         const batch = deliverable.slice(i, i + CONCURRENCY);
-        await Promise.all(batch.map((row) => deliverOne(db, config, row)));
+        const claimed = await Promise.all(batch.map((row) => deliverOne(db, config, row)));
         processed += batch.length;
+        // 只有真正 claim（status → sending，再落终态或退避）才算推进：
+        // deliverOne 在 claim 前因路由/secret 缺失 return 时行仍留在待投集合里，
+        // 那种行下一轮会被重新取回，不推进就会自旋。
+        for (const did of claimed) if (did) advanced = true;
       }
-      if (deliverable.length === 0) break;
+      // 零推进 = 本轮窗口里的行全部原地未动（只有静默时段能做到）。游标已经前移到本批
+      // 末尾，所以继续循环是有界的：下一轮只会看到**本批之后**的行，而库里没有新行时
+      // `rows.length === 0` 会收工。若把 break 判据写成「永远不 break」，
+      // 静默时段会让每一轮都零推进、游标扫完全库才停（O(库大小) 次空转查询）。
+      // 故零推进且已无新窗口时收工；游标本身保证不会自旋。
+      if (!advanced && rows.length < BATCH_LIMIT) break;
     }
     return processed;
   })();
@@ -378,16 +455,17 @@ function skipReason(db: DatabaseSync, config: ResolvedConfig, row: DeliveryRow):
   return null;
 }
 
+/** 投递单行；返回是否真的 claim 了这行（false = 行原样留在待投集合里） */
 async function deliverOne(
   db: DatabaseSync,
   config: ResolvedConfig,
   row: DeliveryRow,
-): Promise<void> {
+): Promise<boolean> {
   // 路由/secret 必须在 claim 之前判定：claim 之后才发现缺失会留下一条持久为
   // 'sending' 的行（下一轮 recoverStaleSending 虽会复位，但先写后弃本身就是脏状态）。
   const route = getPushRoute(db, row.profile_id);
   const secret = routeSecret(config, row.profile_id);
-  if (route === null || secret === undefined) return;
+  if (route === null || secret === undefined) return false;
 
   const claimId = newId();
   const claimed = db
@@ -404,7 +482,7 @@ async function deliverOne(
       nowIso(),
       row.id,
     );
-  if (claimed.changes !== 1) return;
+  if (claimed.changes !== 1) return false;
 
   const current = db
     .prepare("SELECT request_id, generation FROM deliveries WHERE id = ?")
@@ -441,7 +519,7 @@ async function deliverOne(
     if (response.body !== null) response.body.cancel().catch(() => {});
     if (response.ok) {
       markSent(db, row);
-      return;
+      return true;
     }
     // 确定性拒绝不重试：4xx（408/429 除外）与 3xx 重定向改不了结果，只会在阶梯上耗到
     // 1 小时。3xx 尤其如此：redirect: "manual" 下投递请求根本没有被 webhook 处理，
@@ -450,12 +528,14 @@ async function deliverOne(
     const retryable = status === 408 || status === 429 || (status >= 500 && status <= 599);
     if (!retryable) {
       markTerminalFallback(db, row, `HTTP ${status}`);
-      return;
+      return true;
     }
     markConfirmedFailure(db, row, `HTTP ${status}`);
   } catch (e) {
     markTransportFailure(db, row, e instanceof Error ? e.message : String(e));
   }
+  // claim 已成功：行无论落到 sent / fallback / 退避重试，都已离开待投集合
+  return true;
 }
 
 function markSent(db: DatabaseSync, row: DeliveryRow): void {
@@ -477,11 +557,15 @@ function markSent(db: DatabaseSync, row: DeliveryRow): void {
 /**
  * 终态失败：不再重试。`request_started_at` 必须清空 —— requeueRoute 只重新入队
  * 「从未发出不确定请求」的行，清空它才能让路由恢复后重新投递。
+ *
+ * 但清空 request_started_at 只说明「这个投递世代没在飞」，不说明「换条路由还值得再发」：
+ * 走到这里的都是确定性拒绝（4xx/3xx，重试只会原样再被拒），所以另立
+ * `deterministic_reject` 标记，让 requeueRoute 能把它与「从未发出过」区分开。
  */
 function markTerminalFallback(db: DatabaseSync, row: DeliveryRow, error: string): void {
   db.prepare(
     `UPDATE deliveries SET status = 'fallback', attempts = attempts + 1,
-       request_started_at = NULL, last_error = ?, updated_at = ?
+       request_started_at = NULL, deterministic_reject = 1, last_error = ?, updated_at = ?
      WHERE id = ?`,
   ).run(error, nowIso(), row.id);
 }

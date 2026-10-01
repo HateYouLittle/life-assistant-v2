@@ -55,6 +55,55 @@ describe("database schema v2", () => {
     }
   });
 
+  it("老库补 deliveries.deterministic_reject（幂等补列，且默认 0 不改既有语义）", () => {
+    // 该列决定「4xx 确定性拒绝的终态行会不会被重新入队」。老库缺列时 notify.ts 的
+    // requeueRoute / markTerminalFallback 会直接抛「no such column」，整个 drain 断掉。
+    const env = makeTestEnv();
+    try {
+      env.db.close();
+      // 还原成「没有该列」的旧形状（幂等补列路径）
+      const raw = new DatabaseSync(env.config.dbPath);
+      raw.exec("ALTER TABLE deliveries DROP COLUMN deterministic_reject");
+      raw.close();
+
+      const upgraded = openDatabase(env.config.dbPath);
+      try {
+        const columns = (
+          upgraded.prepare("PRAGMA table_info(deliveries)").all() as {
+            name: string;
+            dflt_value: string | null;
+          }[]
+        ).map((c) => c.name);
+        assert.ok(
+          columns.includes("deterministic_reject"),
+          `缺列会让 requeueRoute/markTerminalFallback 直接抛错：${columns.join(",")}`,
+        );
+        // 默认 0 = 升级前的语义（所有存量 fallback 行仍可重投），不得把老数据静默改语义
+        upgraded
+          .prepare(
+            "INSERT INTO notifications (id, profile_id, kind, title, body_md, created_at) VALUES ('n1', 'default', 'k', 't', 'b', '2026-01-01T00:00:00.000Z')",
+          )
+          .run();
+        upgraded
+          .prepare(
+            `INSERT INTO deliveries (id, notification_id, route_name, status, next_attempt_at, created_at, updated_at)
+             VALUES ('d1', 'n1', 'r', 'fallback', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`,
+          )
+          .run();
+        const row = upgraded
+          .prepare("SELECT deterministic_reject FROM deliveries WHERE id='d1'")
+          .get() as {
+          deterministic_reject: number;
+        };
+        assert.equal(row.deterministic_reject, 0, "存量行的默认值必须是 0（=升级前的可重投语义）");
+      } finally {
+        upgraded.close();
+      }
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("STRICT 表拒绝错误类型与非法 CHECK", () => {
     const env = makeTestEnv();
     try {

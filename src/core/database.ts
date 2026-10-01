@@ -129,6 +129,13 @@ CREATE TABLE IF NOT EXISTS deliveries (
   next_attempt_at TEXT NOT NULL,
   sent_at TEXT,
   last_error TEXT,
+  /**
+   * 1 = 被对端**确定性拒绝**（4xx/3xx 等，改参数也不会变的拒绝，见 core/notify.ts 的
+   * markTerminalFallback）。这类行不该被 requeueRoute 重新入队：重发只会原样再被拒一次。
+   * 与「从未发出过」（request_started_at IS NULL）、「已发出但结果不确定」严格区分开 ——
+   * 后两者仍要靠路由恢复重新入队，所以不能只靠 last_error 的 "HTTP " 前缀猜。
+   */
+  deterministic_reject INTEGER NOT NULL DEFAULT 0,
   /** 投递截止时刻（ISO）：到点仍未投出即作废，见 core/notify.ts 的 drainDue */
   expire_at TEXT,
   created_at TEXT NOT NULL,
@@ -209,6 +216,9 @@ export function migrate(db: DatabaseSync): void {
   // 幂等补列：老库（含 v2）补 schedules.escalation_json；新库由 DDL 直接建出。
   // 不提升 SCHEMA_VERSION、不重建 schedules（kind 有 CHECK，重建会牵动 occurrences 外键）。
   addColumnIfMissing(db, "schedules", "escalation_json", "TEXT");
+  // 同理补 deliveries.deterministic_reject（纯附加列，默认 0 = 非确定性拒绝，
+  // 与升级前「所有 fallback 行都可重投」的既有行为一致，老数据不会被静默改语义）。
+  addColumnIfMissing(db, "deliveries", "deterministic_reject", "INTEGER NOT NULL DEFAULT 0");
 }
 
 export function getSchemaVersion(db: DatabaseSync): number {
