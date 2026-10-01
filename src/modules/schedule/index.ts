@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { DateTime } from "luxon";
 import { DATE_RE, TIME_RE, TZ, instantToLocalDate } from "../../time.js";
-import { describeRecurrence } from "../../core/recurrence.js";
+import { describeRecurrence, lunarMonthDayProblem } from "../../core/recurrence.js";
 import type { Recurrence } from "../../core/recurrence.js";
 import {
   fail,
@@ -35,7 +35,13 @@ import {
 
 const recurrenceInput = z.object({
   freq: z.enum(["daily", "weekly", "monthly", "yearly"]).describe("循环频率"),
-  interval: z.number().int().min(1).max(365).default(1).describe("间隔（默认 1）"),
+  interval: z
+    .number()
+    .int()
+    .min(1)
+    .max(365)
+    .default(1)
+    .describe("间隔（默认 1）；calendar=lunar 时只支持 1，填 >1 会报错（农历循环不按间隔跳年）"),
   byweekday: z
     .array(z.number().int().min(0).max(6))
     .max(7)
@@ -114,6 +120,19 @@ function localStampText(iso: string | null): string | null {
   return dt.isValid ? dt.toFormat("yyyy-LL-dd HH:mm") : null;
 }
 
+/**
+ * 「日历」栏文本：公历行回显 start_date；农历行回显「农历M月D日」。
+ * 畸形农历存量行（NULL/越界月日）改为与「重复」栏同口径的说明——裸插值会漏出
+ * 「农历null月null日」，那是模板漏洞而非用户能懂的信息（N15，与 describeRecurrence 共用判定）。
+ */
+function calendarText(row: ScheduleRow): string | null {
+  if (row.calendar !== "lunar") return row.start_date;
+  return (
+    lunarMonthDayProblem(row.calendar, row.lunar_month, row.lunar_day) ??
+    `农历${row.lunar_month}月${row.lunar_day}日`
+  );
+}
+
 function rowToPublic(row: ScheduleRow): Record<string, unknown> {
   // 逐行容错：一条损坏的 recurrence_json 只应让该行显示「规则损坏」，
   // 而不是让整个 list/upcoming 工具报错（脏数据由导入或手改库引入）。
@@ -129,7 +148,7 @@ function rowToPublic(row: ScheduleRow): Record<string, unknown> {
     id: row.id,
     标题: row.title,
     类型: escalation === null ? KIND_LABEL[row.kind] : "截止",
-    日历: row.calendar === "lunar" ? `农历${row.lunar_month}月${row.lunar_day}日` : row.start_date,
+    日历: calendarText(row),
     时间: row.all_day === 1 ? `${row.time}（全天）` : row.time,
     重复: recurrenceBroken
       ? "（循环规则损坏，需修复）"
@@ -140,6 +159,7 @@ function rowToPublic(row: ScheduleRow): Record<string, unknown> {
             lunarMonth: row.lunar_month,
             lunarDay: row.lunar_day,
             leapPolicy: (row.leap_policy ?? "follow") as "follow" | "regular",
+            lunarClamp: row.lunar_clamp === 1,
           },
           row.start_date,
         ),
@@ -273,7 +293,9 @@ registerModule({
         lunar_clamp: z
           .boolean()
           .optional()
-          .describe("农历日越界（如腊月三十缺失）取当月最后一天，默认 true"),
+          .describe(
+            "农历日越界（如腊月三十缺失）取当月最后一天，默认 true；关掉后遇到小月（如腊月三十）会整年跳过，不产生提醒",
+          ),
         time: z.string().regex(TIME_RE).optional().describe("提醒时刻 HH:MM，默认 09:00"),
         all_day: z
           .boolean()

@@ -4,6 +4,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { now, nowIso, localToInstant, instantToLocalDate, TZ } from "../../time.js";
 import { dayType, ensureYears } from "../../core/holiday.js";
 import {
+  collapseLunarInterval,
   describeRecurrence,
   nextDate,
   type OccurrenceSource,
@@ -237,6 +238,41 @@ export function sourceOf(row: ScheduleRow): OccurrenceSource {
   };
 }
 
+/**
+ * update 继承既有 recurrence_json 时的**校验用**归一。与 N5（interval）同构，
+ * 这里再收窄 freq 与「农历 recurrence 为 null」两种存量畸形：
+ *
+ * - **freq ≠ yearly**：农历引擎对 once/daily/weekly/monthly/yearly 一视同仁按农历年触发
+ *   （core/recurrence.ts 的 iterate 对 calendar==="lunar" 直接 yield* iterateLunar，freq
+ *   被完全丢弃）。这类行多来自 import:v1 的旧数据。校验若按原值拒，用户会被**完全锁死**：
+ *   连「只改标题」都不行，唯一出路是显式传 `recurrence: {freq:"yearly", interval:1}` ——
+ *   而对原本 v1 `once` 的一行，那等于把一次性事件改成每年重复。存量行只能改标题/删除才合理。
+ * - **recurrence 为 null**：v1 的 `once` / `{}` / 缺字段经 import:v1 落库后是零 occurrence
+ *   的死行（iterateLunar 首行 `if recurrence===null return`），同样不该把用户锁死。
+ *
+ * - **interval ≠ 1**（N5）：农历引擎只做 lunarYear++，与 interval=1 完全等价。
+ *
+ * 三条归一都**只喂 validateScheduleInput，绝不落库**：patch 显式传了 recurrence 的走正常
+ * 校验（非法即报错）。落库始终用 parseRecurrence(row.recurrence_json) 的原值，否则「只改标题」
+ * 会把用户的 interval/freq 静默改掉并提交，describeRecurrence 专门为存量脏数据写的
+ * 「interval=N 不生效」提示也就此失去证据（提示只在纯读路径还成立）。
+ * **显式传 recurrence 的 patch 不走这里**，仍按显式值严格校验（传 yearly 才放行）。
+ */
+function normalizeInheritedRecurrence(
+  calendar: "solar" | "lunar",
+  recurrence: Recurrence | null,
+): Recurrence | null {
+  const collapsed = collapseLunarInterval(calendar, recurrence);
+  if (calendar !== "lunar") return collapsed;
+  // 与引擎等价：农历下不管原 freq 是什么，实际都按农历年触发，所以校验看到 {yearly,1}
+  const freqNormalized =
+    collapsed === null || collapsed.freq === "yearly"
+      ? collapsed
+      : { ...collapsed, freq: "yearly" as const, interval: 1 };
+  // recurrence=null 的农历行是死行（不是「一次性」）：给引擎等价的 yearly 让无关 patch 通过
+  return freqNormalized ?? { freq: "yearly", interval: 1 };
+}
+
 export function validateScheduleInput(input: ScheduleInput): void {
   if (input.title.trim() === "") throw new Error("标题不能为空");
   if (input.title.length > 120) throw new Error("标题过长（≤120 字符）");
@@ -256,6 +292,14 @@ export function validateScheduleInput(input: ScheduleInput): void {
       throw new Error("农历日程需要 lunar_month(1-12) 与 lunar_day(1-30)");
     if (input.recurrence === null || input.recurrence.freq !== "yearly") {
       throw new Error("农历日程只支持按年循环（recurrence.freq = yearly）");
+    }
+    // interval 在农历路径上不参与推进（iterateLunar 只做 lunarYear++），引擎每年触发一次。
+    // 曾照单全收 interval 又在回显里写「每年」，于是设 2/3 与设 1 完全等价且无任何提示 ——
+    // 与「农历只支持按年循环」的既有口径一致，这里直接拒掉，不改引擎。
+    if (input.recurrence.interval !== 1) {
+      throw new Error(
+        `农历日程只支持按年循环（recurrence.interval 必须为 1，收到 ${String(input.recurrence.interval)}；农历循环不按 interval 跳年）`,
+      );
     }
     if (input.workdayFilter !== "any") throw new Error("workday/holiday 过滤仅支持公历日程");
   }
@@ -568,6 +612,9 @@ export function updateSchedule(
 ): ScheduleRow {
   const row = getSchedule(db, profileId, id);
   if (row === undefined) throw new Error(`日程不存在: ${id}`);
+  // 归一只服务校验：写回时仍用 inheritedRecurrence 的原值（用户设的 interval 不能被
+  // 一次无关的 patch 顺手改掉）。patch 显式传了 recurrence 的按显式值校验。
+  const inheritedRecurrence = parseRecurrence(row.recurrence_json);
   const merged: ScheduleInput = {
     title: patch.title ?? row.title,
     note: patch.note !== undefined ? patch.note : row.note,
@@ -580,8 +627,7 @@ export function updateSchedule(
     lunarClamp: patch.lunarClamp !== undefined ? patch.lunarClamp : row.lunar_clamp === 1,
     time: patch.time ?? row.time,
     allDay: patch.allDay !== undefined ? patch.allDay : row.all_day === 1,
-    recurrence:
-      patch.recurrence !== undefined ? patch.recurrence : parseRecurrence(row.recurrence_json),
+    recurrence: patch.recurrence !== undefined ? patch.recurrence : inheritedRecurrence,
     remindOffsets: patch.remindOffsets ?? parseOffsets(row.remind_offsets_json),
     resendMinutes: patch.resendMinutes ?? row.resend_minutes,
     escalation:
@@ -595,7 +641,26 @@ export function updateSchedule(
   if (status === "active" && row.status === "done" && row.kind === "todo") {
     throw new Error("已完成的待办不能重新激活");
   }
-  validateScheduleInput(merged);
+  // patch 未显式传 recurrence 时，校验用归一值（存量农历 interval>1 与引擎行为等价，
+  // 不该把这类行卡到连改名都不行）。
+  validateScheduleInput({
+    ...merged,
+    recurrence:
+      patch.recurrence === undefined
+        ? normalizeInheritedRecurrence(merged.calendar, merged.recurrence)
+        : merged.recurrence,
+  });
+  // 落库前的农历 interval 收口（写入侧单一收口，见 core/recurrence.ts）：
+  // **只有本次 patch 新造出「农历+interval>1」的行**（solar→lunar 转换且没显式传
+  // recurrence）才把 interval 收敛为 1 —— 校验看到的是归一值、落库若写回原值就会
+  // 绕过写入侧拒错，造出引擎根本不读的 interval。
+  // 对**既有**脏数据（本来就是农历、interval>1）的无关 patch（改标题/备注）仍原样
+  // 保真：那次写入没造脏数据，且 describeRecurrence 的「interval=N 不生效」提示正
+  // 靠它继续成立（见 N5 用例）。故收口条件要求「本次确实把日历改成了农历」。
+  const storedRecurrence =
+    patch.recurrence === undefined && patch.calendar === "lunar" && row.calendar !== "lunar"
+      ? collapseLunarInterval(merged.calendar, merged.recurrence)
+      : merged.recurrence;
   const ts = nowIso();
   withTransaction(db, () => {
     // 必须在 DELETE 之前判定：删除 pending 行后「最近事件是否进行中」的信息就没了。
@@ -619,7 +684,7 @@ export function updateSchedule(
       merged.calendar === "lunar" ? (merged.lunarClamp === false ? 0 : 1) : 1,
       merged.time,
       merged.allDay ? 1 : 0,
-      merged.recurrence === null ? null : JSON.stringify(merged.recurrence),
+      storedRecurrence === null ? null : JSON.stringify(storedRecurrence),
       JSON.stringify(merged.remindOffsets),
       merged.resendMinutes,
       merged.escalation === null ? null : JSON.stringify(merged.escalation),

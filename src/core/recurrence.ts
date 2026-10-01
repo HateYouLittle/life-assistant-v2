@@ -141,6 +141,37 @@ function* iterate(source: OccurrenceSource, afterDay: DateTime): Generator<DateT
   }
 }
 
+/**
+ * 农历循环的 interval 写入侧收口：「农历必须 interval === 1」的**单一收口**。
+ *
+ * 农历引擎不按间隔跳年（iterateLunar 只做 lunarYear++），所以农历 + interval>1 是
+ * 一条「校验认账、引擎忽略」的组合。validateScheduleInput 只拦显式传入的非法值，
+ * 而两条写入路径会绕过它：
+ * - MCP 的 solar→lunar 转换：patch 不传 recurrence 时校验看到的是归一值（interval=1），
+ *   落库却写回继承来的原值；
+ * - import:v1 的裸 SQL INSERT：整条路径不经任何校验。
+ * 两条都在**落库前**走这里收敛，故脏数据没有第二个产生入口。
+ *
+ * 只收 interval，不动 freq/until/count：那些是合法的用户配置（农历 freq 必须是
+ * yearly，由校验与导入映射分别保证）。describeRecurrence 对**存量**脏数据仍会显式
+ * 说明 interval 被忽略（收敛只发生在写入侧，不追溯改历史行）。
+ */
+export function collapseLunarInterval(
+  calendar: "solar" | "lunar",
+  recurrence: Recurrence | null,
+): Recurrence | null {
+  if (calendar === "lunar" && recurrence !== null && recurrence.interval !== 1) {
+    return { ...recurrence, interval: 1 };
+  }
+  return recurrence;
+}
+
+/**
+ * 农历（年, 月, 日）→ 公历零点序列。**每年一次**：`recurrence.interval` 不参与推进
+ * （农历年与公历年不等长，「每 2 年」在农历上没有自洽的锚点），写入侧由
+ * collapseLunarInterval 收敛、validateScheduleInput 拒掉显式非法值，
+ * describeRecurrence 对存量脏数据显式说明它被忽略。
+ */
 function* iterateLunar(source: OccurrenceSource, afterDay: DateTime): Generator<DateTime> {
   const month = source.lunarMonth ?? 0;
   const day = source.lunarDay ?? 0;
@@ -202,18 +233,83 @@ function uniqSorted(values: number[]): number[] {
     .sort((a, b) => a - b);
 }
 
+/**
+ * 日号落在「规则会访问到的某个月」之外时，实际物化会被 clampDay 夹到该月最后一天，
+ * 而非该日号在短月里不存在（如「每月31日」在 11 月只得 30 日、「每年2月29日」在平年只得 28 日）。
+ * 文案必须体现这个夹取，否则回显与实际排期互相矛盾（yearly 的 interval 曾出过同类问题）。
+ */
+const CLAMP_NOTE = "（不足则取月末）";
+/** 不允许顺延时三十日所在的小月整年没有该日：引擎直接跳过，不是「改到月末」 */
+const LUNAR_SKIP_NOTE = "（小月整年跳过）";
+
+/** 该日号在给定月份里是否会被夹到月末；用平年算二月（28 天）即最短月 */
+function willClamp(months: number[], day: number): boolean {
+  return months.some(
+    (month) => day > (DateTime.fromObject({ year: 2026, month }, { zone: TZ }).daysInMonth ?? 30),
+  );
+}
+
+const ALL_MONTHS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+
+/**
+ * 农历月/日「缺失或越界」的判定与统一文案；无问题时返回 null。
+ *
+ * 存量脏数据（import:v1 的裸 INSERT 可静默写入 NULL 月/日；schedules 的 CHECK 写的是
+ * `IS NULL OR (1..12)`，即只放行 NULL、拒掉 0/13 这类越界值）会让裸插值回显
+ * 「农历null月null日」——用户看到的是模板漏字，而不是「这条日程坏掉了」。
+ * 同时 iterateLunar 的范围判断让它产出零 occurrence（N12 的 B 类死行），文案必须如实说。
+ *
+ * describeRecurrence（循环规则栏）与 schedule 的 rowToPublic（日历栏）必须调同一个函数：
+ * 两处各写一份判定时，只要有人只改其中一处，同一份输出里就会出现一半已修、一半漏字（N15）。
+ */
+export function lunarMonthDayProblem(
+  calendar: "solar" | "lunar",
+  lunarMonth: number | null,
+  lunarDay: number | null,
+): string | null {
+  if (calendar !== "lunar") return null;
+  const m = lunarMonth ?? 0;
+  const d = lunarDay ?? 0;
+  if (m < 1 || m > 12 || d < 1 || d > 30) {
+    return "农历月/日缺失或越界（不会产生任何提醒，请补齐 lunar_month/lunar_day）";
+  }
+  return null;
+}
+
 /** 供通知/列表展示的循环规则人话描述 */
 export function describeRecurrence(
   source: Pick<
     OccurrenceSource,
-    "calendar" | "recurrence" | "lunarMonth" | "lunarDay" | "leapPolicy"
+    "calendar" | "recurrence" | "lunarMonth" | "lunarDay" | "leapPolicy" | "lunarClamp"
   >,
   startDate: string | null,
 ): string {
   const rec = source.recurrence;
   if (source.calendar === "lunar") {
-    const name = `农历${source.lunarMonth}月${source.lunarDay}日`;
-    return rec === null ? `一次：${name}` : `每年${name}`;
+    // 判定与文案集中在 lunarMonthDayProblem，避免与 rowToPublic 的「日历」栏口径漂移（N15）
+    const problem = lunarMonthDayProblem(source.calendar, source.lunarMonth, source.lunarDay);
+    if (problem !== null) return problem;
+    const m = source.lunarMonth ?? 0;
+    const d = source.lunarDay ?? 0;
+    const name = `农历${m}月${d}日`;
+    // recurrence 为 null 的农历行**不是「一次性」**：农历事件没有年份锚点，
+    // iterateLunar 对 recurrence===null 直接 return → 零 occurrence。写「一次：」会让
+    // 用户以为它会触发一次（而 v1 侧的一次性语义本身也无法在农历上表达）。
+    if (rec === null) return `${name}（无循环规则，不会产生任何提醒）`;
+    // 农历月只有 29/30 天：三十日只在大月存在，小月里有两种截然不同的后果 ——
+    // lunarClamp=true 夹到月末（lunarToSolar 的 clamp），lunarClamp=false 时
+    // lunarToSolar 返回 null、iterateLunar 直接 continue，**整年静默跳过**
+    // （实测 2027-2029 连续三年都没有腊月三十）。两种口径都必须写进文案，
+    // 否则用户按「每年」等提醒会以为服务坏了或提醒丢了。
+    // 二十九日在大小月都存在，两种口径都不会跳过，因此绝不加注记。
+    const clamp = source.lunarDay === 30 ? (source.lunarClamp ? CLAMP_NOTE : LUNAR_SKIP_NOTE) : "";
+    // 历史脏数据：农历的 interval 不参与推进（引擎每年一次），但不能因此谎称「每年」——
+    // 那正是「设了 interval 被静默忽略」的回显。validateScheduleInput 已拒掉新的写入，
+    // 这里对存量行显式说明 interval 被忽略，不误导使用者。
+    if (rec.interval !== 1) {
+      return `每年${name}${clamp}（interval=${rec.interval} 不生效：农历只支持按年循环）`;
+    }
+    return `每年${name}${clamp}`;
   }
   if (rec === null) return `一次：${startDate ?? ""}`;
   const n = rec.interval;
@@ -230,11 +326,20 @@ export function describeRecurrence(
       // 时不留尾随空格，避免描述拼成「每 2 周 」
       return days === "" ? week.trimEnd() : `${week}${days}`;
     }
-    case "monthly":
-      return n === 1 ? `每月${startDate?.slice(8, 10) ?? ""}日` : `每 ${n} 个月`;
-    case "yearly":
-      return n === 1
-        ? `每年${startDate?.slice(5, 7) ?? ""}月${startDate?.slice(8, 10) ?? ""}日`
-        : `每 ${n} 年`;
+    case "monthly": {
+      if (n !== 1) return `每 ${n} 个月`; // 不带日号，夹取无从体现
+      const day = startDate?.slice(8, 10) ?? "";
+      const text = `每月${day}日`;
+      return day !== "" && willClamp(ALL_MONTHS, Number(day)) ? `${text}${CLAMP_NOTE}` : text;
+    }
+    case "yearly": {
+      if (n !== 1) return `每 ${n} 年`;
+      const month = startDate?.slice(5, 7) ?? "";
+      const day = startDate?.slice(8, 10) ?? "";
+      const text = `每年${month}月${day}日`;
+      return month !== "" && day !== "" && willClamp([Number(month)], Number(day))
+        ? `${text}${CLAMP_NOTE}`
+        : text;
+    }
   }
 }
