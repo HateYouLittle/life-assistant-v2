@@ -128,6 +128,20 @@ describe("registry 契约", () => {
     assert.ok(tool !== undefined);
   });
 
+  it("工具描述里声明的互斥/默认口径必须落到 inputSchema 的 describe（agent 只看得见 schema）", () => {
+    // 回归：expense 的 month 与 from/to 互斥、summary 无参默认「月初→今天」，
+    // 过去只写在 handler 里（或干脆没写），schema 上看不出来 —— agent 只能照 schema 猜。
+    registerAllModules();
+    const shape = allTools().find((t) => t.def.name === "expense")?.def.inputSchema ?? {};
+    const described = (key: string): string => {
+      const field = (shape as Record<string, { description?: string } | undefined>)[key];
+      return field?.description ?? "";
+    };
+    assert.match(described("month"), /与 from\/to 互斥/, "month 的 schema 描述要写明互斥");
+    assert.match(described("from"), /与 month 互斥/);
+    assert.match(described("to"), /与 month 互斥/);
+  });
+
   it("核心不 import 模块内部（静态 import 图检查，而非仅运行时查重）", () => {
     // registry.ts 的注释声称本文件强制「核心不 import 模块内部」。运行时查重做不到这点，
     // 这里直接检查 src/core 下每个源文件的静态 import，让注释与实现一致。

@@ -14,7 +14,8 @@ import {
   pushMonthlyReports,
 } from "../src/modules/bookkeeping/service.js";
 import { bookkeepingLedgerTool, bookkeepingExpenseTool } from "../src/modules/bookkeeping/index.js";
-import { todayIso } from "../src/time.js";
+import { TZ, todayIso } from "../src/time.js";
+import { DateTime } from "luxon";
 import { cleanupTestEnv, makeTestEnv, type Published, type TestEnv } from "./helpers.js";
 
 function tools(env: TestEnv, profileId = "default") {
@@ -152,6 +153,173 @@ describe("bookkeeping：支出", () => {
         true,
         "归档账本不可记账",
       );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("summary 不传 month/from/to 时默认「月初 → 今天」，且不含月内未来日", () => {
+    // 与状态页/预算对照的「本月=自然月全月」不同：工具 summary 无参时是「本月至今」的
+    // 查询默认（to = 今天），刻意不把已录入的月内未来日算进来。
+    const env = makeTestEnv();
+    const t = tools(env);
+    try {
+      const ledger = createLedger(env.db, "默认区间账本");
+      const today = todayIso();
+      addExpense(env.db, "default", {
+        ledgerId: ledger.id,
+        amountCents: 1000,
+        spentOn: today,
+      });
+      addExpense(env.db, "default", {
+        ledgerId: ledger.id,
+        amountCents: 2000,
+        spentOn: "2099-01-15",
+      });
+      const body = JSON.parse(text(t.expense({ action: "summary", ledger_id: ledger.id }))) as {
+        区间: { from: string; to: string };
+        合计: string;
+        笔数: number;
+      };
+      assert.deepEqual(body.区间, { from: `${today.slice(0, 7)}-01`, to: today });
+      assert.equal(body.合计, "¥10.00");
+      assert.equal(body.笔数, 1, "月内未到来的日期不在默认区间内");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("month 与 from/to 互斥：两个 action 同样报错，不再一个越界一个静默忽略", () => {
+    // 回归：list 曾逐边合并（month + from 给出「月内且不早于 from」的越界区间，
+    // month + to 甚至得到反向区间静默 0 笔），summary 则整体走 monthRange 静默忽略 from/to
+    // —— 同一个工具两个 action 口径相反，且都不报错。
+    const env = makeTestEnv();
+    const t = tools(env);
+    try {
+      const ledger = createLedger(env.db, "区间账本");
+      for (const [spentOn, cents] of [
+        ["2026-05-10", 1000],
+        ["2026-06-10", 2000],
+        ["2026-07-10", 4000],
+      ] as const) {
+        addExpense(env.db, "default", { ledgerId: ledger.id, amountCents: cents, spentOn });
+      }
+      const errorOf = (args: Record<string, unknown>): string => {
+        const result = t.expense(args);
+        assert.equal(result.isError, true, `应报错: ${text(result)}`);
+        return text(result);
+      };
+
+      // 只给 month：两者的区间必须一致
+      const listMonth = JSON.parse(
+        text(t.expense({ action: "list", ledger_id: ledger.id, month: "2026-06" })),
+      ) as { 账目: { 日期: string }[]; 匹配总数: number };
+      assert.equal(listMonth.匹配总数, 1);
+      assert.equal(listMonth.账目[0]?.日期, "2026-06-10");
+      const sumMonth = JSON.parse(
+        text(t.expense({ action: "summary", ledger_id: ledger.id, month: "2026-06" })),
+      ) as { 区间: { from: string; to: string }; 合计: string; 笔数: number };
+      assert.deepEqual(sumMonth.区间, { from: "2026-06-01", to: "2026-06-30" });
+      assert.equal(sumMonth.合计, "¥20.00");
+      assert.equal(sumMonth.笔数, 1, "list 与 summary 必须覆盖同一区间");
+
+      // month + from / month + to：两个 action 报同一条错
+      for (const extra of [{ from: "2026-05-01" }, { to: "2026-05-01" }]) {
+        const fromList = errorOf({
+          action: "list",
+          ledger_id: ledger.id,
+          month: "2026-06",
+          ...extra,
+        });
+        const fromSummary = errorOf({
+          action: "summary",
+          ledger_id: ledger.id,
+          month: "2026-06",
+          ...extra,
+        });
+        assert.equal(fromList, fromSummary, "list 与 summary 对同一输入必须给同一条错误");
+        assert.match(fromList, /month 与 from\/to 不能同时指定/);
+      }
+
+      // from > to：明确报错而不是静默 0 笔
+      for (const action of ["list", "summary"]) {
+        const message = errorOf({
+          action,
+          ledger_id: ledger.id,
+          from: "2026-07-01",
+          to: "2026-05-01",
+        });
+        assert.match(message, /2026-07-01.*2026-05-01/, "报错要说清哪个区间反了");
+      }
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("只给单边 from/to：summary 与 list 口径一致，不被补默认区间反转", () => {
+    // 回归：expenseRange 的 defaults 曾是「逐边」兜底（from ?? defaults.from / to ?? defaults.to），
+    // 于是只给 from 时 summary 被补上 to=今天 —— 明细说有 N 笔（含未来账目），汇总只覆盖到今天，
+    // 同一句查询两个 action 给出相反结论；只给 to 时又补上 from=月初，静默丢掉更早的账目。
+    // 现在 defaults 只在 from/to 都不传时整体套用，半边给参就是半边语义（[from, +∞) / (-∞, to]）。
+    // 日期全部相对 todayIso() 派生（±400 天），断言对运行日不敏感。
+    const env = makeTestEnv();
+    const t = tools(env);
+    try {
+      const today = DateTime.fromISO(todayIso(), { zone: TZ });
+      const past = today.minus({ days: 100 }).toISODate() as string;
+      const older = today.minus({ days: 400 }).toISODate() as string;
+      const future = today.plus({ days: 400 }).toISODate() as string;
+      const from = today.minus({ days: 200 }).toISODate() as string;
+      const to = today.plus({ days: 200 }).toISODate() as string;
+
+      const ledger = createLedger(env.db, "半边区间账本");
+      addExpense(env.db, "default", { ledgerId: ledger.id, amountCents: 1000, spentOn: older });
+      addExpense(env.db, "default", { ledgerId: ledger.id, amountCents: 2000, spentOn: past });
+      addExpense(env.db, "default", { ledgerId: ledger.id, amountCents: 4000, spentOn: future });
+
+      const summaryOf = (
+        args: Record<string, unknown>,
+      ): {
+        区间: { from?: string; to?: string };
+        合计: string;
+        笔数: number;
+      } => JSON.parse(text(t.expense({ action: "summary", ledger_id: ledger.id, ...args })));
+      const countOf = (args: Record<string, unknown>): number =>
+        (
+          JSON.parse(text(t.expense({ action: "list", ledger_id: ledger.id, ...args }))) as {
+            匹配总数: number;
+          }
+        ).匹配总数;
+
+      // 只给 from：[from, +∞) —— 含未来账目，不补 to
+      const sumFrom = summaryOf({ from });
+      assert.deepEqual(sumFrom.区间, { from }, "只给 from 时不得补上默认 to");
+      assert.equal(sumFrom.笔数, 2, "[from, +∞) 应含今天之后的账目");
+      assert.equal(sumFrom.合计, "¥60.00");
+      assert.equal(countOf({ from }), sumFrom.笔数, "list 与 summary 必须覆盖同一区间");
+
+      // 只给 to：(-∞, to] —— 含月初之外的旧账目，不补 from
+      const sumTo = summaryOf({ to });
+      assert.deepEqual(sumTo.区间, { to }, "只给 to 时不得补上默认 from");
+      assert.equal(sumTo.笔数, 2, "(-∞, to] 应含远早于本月的账目");
+      assert.equal(sumTo.合计, "¥30.00");
+      assert.equal(countOf({ to }), sumTo.笔数, "list 与 summary 必须覆盖同一区间");
+
+      // 未来起点：list 静默 0 条，summary 也必须是 0 笔，而不是报「区间非法」
+      const far = today.plus({ days: 3000 }).toISODate() as string;
+      const resultFuture = t.expense({ action: "summary", ledger_id: ledger.id, from: far });
+      assert.notEqual(resultFuture.isError, true, "未来区间不是写反了，不该报错");
+      const sumFuture = JSON.parse(text(resultFuture)) as {
+        区间: { from?: string; to?: string };
+        笔数: number;
+      };
+      assert.deepEqual(sumFuture.区间, { from: far }, "未来起点不得被补上默认 to");
+      assert.equal(sumFuture.笔数, 0);
+      assert.equal(countOf({ from: far }), sumFuture.笔数, "未来区间两个 action 结论也必须一致");
+
+      // 仍然不传：默认区间（月初→今天）整体套用，不退化成逐边兜底
+      const sumDefault = summaryOf({});
+      assert.deepEqual(sumDefault.区间, { from: `${todayIso().slice(0, 7)}-01`, to: todayIso() });
     } finally {
       cleanupTestEnv(env);
     }

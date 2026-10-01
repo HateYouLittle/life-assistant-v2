@@ -169,13 +169,25 @@ export interface ExpenseSummary {
   profiles: Array<{ profile: string; cents: number }>;
 }
 
+/**
+ * 汇总。`from`/`to` 都可缺省（缺哪边就不加哪边的条件），与 listExpenses 同口径：
+ * 调用方只给单边时必须与 list 覆盖同一集合，逐边补默认会让两个 action 结论相反。
+ */
 export function summarizeExpenses(
   db: DatabaseSync,
   ledgerId: string,
-  opts: { from: string; to: string; by?: string },
+  opts: { from?: string; to?: string; by?: string },
 ): ExpenseSummary {
-  const conditions = ["ledger_id = ?", "spent_on >= ?", "spent_on <= ?"];
-  const params: string[] = [ledgerId, opts.from, opts.to];
+  const conditions = ["ledger_id = ?"];
+  const params: (string | number)[] = [ledgerId];
+  if (opts.from !== undefined) {
+    conditions.push("spent_on >= ?");
+    params.push(opts.from);
+  }
+  if (opts.to !== undefined) {
+    conditions.push("spent_on <= ?");
+    params.push(opts.to);
+  }
   if (opts.by !== undefined) {
     conditions.push("created_by_profile = ?");
     params.push(opts.by);
@@ -212,6 +224,16 @@ export function summarizeExpenses(
   });
 }
 
+/**
+ * 「本月」区间 = 自然月全月（月初 → 月末），**含月内尚未到来的日期**。
+ *
+ * 口径依据：spent_on 是已录入的记账事实，指定了未来日期就是「这笔钱记在那天」，
+ * 状态页本月支出、预算对照、月报三处都按同一区间算 —— 若这里再加一道「≤今天」上界，
+ * 同一个「本月」数字会随日历推移忽增忽减（月初看不全、月中突然跳变），对不上账。
+ *
+ * 工具侧 `expense summary` 不传 month/from/to 时的默认区间是「月初 → 今天」，
+ * 那是「本月至今」的查询默认，与本函数（状态页/月报/预算）有意不同，见 modules/bookkeeping/index.ts。
+ */
 export function monthRange(ym: string): { from: string; to: string } {
   if (!/^\d{4}-\d{2}$/.test(ym)) throw new Error(`月份格式需为 YYYY-MM: ${ym}`);
   const year = Number(ym.slice(0, 4));

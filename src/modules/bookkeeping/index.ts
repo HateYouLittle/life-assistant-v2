@@ -127,6 +127,43 @@ export function bookkeepingLedgerTool(args: Record<string, unknown>, ctx: ToolCo
   }
 }
 
+/**
+ * list / summary 共用的查询区间解析，两个 action 口径必须一致：
+ * - `month` 与 `from`/`to` 互斥。`month` 已给出整月区间，并列时 list 曾逐边合并成
+ *   「月内且不早于 from」的越界区间（month + to 更会得到反向区间、静默 0 笔），
+ *   而 summary 整体走 monthRange、静默忽略 from/to —— 同一工具两个 action 结论相反。
+ * - `from > to` 显式报错，不当成「查不到」。
+ * - `defaults` 只用于 summary **完全没指定** from/to 时的默认（月初 → 今天）；list 不传任何
+ *   参数时仍是不限区间的全量查询，不能给默认区间（那会把历史账目藏掉）。
+ * - defaults 必须**整体**套用，不能逐边兜底（`from ?? defaults.from` / `to ?? defaults.to`）：
+ *   逐边兜底会让只给 from 的 summary 被补上 to=今天，只给 to 的被补上 from=月初，于是同一句
+ *   查询 list（半边语义）与 summary（被补全的区间）给出相反的笔数/金额；「未来起点」还会被
+ *   补出来的 to 判成「区间写反了」而报错，而 list 同一输入静默返回 0 条。
+ */
+function expenseRange(
+  args: Record<string, unknown>,
+  defaults?: { from: string; to: string },
+): { from?: string; to?: string } {
+  const month = args.month as string | undefined;
+  const from = args.from as string | undefined;
+  const to = args.to as string | undefined;
+  if (month !== undefined) {
+    if (from !== undefined || to !== undefined) {
+      throw new Error("month 与 from/to 不能同时指定（month 已给出整月区间，二选一）");
+    }
+    return monthRange(month);
+  }
+  // defaults 整体套用：半边给参就保持半边语义，与 list 完全一致。
+  const range =
+    from === undefined && to === undefined && defaults !== undefined
+      ? { ...defaults }
+      : { from, to };
+  if (range.from !== undefined && range.to !== undefined && range.from > range.to) {
+    throw new Error(`区间非法: from(${range.from}) 晚于 to(${range.to})`);
+  }
+  return range;
+}
+
 export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolContext) {
   try {
     const action = args.action as string;
@@ -183,11 +220,8 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
       if (ledgerId === undefined) {
         return fail('list 需要 ledger_id（先调用 ledger {action:"list"} 取账本 id）');
       }
-      const range: { from?: string; to?: string } =
-        args.month === undefined ? {} : monthRange(args.month as string);
       const page = listExpenses(db, ledgerId, {
-        from: (args.from as string | undefined) ?? range.from,
-        to: (args.to as string | undefined) ?? range.to,
+        ...expenseRange(args),
         by: args.by as string | undefined,
         limit: args.limit as number | undefined,
       });
@@ -213,13 +247,12 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
         return fail('summary 需要 ledger_id（先调用 ledger {action:"list"} 取账本 id）');
       }
       if (getLedger(db, ledgerId) === undefined) return fail(`账本不存在: ${ledgerId}`);
-      const range =
-        args.month !== undefined
-          ? monthRange(args.month as string)
-          : {
-              from: (args.from as string | undefined) ?? `${todayIso().slice(0, 7)}-01`,
-              to: (args.to as string | undefined) ?? todayIso(),
-            };
+      // 未指定区间时默认「月初 → 今天」（本月至今）；看板/月报的「本月」是自然月全月，
+      // 口径差异见 service.ts 的 monthRange 注释
+      const range = expenseRange(args, {
+        from: `${todayIso().slice(0, 7)}-01`,
+        to: todayIso(),
+      });
       const summary = summarizeExpenses(db, ledgerId, {
         ...range,
         by: args.by as string | undefined,
@@ -291,7 +324,7 @@ registerModule({
     {
       name: "expense",
       description:
-        "支出记账：add 记一笔（ledger_id + amount 元，可选 category/note/date，回执全局推送）；list 明细（可按 month/from/to/by 过滤）；summary 汇总（按分类与记账人）；delete 删除记错的一笔（id 从 list 获取）。金额只支持支出，单位为元。",
+        "支出记账：add 记一笔（ledger_id + amount 元，可选 category/note/date，回执全局推送）；list 明细（可按 month/from/to/by 过滤）；summary 汇总（按分类与记账人）；delete 删除记错的一笔（id 从 list 获取）。month 与 from/to 互斥（同时传会报错）；from/to 只给一边就是半边区间（只给 from = [from, 将来)，只给 to = (过去, to]），两个 action 口径一致；默认区间只在 month/from/to **都不传**时生效（summary 默认「月初→今天」，list 不传时不限区间）。金额只支持支出，单位为元。",
       inputSchema: {
         action: z.enum(["add", "list", "summary", "delete"]),
         id: z.string().optional().describe("delete 时的账目 id"),
@@ -307,9 +340,21 @@ registerModule({
           .string()
           .regex(/^\d{4}-\d{2}$/)
           .optional()
-          .describe("按月过滤/汇总"),
-        from: z.string().regex(DATE_RE).optional(),
-        to: z.string().regex(DATE_RE).optional(),
+          .describe("按自然月过滤/汇总（整月，含月内未来日）；与 from/to 互斥"),
+        from: z
+          .string()
+          .regex(DATE_RE)
+          .optional()
+          .describe(
+            "起始日（含）；与 month 互斥；只给 from 不给 to 时区间是 [from, 将来)（不限上界）",
+          ),
+        to: z
+          .string()
+          .regex(DATE_RE)
+          .optional()
+          .describe(
+            "截止日（含）；与 month 互斥；只给 to 不给 from 时区间是 (过去, to]（不限下界）",
+          ),
         by: z.string().optional().describe("按记账人 Profile 过滤"),
         limit: z
           .number()

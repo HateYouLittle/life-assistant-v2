@@ -106,11 +106,13 @@ describe("状态接口", () => {
           "INSERT INTO ledgers (id, name, created_at) VALUES ('l1', '日用', '2026-01-01T00:00:00.000Z')",
         )
         .run();
+      // spent_on 是 Asia/Shanghai 本地日历日，不能用 toISOString()（UTC）：
+      // 本地 00:00-08:00 期间 UTC 仍是昨天，会落到月初之前让计数恒为 0
       env.db
         .prepare(
           "INSERT INTO expenses (id, ledger_id, amount_cents, spent_on, created_by_profile, created_at) VALUES ('e1','l1',12345,?, 'default', '2026-01-01T00:00:00.000Z')",
         )
-        .run(new Date().toISOString().slice(0, 10));
+        .run(todayIso());
       const payload = statusPayload(env.config, env.db);
       assert.equal(payload.ok, true);
       assert.deepEqual(payload.profiles, ["default"]);
@@ -188,7 +190,10 @@ describe("状态接口", () => {
     }
   });
 
-  it("未来日期的支出不计入本月支出", () => {
+  it("本月支出 = 自然月全月：月内更晚的已录入日计入，邻月不计入", () => {
+    // 口径（见 service.ts 的 monthRange 注释）：状态页/看板/预算对照的「本月」是自然月全月，
+    // 含月内尚未到来的日期 —— spent_on 是已录入事实，不能因为日历没到那天就从本月数字里消失。
+    // 月内最后一天恒不早于今天：今天恰是月末时它落在今天，合计结论不变。
     const env = makeTestEnv();
     try {
       env.db
@@ -197,14 +202,28 @@ describe("状态接口", () => {
         )
         .run();
       const today = todayIso();
+      // 月末用日历事实算出，不走 monthRange —— 否则被测函数改错时夹具会跟着一起错，断言恒真
+      const monthEnd = DateTime.fromISO(`${today.slice(0, 7)}-01`, { zone: TZ })
+        .endOf("month")
+        .toISODate() as string;
+      const nextMonth = DateTime.fromISO(`${today.slice(0, 7)}-01`, { zone: TZ })
+        .plus({ months: 1 })
+        .toISODate() as string;
       const insert = env.db.prepare(
         "INSERT INTO expenses (id, ledger_id, amount_cents, spent_on, created_by_profile, created_at) VALUES (?, 'l1', ?, ?, 'default', '2026-01-01T00:00:00.000Z')",
       );
       insert.run("e-now", 1000, today);
-      insert.run("e-future", 9999, "2099-01-15");
+      insert.run("e-month-end", 9999, monthEnd);
+      insert.run("e-next-month", 7777, nextMonth);
+
       const payload = statusPayload(env.config, env.db);
-      const expenses = payload.expenses as { month_cents: number };
-      assert.equal(expenses.month_cents, 1000, "只筛 >= 月初会把未来支出也算进本月");
+      const expenses = payload.expenses as { month: string; month_cents: number };
+      assert.equal(expenses.month, today.slice(0, 7));
+      assert.equal(
+        expenses.month_cents,
+        10999,
+        `同月的 ${monthEnd} 必须计入本月（口径=自然月全月），只有今天那一笔才是 1000`,
+      );
     } finally {
       cleanupTestEnv(env);
     }
@@ -282,6 +301,43 @@ describe("看板明细接口", () => {
       assert.equal(body.entries.length, 3);
       assert.equal(body.entries[0]?.ledger_name, "家庭账本");
       assert.equal(body.prev.month.length, 7);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("/api/expenses?month= 钉死挂钟：显式月份只看该月，与「今天在哪天」无关", async () => {
+    // 口径：month 是自然月全月（含该月内所有已录入日，不设「今天」上界）。
+    // 用固定夹具日期，任何挂钟时刻都应得到同一结果。
+    const env = makeTestEnv();
+    try {
+      env.db
+        .prepare(
+          "INSERT INTO ledgers (id, name, created_at) VALUES ('l1','家庭账本','2026-01-01T00:00:00.000Z')",
+        )
+        .run();
+      const insert = env.db.prepare(
+        `INSERT INTO expenses (id, ledger_id, amount_cents, spent_on, created_by_profile, created_at)
+         VALUES (?, 'l1', ?, ?, 'default', '2026-01-01T00:00:00.000Z')`,
+      );
+      insert.run("m1", 1000, "2026-06-01");
+      insert.run("m2", 2000, "2026-06-15");
+      insert.run("m3", 3000, "2026-06-30");
+      insert.run("prev", 4000, "2026-05-31");
+      insert.run("next", 5000, "2026-07-01");
+
+      const body = (await (await app(env).request("/api/expenses?month=2026-06")).json()) as {
+        range: { from: string; to: string };
+        total_cents: number;
+        daily: { date: string }[];
+      };
+      assert.deepEqual(body.range, { from: "2026-06-01", to: "2026-06-30" });
+      assert.equal(body.total_cents, 6000, "只取 6 月三笔（含月末），邻月不入账");
+      assert.deepEqual(
+        body.daily.map((d) => d.date),
+        ["2026-06-01", "2026-06-15", "2026-06-30"],
+        "月末那一笔必须计入（这是「本月=自然月全月」口径的直接体现）",
+      );
     } finally {
       cleanupTestEnv(env);
     }
