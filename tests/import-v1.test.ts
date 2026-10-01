@@ -210,6 +210,230 @@ describe("import:v1 旧库路径解析", () => {
 });
 
 describe("import:v1", () => {
+  it("农历 interval>1 的旧库行：导入时收敛为 1 并在报告里留痕", () => {
+    // 回归（N9）：导入走的是裸 SQL INSERT，整条路径不经 validateScheduleInput，
+    // 而农历引擎根本不按 interval 跳年（iterateLunar 只做 lunarYear++）。旧实现在
+    // `case "yearly"` 里原样取旧库的 base.interval，于是 interval=3 被静默导入成
+    // 一条「引擎不读、报告不提」的脏数据：用户以为「每 3 年」在跑，实际每年都跑。
+    // 修法：导入在落库前走 core/recurrence.ts 的 collapseLunarInterval（与 MCP
+    // 写入侧同一个收口），并往 scheduleWarnings 记一条明确的 warning。
+    const env = makeTestEnv();
+    try {
+      const oldPath = `${env.dir}/old.db`;
+      const old = new DatabaseSync(oldPath);
+      old.exec(OLD_DDL);
+      const ts = "2026-01-01T00:00:00.000Z";
+      old.prepare("INSERT INTO profiles VALUES ('p1', ?)").run(ts);
+      const insert = old.prepare(
+        `INSERT INTO schedules (profile_id, id, type, title, status, calendar, date, lunar_month, lunar_day,
+           leap_month_policy, time, all_day, timezone, recurrence_json, reminders_json, enabled, version,
+           created_at, updated_at)
+         VALUES ('p1', ?, 'birthday', ?, 'active', ?, ?, ?, ?, ?, '09:00', 0, 'Asia/Shanghai', ?, '[]', 1, 1, ?, ?)`,
+      );
+      // 农历 + yearly + interval=3：引擎只按农历年推进，interval 不生效
+      insert.run(
+        "lunar-iv",
+        "农历每三年",
+        "lunar",
+        null,
+        8,
+        15,
+        "regular",
+        JSON.stringify({ frequency: "yearly", interval: 3 }),
+        ts,
+        ts,
+      );
+      // 对照：公历 + yearly + interval=3 是合法配置，必须原样保留
+      insert.run(
+        "solar-iv",
+        "公历每三年",
+        "solar",
+        "2026-06-06",
+        null,
+        null,
+        "regular",
+        JSON.stringify({ frequency: "yearly", interval: 3 }),
+        ts,
+        ts,
+      );
+      old.close();
+
+      const report = runImport(env.db, oldPath);
+      const read = (id: string): Record<string, unknown> =>
+        env.db.prepare("SELECT * FROM schedules WHERE id = ?").get(id) as Record<string, unknown>;
+      assert.deepEqual(
+        JSON.parse(read("lunar-iv").recurrence_json as string),
+        { freq: "yearly", interval: 1 },
+        "农历 interval>1 必须收敛为 1（引擎不按间隔跳年）",
+      );
+      assert.deepEqual(
+        JSON.parse(read("solar-iv").recurrence_json as string),
+        { freq: "yearly", interval: 3 },
+        "公历 interval>3 是合法配置，收口不得误伤",
+      );
+      assert.ok(
+        report.scheduleWarnings.some(
+          (w) => w.includes("农历每三年") && w.includes("interval=3") && w.includes("已按 1 导入"),
+        ),
+        `农历 interval 收敛必须留痕，实际 ${JSON.stringify(report.scheduleWarnings)}`,
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("农历 + daily/weekly/monthly 导入必须告警：农历引擎一律按农历年触发，原语义被静默改写", () => {
+    // N12 的 A 类。机理（已实跑复核）：core/recurrence.ts 的 iterate 对 calendar==="lunar"
+    // 直接 `yield* iterateLunar; return;` —— once/daily/weekly/monthly/yearly **一视同仁**
+    // 按农历年触发，freq 被完全丢弃；回显 describeRecurrence 也一律写「每年」。
+    // 所以旧农历数据里 frequency=daily 的行，导入后实际是每年触发，而导入报告**零告警**
+    // （interval 已是 1，不触发第 4 轮 N9 的 interval warning）——用户从报告与回显都
+    // 看不出原意被改过。mapRecurrence 此前对 daily/weekly/monthly 完全不看 calendar。
+    const env = makeTestEnv();
+    try {
+      const oldPath = `${env.dir}/old-lunar-freq.db`;
+      const old = new DatabaseSync(oldPath);
+      old.exec(OLD_DDL);
+      const ts = "2026-01-01T00:00:00.000Z";
+      old.prepare("INSERT INTO profiles VALUES ('p1', ?)").run(ts);
+      const insert = old.prepare(
+        `INSERT INTO schedules (profile_id, id, type, title, status, calendar, date, lunar_month, lunar_day,
+           leap_month_policy, time, all_day, timezone, recurrence_json, reminders_json, reminder_interval_minutes,
+           enabled, version, created_at, updated_at)
+         VALUES ('p1', ?, 'birthday', ?, 'active', 'lunar', null, ?, ?, 'regular', '09:00', 0, 'Asia/Shanghai', ?, '[]', NULL, 1, 1, ?, ?)`,
+      );
+      const lunarRow = (
+        id: string,
+        title: string,
+        month: number,
+        day: number,
+        frequency: string,
+      ): void => {
+        insert.run(id, title, month, day, JSON.stringify({ frequency, interval: 1 }), ts, ts);
+      };
+      lunarRow("l-daily", "农历每日", 5, 5, "daily");
+      lunarRow("l-weekly", "农历每周", 6, 6, "weekly");
+      lunarRow("l-monthly", "农历每月", 7, 7, "monthly");
+      // 对照：公历 daily 绝不能被这条守卫误伤
+      old
+        .prepare(
+          `INSERT INTO schedules (profile_id, id, type, title, status, calendar, date, lunar_month, lunar_day,
+             leap_month_policy, time, all_day, timezone, recurrence_json, reminders_json, reminder_interval_minutes,
+             enabled, version, created_at, updated_at)
+           VALUES ('p1', 's-daily', 'todo', '公历每日', 'active', 'solar', '2026-01-01', NULL, NULL,
+             NULL, '09:00', 0, 'Asia/Shanghai', '{"frequency":"daily","interval":2}', '[]', NULL, 1, 1, ?, ?)`,
+        )
+        .run(ts, ts);
+      old.close();
+
+      const report = runImport(env.db, oldPath);
+      const read = (id: string): Record<string, unknown> =>
+        env.db.prepare("SELECT * FROM schedules WHERE id = ?").get(id) as Record<string, unknown>;
+
+      for (const [id, freq] of [
+        ["l-daily", "daily"],
+        ["l-weekly", "weekly"],
+        ["l-monthly", "monthly"],
+      ] as const) {
+        assert.ok(
+          report.scheduleWarnings.some(
+            (w) =>
+              w.includes(
+                id === "l-daily" ? "农历每日" : id === "l-weekly" ? "农历每周" : "农历每月",
+              ) &&
+              w.includes(freq) &&
+              w.includes("农历"),
+          ),
+          `农历 ${freq} 必须有告警说明无法在 v2 表达，实际 ${JSON.stringify(report.scheduleWarnings)}`,
+        );
+        // 落库值必须与引擎实际行为一致（每年），而不是保留一个引擎根本不读的 freq
+        assert.deepEqual(
+          JSON.parse(read(id).recurrence_json as string),
+          { freq: "yearly", interval: 1 },
+          `农历 ${freq} 应落成 yearly（引擎只按农历年触发）`,
+        );
+      }
+      // 守卫不得误伤公历：公历 daily interval=2 是合法配置
+      assert.deepEqual(
+        JSON.parse(read("s-daily").recurrence_json as string),
+        { freq: "daily", interval: 2 },
+        "公历 daily 不得被农历守卫误伤",
+      );
+      assert.ok(
+        !report.scheduleWarnings.some((w) => w.includes("公历每日") && w.includes("不支持")),
+        `公历 daily 不该有任何「不支持」告警：${JSON.stringify(report.scheduleWarnings)}`,
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("农历 once / {} / 缺月日：导入即死行（零 occurrence），必须有告警不得静默", () => {
+    // N12 的 B 类。CHECK 允许 lunar_month/lunar_day 为 NULL（core/database.ts），
+    // 而 iterateLunar 对「月/日越界」与「recurrence 为 null」都是直接 return ——
+    // 产出零 occurrence，提醒永不发生，回显写「一次：农历X月X日」或「每年农历null月null日」。
+    // 用户从报告里看不到任何提示，所以「永远不触发」必须有告警。
+    const env = makeTestEnv();
+    try {
+      const oldPath = `${env.dir}/old-lunar-dead.db`;
+      const old = new DatabaseSync(oldPath);
+      old.exec(OLD_DDL);
+      const ts = "2026-01-01T00:00:00.000Z";
+      old.prepare("INSERT INTO profiles VALUES ('p1', ?)").run(ts);
+      const insert = old.prepare(
+        `INSERT INTO schedules (profile_id, id, type, title, status, calendar, date, lunar_month, lunar_day,
+           leap_month_policy, time, all_day, timezone, recurrence_json, reminders_json, reminder_interval_minutes,
+           enabled, version, created_at, updated_at)
+         VALUES ('p1', ?, 'birthday', ?, 'active', 'lunar', null, ?, ?, 'regular', '09:00', 0, 'Asia/Shanghai', ?, '[]', NULL, 1, 1, ?, ?)`,
+      );
+      // once：recurrence 映射成 null → iterateLunar 首行 return → 零 occurrence
+      insert.run("l-once", "农历一次性", 5, 5, JSON.stringify({ frequency: "once" }), ts, ts);
+      // {}：mapRecurrence 的空对象早退 → 同样 null
+      insert.run("l-empty", "农历空规则", 6, 6, "{}", ts, ts);
+      // 月/日为 NULL：targets 的 CHECK 写的是 `lunar_month IS NULL OR (1..12)`，
+      // **NULL 直接放行**，于是这行静默入库并成为零 occurrence 的死行。
+      // （越界的 0 则会被 CHECK 拒掉、逐行隔离进 problems —— 那条路径已有告警，不在本用例范围）
+      insert.run(
+        "l-nomd",
+        "农历缺月日",
+        null,
+        null,
+        JSON.stringify({ frequency: "yearly" }),
+        ts,
+        ts,
+      );
+      old.close();
+
+      const report = runImport(env.db, oldPath);
+
+      assert.ok(
+        report.scheduleWarnings.some((w) => w.includes("农历一次性") && w.includes("循环规则")),
+        `农历 once 必须告警它不会产生任何提醒，实际 ${JSON.stringify(report.scheduleWarnings)}`,
+      );
+      assert.ok(
+        report.scheduleWarnings.some((w) => w.includes("农历空规则") && w.includes("循环规则")),
+        `农历 {} 必须告警，实际 ${JSON.stringify(report.scheduleWarnings)}`,
+      );
+      assert.ok(
+        report.scheduleWarnings.some((w) => w.includes("农历缺月日") && w.includes("月/日")),
+        `农历缺月日必须告警，实际 ${JSON.stringify(report.scheduleWarnings)}`,
+      );
+      // 三行都要真的入库（不是被跳过），但一条 occurrence 都不该有
+      const rows = env.db.prepare("SELECT id FROM schedules").all() as { id: string }[];
+      assert.deepEqual(
+        rows.map((r) => r.id).sort(),
+        ["l-empty", "l-nomd", "l-once"],
+        "三条农历行都应入库（告警而非静默丢弃）",
+      );
+      const occ = env.db
+        .prepare("SELECT COUNT(*) AS n FROM occurrences WHERE schedule_id LIKE 'l-%'")
+        .get() as { n: number };
+      assert.equal(occ.n, 0, "死行本就不该有 occurrence（这是缺陷的成因，不是期望行为）");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("profile_settings 里的非法 Profile 名被逐行隔离，不落库（状态页注入入口的回归）", () => {
     const env = makeTestEnv();
     try {

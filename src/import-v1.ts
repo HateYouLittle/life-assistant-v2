@@ -7,7 +7,7 @@ import { TZ } from "./time.js";
 import { openDatabase, withTransaction } from "./core/database.js";
 import { logger } from "./core/logger.js";
 import { ensureProfile, setSetting } from "./core/settings.js";
-import type { Recurrence } from "./core/recurrence.js";
+import { collapseLunarInterval, type Recurrence } from "./core/recurrence.js";
 
 /**
  * v1 → v2 一次性导入：旧库只读打开，映射 profiles/静默时段/日程/账本/支出/节假日。
@@ -194,8 +194,16 @@ function mapRecurrence(
     case "once":
       return { recurrence: null, workdayFilter: "any" };
     case "daily":
+      // 农历守卫（N12）：农历引擎对 once/daily/weekly/monthly/yearly **一视同仁**按农历年
+      // 触发（core/recurrence.ts 的 iterate 对 calendar==="lunar" 直接 yield* iterateLunar，
+      // freq 被完全丢弃），且回显一律写「每年」。所以旧数据里农历+daily/weekly/monthly 若
+      // 原样映射，导入报告会**零告警**而实际语义已从「每天」变成「每年」——用户从报告与
+      // 回显都看不出原意被改过。与下面的 workday/holiday 同形：非公历一律 break 到兜底
+      // warning（那里会说明「无法在 v2 表达，已按每年循环导入」）。
+      if (calendar !== "solar") break;
       return { recurrence: { freq: "daily", ...base }, workdayFilter: "any" };
     case "weekly": {
+      if (calendar !== "solar") break;
       // 空的 byweekday 会让 recurrence 引擎无候选日可产出，此前会导致进程同步死循环。
       // 旧库的星期写法可能认不出来，此时回退到「开始日期的星期」（等价于每周一次）。
       if (weeklyDays.length > 0) {
@@ -220,6 +228,7 @@ function mapRecurrence(
       return { recurrence: null, workdayFilter: "any" };
     }
     case "monthly":
+      if (calendar !== "solar") break;
       return { recurrence: { freq: "monthly", ...base }, workdayFilter: "any" };
     case "yearly":
       return { recurrence: { freq: "yearly", ...base }, workdayFilter: "any" };
@@ -433,13 +442,52 @@ export function runImport(
             );
           }
           const status = mappedStatus ?? "active";
-          const { recurrence, workdayFilter } = mapRecurrence(
+          const { recurrence: mappedRecurrence, workdayFilter } = mapRecurrence(
             s.recurrence_json,
             calendar,
             s.title,
             report.scheduleWarnings,
             s.date,
           );
+          // 农历 interval 收口（与 MCP 写入侧同一个函数，core/recurrence.ts）：
+          // 导入是裸 SQL INSERT，整条路径不经 validateScheduleInput，而农历引擎
+          // 根本不按 interval 跳年（只做 lunarYear++）。不收口就会静默导入一条
+          // 「interval 不生效」的脏数据，且用户从报告里看不到任何提示。
+          const recurrence = collapseLunarInterval(
+            calendar === "lunar" ? "lunar" : "solar",
+            mappedRecurrence,
+          );
+          if (
+            recurrence !== null &&
+            mappedRecurrence !== null &&
+            recurrence.interval !== mappedRecurrence.interval
+          ) {
+            report.scheduleWarnings.push(
+              `日程「${s.title}」是农历循环，interval=${mappedRecurrence.interval} 不生效（农历只按农历年循环），已按 1 导入`,
+            );
+          }
+          // 农历行的月/日是它唯一的锚点（start_date 对农历行无意义，被置 NULL）：
+          // 为空或越界时 iterateLunar 的 `month<1||month>12||day<1||day>30` 直接 return，
+          // 产出**零 occurrence** —— 提醒永不发生，而数据库的 CHECK 允许 NULL（core/database.ts
+          // 的 lunar_month/lunar_day 均带 `IS NULL OR ...`），脏行会静默入库。
+          // 「一行永远不触发」是导入能造出的最隐蔽的错误，必须留痕。
+          if (calendar === "lunar") {
+            const m = s.lunar_month;
+            const d = s.lunar_day;
+            if (m === null || m < 1 || m > 12 || d === null || d < 1 || d > 30) {
+              report.scheduleWarnings.push(
+                `日程「${s.title}」是农历日程但农历月/日缺失或越界（lunar_month=${String(m)}, lunar_day=${String(d)}），不会产生任何提醒，请补齐 1-12 / 1-30`,
+              );
+            }
+            // recurrence 为 null 同样零 occurrence（iterateLunar 首行即 `if recurrence===null return`）：
+            // 旧行的 once / {} / "" / 缺字段都落到这里。回显写「一次：农历X月X日」，
+            // 但农历的一次性事件无法表达（没有年份锚点），所以这条永远是死行。
+            if (recurrence === null) {
+              report.scheduleWarnings.push(
+                `日程「${s.title}」是农历日程但没有循环规则（recurrence 为空），不会产生任何提醒，请改为每年循环（recurrence: {freq:"yearly", interval:1}）`,
+              );
+            }
+          }
           const offsets = mapReminders(s.reminders_json, s.title, report.scheduleWarnings);
           const resend =
             s.reminder_interval_minutes !== null && s.reminder_interval_minutes > 0
