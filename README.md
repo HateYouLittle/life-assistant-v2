@@ -43,7 +43,7 @@ npm run build
 | `QWEATHER_JWT_KEY_ID` / `QWEATHER_JWT_PROJECT_ID` / `QWEATHER_JWT_DEVELOPER_ID` / `QWEATHER_JWT_PRIVATE_KEY_PATH` | | **推荐**：Ed25519 JWT 认证。前三个是控制台的凭据 ID / 项目 ID / 开发者 ID，第四个是仓库外的私钥 PEM **绝对路径**（如 `/home/you/.secrets/qweather-ed25519.pem`，权限 600；`~` 不会被展开）。四项**要么全配、要么全不配**：只写一半会启动报错，不会静默退回 API KEY。注意启动阶段只校验"四项是否齐全"——私钥文件不存在/不可读/非 Ed25519 PKCS8 时报错发生在**第一次天气请求**，不在启动时。两者都配时优先 JWT |
 | `QWEATHER_JWT_TTL_SECONDS` | | JWT 有效期，默认 `43200`（12 小时），上限 `86400` |
 | `DEFAULT_CITY` | | Profile 未设位置时的兜底城市，默认 `北京` |
-| `HOST` / `PORT` | | 默认 `127.0.0.1:3080`；**非回环地址必须配 `WEB_API_TOKEN`**，否则拒绝启动 |
+| `HOST` / `PORT` | | 默认 `127.0.0.1:3080`；**非回环地址必须配 `WEB_API_TOKEN`**，否则拒绝启动。`HOST` 只写主机（可含 scheme，如 `http://127.0.0.1`），端口一律用 `PORT` 指定，误写成 `127.0.0.1:3080` 会报错 |
 | `WEB_API_TOKEN` | | 非回环地址必填且**至少 32 字符**（回环地址下短 token 只告警不拦截）；保护 `/api/*`（Bearer 或 `?token=`）与 `/mcp`（仅 Bearer） |
 | `MCP_DAEMON_TOKEN` | | stdio 壳访问 daemon 用的 token；缺省复用 `WEB_API_TOKEN` |
 | `PROFILE_ROUTE_SECRETS_JSON` | 主动推送需要 | `'{"default":"<openssl rand -hex 32>"}'`（整段用单引号包裹；每个 secret **至少 32 字符**） |
