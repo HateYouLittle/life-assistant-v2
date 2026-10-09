@@ -187,6 +187,19 @@ function addColumnIfMissing(db: DatabaseSync, table: string, column: string, typ
 
 export function migrate(db: DatabaseSync): void {
   db.exec(DDL);
+  // 活动账本名唯一：JS 层一直在查重，但没有数据库约束兜底，并发创建理论上可同时通过。
+  // 用**部分**唯一索引（archived_at IS NULL 才约束）——归档账本允许重名，与既有语义一致。
+  // best-effort：历史库若已存在重名活动账本，建索引会失败；这里只告警、不拒绝启动
+  // （宁可少一道约束，也不能让用户因历史脏数据起不来），并提示人工核查。
+  try {
+    db.exec(
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_ledgers_active_name ON ledgers(name) WHERE archived_at IS NULL",
+    );
+  } catch (e) {
+    logger.warn(
+      `未能创建活动账本名唯一索引（可能存在历史重名账本，请人工核查后重试）: ${String(e)}`,
+    );
+  }
   const row = db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as
     | { value: string }
     | undefined;

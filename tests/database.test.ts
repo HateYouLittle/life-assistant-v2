@@ -145,6 +145,45 @@ describe("database schema v2", () => {
     }
   });
 
+  it("活动账本名由数据库唯一约束兜底；归档后同名可复用", () => {
+    const env = makeTestEnv();
+    try {
+      const insert = env.db.prepare(
+        "INSERT INTO ledgers (id, name, created_at) VALUES (?, ?, '2026-01-01T00:00:00.000Z')",
+      );
+      insert.run("l1", "日用");
+      assert.throws(() => insert.run("l2", "日用"), /UNIQUE/, "活动账本重名必须被数据库拒绝");
+      env.db
+        .prepare("UPDATE ledgers SET archived_at = '2026-02-01T00:00:00.000Z' WHERE id = 'l1'")
+        .run();
+      insert.run("l3", "日用");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("历史重名活动账本：唯一索引创建失败只告警，不拒绝启动", () => {
+    const env = makeTestEnv();
+    let reopened: DatabaseSync | undefined;
+    try {
+      // 去掉索引后制造历史重名（模拟旧库脏数据）
+      env.db.exec("DROP INDEX idx_ledgers_active_name");
+      const insert = env.db.prepare(
+        "INSERT INTO ledgers (id, name, created_at) VALUES (?, ?, '2026-01-01T00:00:00.000Z')",
+      );
+      insert.run("l1", "日用");
+      insert.run("l2", "日用");
+      env.db.close();
+
+      // 打不开就说明 best-effort 失效：历史脏数据不该让进程起不来
+      reopened = openDatabase(env.config.dbPath);
+      assert.equal(getSchemaVersion(reopened), 2);
+    } finally {
+      reopened?.close();
+      cleanupTestEnv(env);
+    }
+  });
+
   it("外键开启：账目必须挂在存在的账本上", () => {
     const env = makeTestEnv();
     try {
