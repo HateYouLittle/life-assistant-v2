@@ -43,6 +43,14 @@ describe("config", () => {
     assert.equal(local.webApiToken, "t".repeat(8));
   });
 
+  it("HOST 归一化 scheme；误写端口给出明确报错（IPv6 不受影响）", () => {
+    assert.equal(loadConfig({ ...BASE, HOST: "http://127.0.0.1" }).host, "127.0.0.1");
+    assert.throws(() => loadConfig({ ...BASE, HOST: "127.0.0.1:3080" }), /端口/);
+    assert.throws(() => loadConfig({ ...BASE, HOST: "http://localhost:3080" }), /端口/);
+    // IPv6 字面量含多个冒号/方括号，不能被误判成「主机:端口」
+    assert.equal(loadConfig({ ...BASE, HOST: "[::1]" }).host, "[::1]");
+  });
+
   it("QWeather 必须成对配置", () => {
     assert.throws(() => loadConfig({ ...BASE, QWEATHER_API_HOST: "h.example.com" }), /同时/);
     assert.throws(() => loadConfig({ ...BASE, QWEATHER_KEY: "k" }), /同时/);

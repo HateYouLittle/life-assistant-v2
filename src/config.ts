@@ -87,6 +87,19 @@ function normalizeHost(raw: string): string {
   return host;
 }
 
+/**
+ * 判断 host 是否误写了「主机:端口」。端口应由 PORT 单独指定，混进 HOST 会让
+ * `isLoopbackHost` 判成非回环（进而要求 WEB_API_TOKEN），报错也牛头不对马嘴。
+ * IPv6 字面量（`::1`、`[::1]`）必然含多个冒号或方括号，不在此列；
+ * 只有「恰好一个冒号 + 纯数字端口」才判定为误写。
+ */
+function looksLikeHostWithPort(host: string): boolean {
+  if (host.startsWith("[")) return false;
+  const colon = host.lastIndexOf(":");
+  if (colon < 0 || host.indexOf(":") !== colon) return false;
+  return /^\d+$/.test(host.slice(colon + 1));
+}
+
 interface JwtCredentials {
   keyId: string;
   projectId: string;
@@ -208,7 +221,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
   if (!isAbsolute(dataDir)) throw new Error(`DATA_DIR 必须是绝对路径: ${dataDir}`);
 
   const webApiToken = env.WEB_API_TOKEN?.trim() || undefined;
-  const host = env.HOST?.trim() || "127.0.0.1";
+  // 与 QWEATHER_API_HOST 同口径归一（剥 scheme/尾斜杠），否则 `HOST=http://127.0.0.1`
+  // 会被判成非回环并索要 WEB_API_TOKEN，用户完全看不懂。
+  const host = normalizeHost(env.HOST ?? "") || "127.0.0.1";
+  if (looksLikeHostWithPort(host)) {
+    throw new Error(`HOST 不能带端口（端口请用 PORT 指定）: ${host}`);
+  }
   const loopback = isLoopbackHost(host);
   if (!loopback && !webApiToken) {
     throw new Error(`HOST=${host} 非回环地址且未设置 WEB_API_TOKEN，拒绝启动`);
