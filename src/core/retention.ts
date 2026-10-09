@@ -30,6 +30,17 @@ function cutoffIso(days: number, now: number = Date.now()): string {
 }
 
 /**
+ * 可清理的「已取消」日程判定（唯一来源）：已取消 + 超期 + 未使用 `recurrence.count`。
+ * `count` 日程的 occurrence 整条豁免（见 core/recurrence 与 schedule 的 occurrence 清理），
+ * 删掉日程会让已达上限的循环复活。
+ * 预演与实删必须共用它 —— 两处各自内联会让判定悄悄漂移成「预演数 ≠ 实删数」。
+ */
+function cancelledScheduleCleanupWhere(): string {
+  return `status = 'cancelled' AND updated_at < ?
+    AND (recurrence_json IS NULL OR recurrence_json NOT LIKE '%"count"%')`;
+}
+
+/**
  * 可清理通知的判定（唯一来源）：已读 + 超期 + 没有任何未终结的投递。
  * 预演的「几条通知/几条投递」与实删必须共用它 —— 否则预演数字会大于实删
  * （按「已读且超期」统计时，会把「仍有待投递所以不会删」的通知的投递也算进去）。
@@ -62,11 +73,7 @@ export function cancelledScheduleRetentionPlan(
 ): { count: number; cutoff: string } {
   const cutoff = cutoffIso(days, now);
   const row = db
-    .prepare(
-      `SELECT COUNT(*) AS n FROM schedules
-       WHERE status = 'cancelled' AND updated_at < ?
-         AND (recurrence_json IS NULL OR recurrence_json NOT LIKE '%"count"%')`,
-    )
+    .prepare(`SELECT COUNT(*) AS n FROM schedules WHERE ${cancelledScheduleCleanupWhere()}`)
     .get(cutoff) as { n: number };
   return { count: row.n, cutoff };
 }
@@ -100,11 +107,7 @@ export function runRetention(db: DatabaseSync, now: number = Date.now()): Retent
     .run(cutoffIso(NOTIFICATION_RETENTION_DAYS, now));
 
   const deletedSchedules = db
-    .prepare(
-      `DELETE FROM schedules
-       WHERE status = 'cancelled' AND updated_at < ?
-         AND (recurrence_json IS NULL OR recurrence_json NOT LIKE '%"count"%')`,
-    )
+    .prepare(`DELETE FROM schedules WHERE ${cancelledScheduleCleanupWhere()}`)
     .run(cutoffIso(CANCELLED_SCHEDULE_RETENTION_DAYS, now));
 
   const result: RetentionPreview = {
