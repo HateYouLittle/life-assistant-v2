@@ -2,6 +2,7 @@ import { DateTime } from "luxon";
 import type { DatabaseSync } from "node:sqlite";
 import { monthRange } from "../modules/bookkeeping/service.js";
 import { KIND_LABEL, parseEscalation, type ScheduleKind } from "../modules/schedule/service.js";
+import { withReadTransaction } from "../core/database.js";
 import { TZ, todayIso } from "../time.js";
 
 /**
@@ -67,68 +68,72 @@ export function expenseDetails(
   const { from, to } = monthRange(month);
   const limit = clampLimit(rawLimit, 50);
 
-  const totals = db
-    .prepare(
-      "SELECT COALESCE(SUM(amount_cents), 0) AS cents, COUNT(*) AS count FROM expenses WHERE spent_on >= ? AND spent_on <= ?",
-    )
-    .get(from, to) as { cents: number; count: number };
+  // 6 条独立 SELECT 需要一个一致快照：并发写入时否则「合计」与「分类/明细」会对不上
+  // （与 bookkeeping 的 summarizeExpenses 同口径）。
+  return withReadTransaction(db, () => {
+    const totals = db
+      .prepare(
+        "SELECT COALESCE(SUM(amount_cents), 0) AS cents, COUNT(*) AS count FROM expenses WHERE spent_on >= ? AND spent_on <= ?",
+      )
+      .get(from, to) as { cents: number; count: number };
 
-  const categories = db
-    .prepare(
-      `SELECT category, SUM(amount_cents) AS cents, COUNT(*) AS count FROM expenses
+    const categories = db
+      .prepare(
+        `SELECT category, SUM(amount_cents) AS cents, COUNT(*) AS count FROM expenses
        WHERE spent_on >= ? AND spent_on <= ? GROUP BY category ORDER BY cents DESC`,
-    )
-    .all(from, to) as { category: string; cents: number; count: number }[];
+      )
+      .all(from, to) as { category: string; cents: number; count: number }[];
 
-  const daily = db
-    .prepare(
-      `SELECT spent_on AS date, SUM(amount_cents) AS cents FROM expenses
+    const daily = db
+      .prepare(
+        `SELECT spent_on AS date, SUM(amount_cents) AS cents FROM expenses
        WHERE spent_on >= ? AND spent_on <= ? GROUP BY spent_on ORDER BY spent_on`,
-    )
-    .all(from, to) as { date: string; cents: number }[];
+      )
+      .all(from, to) as { date: string; cents: number }[];
 
-  const ledgers = db
-    .prepare(
-      `SELECT e.ledger_id AS ledger_id, l.name AS ledger_name, SUM(e.amount_cents) AS cents, COUNT(*) AS count
+    const ledgers = db
+      .prepare(
+        `SELECT e.ledger_id AS ledger_id, l.name AS ledger_name, SUM(e.amount_cents) AS cents, COUNT(*) AS count
        FROM expenses e JOIN ledgers l ON l.id = e.ledger_id
        WHERE e.spent_on >= ? AND e.spent_on <= ? GROUP BY e.ledger_id ORDER BY cents DESC`,
-    )
-    .all(from, to) as { ledger_id: string; ledger_name: string; cents: number; count: number }[];
+      )
+      .all(from, to) as { ledger_id: string; ledger_name: string; cents: number; count: number }[];
 
-  const entries = db
-    .prepare(
-      `SELECT e.id, e.ledger_id, COALESCE(l.name, e.ledger_id) AS ledger_name, e.amount_cents, e.category,
+    const entries = db
+      .prepare(
+        `SELECT e.id, e.ledger_id, COALESCE(l.name, e.ledger_id) AS ledger_name, e.amount_cents, e.category,
               e.note, e.spent_on, e.created_by_profile
        FROM expenses e LEFT JOIN ledgers l ON l.id = e.ledger_id
        WHERE e.spent_on >= ? AND e.spent_on <= ? ORDER BY e.spent_on DESC, e.created_at DESC LIMIT ?`,
-    )
-    .all(from, to, limit) as unknown as ExpenseEntry[];
+      )
+      .all(from, to, limit) as unknown as ExpenseEntry[];
 
-  const prevMonth = previousMonthOf(month);
-  const prevRange = monthRange(prevMonth);
-  const prev = db
-    .prepare(
-      "SELECT COALESCE(SUM(amount_cents), 0) AS cents FROM expenses WHERE spent_on >= ? AND spent_on <= ?",
-    )
-    .get(prevRange.from, prevRange.to) as { cents: number };
+    const prevMonth = previousMonthOf(month);
+    const prevRange = monthRange(prevMonth);
+    const prev = db
+      .prepare(
+        "SELECT COALESCE(SUM(amount_cents), 0) AS cents FROM expenses WHERE spent_on >= ? AND spent_on <= ?",
+      )
+      .get(prevRange.from, prevRange.to) as { cents: number };
 
-  return {
-    month,
-    range: { from, to },
-    total_cents: totals.cents,
-    count: totals.count,
-    prev: { month: prevMonth, total_cents: prev.cents },
-    categories: categories.map((c) => ({
-      category: c.category,
-      cents: c.cents,
-      count: c.count,
-      share: totals.cents > 0 ? c.cents / totals.cents : 0,
-    })),
-    daily,
-    ledgers,
-    entries,
-    entries_total: totals.count,
-  };
+    return {
+      month,
+      range: { from, to },
+      total_cents: totals.cents,
+      count: totals.count,
+      prev: { month: prevMonth, total_cents: prev.cents },
+      categories: categories.map((c) => ({
+        category: c.category,
+        cents: c.cents,
+        count: c.count,
+        share: totals.cents > 0 ? c.cents / totals.cents : 0,
+      })),
+      daily,
+      ledgers,
+      entries,
+      entries_total: totals.count,
+    };
+  });
 }
 
 export interface ScheduleDetailItem {
