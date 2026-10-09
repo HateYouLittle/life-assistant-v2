@@ -61,6 +61,24 @@ async function waitFor(cond: () => boolean, timeoutMs = 3000): Promise<boolean> 
   return cond();
 }
 
+/**
+ * 种入「当年 + 次年」节假日数据，并把当年假日设在今天。
+ * 状态页默认展示「还有假期的年份」：当年假日若已全部过完，`holidayDetails` 会顺延到次年。
+ * 因此种子必须相对今天生成，写死某一年会让用例随日期漂移（曾经的失败用例正是如此）。
+ */
+function seedHolidayYears(env: TestEnv, year: number): void {
+  env.db
+    .prepare(
+      "INSERT INTO cn_holiday_years (year, status, source, fetched_at) VALUES (?, 'ready', 'test', '2026-01-01T00:00:00.000Z'), (?, 'ready', 'test', '2026-01-01T00:00:00.000Z')",
+    )
+    .run(year, year + 1);
+  env.db
+    .prepare(
+      "INSERT INTO cn_holiday_days (date, year, day_type, name, source, updated_at) VALUES (?, ?, 'holiday', '测试节', 'test', '2026-01-01T00:00:00.000Z'), (?, ?, 'holiday', '元旦', 'test', '2026-01-01T00:00:00.000Z')",
+    )
+    .run(todayIso(), year, `${year + 1}-01-01`, year + 1);
+}
+
 export interface PageRun {
   elements: Map<string, StubElement>;
   authHeaders: (string | undefined)[];
@@ -293,16 +311,9 @@ describe("看板抽屉（点击委托 + 明细渲染）", () => {
   it("节假日抽屉翻年后保留所选年份（30s 自动刷新不再打回当年）", async () => {
     const env = makeTestEnv();
     try {
-      env.db
-        .prepare(
-          `INSERT INTO cn_holiday_years (year, status, source, fetched_at) VALUES (2026,'ready','test','2026-01-01T00:00:00.000Z'), (2027,'ready','test','2026-01-01T00:00:00.000Z')`,
-        )
-        .run();
-      env.db
-        .prepare(
-          `INSERT INTO cn_holiday_days (date, year, day_type, name, source, updated_at) VALUES ('2026-10-01',2026,'holiday','国庆节','test','2026-01-01T00:00:00.000Z'), ('2027-01-01',2027,'holiday','元旦','test','2026-01-01T00:00:00.000Z')`,
-        )
-        .run();
+      // 动态年份：当年假日设在今天，保证当年仍有未过假日 → 默认展示当年
+      const year = Number(todayIso().slice(0, 4));
+      seedHolidayYears(env, year);
       const run = runPageScript(env, "");
       run.clickDrawer("holidays");
       const rendered = await waitFor(() =>
@@ -310,7 +321,7 @@ describe("看板抽屉（点击委托 + 明细渲染）", () => {
       );
       assert.ok(rendered);
       const html = run.elements.get("drawer-body")?.innerHTML ?? "";
-      assert.match(html, /2026 年安排/, "默认展示当年");
+      assert.match(html, new RegExp(`${year} 年安排`), "默认展示当年");
     } finally {
       cleanupTestEnv(env);
     }
@@ -319,16 +330,8 @@ describe("看板抽屉（点击委托 + 明细渲染）", () => {
   it("30s 自动刷新不把开着的抽屉打回「加载中…」（且保留所选年份）", async () => {
     const env = makeTestEnv();
     try {
-      env.db
-        .prepare(
-          `INSERT INTO cn_holiday_years (year, status, source, fetched_at) VALUES (2026,'ready','test','2026-01-01T00:00:00.000Z'), (2027,'ready','test','2026-01-01T00:00:00.000Z')`,
-        )
-        .run();
-      env.db
-        .prepare(
-          `INSERT INTO cn_holiday_days (date, year, day_type, name, source, updated_at) VALUES ('2026-10-01',2026,'holiday','国庆节','test','2026-01-01T00:00:00.000Z'), ('2027-01-01',2027,'holiday','元旦','test','2026-01-01T00:00:00.000Z')`,
-        )
-        .run();
+      const year = Number(todayIso().slice(0, 4));
+      seedHolidayYears(env, year);
       const run = runPageScript(env, "");
       run.clickDrawer("holidays");
       await waitFor(() => (run.elements.get("drawer-body")?.innerHTML ?? "").includes("年安排"));
@@ -337,7 +340,7 @@ describe("看板抽屉（点击委托 + 明细渲染）", () => {
       // 刷新走已保存的渲染函数：同步阶段不得把 body 换成加载中
       const html = run.elements.get("drawer-body")?.innerHTML ?? "";
       assert.doesNotMatch(html, /<div class="spin">/, "自动刷新不应把抽屉打回「加载中…」");
-      assert.match(html, /2026 年安排/, "刷新后仍显示所选年份");
+      assert.match(html, new RegExp(`${year} 年安排`), "刷新后仍显示所选年份");
     } finally {
       cleanupTestEnv(env);
     }
