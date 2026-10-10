@@ -5,12 +5,13 @@ import { withReadTransaction } from "../../core/database.js";
 import type { NotifyBlock } from "../../core/registry.js";
 import { newId } from "../../core/settings.js";
 
-/** 账本是全局资源：所有 Profile 均可读写，无角色/成员/授权层 */
+/** 账本归属：owner_profile_id = NULL 为家庭账本（所有 Profile 共享）；非空为个人账本（仅归属人可见可写） */
 export interface LedgerRow {
   id: string;
   name: string;
   created_at: string;
   archived_at: string | null;
+  owner_profile_id: string | null;
 }
 
 export interface ExpenseRow {
@@ -41,7 +42,11 @@ export function listLedgers(db: DatabaseSync, includeArchived = false): LedgerRo
     .all() as unknown as LedgerRow[];
 }
 
-export function createLedger(db: DatabaseSync, name: string): LedgerRow {
+export function createLedger(
+  db: DatabaseSync,
+  name: string,
+  ownerProfileId: string | null = null,
+): LedgerRow {
   const trimmed = name.trim();
   if (trimmed === "" || trimmed.length > 40) throw new Error("账本名需为 1-40 字符");
   const dup = db
@@ -49,11 +54,51 @@ export function createLedger(db: DatabaseSync, name: string): LedgerRow {
     .get(trimmed);
   if (dup !== undefined) throw new Error(`已存在同名账本: ${trimmed}`);
   const id = newId();
-  db.prepare("INSERT INTO ledgers (id, name, created_at) VALUES (?, ?, ?)").run(
-    id,
-    trimmed,
-    nowIso(),
-  );
+  db.prepare(
+    "INSERT INTO ledgers (id, name, created_at, owner_profile_id) VALUES (?, ?, ?, ?)",
+  ).run(id, trimmed, nowIso(), ownerProfileId);
+  return getLedger(db, id) as LedgerRow;
+}
+
+/**
+ * 归属可见性：家庭账本（owner_profile_id = NULL）对所有 Profile 可见；
+ * 个人账本仅归属人本身可见。不可见一律以「账本不存在」对外（不泄露其存在）。
+ */
+export function isLedgerVisible(ledger: LedgerRow, profileId: string): boolean {
+  return ledger.owner_profile_id === null || ledger.owner_profile_id === profileId;
+}
+
+/** 取一个对 profileId 可见的账本；不存在或不可见均返回 undefined，由调用方报「账本不存在」 */
+export function getVisibleLedger(
+  db: DatabaseSync,
+  id: string,
+  profileId: string,
+): LedgerRow | undefined {
+  const ledger = getLedger(db, id);
+  if (ledger === undefined || !isLedgerVisible(ledger, profileId)) return undefined;
+  return ledger;
+}
+
+/**
+ * 转移账本归属：仅个人账本可转移（家庭 → 个人永不允许）。
+ * targetOwnerId 为 null 表示转回家庭（不可逆）；非 null 时该 Profile 必须已存在。
+ * 调用方负责校验调用者是当前归属人。
+ */
+export function transferLedger(
+  db: DatabaseSync,
+  id: string,
+  targetOwnerId: string | null,
+): LedgerRow {
+  const ledger = getLedger(db, id);
+  if (ledger === undefined) throw new Error(`账本不存在: ${id}`);
+  if (ledger.owner_profile_id === null) {
+    throw new Error("家庭账本不支持转移（家庭账本不能转为个人账本）");
+  }
+  if (targetOwnerId !== null) {
+    const target = db.prepare("SELECT id FROM profiles WHERE id = ?").get(targetOwnerId);
+    if (target === undefined) throw new Error(`目标 Profile 不存在: ${targetOwnerId}`);
+  }
+  db.prepare("UPDATE ledgers SET owner_profile_id = ? WHERE id = ?").run(targetOwnerId, id);
   return getLedger(db, id) as LedgerRow;
 }
 
@@ -120,6 +165,10 @@ export function addExpense(
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(id, input.ledgerId, input.amountCents, category, note, spentOn, profileId, nowIso());
   return db.prepare("SELECT * FROM expenses WHERE id = ?").get(id) as unknown as ExpenseRow;
+}
+
+export function getExpense(db: DatabaseSync, id: string): ExpenseRow | undefined {
+  return db.prepare("SELECT * FROM expenses WHERE id = ?").get(id) as ExpenseRow | undefined;
 }
 
 export function deleteExpense(db: DatabaseSync, id: string): ExpenseRow {
@@ -476,10 +525,17 @@ export function entryReceiptBlocks(ledger: LedgerRow, entry: ExpenseRow): Notify
 }
 
 /**
- * 月报推送：全局事件，物化到每个配置了路由的 Profile（Profile 内去重）。
+ * 月报推送：家庭账本物化到每个配置了路由的 Profile（publishGlobal，Profile 内去重）；
+ * 个人账本只推给归属人（publishProfile），其他 Profile 不收到任何内容。
  *
  * 覆盖**含已归档**的账本：9 月 15 日归档的账本仍持有 9 月的支出，若只遍历活跃
  * 账本，该账本的当月账单永远不会发出（且没有任何提示）。空账本由 count === 0 跳过。
+ *
+ * 归属变更与重复：月报 dedupeKey 为 `report:<ledgerId>:<ym>`，对家庭账本而言同一份
+ * 账单物化到多个 Profile，对个人账本只物化到归属人。findMissingMonthlyReports 按
+ * dedupe_key **全局**判断「该月是否已发过」，因此账本在当月中转归属后不会被补发成
+ * 两份；即便本函数在转归属后被再次调用，publishProfile/publishGlobal 的 Profile 内
+ * 去重也会吞掉重复（归属人此前已收到该月账单时不会再来一份）。
  */
 export async function pushMonthlyReports(
   db: DatabaseSync,
@@ -490,6 +546,15 @@ export async function pushMonthlyReports(
       blocks: NotifyBlock;
       dedupeKey?: string;
     }): Promise<{ materialized: number }>;
+    publishProfile(
+      profileId: string,
+      input: {
+        kind: string;
+        title: string;
+        blocks: NotifyBlock;
+        dedupeKey?: string;
+      },
+    ): Promise<{ deduped: boolean }>;
   },
   ym: string,
 ): Promise<number> {
@@ -499,13 +564,19 @@ export async function pushMonthlyReports(
     const summary = summarizeExpenses(db, ledger.id, { from, to });
     if (summary.count === 0) continue;
     const budget = getBudgets(db, ledger.id).length > 0 ? budgetStatus(db, ledger.id, ym) : null;
-    const result = await services.publishGlobal({
+    const input = {
       kind: "bookkeeping.monthly",
       title: `${ym} 月度账单 · ${ledger.name}`,
       blocks: monthlyReportBlocks(summary, budget),
       dedupeKey: `report:${ledger.id}:${ym}`,
-    });
-    pushed += result.materialized;
+    };
+    if (ledger.owner_profile_id === null) {
+      const result = await services.publishGlobal(input);
+      pushed += result.materialized;
+    } else {
+      const result = await services.publishProfile(ledger.owner_profile_id, input);
+      if (!result.deduped) pushed += 1;
+    }
   }
   return pushed;
 }

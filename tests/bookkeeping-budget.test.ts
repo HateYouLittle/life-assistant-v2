@@ -473,9 +473,32 @@ describe("bookkeeping 预算：月报增强", () => {
   });
 });
 
-/** 用真实 notifications 表模拟 publishGlobal 的 Profile 内去重（与既有测试一致） */
+/** 用真实 notifications 表模拟 publishGlobal/publishProfile 的 Profile 内去重（与既有测试一致） */
 function makeServices(env: TestEnv) {
   return {
+    publishProfile: async (
+      profileId: string,
+      input: { kind: string; title: string; dedupeKey?: string },
+    ) => {
+      const existing = env.db
+        .prepare("SELECT 1 FROM notifications WHERE profile_id = ? AND dedupe_key = ?")
+        .get(profileId, input.dedupeKey ?? null);
+      if (existing !== undefined) return { deduped: true };
+      env.db
+        .prepare(
+          "INSERT INTO notifications (id, profile_id, kind, title, body_md, dedupe_key, read, created_at) VALUES (?, ?, ?, ?, '', ?, 0, ?)",
+        )
+        .run(
+          `n-${env.published.length + 1}`,
+          profileId,
+          input.kind,
+          input.title,
+          input.dedupeKey ?? null,
+          new Date().toISOString(),
+        );
+      env.published.push({ profileId, input: input as never });
+      return { deduped: false };
+    },
     publishGlobal: async (input: { kind: string; title: string; dedupeKey?: string }) => {
       const existing = env.db
         .prepare("SELECT 1 FROM notifications WHERE profile_id = 'default' AND dedupe_key = ?")

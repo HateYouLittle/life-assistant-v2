@@ -11,14 +11,14 @@ import {
 import { getCache, pruneCache, setCache } from "../src/core/settings.js";
 import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
 
-describe("database schema v2", () => {
+describe("database schema v3", () => {
   it("新库迁移到最新版本并可重复打开", () => {
     const env = makeTestEnv();
     try {
-      assert.equal(getSchemaVersion(env.db), 2);
+      assert.equal(getSchemaVersion(env.db), 3);
       env.db.close();
       const reopened = openDatabase(env.config.dbPath);
-      assert.equal(getSchemaVersion(reopened), 2);
+      assert.equal(getSchemaVersion(reopened), 3);
       reopened.close();
     } finally {
       cleanupTestEnv(env);
@@ -32,12 +32,13 @@ describe("database schema v2", () => {
       // 还原成 v1 形状：去掉新列 + 版本号写回 1
       const raw = new DatabaseSync(env.config.dbPath);
       raw.exec("ALTER TABLE deliveries DROP COLUMN expire_at");
+      raw.exec("ALTER TABLE ledgers DROP COLUMN owner_profile_id");
       raw.prepare("UPDATE meta SET value = '1' WHERE key = 'schema_version'").run();
       raw.close();
 
       const upgraded = openDatabase(env.config.dbPath);
       try {
-        assert.equal(getSchemaVersion(upgraded), 2, "老库必须在启动时升级版本号");
+        assert.equal(getSchemaVersion(upgraded), 3, "老库必须在启动时升级版本号");
         const columns = (
           upgraded.prepare("PRAGMA table_info(deliveries)").all() as { name: string }[]
         ).map((c) => c.name);
@@ -46,10 +47,48 @@ describe("database schema v2", () => {
         upgraded.close();
       }
 
-      // 再次打开：已是 v2，迁移必须幂等（否则每次启动都会炸在重复 ALTER 上）
+      // 再次打开：已是 v3，迁移必须幂等（否则每次启动都会炸在重复 ALTER 上）
       const again = openDatabase(env.config.dbPath);
-      assert.equal(getSchemaVersion(again), 2);
+      assert.equal(getSchemaVersion(again), 3);
       again.close();
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("v2 老库升级到 v3 时补 ledgers.owner_profile_id，既有账本视为家庭（NULL）", () => {
+    const env = makeTestEnv();
+    try {
+      // 既有账本（升级前建的）没有 owner 概念
+      env.db
+        .prepare(
+          "INSERT INTO ledgers (id, name, created_at) VALUES ('l1', '旧账本', '2026-01-01T00:00:00.000Z')",
+        )
+        .run();
+      env.db.close();
+      // 还原成 v2 形状：去掉 owner 列、版本号写回 2
+      const raw = new DatabaseSync(env.config.dbPath);
+      raw.exec("ALTER TABLE ledgers DROP COLUMN owner_profile_id");
+      raw.prepare("UPDATE meta SET value = '2' WHERE key = 'schema_version'").run();
+      raw.close();
+
+      const upgraded = openDatabase(env.config.dbPath);
+      try {
+        assert.equal(getSchemaVersion(upgraded), 3);
+        const columns = (
+          upgraded.prepare("PRAGMA table_info(ledgers)").all() as { name: string }[]
+        ).map((c) => c.name);
+        assert.ok(
+          columns.includes("owner_profile_id"),
+          `缺列会让归属判定失败：${columns.join(",")}`,
+        );
+        const row = upgraded
+          .prepare("SELECT owner_profile_id FROM ledgers WHERE id = 'l1'")
+          .get() as { owner_profile_id: string | null };
+        assert.equal(row.owner_profile_id, null, "既有账本必须视为家庭账本，行为不变");
+      } finally {
+        upgraded.close();
+      }
     } finally {
       cleanupTestEnv(env);
     }
@@ -177,7 +216,7 @@ describe("database schema v2", () => {
 
       // 打不开就说明 best-effort 失效：历史脏数据不该让进程起不来
       reopened = openDatabase(env.config.dbPath);
-      assert.equal(getSchemaVersion(reopened), 2);
+      assert.equal(getSchemaVersion(reopened), 3);
     } finally {
       reopened?.close();
       cleanupTestEnv(env);

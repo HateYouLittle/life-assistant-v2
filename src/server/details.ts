@@ -73,21 +73,27 @@ export function expenseDetails(
   return withReadTransaction(db, () => {
     const totals = db
       .prepare(
-        "SELECT COALESCE(SUM(amount_cents), 0) AS cents, COUNT(*) AS count FROM expenses WHERE spent_on >= ? AND spent_on <= ?",
+        `SELECT COALESCE(SUM(e.amount_cents), 0) AS cents, COUNT(*) AS count
+       FROM expenses e JOIN ledgers l ON l.id = e.ledger_id
+       WHERE e.spent_on >= ? AND e.spent_on <= ? AND l.owner_profile_id IS NULL`,
       )
       .get(from, to) as { cents: number; count: number };
 
     const categories = db
       .prepare(
-        `SELECT category, SUM(amount_cents) AS cents, COUNT(*) AS count FROM expenses
-       WHERE spent_on >= ? AND spent_on <= ? GROUP BY category ORDER BY cents DESC`,
+        `SELECT e.category, SUM(e.amount_cents) AS cents, COUNT(*) AS count FROM expenses e
+       JOIN ledgers l ON l.id = e.ledger_id
+       WHERE e.spent_on >= ? AND e.spent_on <= ? AND l.owner_profile_id IS NULL
+       GROUP BY e.category ORDER BY cents DESC`,
       )
       .all(from, to) as { category: string; cents: number; count: number }[];
 
     const daily = db
       .prepare(
-        `SELECT spent_on AS date, SUM(amount_cents) AS cents FROM expenses
-       WHERE spent_on >= ? AND spent_on <= ? GROUP BY spent_on ORDER BY spent_on`,
+        `SELECT e.spent_on AS date, SUM(e.amount_cents) AS cents FROM expenses e
+       JOIN ledgers l ON l.id = e.ledger_id
+       WHERE e.spent_on >= ? AND e.spent_on <= ? AND l.owner_profile_id IS NULL
+       GROUP BY e.spent_on ORDER BY e.spent_on`,
       )
       .all(from, to) as { date: string; cents: number }[];
 
@@ -95,16 +101,19 @@ export function expenseDetails(
       .prepare(
         `SELECT e.ledger_id AS ledger_id, l.name AS ledger_name, SUM(e.amount_cents) AS cents, COUNT(*) AS count
        FROM expenses e JOIN ledgers l ON l.id = e.ledger_id
-       WHERE e.spent_on >= ? AND e.spent_on <= ? GROUP BY e.ledger_id ORDER BY cents DESC`,
+       WHERE e.spent_on >= ? AND e.spent_on <= ? AND l.owner_profile_id IS NULL
+       GROUP BY e.ledger_id ORDER BY cents DESC`,
       )
       .all(from, to) as { ledger_id: string; ledger_name: string; cents: number; count: number }[];
 
+    // 状态页只展示家庭账本；个人账本及其支出完全不出现在看板（无 Profile 维度）
     const entries = db
       .prepare(
-        `SELECT e.id, e.ledger_id, COALESCE(l.name, e.ledger_id) AS ledger_name, e.amount_cents, e.category,
+        `SELECT e.id, e.ledger_id, l.name AS ledger_name, e.amount_cents, e.category,
               e.note, e.spent_on, e.created_by_profile
-       FROM expenses e LEFT JOIN ledgers l ON l.id = e.ledger_id
-       WHERE e.spent_on >= ? AND e.spent_on <= ? ORDER BY e.spent_on DESC, e.created_at DESC LIMIT ?`,
+       FROM expenses e JOIN ledgers l ON l.id = e.ledger_id
+       WHERE e.spent_on >= ? AND e.spent_on <= ? AND l.owner_profile_id IS NULL
+       ORDER BY e.spent_on DESC, e.created_at DESC LIMIT ?`,
       )
       .all(from, to, limit) as unknown as ExpenseEntry[];
 
@@ -112,7 +121,9 @@ export function expenseDetails(
     const prevRange = monthRange(prevMonth);
     const prev = db
       .prepare(
-        "SELECT COALESCE(SUM(amount_cents), 0) AS cents FROM expenses WHERE spent_on >= ? AND spent_on <= ?",
+        `SELECT COALESCE(SUM(e.amount_cents), 0) AS cents FROM expenses e
+       JOIN ledgers l ON l.id = e.ledger_id
+       WHERE e.spent_on >= ? AND e.spent_on <= ? AND l.owner_profile_id IS NULL`,
       )
       .get(prevRange.from, prevRange.to) as { cents: number };
 

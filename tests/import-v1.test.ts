@@ -568,7 +568,7 @@ describe("import:v1", () => {
       assert.equal(report.holidayYears, 1);
       assert.equal(report.occurrencesDropped, 1);
       assert.ok(report.scheduleWarnings.some((w) => w.includes("坏数据")));
-      assert.ok(report.scheduleWarnings.some((w) => w.includes("全局可编辑")));
+      assert.ok(report.scheduleWarnings.some((w) => w.includes("家庭账本")));
 
       const s1 = env.db
         .prepare("SELECT * FROM schedules WHERE id = 's1'")

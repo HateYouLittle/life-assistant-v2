@@ -3,7 +3,7 @@ import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { logger } from "./logger.js";
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -34,7 +34,10 @@ CREATE TABLE IF NOT EXISTS ledgers (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   created_at TEXT NOT NULL,
-  archived_at TEXT
+  archived_at TEXT,
+  -- 归属 Profile：NULL = 家庭账本（所有 Profile 共享）；非空 = 个人账本（仅归属人可见可写）。
+  -- 与 expenses.created_by_profile 一样用裸 TEXT，不加外键（Profile 是软引用）。
+  owner_profile_id TEXT
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS expenses (
@@ -221,6 +224,11 @@ export function migrate(db: DatabaseSync): void {
   if (version === 1) {
     addColumnIfMissing(db, "deliveries", "expire_at", "TEXT");
     version = 2;
+  }
+  if (version === 2) {
+    // 账本归属：老库所有既有账本补 owner_profile_id = NULL，视为家庭账本，行为不变。
+    addColumnIfMissing(db, "ledgers", "owner_profile_id", "TEXT");
+    version = 3;
   }
   if (version !== stored) {
     db.prepare("UPDATE meta SET value = ? WHERE key = 'schema_version'").run(String(version));

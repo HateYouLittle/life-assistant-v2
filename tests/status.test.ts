@@ -259,9 +259,10 @@ describe("看板明细接口", () => {
         "INSERT INTO ledgers (id, name, created_at) VALUES ('l1','家庭账本','2026-01-01T00:00:00.000Z')",
       )
       .run();
+    // l2 是个人账本（归属 default）：状态页/接口必须完全看不到它及其支出
     env.db
       .prepare(
-        "INSERT INTO ledgers (id, name, created_at) VALUES ('l2','个人账本','2026-01-01T00:00:00.000Z')",
+        "INSERT INTO ledgers (id, name, created_at, owner_profile_id) VALUES ('l2','个人账本','2026-01-01T00:00:00.000Z','default')",
       )
       .run();
     const today = todayIso();
@@ -274,7 +275,7 @@ describe("看板明细接口", () => {
     insert.run("e3", "l2", 1500, "餐饮", null, today, "default", "2026-01-02T00:00:00.000Z");
   }
 
-  it("/api/expenses 给出分类、按天与逐笔", async () => {
+  it("/api/expenses 给出分类、按天与逐笔（个人账本及其支出不出现在看板）", async () => {
     const env = makeTestEnv();
     try {
       seedAccounting(env);
@@ -287,18 +288,20 @@ describe("看板明细接口", () => {
         entries: { id: string; ledger_name: string; created_by_profile: string }[];
         prev: { month: string; total_cents: number };
       };
-      assert.equal(body.total_cents, 233540);
-      assert.equal(body.count, 3);
+      // 只统计家庭账本 l1 的两笔（200000 + 32040）；个人账本 l2 的 1500 完全不计
+      assert.equal(body.total_cents, 232040);
+      assert.equal(body.count, 2);
       assert.equal(body.categories[0]?.category, "人情");
       assert.equal(body.categories[0]?.count, 1);
       assert.ok((body.categories[0]?.share ?? 0) > 0.85);
-      assert.equal(body.daily.length, 1, "同一天的三笔应聚合成一天");
-      assert.equal(body.daily[0]?.cents, 233540);
+      assert.equal(body.daily.length, 1, "同一天的家庭账本支出应聚合成一天");
+      assert.equal(body.daily[0]?.cents, 232040);
       assert.deepEqual(
         body.ledgers.map((l) => l.ledger_name),
-        ["家庭账本", "个人账本"],
+        ["家庭账本"],
+        "个人账本不得出现在按账本聚合里",
       );
-      assert.equal(body.entries.length, 3);
+      assert.equal(body.entries.length, 2);
       assert.equal(body.entries[0]?.ledger_name, "家庭账本");
       assert.equal(body.prev.month.length, 7);
     } finally {
@@ -632,7 +635,7 @@ describe("看板明细接口", () => {
       assert.match(body.today.time, /^\d{2}:\d{2}$/);
       assert.ok(Array.isArray(body.expenses.daily), "支出按天序列缺失会让首页渲染中断");
       assert.ok(Array.isArray(body.expenses.categories));
-      assert.equal(body.expenses.count, 3);
+      assert.equal(body.expenses.count, 2, "个人账本的支出不计入概览");
       assert.equal(typeof body.expenses.prev_month_cents, "number");
       assert.ok(Array.isArray(body.notifications.daily));
       assert.ok(Array.isArray(body.schedules.next));

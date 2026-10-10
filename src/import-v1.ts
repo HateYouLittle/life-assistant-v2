@@ -571,7 +571,7 @@ export function runImport(
       }
       if (report.ledgers > 0) {
         report.scheduleWarnings.push(
-          `${report.ledgers} 个账本已迁移为全局可编辑（旧角色/成员信息不迁移）`,
+          `${report.ledgers} 个账本已迁移为家庭账本（所有 Profile 可见可编辑；旧角色/成员信息不迁移）`,
         );
       }
 

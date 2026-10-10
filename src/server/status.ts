@@ -64,8 +64,12 @@ export function statusPayload(config: ResolvedConfig, db: DatabaseSync): Record<
       daily: deliveries.daily,
     },
     ledgers: {
-      total: count("SELECT COUNT(*) AS n FROM ledgers WHERE archived_at IS NULL"),
-      archived: count("SELECT COUNT(*) AS n FROM ledgers WHERE archived_at IS NOT NULL"),
+      total: count(
+        "SELECT COUNT(*) AS n FROM ledgers WHERE archived_at IS NULL AND owner_profile_id IS NULL",
+      ),
+      archived: count(
+        "SELECT COUNT(*) AS n FROM ledgers WHERE archived_at IS NOT NULL AND owner_profile_id IS NULL",
+      ),
     },
     expenses: {
       month: expenses.month,

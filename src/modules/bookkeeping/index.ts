@@ -9,6 +9,7 @@ import {
   type ToolContext,
 } from "../../core/registry.js";
 import { logger } from "../../core/logger.js";
+import { ensureProfile } from "../../core/settings.js";
 import {
   addExpense,
   budgetAlertsForEntry,
@@ -22,7 +23,10 @@ import {
   entryReceiptBlocks,
   findMissingMonthlyReports,
   getBudgets,
+  getExpense,
   getLedger,
+  getVisibleLedger,
+  isLedgerVisible,
   listExpenses,
   listLedgers,
   monthRange,
@@ -32,8 +36,21 @@ import {
   setBudget,
   setLedgerArchived,
   summarizeExpenses,
+  transferLedger,
   type BudgetStatus,
+  type LedgerRow,
 } from "./service.js";
+
+/** 账本的工具视图：家庭账本标注「家庭」，个人账本标注「个人 + 归属人」 */
+function ledgerView(row: LedgerRow) {
+  return {
+    id: row.id,
+    名称: row.name,
+    归档: row.archived_at !== null,
+    类型: row.owner_profile_id === null ? "家庭" : "个人",
+    ...(row.owner_profile_id === null ? {} : { 归属人: row.owner_profile_id }),
+  };
+}
 
 /** 预算对照的可读视图（工具回显用） */
 function budgetStatusView(status: BudgetStatus) {
@@ -56,37 +73,70 @@ export function bookkeepingLedgerTool(args: Record<string, unknown>, ctx: ToolCo
     if (action === "create") {
       const name = args.name as string | undefined;
       if (name === undefined) return fail("create 需要 name");
-      const row = createLedger(db, name);
-      return okJson({ 已创建: row });
+      // personal=true 建个人账本（归属调用方）；缺省建家庭账本（所有 Profile 共享）
+      const personal = args.personal === true;
+      let ownerProfileId: string | null = null;
+      if (personal) {
+        ensureProfile(db, ctx.profileId);
+        ownerProfileId = ctx.profileId;
+      }
+      const row = createLedger(db, name, ownerProfileId);
+      return okJson({ 已创建: ledgerView(row) });
     }
     if (action === "list") {
       const includeArchived = args.include_archived === true;
-      const rows = listLedgers(db, includeArchived);
+      // 只列当前 Profile 可见的账本：家庭账本 + 自己名下个人账本
+      const rows = listLedgers(db, includeArchived).filter((r) =>
+        isLedgerVisible(r, ctx.profileId),
+      );
       return okJson({
-        账本: rows.map((r) => ({ id: r.id, 名称: r.name, 归档: r.archived_at !== null })),
-        说明: "账本为所有 Profile 共享，均可记账",
+        账本: rows.map(ledgerView),
+        说明: "家庭账本所有 Profile 可见可记账；个人账本仅归属人可见可写",
       });
     }
     if (action === "rename") {
       const id = args.id as string | undefined;
       const name = args.name as string | undefined;
       if (id === undefined || name === undefined) return fail("rename 需要 id 和 name");
+      if (getVisibleLedger(db, id, ctx.profileId) === undefined) return fail(`账本不存在: ${id}`);
       const row = renameLedger(db, id, name);
-      return okJson({ 已重命名: row });
+      return okJson({ 已重命名: ledgerView(row) });
     }
     if (action === "archive") {
       const id = args.id as string | undefined;
       if (id === undefined) return fail("archive 需要 id");
+      if (getVisibleLedger(db, id, ctx.profileId) === undefined) return fail(`账本不存在: ${id}`);
       const unarchive = args.unarchive === true;
       const row = setLedgerArchived(db, id, !unarchive);
-      return okJson({ 结果: row });
+      return okJson({ 结果: ledgerView(row) });
+    }
+    if (action === "transfer") {
+      const id = args.id as string | undefined;
+      if (id === undefined) return fail("transfer 需要 id");
+      const ledger = getLedger(db, id);
+      if (ledger === undefined) return fail(`账本不存在: ${id}`);
+      // 家庭账本 → 个人是单向禁止；非归属人的个人账本按「不存在」处理（不泄露存在性）
+      if (ledger.owner_profile_id === null) {
+        return fail("家庭账本不支持转移（家庭账本不能转为个人账本）");
+      }
+      if (ledger.owner_profile_id !== ctx.profileId) return fail(`账本不存在: ${id}`);
+      // profile 缺省 = 转回家庭（不可逆）；给出 = 转给该 Profile（须已存在，由 service 校验）
+      const profile = args.profile as string | undefined;
+      const row = transferLedger(db, id, profile ?? null);
+      return okJson({
+        已转移: ledgerView(row),
+        说明:
+          row.owner_profile_id === null
+            ? "已转为家庭账本（所有 Profile 共享，不可再转回个人）"
+            : `归属已转移给 ${row.owner_profile_id}`,
+      });
     }
     if (action === "budget") {
       const ledgerId = args.ledger_id as string | undefined;
       if (ledgerId === undefined) {
         return fail('budget 需要 ledger_id（先调用 ledger {action:"list"} 取账本 id）');
       }
-      const ledger = getLedger(db, ledgerId);
+      const ledger = getVisibleLedger(db, ledgerId, ctx.profileId);
       if (ledger === undefined) return fail(`账本不存在: ${ledgerId}`);
       const category = ((args.category as string | undefined) ?? "").trim();
       if (args.clear === true) {
@@ -174,6 +224,8 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
       if (ledgerId === undefined || amount === undefined) {
         return fail('add 需要 ledger_id（先调用 ledger {action:"list"} 取账本 id）和 amount（元）');
       }
+      const ledger = getVisibleLedger(db, ledgerId, ctx.profileId);
+      if (ledger === undefined) return fail(`账本不存在: ${ledgerId}`);
       if (!Number.isFinite(amount) || amount <= 0 || amount > 1_000_000)
         return fail(`金额不合法: ${String(amount)}`);
       const cents = Math.round(amount * 100);
@@ -184,25 +236,26 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
         note: args.note as string | undefined,
         spentOn: args.date as string | undefined,
       });
-      const ledger = getLedger(db, entry.ledger_id);
-      if (ledger === undefined) return fail(`账本不存在: ${entry.ledger_id}`);
-      void ctx.services
-        .publishGlobal({
-          kind: "bookkeeping.entry",
-          title: `记账：¥${centsToYuan(entry.amount_cents)}（${ledger.name}）`,
-          blocks: entryReceiptBlocks(ledger, entry),
-          dedupeKey: `entry:${entry.id}`,
-        })
-        .catch((e) => logger.warn(`记账回执发布失败（记账已成功）: ${errorMessage(e)}`));
-      // 预算阈值提醒：只在本笔「跨越」80%/100% 时推；失败绝不影响记账成功。
-      try {
-        for (const alert of budgetAlertsForEntry(db, ledger, entry)) {
-          void ctx.services
-            .publishGlobal(alert)
-            .catch((e) => logger.warn(`预算提醒发布失败（记账已成功）: ${errorMessage(e)}`));
+      // 个人账本：不回执、不推预算提醒（连归属人也不推，保持记账私密）；家庭账本维持全局推送
+      if (ledger.owner_profile_id === null) {
+        void ctx.services
+          .publishGlobal({
+            kind: "bookkeeping.entry",
+            title: `记账：¥${centsToYuan(entry.amount_cents)}（${ledger.name}）`,
+            blocks: entryReceiptBlocks(ledger, entry),
+            dedupeKey: `entry:${entry.id}`,
+          })
+          .catch((e) => logger.warn(`记账回执发布失败（记账已成功）: ${errorMessage(e)}`));
+        // 预算阈值提醒：只在本笔「跨越」80%/100% 时推；失败绝不影响记账成功。
+        try {
+          for (const alert of budgetAlertsForEntry(db, ledger, entry)) {
+            void ctx.services
+              .publishGlobal(alert)
+              .catch((e) => logger.warn(`预算提醒发布失败（记账已成功）: ${errorMessage(e)}`));
+          }
+        } catch (e) {
+          logger.warn(`预算提醒判定失败（记账已成功）: ${errorMessage(e)}`);
         }
-      } catch (e) {
-        logger.warn(`预算提醒判定失败（记账已成功）: ${errorMessage(e)}`);
       }
       return okJson({
         已记账: {
@@ -219,6 +272,9 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
       const ledgerId = args.ledger_id as string | undefined;
       if (ledgerId === undefined) {
         return fail('list 需要 ledger_id（先调用 ledger {action:"list"} 取账本 id）');
+      }
+      if (getVisibleLedger(db, ledgerId, ctx.profileId) === undefined) {
+        return fail(`账本不存在: ${ledgerId}`);
       }
       const page = listExpenses(db, ledgerId, {
         ...expenseRange(args),
@@ -246,7 +302,8 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
       if (ledgerId === undefined) {
         return fail('summary 需要 ledger_id（先调用 ledger {action:"list"} 取账本 id）');
       }
-      if (getLedger(db, ledgerId) === undefined) return fail(`账本不存在: ${ledgerId}`);
+      if (getVisibleLedger(db, ledgerId, ctx.profileId) === undefined)
+        return fail(`账本不存在: ${ledgerId}`);
       // 未指定区间时默认「月初 → 今天」（本月至今）；看板/月报的「本月」是自然月全月，
       // 口径差异见 service.ts 的 monthRange 注释
       const range = expenseRange(args, {
@@ -275,6 +332,12 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
     if (action === "delete") {
       const id = args.id as string | undefined;
       if (id === undefined) return fail("delete 需要 id（可从 expense {action:'list'} 获取）");
+      const existing = getExpense(db, id);
+      if (existing === undefined) return fail(`账目不存在: ${id}`);
+      // 先按该笔所属账本判断可见性：不可见账本下的账目一并以「账本不存在」处理
+      if (getVisibleLedger(db, existing.ledger_id, ctx.profileId) === undefined) {
+        return fail(`账本不存在: ${existing.ledger_id}`);
+      }
       const entry = deleteExpense(db, id);
       return okJson({
         已删除: {
@@ -299,11 +362,19 @@ registerModule({
     {
       name: "ledger",
       description:
-        "账本管理（全局共享，所有 Profile 均可读写）：create 创建、list 列出（含归档需 include_archived）、rename 重命名、archive 归档/恢复（unarchive=true）、budget 月度预算（传 ledger_id 查看全部预算与本月对照；带 amount 设置/覆盖，单位元，带 category 为分类预算、缺省为账本总额；clear=true 删除该范围）。预算按账本每月滚动，跨越 80%/100% 时自动推送提醒（同一预算一笔只推跨过的最高阈值那一条）。",
+        "账本管理：create 创建（personal=true 建个人账本，仅归属人可见可写；缺省建家庭账本，所有 Profile 共享）、list 列出当前 Profile 可见的账本（家庭账本 + 自己的个人账本；含归档需 include_archived）、rename 重命名、archive 归档/恢复（unarchive=true）、transfer 转移个人账本归属（带 profile 转给该 Profile，缺省转回家庭且不可逆；仅当前归属人可操作）、budget 月度预算（传 ledger_id 查看全部预算与本月对照；带 amount 设置/覆盖，单位元，带 category 为分类预算、缺省为账本总额；clear=true 删除该范围）。家庭账本的回执与预算提醒全局推送（跨越 80%/100% 时，同一预算一笔只推跨过的最高阈值那一条）；个人账本不回执、不推送预算提醒，月报只发给归属人。",
       inputSchema: {
-        action: z.enum(["create", "list", "rename", "archive", "budget"]),
+        action: z.enum(["create", "list", "rename", "archive", "transfer", "budget"]),
         name: z.string().min(1).max(40).optional(),
         id: z.string().optional(),
+        personal: z
+          .boolean()
+          .optional()
+          .describe("create 时 personal=true 建个人账本（归属当前 Profile）；缺省建家庭账本"),
+        profile: z
+          .string()
+          .optional()
+          .describe("transfer 时的目标 Profile；缺省则转回家庭账本（不可逆）"),
         include_archived: z.boolean().optional(),
         unarchive: z.boolean().optional(),
         ledger_id: z
@@ -324,7 +395,7 @@ registerModule({
     {
       name: "expense",
       description:
-        "支出记账：add 记一笔（ledger_id + amount 元，可选 category/note/date，回执全局推送）；list 明细（可按 month/from/to/by 过滤）；summary 汇总（按分类与记账人）；delete 删除记错的一笔（id 从 list 获取）。month 与 from/to 互斥（同时传会报错）；from/to 只给一边就是半边区间（只给 from = [from, 将来)，只给 to = (过去, to]），两个 action 口径一致；默认区间只在 month/from/to **都不传**时生效（summary 默认「月初→今天」，list 不传时不限区间）。金额只支持支出，单位为元。",
+        "支出记账：add 记一笔（ledger_id + amount 元，可选 category/note/date；家庭账本回执全局推送，个人账本不回执不提醒）；list 明细（可按 month/from/to/by 过滤）；summary 汇总（按分类与记账人）；delete 删除记错的一笔（id 从 list 获取）。仅能操作当前 Profile 可见的账本（家庭账本或自己的个人账本）。month 与 from/to 互斥（同时传会报错）；from/to 只给一边就是半边区间（只给 from = [from, 将来)，只给 to = (过去, to]），两个 action 口径一致；默认区间只在 month/from/to **都不传**时生效（summary 默认「月初→今天」，list 不传时不限区间）。金额只支持支出，单位为元。",
       inputSchema: {
         action: z.enum(["add", "list", "summary", "delete"]),
         id: z.string().optional().describe("delete 时的账目 id"),

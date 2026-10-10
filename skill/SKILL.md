@@ -35,7 +35,7 @@ read_when:
 - `holiday` 数据未覆盖的日期返回"未知"，绝不按星期猜测调休。
 - `holiday {view:"next"}` 输出带「进行中」布尔：假期期间为 `true` —— 别只看「开始/结束」日期就告诉用户"假期还没到"。
 - 不要虚构工具之外的能力（油价、共享账本角色、快递等 v1 能力已移除）。
-- 只操作当前 Profile 的日程与通知；账本为所有 Profile 共享。
+- 只操作当前 Profile 的日程与通知；账本分**家庭**（所有 Profile 共享）与**个人**（仅归属人可见可写）。
 
 ## 天气与位置
 
@@ -64,14 +64,14 @@ read_when:
 ## 记账
 
 - 只记支出，金额单位为元（`amount: 12.34`）。
-- 账本全局共享：任何 Profile 创建/记账/汇总均可，回执与月报会推送给所有配置了路由的 Profile。
-- 记账前先 `ledger {action: "list"}` 取得账本 id（**创建账本 `ledger {action:"create"}` 必须给 `name`**）；`expense` 的 `add`/`list`/`summary` 三个 action 都必须传 `ledger_id`。
+- 账本分**家庭**与**个人**：`ledger {action:"create"}` 缺省建家庭账本（所有 Profile 可见可记账，回执/预算提醒/月报推送给所有配置了路由的 Profile）；`personal: true` 建个人账本（仅归属人可见可写，**不回执、不推预算提醒**，月报只发给归属人）。个人账本可 `ledger {action:"transfer", id, profile}` 转给其他 Profile 归属（目标 Profile 须已存在），省略 `profile` 转回家庭（**不可逆**）；**家庭账本不能转为个人账本**。非归属人访问个人账本一律得到「账本不存在」。
+- 记账前先 `ledger {action: "list"}` 取得账本 id（**只列当前 Profile 可见的账本**：家庭账本 + 自己的个人账本；**创建账本 `ledger {action:"create"}` 必须给 `name`**）；`expense` 的 `add`/`list`/`summary` 三个 action 都必须传 `ledger_id`。
 - `ledger.list` 默认不含归档账本；核账时传 `include_archived: true`。
 - 汇总用 `expense {action: "summary"}`，可按 `month`、`from/to`、`by`（记账人）过滤。`month`（自然月整月，含该月内已录入但尚未到来的日期）与 `from`/`to` **互斥**，同时传会报错；`from > to` 也报错。`from`/`to` **只给一边就是半边区间**（只给 `from` = `[from, 将来)` 不限上界；只给 `to` = `(过去, to]` 不限下界），与 `list` 完全一致 —— 别为了「凑一个区间」自己补另一端。只有 `month`/`from`/`to` **都不传**时才套默认区间：`summary` 是「月初 → 今天」（不含月内未来日），`list` 是不限区间。
 - **「本月」有两个口径，别混**：状态页看板、预算对照、月报里的「本月」是**自然月全月**（含月内未来日 —— `spent_on` 是已录入事实，不因日历没到那天就从数字里消失）；只有 `expense summary` 不传区间时的默认值是「本月至今」。向用户报「本月花了多少」以看板/月报为准。
-- 预算：`ledger {action: "budget", ledger_id}` 查看该账本全部预算与本月对照；带 `amount`（元）设置/覆盖，带 `category` 为分类预算（不传为账本总额），`clear: true` 删除该范围。预算按账本每月滚动，支出**跨越** 80%/100% 时自动提醒（同一预算一笔只推跨过的最高阈值那一条，跨月重新判定，同月同阈值不重推）；设了预算的账本月报会附预算对照行。
+- 预算：`ledger {action: "budget", ledger_id}` 查看该账本全部预算与本月对照；带 `amount`（元）设置/覆盖，带 `category` 为分类预算（不传为账本总额），`clear: true` 删除该范围。预算按账本每月滚动，支出**跨越** 80%/100% 时自动提醒（同一预算一笔只推跨过的最高阈值那一条，跨月重新判定，同月同阈值不重推）；设了预算的账本月报会附预算对照行。**个人账本不推预算提醒**。
 - **没有编辑功能**：改金额/分类/备注只能 `expense {action: "delete", id}`（id 从 `list` 取）再重新 `add`。删除**不可恢复**，且重记后「记账人」会变成当前 Profile——动手前把这两点告知用户。用户说「改一下备注/金额」时按此处理，不要声称可以直接改。
-- 账本改名用 `ledger {action: "rename", id, name}`；归档/恢复用 `action: "archive"`（`unarchive: true` 恢复）。**没有删除账本的接口**——要彻底删除只能直连服务端数据库操作。
+- 账本改名用 `ledger {action: "rename", id, name}`；归档/恢复用 `action: "archive"`（`unarchive: true` 恢复）；转移个人账本归属用 `action: "transfer"`（见上）。**没有删除账本的接口**——要彻底删除只能直连服务端数据库操作。
 - `expense {action: "list"}` 不传 `month`/`from`/`to` 时不限区间（只受 `limit` 限制），且默认只返回 20 条：返回里 `已返回` 与 `匹配总数` 是两个数，别把窗口当全量。
 - 每月 1 号 09:00 自动推送上月月报（表格），不要手动复算。
 
