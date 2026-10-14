@@ -30,6 +30,13 @@ CREATE TABLE IF NOT EXISTS cache (
   expires_at TEXT NOT NULL
 ) STRICT;
 
+-- QWeather 每日上游请求计数（按本地日历日）。独立于 cache：计量不是可过期缓存，
+-- 混进 cache 会让「缓存体积治理」时误删/误留用量行（旧实现借道 cache 的 400 天 TTL 行）。
+CREATE TABLE IF NOT EXISTS qweather_usage (
+  day TEXT PRIMARY KEY,
+  requests INTEGER NOT NULL CHECK (requests >= 0)
+) STRICT;
+
 CREATE TABLE IF NOT EXISTS ledgers (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -188,36 +195,71 @@ function addColumnIfMissing(db: DatabaseSync, table: string, column: string, typ
   db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
 }
 
-export function migrate(db: DatabaseSync): void {
-  db.exec(DDL);
-  // 活动账本名唯一：JS 层一直在查重，但没有数据库约束兜底，并发创建理论上可同时通过。
-  // 用**部分**唯一索引（archived_at IS NULL 才约束）——归档账本允许重名，与既有语义一致。
-  // best-effort：历史库若已存在重名活动账本，建索引会失败；这里只告警、不拒绝启动
-  // （宁可少一道约束，也不能让用户因历史脏数据起不来），并提示人工核查。
+/**
+ * 活动账本名的**分范围**唯一索引：家庭账本（owner_profile_id IS NULL）之间唯一，
+ * 每个 Profile 的个人账本各自唯一 —— 于是不同人可建同名个人账本，也不会因「创建失败」
+ * 泄露他人账本名。部分索引仅在 archived_at IS NULL 时约束（归档账本允许重名，与既有语义一致）。
+ *
+ * 必须在 owner_profile_id 补列之后调用（v1/v2 老库此时才有该列）；旧的全局唯一索引
+ * `idx_ledgers_active_name` 必须显式 DROP —— 否则它仍在暗中强制全局唯一，与本语义冲突。
+ * best-effort：历史库若已存在同范围重名，建索引会失败；只告警、不拒绝启动。
+ */
+function ensureLedgerNameIndex(db: DatabaseSync): void {
   try {
+    db.exec("DROP INDEX IF EXISTS idx_ledgers_active_name");
     db.exec(
-      "CREATE UNIQUE INDEX IF NOT EXISTS idx_ledgers_active_name ON ledgers(name) WHERE archived_at IS NULL",
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_ledgers_scoped_name ON ledgers(name, COALESCE(owner_profile_id, '')) WHERE archived_at IS NULL",
     );
   } catch (e) {
     logger.warn(
-      `未能创建活动账本名唯一索引（可能存在历史重名账本，请人工核查后重试）: ${String(e)}`,
+      `未能创建活动账本名唯一索引（可能存在历史同范围重名账本，请人工核查后重试）: ${String(e)}`,
     );
   }
+}
+
+/**
+ * 旧实现把 QWeather 每日用量寄存在 cache 表的 `qweather:usage:<day>`（400 天 TTL），
+ * 与天气缓存混在一起。迁到独立的 qweather_usage 表后清掉残留，避免两处口径并存。
+ * 幂等：残留行被删除后下次为空，直接返回。
+ */
+function migrateLegacyQweatherUsage(db: DatabaseSync): void {
+  const rows = db
+    .prepare("SELECT key, value_json FROM cache WHERE key LIKE 'qweather:usage:%'")
+    .all() as { key: string; value_json: string }[];
+  if (rows.length === 0) return;
+  const upsert = db.prepare(
+    `INSERT INTO qweather_usage (day, requests) VALUES (?, ?)
+     ON CONFLICT (day) DO UPDATE SET requests = MAX(requests, excluded.requests)`,
+  );
+  for (const { key, value_json } of rows) {
+    const day = key.slice("qweather:usage:".length);
+    const n = Number(value_json);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || !Number.isFinite(n) || n < 0) continue;
+    upsert.run(day, Math.trunc(n));
+  }
+  db.prepare("DELETE FROM cache WHERE key LIKE 'qweather:usage:%'").run();
+}
+
+export function migrate(db: DatabaseSync): void {
+  db.exec(DDL);
   const row = db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as
     | { value: string }
     | undefined;
+  let stored: number;
   if (row === undefined) {
     db.prepare("INSERT INTO meta (key, value) VALUES ('schema_version', ?)").run(
       String(SCHEMA_VERSION),
     );
-    return;
-  }
-  const stored = Number(row.value);
-  if (!Number.isInteger(stored) || stored < 1) {
-    throw new Error(`数据库 schema 版本不合法: ${row.value}，拒绝启动`);
-  }
-  if (stored > SCHEMA_VERSION) {
-    throw new Error(`数据库 schema 版本 ${stored} 高于程序支持的 ${SCHEMA_VERSION}，拒绝启动`);
+    stored = SCHEMA_VERSION;
+  } else {
+    const parsed = Number(row.value);
+    if (!Number.isInteger(parsed) || parsed < 1) {
+      throw new Error(`数据库 schema 版本不合法: ${row.value}，拒绝启动`);
+    }
+    if (parsed > SCHEMA_VERSION) {
+      throw new Error(`数据库 schema 版本 ${parsed} 高于程序支持的 ${SCHEMA_VERSION}，拒绝启动`);
+    }
+    stored = parsed;
   }
   // 逐级升级（附加式）：只加列/加表，不动既有数据；中途失败会抛出，由调用方关库拒绝启动
   let version = stored;
@@ -240,6 +282,10 @@ export function migrate(db: DatabaseSync): void {
   // 同理补 deliveries.deterministic_reject（纯附加列，默认 0 = 非确定性拒绝，
   // 与升级前「所有 fallback 行都可重投」的既有行为一致，老数据不会被静默改语义）。
   addColumnIfMissing(db, "deliveries", "deterministic_reject", "INTEGER NOT NULL DEFAULT 0");
+  // 索引依赖 owner_profile_id：必须放在上面的补列之后
+  ensureLedgerNameIndex(db);
+  // 用量从 cache 迁到独立表（一次性；幂等）
+  migrateLegacyQweatherUsage(db);
 }
 
 export function getSchemaVersion(db: DatabaseSync): number {

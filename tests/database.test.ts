@@ -31,6 +31,8 @@ describe("database schema v3", () => {
       env.db.close();
       // 还原成 v1 形状：去掉新列 + 版本号写回 1
       const raw = new DatabaseSync(env.config.dbPath);
+      // 先摘掉依赖 owner_profile_id 的分范围唯一索引，否则 SQLite 拒绝 DROP COLUMN
+      raw.exec("DROP INDEX IF EXISTS idx_ledgers_scoped_name");
       raw.exec("ALTER TABLE deliveries DROP COLUMN expire_at");
       raw.exec("ALTER TABLE ledgers DROP COLUMN owner_profile_id");
       raw.prepare("UPDATE meta SET value = '1' WHERE key = 'schema_version'").run();
@@ -68,6 +70,8 @@ describe("database schema v3", () => {
       env.db.close();
       // 还原成 v2 形状：去掉 owner 列、版本号写回 2
       const raw = new DatabaseSync(env.config.dbPath);
+      // 先摘掉依赖 owner_profile_id 的分范围唯一索引，否则 SQLite 拒绝 DROP COLUMN
+      raw.exec("DROP INDEX IF EXISTS idx_ledgers_scoped_name");
       raw.exec("ALTER TABLE ledgers DROP COLUMN owner_profile_id");
       raw.prepare("UPDATE meta SET value = '2' WHERE key = 'schema_version'").run();
       raw.close();
@@ -201,12 +205,64 @@ describe("database schema v3", () => {
     }
   });
 
+  it("账本名分范围唯一：家庭之间唯一、每人个人账本各自唯一，跨范围可同名", () => {
+    const env = makeTestEnv();
+    try {
+      env.db
+        .prepare(
+          "INSERT INTO profiles (id, created_at) VALUES ('p1','2026-01-01T00:00:00.000Z'),('p2','2026-01-01T00:00:00.000Z')",
+        )
+        .run();
+      const insert = env.db.prepare(
+        "INSERT INTO ledgers (id, name, created_at, owner_profile_id) VALUES (?, ?, '2026-01-01T00:00:00.000Z', ?)",
+      );
+      insert.run("l-fam", "日常", null);
+      insert.run("l-p1", "日常", "p1"); // 家庭 vs 个人：允许同名
+      insert.run("l-p2", "日常", "p2"); // 不同人的个人账本：允许同名
+      assert.throws(() => insert.run("l-p1b", "日常", "p1"), /UNIQUE/, "同一范围内仍须唯一");
+      assert.throws(() => insert.run("l-fam2", "日常", null), /UNIQUE/, "家庭账本之间仍须唯一");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("旧全局唯一索引 idx_ledgers_active_name 打开时被替换为分范围索引", () => {
+    const env = makeTestEnv();
+    try {
+      // 模拟升级前的库：只有旧的全局唯一索引
+      env.db.exec("DROP INDEX idx_ledgers_scoped_name");
+      env.db.exec(
+        "CREATE UNIQUE INDEX idx_ledgers_active_name ON ledgers(name) WHERE archived_at IS NULL",
+      );
+      env.db.close();
+
+      const reopened = openDatabase(env.config.dbPath);
+      try {
+        const names = (
+          reopened
+            .prepare(
+              "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_ledgers%'",
+            )
+            .all() as { name: string }[]
+        )
+          .map((r) => r.name)
+          .sort();
+        // 旧索引必须被 DROP（否则仍在暗中强制全局唯一），新索引必须建出
+        assert.deepEqual(names, ["idx_ledgers_scoped_name"]);
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("历史重名活动账本：唯一索引创建失败只告警，不拒绝启动", () => {
     const env = makeTestEnv();
     let reopened: DatabaseSync | undefined;
     try {
       // 去掉索引后制造历史重名（模拟旧库脏数据）
-      env.db.exec("DROP INDEX idx_ledgers_active_name");
+      env.db.exec("DROP INDEX idx_ledgers_scoped_name");
       const insert = env.db.prepare(
         "INSERT INTO ledgers (id, name, created_at) VALUES (?, ?, '2026-01-01T00:00:00.000Z')",
       );
