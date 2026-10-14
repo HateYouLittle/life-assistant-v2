@@ -245,16 +245,16 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
             blocks: entryReceiptBlocks(ledger, entry),
             dedupeKey: `entry:${entry.id}`,
           })
-          .catch((e) => logger.warn(`记账回执发布失败（记账已成功）: ${errorMessage(e)}`));
+          .catch((e) => logger.error(`记账回执发布失败（记账已成功）: ${errorMessage(e)}`));
         // 预算阈值提醒：只在本笔「跨越」80%/100% 时推；失败绝不影响记账成功。
         try {
           for (const alert of budgetAlertsForEntry(db, ledger, entry)) {
             void ctx.services
               .publishGlobal(alert)
-              .catch((e) => logger.warn(`预算提醒发布失败（记账已成功）: ${errorMessage(e)}`));
+              .catch((e) => logger.error(`预算提醒发布失败（记账已成功）: ${errorMessage(e)}`));
           }
         } catch (e) {
-          logger.warn(`预算提醒判定失败（记账已成功）: ${errorMessage(e)}`);
+          logger.error(`预算提醒判定失败（记账已成功）: ${errorMessage(e)}`);
         }
       }
       return okJson({
@@ -447,6 +447,13 @@ registerModule({
         // 上月账单必须按时发，但 node-cron 不补发错过的触发（1 号 09:00 停机即永久丢失）。
         // 每次触发时先补齐最近几个月缺失的账单；dedupeKey 保证幂等（每月只物化一次）。
         const catchup = findMissingMonthlyReports(rt.db);
+        if (catchup.tooOld.length > 0) {
+          // 回看窗口外的月报不会自动补发：停机超窗口时这些账单永久丢失，必须留痕
+          const detail = catchup.tooOld.map((m) => `${m.ledger_name}/${m.ym}`).join("、");
+          logger.warn(
+            `有早于回看窗口、从未推送过的月报，不会自动补发（如需补发请人工处理）：${detail}`,
+          );
+        }
         const months = [...new Set(catchup.missing.map((m) => m.ym))].sort();
         for (const ym of months) {
           logger.warn(`补发缺失的月报：${ym}`);

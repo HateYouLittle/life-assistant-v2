@@ -527,6 +527,29 @@ describe("bookkeeping：月报覆盖与分页语义", () => {
     }
   });
 
+  it("早于回看窗口的未推送月报记入 tooOld（不自动补发，但可告警）", () => {
+    const env = makeTestEnv();
+    try {
+      const ledger = createLedger(env.db, "太久远");
+      addExpense(env.db, "default", {
+        ledgerId: ledger.id,
+        amountCents: 900,
+        spentOn: "2026-01-10",
+      });
+      const found = findMissingMonthlyReports(env.db, 6, "2026-10-05");
+      assert.ok(
+        !found.missing.some((m) => m.ym === "2026-01"),
+        "窗口外的月份不进入补发清单（只告警）",
+      );
+      assert.ok(
+        found.tooOld.some((m) => m.ym === "2026-01"),
+        `窗口外未推送的月份应记入 tooOld：${JSON.stringify(found.tooOld)}`,
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("expense list 报告真实总数与截断标志，且负数 limit 不变成不限量", () => {
     const env = makeTestEnv();
     try {

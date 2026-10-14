@@ -138,6 +138,43 @@ describe("bookkeeping：个人账本", () => {
       cleanupTestEnv(env);
     }
   });
+
+  it("同名分范围唯一：不同人可建同名个人账本，家庭与个人也可同名", () => {
+    const env = makeTestEnv();
+    const owner = tools(env);
+    const partner = tools(env, "partner");
+    try {
+      const a = createLedgerId(owner, "日常", true);
+      const b = createLedgerId(partner, "日常", true);
+      assert.notEqual(a, b, "不同人的同名个人账本应各自创建成功");
+      // 同一个人再建同名 → 同范围，拒绝
+      const again = owner.ledger({ action: "create", name: "日常", personal: true });
+      assert.equal(again.isError, true);
+      assert.match(text(again), /已存在同名账本/);
+      // 家庭账本与个人账本可同名（跨范围）
+      const fam = createLedgerId(owner, "日常", false);
+      assert.notEqual(fam, a);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("转移归属若目标范围已有同名账本，给出可操作报错而不是裸 UNIQUE", () => {
+    const env = makeTestEnv();
+    const owner = tools(env);
+    const partner = tools(env, "partner");
+    try {
+      const mine = createLedgerId(owner, "私房钱", true);
+      createLedgerId(partner, "私房钱", true); // 目标 Profile 已有同名个人账本
+      const moved = owner.ledger({ action: "transfer", id: mine, profile: "partner" });
+      assert.equal(moved.isError, true);
+      assert.match(text(moved), /已有同名活跃账本/);
+      // 转移失败必须保持原归属不变
+      assert.equal(getLedger(env.db, mine)?.owner_profile_id, "default");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
 });
 
 describe("bookkeeping：账本转移", () => {

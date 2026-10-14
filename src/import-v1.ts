@@ -74,11 +74,13 @@ function uniqueLedgerName(
 ): string {
   // 两个条件缺一不可：
   // - 排除自身 id：重跑 --force 时同一账本已存在，否则会被无谓改名成「X (2)」（现在账本走 upsert，不会先删后插）；
-  // - 只看活跃账本：v2 自身规则（createLedger/renameLedger）只要求活跃账本内唯一，
-  //   已归档的同名账本不该逼着导入改名。
+  // - 只看**家庭范围内**的活动账本：导入的账本一律是家庭账本（owner_profile_id = NULL），
+  //   同名的个人账本属于他人私有、不该逼着导入改名；已归档的同名账本也不再占用名字。
   const taken = (candidate: string): boolean =>
     target
-      .prepare("SELECT 1 FROM ledgers WHERE name = ? AND id != ? AND archived_at IS NULL")
+      .prepare(
+        "SELECT 1 FROM ledgers WHERE name = ? AND id != ? AND archived_at IS NULL AND owner_profile_id IS NULL",
+      )
       .get(candidate, selfId) !== undefined;
   if (!taken(name)) return name;
   for (let i = 2; i < 1000; i++) {

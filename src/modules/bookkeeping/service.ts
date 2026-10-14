@@ -42,6 +42,27 @@ export function listLedgers(db: DatabaseSync, includeArchived = false): LedgerRo
     .all() as unknown as LedgerRow[];
 }
 
+/**
+ * 同一「范围」内是否已有活动同名账本。范围 = 家庭（owner_profile_id IS NULL）或某个
+ * Profile 的个人账本。SQLite 的 `IS` 对 NULL 与具体值都成立（`IS NULL` / `IS 'x'`），
+ * 因此一个参数即可同时表达两种范围。excludeId 用于改名/恢复/转移时排除自身。
+ */
+function activeLedgerWithName(
+  db: DatabaseSync,
+  name: string,
+  ownerProfileId: string | null,
+  excludeId?: string,
+): boolean {
+  const params: (string | null)[] = [name, ownerProfileId];
+  let sql =
+    "SELECT 1 FROM ledgers WHERE name = ? AND archived_at IS NULL AND (owner_profile_id IS ?)";
+  if (excludeId !== undefined) {
+    sql += " AND id != ?";
+    params.push(excludeId);
+  }
+  return db.prepare(`${sql} LIMIT 1`).get(...params) !== undefined;
+}
+
 export function createLedger(
   db: DatabaseSync,
   name: string,
@@ -49,10 +70,9 @@ export function createLedger(
 ): LedgerRow {
   const trimmed = name.trim();
   if (trimmed === "" || trimmed.length > 40) throw new Error("账本名需为 1-40 字符");
-  const dup = db
-    .prepare("SELECT id FROM ledgers WHERE name = ? AND archived_at IS NULL")
-    .get(trimmed);
-  if (dup !== undefined) throw new Error(`已存在同名账本: ${trimmed}`);
+  if (activeLedgerWithName(db, trimmed, ownerProfileId)) {
+    throw new Error(`已存在同名账本: ${trimmed}`);
+  }
   const id = newId();
   db.prepare(
     "INSERT INTO ledgers (id, name, created_at, owner_profile_id) VALUES (?, ?, ?, ?)",
@@ -98,6 +118,15 @@ export function transferLedger(
     const target = db.prepare("SELECT id FROM profiles WHERE id = ?").get(targetOwnerId);
     if (target === undefined) throw new Error(`目标 Profile 不存在: ${targetOwnerId}`);
   }
+  // 转归属=换到另一个「范围」：目标范围已有同名活动账本时会撞唯一索引。
+  // 提前给出可操作报错，而不是把 UNIQUE 约束错误原样抛给用户。
+  if (activeLedgerWithName(db, ledger.name, targetOwnerId, id)) {
+    throw new Error(
+      targetOwnerId === null
+        ? `家庭账本里已有同名活跃账本「${ledger.name}」，请先改名再转回家庭`
+        : `目标 Profile「${targetOwnerId}」已有同名活跃账本「${ledger.name}」，请先改名`,
+    );
+  }
   db.prepare("UPDATE ledgers SET owner_profile_id = ? WHERE id = ?").run(targetOwnerId, id);
   return getLedger(db, id) as LedgerRow;
 }
@@ -107,10 +136,9 @@ export function renameLedger(db: DatabaseSync, id: string, name: string): Ledger
   if (row === undefined) throw new Error(`账本不存在: ${id}`);
   const trimmed = name.trim();
   if (trimmed === "" || trimmed.length > 40) throw new Error("账本名需为 1-40 字符");
-  const dup = db
-    .prepare("SELECT id FROM ledgers WHERE name = ? AND archived_at IS NULL AND id != ?")
-    .get(trimmed, id);
-  if (dup !== undefined) throw new Error(`已存在同名账本: ${trimmed}`);
+  if (activeLedgerWithName(db, trimmed, row.owner_profile_id, id)) {
+    throw new Error(`已存在同名账本: ${trimmed}`);
+  }
   db.prepare("UPDATE ledgers SET name = ? WHERE id = ?").run(trimmed, id);
   return getLedger(db, id) as LedgerRow;
 }
@@ -119,13 +147,11 @@ export function setLedgerArchived(db: DatabaseSync, id: string, archived: boolea
   const row = getLedger(db, id);
   if (row === undefined) throw new Error(`账本不存在: ${id}`);
   if (!archived) {
-    // 归档→新建同名→恢复，会得到两个同名活跃账本：create/rename 的重名检查
+    // 归档→新建同名→恢复，会在同一范围内得到两个同名活跃账本：create/rename 的重名检查
     // 只覆盖「已存在且未归档」的账本，恢复路径此前完全没有检查。
-    const dup = db
-      .prepare("SELECT id FROM ledgers WHERE name = ? AND archived_at IS NULL AND id != ?")
-      .get(row.name, id);
-    if (dup !== undefined)
+    if (activeLedgerWithName(db, row.name, row.owner_profile_id, id)) {
       throw new Error(`已有同名活跃账本「${row.name}」，请先改名或归档它再恢复`);
+    }
   }
   db.prepare("UPDATE ledgers SET archived_at = ? WHERE id = ?").run(archived ? nowIso() : null, id);
   return getLedger(db, id) as LedgerRow;
@@ -590,14 +616,22 @@ export function monthlyReportPublished(db: DatabaseSync, ledgerId: string, ym: s
 }
 
 export interface MonthlyCatchup {
-  /** 未推送过年月账单的账本+月份 */
+  /** 未推送过年月账单的账本+月份（会由 job 补发） */
   missing: Array<{ ledger_id: string; ledger_name: string; ym: string }>;
+  /**
+   * 有支出、从未推送过、但**早于回看窗口**的月份：不会自动补发（窗口外），
+   * 仅用于日志告警 —— 停机超过窗口时这些月报会永久丢失，先让运维看得见。
+   */
+  tooOld: Array<{ ledger_id: string; ledger_name: string; ym: string }>;
 }
 
 /**
  * 找出「有支出但从未推送过」的历史月份账单。
  * node-cron 不会补发错过的触发：1 号 09:00 停机就永久丢失该月账单。
  * 靠 notifications.dedupe_key 判断是否推过，因此重复调用是幂等的。
+ *
+ * 回看窗口默认 6 个月；窗口外（再多查一个等长窗口，避免全历史扫描）有支出却从未
+ * 推送过的月份记入 `tooOld`，由调用方告警 —— 否则「补发只覆盖最近 6 个月」会毫无提示。
  */
 export function findMissingMonthlyReports(
   db: DatabaseSync,
@@ -605,19 +639,26 @@ export function findMissingMonthlyReports(
   today: string = todayIso(),
 ): MonthlyCatchup {
   const missing: MonthlyCatchup["missing"] = [];
+  const tooOld: MonthlyCatchup["tooOld"] = [];
   const currentYm = today.slice(0, 7);
-  const months: string[] = [];
-  for (let i = lookbackMonths; i >= 1; i--) {
-    months.push(
-      DateTime.fromISO(`${currentYm}-01`, { zone: TZ }).minus({ months: i }).toFormat("yyyy-MM"),
-    );
-  }
+  const firstOfMonth = DateTime.fromISO(`${currentYm}-01`, { zone: TZ });
+  const monthOf = (i: number): string => firstOfMonth.minus({ months: i }).toFormat("yyyy-MM");
+  // 窗口内：i = lookbackMonths..1；窗口外只多查一个等长窗口（i = 2*lookbackMonths..lookbackMonths+1）
+  const inWindow = Array.from({ length: lookbackMonths }, (_, k) => monthOf(lookbackMonths - k));
+  const outOfWindow = Array.from({ length: lookbackMonths }, (_, k) =>
+    monthOf(lookbackMonths * 2 - k),
+  );
   for (const ledger of listLedgers(db, true)) {
-    for (const ym of months) {
+    for (const ym of inWindow) {
       if (monthlyReportPublished(db, ledger.id, ym)) continue;
       if (summarizeExpenses(db, ledger.id, monthRange(ym)).count === 0) continue;
       missing.push({ ledger_id: ledger.id, ledger_name: ledger.name, ym });
     }
+    for (const ym of outOfWindow) {
+      if (monthlyReportPublished(db, ledger.id, ym)) continue;
+      if (summarizeExpenses(db, ledger.id, monthRange(ym)).count === 0) continue;
+      tooOld.push({ ledger_id: ledger.id, ledger_name: ledger.name, ym });
+    }
   }
-  return { missing };
+  return { missing, tooOld };
 }
