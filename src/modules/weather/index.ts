@@ -48,6 +48,15 @@ function obsTimeText(obsTime: string): string {
 }
 
 function weatherTable(cur: CurrentWeather): { columns: string[]; rows: string[][] } {
+  // 「数据来源时间」：让 agent 能如实标注，而不是省略或编造（见 skill/SKILL.md）。
+  // v1 实时天气不再返回观测时刻（obsTime），退回数据获取时刻（fetchedAt），并
+  // **改标为「数据获取时间」** —— 两者语义不同，不能共用一个「更新时间」标签掩盖新鲜度。
+  const timeRow: string[] | null =
+    cur.obsTime !== undefined
+      ? ["更新时间", obsTimeText(cur.obsTime)]
+      : cur.fetchedAt !== undefined
+        ? ["数据获取时间", obsTimeText(cur.fetchedAt)]
+        : null;
   return {
     columns: ["项目", "内容"],
     rows: [
@@ -55,8 +64,7 @@ function weatherTable(cur: CurrentWeather): { columns: string[]; rows: string[][
       ["气温", `${cur.temp}°C（体感 ${cur.feelsLike}°C）`],
       ["湿度", `${cur.humidity}%`],
       ["风速", `${cur.windSpeed} km/h`],
-      // 「数据来源时间」：让 agent 能如实标注，而不是省略或编造（见 skill/SKILL.md）
-      ...(cur.obsTime === undefined ? [] : [["更新时间", obsTimeText(cur.obsTime)]]),
+      ...(timeRow === null ? [] : [timeRow]),
     ],
   };
 }
@@ -291,15 +299,54 @@ function isExpiredAlert(alert: WeatherAlert, nowMs: number): boolean {
 }
 
 /**
- * 去重键：weather.alert:<id>:<级别>。同一预警同级别只推一次；级别升级会得到新键而再推一次。
- * id 缺失时不能退化成空串（不同预警会共用一个键相互覆盖），改用标题构造稳定串。
+ * 去重键：weather.alert:<内容键>:<级别>。内容键有 id 用 id、缺 id 回退到标题（不同预警
+ * 不能共用空串相互覆盖）。同一预警同级别只推一次；级别升级会得到新键而再推一次。
  */
-function alertDedupeKey(alert: WeatherAlert): string {
-  const level = alert.level.trim();
+const ALERT_DEDUPE_PREFIX = "weather.alert:";
+
+/** 同一预警的内容键：有 id 用 id，缺 id 回退到 `title:<标题>`（与去重键一一对应） */
+function alertContentKey(alert: WeatherAlert): string {
   const id = alert.id.trim();
-  return id === ""
-    ? `weather.alert:title:${alert.title.trim()}:${level}`
-    : `weather.alert:${id}:${level}`;
+  return id === "" ? `title:${alert.title.trim()}` : id;
+}
+
+function alertDedupeKey(alert: WeatherAlert): string {
+  return `${ALERT_DEDUPE_PREFIX}${alertContentKey(alert)}:${alert.level.trim()}`;
+}
+
+/**
+ * 从已落库的去重键还原「内容键 + 级别」；非本类键返回 null。
+ * 级别恒在最后一个冒号之后（色名不含冒号），内容键本身可能含冒号（标题回退）。
+ */
+function parseAlertDedupeKey(key: string): { contentKey: string; level: string } | null {
+  if (!key.startsWith(ALERT_DEDUPE_PREFIX)) return null;
+  const rest = key.slice(ALERT_DEDUPE_PREFIX.length);
+  const cut = rest.lastIndexOf(":");
+  if (cut < 0) return null;
+  return { contentKey: rest.slice(0, cut), level: rest.slice(cut + 1) };
+}
+
+/**
+ * 各预警内容键「已推送过的最高级别」。级别降级不重推的依据：去重键含 level，若不查历史，
+ * orange→yellow 也会得到新键再推一次，与「只有级别升级才再推」的口径不符。
+ * 只看近一天的记录：预警生命周期短，避免用远古同 id 记录误压当前预警。
+ * 空级别（未知，按最高优先级处理）不纳入历史，否则会误压后续真实级别。
+ */
+function notifiedAlertRanks(db: DatabaseSync, profileId: string): Map<string, number> {
+  const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  const rows = db
+    .prepare(
+      "SELECT dedupe_key FROM notifications WHERE profile_id = ? AND kind = 'weather.alert' AND dedupe_key IS NOT NULL AND created_at >= ?",
+    )
+    .all(profileId, since) as { dedupe_key: string }[];
+  const ranks = new Map<string, number>();
+  for (const { dedupe_key } of rows) {
+    const parsed = parseAlertDedupeKey(dedupe_key);
+    if (parsed === null || parsed.level === "") continue;
+    const rank = levelRank(parsed.level);
+    ranks.set(parsed.contentKey, Math.max(ranks.get(parsed.contentKey) ?? 0, rank));
+  }
+  return ranks;
 }
 
 function alertTitle(alert: WeatherAlert): string {
@@ -349,10 +396,17 @@ export async function runAlertWatch(): Promise<void> {
         cityCache.set(city, loc);
       }
       const list = await alerts(rt.db, host, key, loc);
+      const notified = notifiedAlertRanks(rt.db, profileId);
       for (const alert of list) {
         try {
           if (isExpiredAlert(alert, nowMs)) continue;
-          if (levelRank(alert.level) < minRank) continue;
+          const currentRank = levelRank(alert.level);
+          if (currentRank < minRank) continue;
+          const contentKey = alertContentKey(alert);
+          const previousRank = notified.get(contentKey);
+          // 级别降级不再重推：去重键含级别，不比较历史的话 orange→yellow 也会再推一次，
+          // 与 README/SKILL「只有级别升级才再推」的口径不符（同级别仍由去重键兜底）。
+          if (previousRank !== undefined && previousRank > currentRank) continue;
           await publishProfile(rt.db, rt.config, profileId, {
             kind: "weather.alert",
             title: alertTitle(alert),
@@ -361,6 +415,10 @@ export async function runAlertWatch(): Promise<void> {
             // 预警失效时刻即投递截止：静默时段结束后不再补投已失效的预警
             expiresAt: alert.endsAt,
           });
+          // 空级别不纳入历史（未知按最高优先级处理，纳入会误压后续真实级别）
+          if (alert.level.trim() !== "") {
+            notified.set(contentKey, Math.max(previousRank ?? 0, currentRank));
+          }
         } catch (e) {
           // 逐条隔离：一条坏预警只损失它自己，不能让同批其余预警一起丢
           logger.warn(`气象预警处理失败（跳过该条，不影响其余）: ${errorMessage(e)}`);

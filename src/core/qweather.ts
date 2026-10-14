@@ -1,6 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { DateTime } from "luxon";
-import { TZ, todayIso } from "../time.js";
+import { TZ, nowIso, todayIso } from "../time.js";
 import { HttpError, fetchJson, isTransientNetworkError } from "./http.js";
 import type { JwtSigner } from "./qweather-jwt.js";
 import { getCache, getSetting, setCache, setCacheUntil, setSetting } from "./settings.js";
@@ -68,16 +68,13 @@ function recordUpstreamRequest(): void {
   usageSink?.(usage.day);
 }
 
-/** 落库：`cache` 表里按天存一个裸数字，过期时间给足（当天绝不会被 pruneCache 清掉） */
+/** 落库：按本地日历日累加到独立的 `qweather_usage` 表（不再借道 cache 表） */
 export function bumpQweatherUsage(db: DatabaseSync, day: string): void {
-  const expiresAt = new Date(Date.now() + 400 * 24 * 3600 * 1000).toISOString();
   try {
     db.prepare(
-      `INSERT INTO cache (key, value_json, expires_at) VALUES (?, '1', ?)
-       ON CONFLICT (key) DO UPDATE SET
-         value_json = CAST(CAST(cache.value_json AS INTEGER) + 1 AS TEXT),
-         expires_at = excluded.expires_at`,
-    ).run(`qweather:usage:${day}`, expiresAt);
+      `INSERT INTO qweather_usage (day, requests) VALUES (?, 1)
+       ON CONFLICT (day) DO UPDATE SET requests = requests + 1`,
+    ).run(day);
   } catch {
     // 计量是旁路：失败绝不能影响天气请求本身
   }
@@ -85,25 +82,31 @@ export function bumpQweatherUsage(db: DatabaseSync, day: string): void {
 
 /** 读回某天的计数（缺失=0） */
 export function readQweatherUsage(db: DatabaseSync, day: string = todayIso()): number {
-  const row = db
-    .prepare("SELECT value_json FROM cache WHERE key = ?")
-    .get(`qweather:usage:${day}`) as { value_json: string } | undefined;
-  const value = Number(row?.value_json ?? 0);
+  const row = db.prepare("SELECT requests FROM qweather_usage WHERE day = ?").get(day) as
+    | { requests: number }
+    | undefined;
+  const value = Number(row?.requests ?? 0);
   return Number.isFinite(value) && value > 0 ? Math.trunc(value) : 0;
 }
 
 export interface CurrentWeather {
   temp: number;
   feelsLike: number;
+  /** 相对湿度百分数（0-100）；上游 v1 给的是 [0,1] 小数，映射时已换算 */
   humidity: number;
+  /** 风速 km/h；上游 v1 给的是 m/s，映射时已换算 */
   windSpeed: number;
   text: string;
   /**
-   * 观测时刻（上游 `now.obsTime`，ISO 字符串）。SKILL.md 要求"标注数据来源时间"，
-   * 而有 20 分钟缓存，所以必须把上游观测时间透出来，否则 agent 只能省略或编造。
-   * 上游缺失时为 undefined（不猜）。
+   * 观测时刻（旧 v7 上游 `now.obsTime`）。**v1 实时天气不再返回观测时刻**，
+   * 因此该字段在迁移后恒为 undefined；新鲜度改由 fetchedAt（数据获取时刻）表达。
    */
   obsTime?: string;
+  /**
+   * 数据获取时刻（缓存写入时的 ISO）。v1 没有观测时刻，用它作为「数据新鲜度」信号；
+   * SKILL.md 要求标注数据来源时间，有 20 分钟缓存时不标注就等于隐瞒新鲜度。
+   */
+  fetchedAt?: string;
 }
 
 export interface ForecastDay {
@@ -550,6 +553,59 @@ export function saveLocation(db: DatabaseSync, profileId: string, loc: LocationI
   setSetting(db, profileId, "location", loc);
 }
 
+/**
+ * 解包 v1 的 `{value, unit}` 度量对象。v7 把数值写成裸字符串，v1 一律包一层，
+ * 直接取字段会得到对象（`Number({...})` = NaN）——必须先解包再校验。
+ */
+function measureValue(value: unknown, field: string): number {
+  if (typeof value !== "object" || value === null) {
+    throw new Error(`QWeather ${field} 度量对象不合法: ${String(value)}`);
+  }
+  return num((value as { value?: unknown }).value, field);
+}
+
+function round1(value: number): number {
+  return Math.round(value * 10) / 10;
+}
+
+/**
+ * v1 风速单位是 m/s（v7 是 km/h），内部统一换算为 km/h 展示。
+ * 单位不识别时抛错，避免把 m/s 当 km/h 静默报小 3.6 倍。
+ */
+function windSpeedKmh(wind: unknown): number {
+  const speed = (wind as { speed?: unknown } | undefined)?.speed;
+  const value = measureValue(speed, "wind.speed");
+  const unit = String((speed as { unit?: unknown } | undefined)?.unit ?? "")
+    .trim()
+    .toLowerCase();
+  if (unit === "m/s" || unit === "mps") return round1(value * 3.6);
+  if (unit === "km/h" || unit === "kph") return round1(value);
+  throw new Error(`QWeather wind.speed 单位不支持: ${unit}`);
+}
+
+/** 某半天（daytime/nighttime）的降水量 mm；缺失/非法按 0 计（不是「有降水」） */
+function periodPrecipMm(period: Record<string, unknown> | undefined): number {
+  const amount = (period?.precipitation as { amount?: { value?: unknown } } | undefined)?.amount;
+  const value = amount?.value;
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+function conditionText(period: Record<string, unknown> | undefined): string {
+  const condition = period?.condition as { text?: unknown } | undefined;
+  return typeof condition?.text === "string" ? condition.text.trim() : "";
+}
+
+/** v1 逐日预报用 forecastStartTime（UTC ISO）标识某一天；换算成本地日历日 */
+function localDateOf(value: unknown): string {
+  const dt = DateTime.fromISO(String(value ?? ""), { zone: TZ });
+  return dt.isValid ? (dt.toISODate() ?? "") : "";
+}
+
+/**
+ * 实时天气。v1 端点是 `GET /weather/v1/current/{lat}/{lon}`（按经纬度，不再用 location=城市ID），
+ * 字段为 `temperature/feelsLike` 的 `{value}`、`humidity` 小数、`wind.speed`（m/s）。
+ * 特别注意：**v1 不再返回观测时刻**，故用数据获取时刻表达新鲜度（见 fetchedAt）。
+ */
 export async function currentWeather(
   db: DatabaseSync,
   host: string,
@@ -557,21 +613,29 @@ export async function currentWeather(
   loc: LocationInfo,
 ): Promise<CurrentWeather> {
   const auth = resolveAuth(key);
+  const lat = loc.lat.toFixed(2);
+  const lon = loc.lon.toFixed(2);
   return cached(db, `qweather:now:${loc.cityId}`, CACHE_TTL_MS.now, async () => {
     const body = (await requestQw(
-      buildRequest(host, "/v7/weather/now", { location: loc.cityId }, auth),
+      buildRequest(host, `/weather/v1/current/${lat}/${lon}`, { lang: "zh" }, auth),
       auth,
-      "weather/now",
-    )) as { code?: unknown; now?: Record<string, unknown> };
-    const now = body.now;
-    if (now === undefined) throw new Error("QWeather weather/now 响应缺少 now");
+      "weather/current",
+    )) as Record<string, unknown>;
+    const humidity = num(body.humidity, "humidity");
+    // v1 humidity 是 [0,1] 小数（v7 是百分数）。若上游改回百分数，这里必须报错而不是
+    // 静默输出「7000%」——那正是「直接换路径会静默错报湿度」的坑。
+    if (humidity < 0 || humidity > 1) {
+      throw new Error(
+        `QWeather humidity 应为 [0,1] 小数（v1），收到 ${humidity}，拒绝按百分数误报`,
+      );
+    }
     return {
-      temp: num(now.temp, "temp"),
-      feelsLike: num(now.feelsLike, "feelsLike"),
-      humidity: num(now.humidity, "humidity"),
-      windSpeed: num(now.windSpeed, "windSpeed"),
-      text: String(now.text ?? ""),
-      obsTime: typeof now.obsTime === "string" && now.obsTime !== "" ? now.obsTime : undefined,
+      temp: measureValue(body.temperature, "temperature"),
+      feelsLike: measureValue(body.feelsLike, "feelsLike"),
+      humidity: Math.round(humidity * 100),
+      windSpeed: windSpeedKmh(body.wind),
+      text: conditionText(body),
+      fetchedAt: nowIso(),
     };
   });
 }
@@ -599,8 +663,9 @@ export async function forecast(
   loc: LocationInfo,
   days: 3 | 7,
 ): Promise<ForecastDay[]> {
-  const path = days <= 3 ? "3d" : "7d";
   const auth = resolveAuth(key);
+  const lat = loc.lat.toFixed(2);
+  const lon = loc.lon.toFixed(2);
   // 过期时刻按「请求发起时刻」换算成绝对值，但等响应回来（重试时可达数十秒）才写入：
   // 若按发起时刻算好「剩余毫秒」再延迟写入，过期时刻会被顺延到零点之后；
   // 若按写入时刻算，23:59 发起、00:00 返回的响应会活到**下一个**零点，首行仍是昨天。
@@ -611,29 +676,32 @@ export async function forecast(
     CACHE_TTL_MS.daily,
     async () => {
       const body = (await requestQw(
-        buildRequest(host, `/v7/weather/${path}`, { location: loc.cityId }, auth),
+        buildRequest(
+          host,
+          `/weather/v1/daily/${lat}/${lon}`,
+          { days: String(days), lang: "zh" },
+          auth,
+        ),
         auth,
-        `weather/${path}`,
-      )) as { code?: unknown; daily?: Array<Record<string, unknown>> };
-      // 缺失 daily 说明响应不完整；静默变成空预报会让简报得出「适宜出行」的错误结论。
-      if (!Array.isArray(body.daily) || body.daily.length === 0) {
-        throw new Error(`QWeather weather/${path} 响应缺少有效的 daily 数组`);
+        "weather/daily",
+      )) as { days?: Array<Record<string, unknown>> };
+      // 缺失 days 说明响应不完整；静默变成空预报会让简报得出「适宜出行」的错误结论。
+      if (!Array.isArray(body.days) || body.days.length === 0) {
+        throw new Error("QWeather weather/daily 响应缺少有效的 days 数组");
       }
-      const daily = body.daily;
       // 用本地日历日过滤：UTC 日期在 00:00–08:00（Asia/Shanghai）会落在前一天，放行已过期的预报行
       const today = todayIso();
-      const rows = daily
+      const rows = body.days
         .map((d) => {
-          // 上游把「无降水」写作 "0.0"（而非 "0"），必须按数值判断
-          const precip =
-            d.precip === undefined || d.precip === null || d.precip === ""
-              ? 0
-              : num(d.precip, "precip");
+          const daytime = d.daytime as Record<string, unknown> | undefined;
+          const nighttime = d.nighttime as Record<string, unknown> | undefined;
+          // v1 没有「当天降水总量」字段：白天 + 夜间累计相加
+          const precip = round1(periodPrecipMm(daytime) + periodPrecipMm(nighttime));
           return {
-            date: String(d.fxDate ?? ""),
-            tMax: num(d.tempMax, "tempMax"),
-            tMin: num(d.tempMin, "tempMin"),
-            textDay: String(d.textDay ?? "").trim(),
+            date: localDateOf(d.forecastStartTime),
+            tMax: measureValue(d.temperatureMax, "temperatureMax"),
+            tMin: measureValue(d.temperatureMin, "temperatureMin"),
+            textDay: conditionText(daytime) || conditionText(nighttime),
             precipMm: precip > 0 ? precip : undefined,
           };
         })
@@ -641,7 +709,7 @@ export async function forecast(
       // 全部行都不可用（日期格式坏 / 全是过期日）时抛错：返回空数组会被当成「有预报」
       // 缓存 2 小时，简报照发但缺「今日气温」，且「天气与预报全失败则不发送」的兜底失效。
       if (rows.length === 0) {
-        throw new Error(`QWeather weather/${path} 响应没有可用的预报日（本地今天 ${today}）`);
+        throw new Error(`QWeather weather/daily 响应没有可用的预报日（本地今天 ${today}）`);
       }
       return rows;
     },

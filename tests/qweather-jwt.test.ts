@@ -14,6 +14,7 @@ import {
   resetQweatherStateForTests,
   setQweatherAuth,
 } from "../src/core/qweather.js";
+import { v1Current } from "./helpers.js";
 
 /**
  * 阶段 B2：QWeather JWT（Ed25519）认证，API KEY 保留为回退。
@@ -37,10 +38,7 @@ const BASE_OPTS = {
 
 const HOST = "test.example.com";
 const LOC: LocationInfo = { city: "上海", cityId: "101020100", lat: 31.23, lon: 121.47 };
-const NOW_BODY = {
-  code: "200",
-  now: { temp: "26", feelsLike: "28", humidity: "70", windSpeed: "12", text: "多云" },
-};
+const NOW_BODY = v1Current();
 
 interface DecodedToken {
   header: Record<string, unknown>;

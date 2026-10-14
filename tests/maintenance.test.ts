@@ -13,7 +13,8 @@ import {
 } from "../src/core/qweather.js";
 import { todayIso } from "../src/time.js";
 import { runDoctor } from "../src/doctor.js";
-import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
+import { openDatabase } from "../src/core/database.js";
+import { cleanupTestEnv, makeTestEnv, type TestEnv, v1Current } from "./helpers.js";
 
 /** 保留策略：只删该删的（未读通知、仍有待投递的通知、count 日程都不许动） */
 describe("保留策略", () => {
@@ -108,6 +109,33 @@ describe("保留策略", () => {
       cleanupTestEnv(env);
     }
   });
+
+  it("recurrence_json 损坏时保守豁免，且预演数与实删数一致（与 occurrence 清理同口径）", () => {
+    const env = makeTestEnv();
+    try {
+      const insert = env.db.prepare(
+        `INSERT INTO schedules (id, profile_id, title, kind, calendar, start_date, time, all_day,
+           recurrence_json, remind_offsets_json, resend_minutes, workday_filter, status, version, created_at, updated_at)
+         VALUES (?, 'default', ?, 'todo', 'solar', '2026-01-01', '09:00', 1, ?, '[0]', 0, 'any', 'cancelled', 1, ?, ?)`,
+      );
+      // 回归：保留策略曾用 `NOT LIKE '%"count"%'` 判 count —— 这条损坏 JSON 里没有 "count"
+      // 子串，会被当成「没用到 count」删掉；而 occurrence 清理（countProtectedScheduleIds）
+      // 按解析结果保守豁免。改成共用 recurrenceDeclaresCount 后两处口径一致。
+      insert.run("s-broken", "损坏规则", '{"freq":"daily"', OLD, OLD);
+      insert.run("s-plain-cancelled", "普通已取消", '{"freq":"daily","interval":1}', OLD, OLD);
+
+      const preview = retentionPreview(env.db);
+      assert.equal(preview.cancelledSchedules, 1, "只预演能安全删除的那条");
+      const result = runRetention(env.db);
+      assert.equal(result.cancelledSchedules, 1, "预演数必须等于实删数");
+      const left = (
+        env.db.prepare("SELECT id FROM schedules ORDER BY id").all() as { id: string }[]
+      ).map((r) => r.id);
+      assert.deepEqual(left, ["s-broken"], "损坏规则保守保留，避免让已达上限的循环复活");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
 });
 
 describe("/healthz", () => {
@@ -143,6 +171,30 @@ describe("QWeather 用量计量", () => {
     }
   });
 
+  it("旧库把用量寄存在 cache：打开时迁移到 qweather_usage 并清掉 cache 行", () => {
+    const env = makeTestEnv();
+    try {
+      const day = todayIso();
+      env.db
+        .prepare("INSERT INTO cache (key, value_json, expires_at) VALUES (?, '7', ?)")
+        .run(`qweather:usage:${day}`, new Date(Date.now() + 400 * 86_400_000).toISOString());
+      env.db.close();
+
+      const reopened = openDatabase(env.config.dbPath);
+      try {
+        assert.equal(readQweatherUsage(reopened, day), 7, "旧计数应迁移到独立表（重启不清零）");
+        const cacheRows = reopened
+          .prepare("SELECT COUNT(*) AS n FROM cache WHERE key LIKE 'qweather:usage:%'")
+          .get() as { n: number };
+        assert.equal(cacheRows.n, 0, "残留的 cache 用量行应被清理，避免两处口径并存");
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("真实出网才计数：第二次走缓存不再增加", async () => {
     const env = makeTestEnv({ QWEATHER_API_HOST: "h.example.com", QWEATHER_KEY: "k" });
     const originalFetch = globalThis.fetch;
@@ -151,13 +203,10 @@ describe("QWeather 用量计量", () => {
       seedQweatherUsage(0);
       globalThis.fetch = (async () => {
         calls += 1;
-        return new Response(
-          JSON.stringify({
-            code: "200",
-            now: { temp: "26", feelsLike: "28", humidity: "70", windSpeed: "12", text: "多云" },
-          }),
-          { status: 200, headers: { "content-type": "application/json" } },
-        );
+        return new Response(JSON.stringify(v1Current()), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
       }) as typeof fetch;
       const loc = { city: "上海", cityId: "101020100", lat: 31.23, lon: 121.47 };
       await currentWeather(env.db, "h.example.com", "k", loc);

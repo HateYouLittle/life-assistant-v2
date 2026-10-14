@@ -19,6 +19,7 @@ import {
   setQweatherDepsForTests,
 } from "../src/core/qweather.js";
 import { todayIso } from "../src/time.js";
+import { localDayStart, v1Current, v1Daily, v1Day } from "./helpers.js";
 
 /**
  * 阶段 B1：QWeather 客户端加固 —— 短 TTL 缓存 / 并发上限 / 指数退避 / GeoAPI 合规。
@@ -29,10 +30,7 @@ const HOST = "test.example.com";
 const KEY = "test-key";
 const LOC: LocationInfo = { city: "上海", cityId: "101020100", lat: 31.23, lon: 121.47 };
 
-const NOW_BODY = {
-  code: "200",
-  now: { temp: "26", feelsLike: "28", humidity: "70", windSpeed: "12", text: "多云" },
-};
+const NOW_BODY = v1Current();
 
 function makeDb(): DatabaseSync {
   const db = new DatabaseSync(":memory:");
@@ -135,15 +133,11 @@ describe("QWeather：短 TTL 缓存", () => {
 
   it("缓存键区分城市与数据类型", async () => {
     const db = makeDb();
-    const daily = () => ({
-      code: "200",
-      daily: [{ fxDate: todayIso(), tempMax: "30", tempMin: "24", textDay: "晴", precip: "0" }],
-    });
+    const daily = () => v1Daily([v1Day({ start: localDayStart(todayIso()) })]);
     await withFetch(
       (url) => {
-        if (url.includes("/v7/weather/now")) return jsonResponse(NOW_BODY);
-        if (url.includes("/v7/weather/7d") || url.includes("/v7/weather/3d"))
-          return jsonResponse(daily());
+        if (url.includes("/weather/v1/current")) return jsonResponse(NOW_BODY);
+        if (url.includes("/weather/v1/daily")) return jsonResponse(daily());
         if (url.includes("/weatheralert/")) return jsonResponse({ code: "200", alerts: [] });
         if (url.includes("/airquality/"))
           return jsonResponse({
@@ -179,10 +173,7 @@ describe("QWeather：短 TTL 缓存", () => {
     t.mock.timers.enable({ apis: ["Date"] });
     t.mock.timers.setTime(Date.parse("2026-09-18T15:59:00.000Z")); // 2026-09-18 23:59 +08
     const db = makeDb();
-    const daily = () => ({
-      code: "200",
-      daily: [{ fxDate: todayIso(), tempMax: "30", tempMin: "24", textDay: "晴", precip: "0" }],
-    });
+    const daily = () => v1Daily([v1Day({ start: localDayStart(todayIso()) })]);
 
     await withFetch(
       () => jsonResponse(daily()),
@@ -535,11 +526,7 @@ describe("QWeather：逐天预报的跨日边界", () => {
   it("过滤后没有可用预报日时抛错且不写缓存（避免简报缺今日气温却照发）", async () => {
     const db = makeDb();
     await withFetch(
-      () =>
-        jsonResponse({
-          code: "200",
-          daily: [{ fxDate: "2020-01-01", tempMax: "30", tempMin: "24", textDay: "晴" }],
-        }),
+      () => jsonResponse(v1Daily([v1Day({ start: localDayStart("2020-01-01") })])),
       async () => {
         await assert.rejects(() => forecast(db, HOST, KEY, LOC, 7), /没有可用的预报日/);
         assert.equal(countCache(db, "qweather:daily:%"), 0);
@@ -555,10 +542,7 @@ describe("QWeather：逐天预报的跨日边界", () => {
     await withFetch(
       () => {
         t.mock.timers.setTime(Date.parse("2026-09-18T16:00:30.000Z"));
-        return jsonResponse({
-          code: "200",
-          daily: [{ fxDate: todayIso(), tempMax: "30", tempMin: "24", textDay: "晴" }],
-        });
+        return jsonResponse(v1Daily([v1Day({ start: localDayStart(todayIso()) })]));
       },
       async (calls) => {
         await forecast(db, HOST, KEY, LOC, 7);
@@ -585,6 +569,81 @@ describe("QWeather：逐天预报的跨日边界", () => {
         assert.equal(calls.length, 1, "并发相同 key 应合并为一次上游请求");
         assert.deepEqual(b, a);
         assert.deepEqual(c, a);
+      },
+    );
+    db.close();
+  });
+});
+
+describe("QWeather：v1 字段/单位映射（迁移回归）", () => {
+  it("humidity [0,1] → 百分数；wind m/s → km/h；且不再有观测时刻", async () => {
+    const db = makeDb();
+    await withFetch(
+      () => jsonResponse(v1Current({ humidity: 0.69, windMs: 4.74 })),
+      async () => {
+        const cur = await currentWeather(db, HOST, KEY, LOC);
+        assert.equal(cur.humidity, 69, "0.69 应换算成 69%");
+        assert.equal(cur.windSpeed, 17.1, "4.74 m/s 应换算成约 17.1 km/h");
+        assert.equal(cur.text, "多云");
+        assert.equal(cur.obsTime, undefined, "v1 不提供观测时刻");
+        assert.equal(typeof cur.fetchedAt, "string", "应以数据获取时刻表达新鲜度");
+      },
+    );
+    db.close();
+  });
+
+  it("humidity 若像 v7 那样是百分数（>1）必须报错，而不是输出 7000%", async () => {
+    const db = makeDb();
+    await withFetch(
+      () => jsonResponse(v1Current({ humidity: 70 })),
+      async () => {
+        await assert.rejects(() => currentWeather(db, HOST, KEY, LOC), /humidity/);
+      },
+    );
+    db.close();
+  });
+
+  it("风速单位无法识别时报错，而不是把 m/s 当 km/h", async () => {
+    const db = makeDb();
+    await withFetch(
+      () => jsonResponse({ ...v1Current(), wind: { speed: { value: 5, unit: "mph" } } }),
+      async () => {
+        await assert.rejects(() => currentWeather(db, HOST, KEY, LOC), /wind\.speed/);
+      },
+    );
+    db.close();
+  });
+
+  it("缺少温度度量对象时报错（不把缺字段读成 0/NaN）", async () => {
+    const db = makeDb();
+    await withFetch(
+      () => jsonResponse({ ...v1Current(), temperature: undefined }),
+      async () => {
+        await assert.rejects(() => currentWeather(db, HOST, KEY, LOC), /temperature/);
+      },
+    );
+    db.close();
+  });
+
+  it("逐日预报：白天+夜间降水相加，forecastStartTime 换算本地日历日", async () => {
+    const db = makeDb();
+    await withFetch(
+      () =>
+        jsonResponse(
+          v1Daily([
+            v1Day({
+              start: localDayStart(todayIso()),
+              text: "小雨",
+              precipDay: 1.2,
+              precipNight: 0.3,
+            }),
+          ]),
+        ),
+      async () => {
+        const days = await forecast(db, HOST, KEY, LOC, 7);
+        assert.equal(days[0]?.date, todayIso(), "forecastStartTime 应换算为本地日历日");
+        assert.equal(days[0]?.textDay, "小雨");
+        assert.equal(days[0]?.precipMm, 1.5, "白天 1.2 + 夜间 0.3");
       },
     );
     db.close();

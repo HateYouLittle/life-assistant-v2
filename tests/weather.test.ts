@@ -4,7 +4,16 @@ import { todayIso } from "../src/time.js";
 import { setPushRoute } from "../src/core/notify.js";
 import { importYear } from "../src/core/holiday.js";
 import { runDailyBrief, weatherTool } from "../src/modules/weather/index.js";
-import { cleanupTestEnv, makeTestEnv, SECRET, type TestEnv } from "./helpers.js";
+import {
+  cleanupTestEnv,
+  localDayStart,
+  makeTestEnv,
+  SECRET,
+  v1Current,
+  v1Daily,
+  v1Day,
+  type TestEnv,
+} from "./helpers.js";
 
 interface Call {
   url: string;
@@ -47,27 +56,18 @@ const GEO = { code: "200", location: [{ id: "101020100", lat: "31.23", lon: "121
 
 function handlerFor(url: string): unknown {
   if (url.includes("/geo/v2/city/lookup")) return GEO;
-  if (url.includes("/v7/weather/now")) {
-    return {
-      code: "200",
-      now: {
-        temp: "26",
-        feelsLike: "28",
-        humidity: "70",
-        windSpeed: "12",
-        text: "多云",
-        obsTime: "2026-09-25T08:00+08:00",
-      },
-    };
-  }
-  if (url.includes("/v7/weather/7d") || url.includes("/v7/weather/3d")) {
-    return {
-      code: "200",
-      daily: [
-        { fxDate: todayIso(), tempMax: "30", tempMin: "24", textDay: "晴", precip: "0.0" },
-        { fxDate: "2026-09-13", tempMax: "29", tempMin: "23", textDay: "雷阵雨", precip: "4.5" },
-      ],
-    };
+  if (url.includes("/weather/v1/current")) return v1Current();
+  if (url.includes("/weather/v1/daily")) {
+    return v1Daily([
+      v1Day({ start: localDayStart(todayIso()) }),
+      v1Day({
+        start: localDayStart("2026-09-13"),
+        text: "雷阵雨",
+        tMax: 29,
+        tMin: 23,
+        precipDay: 4.5,
+      }),
+    ]);
   }
   if (url.includes("/weatheralert/v1/current")) return { code: "200", alerts: [] };
   if (url.includes("/airquality/v1/current")) {
@@ -108,13 +108,27 @@ describe("weather / air_quality", () => {
         };
         assert.equal(payload.城市, "上海");
         assert.deepEqual(payload.天气.rows[0], ["天气", "多云"]);
-        // SKILL.md 要求「标注数据来源时间」：上游 obsTime 必须透出为本地时间
         assert.deepEqual(
-          payload.天气.rows.find((r) => r[0] === "更新时间"),
-          ["更新时间", "2026-09-25 08:00"],
+          payload.天气.rows.find((r) => r[0] === "气温"),
+          ["气温", "26°C（体感 28°C）"],
         );
+        assert.deepEqual(
+          payload.天气.rows.find((r) => r[0] === "湿度"),
+          ["湿度", "70%"],
+        );
+        assert.deepEqual(
+          payload.天气.rows.find((r) => r[0] === "风速"),
+          ["风速", "12 km/h"],
+        );
+        // SKILL.md 要求「标注数据来源时间」：v1 无观测时刻，退回数据获取时刻并如实标注
+        const stampRow = payload.天气.rows.find((r) => r[0] === "数据获取时间");
+        assert.ok(stampRow !== undefined, "应有一行「数据获取时间」");
+        assert.match(stampRow?.[1] ?? "", /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
         assert.ok(
-          calls.some((c) => c.url.includes("/v7/weather/now?location=101020100&key=test-key")),
+          calls.some((c) =>
+            c.url.includes("/weather/v1/current/31.23/121.47?lang=zh&key=test-key"),
+          ),
+          `应请求 v1 实时天气端点（按经纬度）；实际 ${JSON.stringify(calls.map((c) => c.url))}`,
         );
         assert.ok(
           calls.some((c) =>
@@ -238,7 +252,7 @@ describe("weather / air_quality", () => {
       await withMockFetch(
         (url) => {
           if (url.includes("/geo/")) return GEO;
-          if (url.includes("/v7/weather/")) throw new Error("HTTP 503");
+          if (url.includes("/weather/v1/")) throw new Error("HTTP 503");
           return { code: "200", alerts: [] };
         },
         async () => {
@@ -272,17 +286,9 @@ describe("weather：v1 预警字段映射", () => {
   function alertHandler(url: string): unknown {
     if (url.includes("/geo/")) return GEO;
     if (url.includes("/weatheralert/v1/current")) return ALERT_BODY;
-    if (url.includes("/v7/weather/now")) {
-      return {
-        code: "200",
-        now: { temp: "26", feelsLike: "28", humidity: "70", windSpeed: "12", text: "多云" },
-      };
-    }
-    if (url.includes("/v7/weather/")) {
-      return {
-        code: "200",
-        daily: [{ fxDate: todayIso(), tempMax: "30", tempMin: "24", textDay: "晴", precip: "0.0" }],
-      };
+    if (url.includes("/weather/v1/current")) return v1Current();
+    if (url.includes("/weather/v1/daily")) {
+      return v1Daily([v1Day({ start: localDayStart(todayIso()) })]);
     }
     if (url.includes("/airquality/")) {
       return { indexes: [{ code: "cn-mee", aqi: 42, category: "优" }], pollutants: [] };
@@ -391,20 +397,18 @@ describe("weather：数值与预报健壮性", () => {
       await withMockFetch(
         (url) => {
           if (url.includes("/geo/")) return GEO;
-          if (url.includes("/v7/weather/7d") || url.includes("/v7/weather/3d")) {
-            return {
-              code: "200",
-              daily: [
-                { fxDate: todayIso(), tempMax: "30", tempMin: "24", textDay: "晴", precip: "0.0" },
-                {
-                  fxDate: todayIso(),
-                  tempMax: "29",
-                  tempMin: "23",
-                  textDay: "雷阵雨",
-                  precip: "4.5",
-                },
-              ],
-            };
+          if (url.includes("/weather/v1/daily")) {
+            const today = todayIso();
+            return v1Daily([
+              v1Day({ start: localDayStart(today) }),
+              v1Day({
+                start: localDayStart(today),
+                text: "雷阵雨",
+                tMax: 29,
+                tMin: 23,
+                precipDay: 4.5,
+              }),
+            ]);
           }
           throw new Error(`unexpected url ${url}`);
         },
@@ -413,7 +417,7 @@ describe("weather：数值与预报健壮性", () => {
           const payload = JSON.parse(result.content[0]?.text ?? "{}") as {
             预报: { rows: string[][] };
           };
-          assert.equal(payload.预报.rows[0]?.[3], "—", "0.0 应显示为无降水");
+          assert.equal(payload.预报.rows[0]?.[3], "—", "0 降水应显示为无降水");
           assert.equal(payload.预报.rows[1]?.[3], "4.5mm");
         },
       );
@@ -453,7 +457,7 @@ describe("weather：数值与预报健壮性", () => {
       await withMockFetch(
         (url) => {
           if (url.includes("/geo/")) return GEO;
-          if (url.includes("/v7/weather/")) return { code: "200" };
+          if (url.includes("/weather/v1/")) return { code: "200" };
           throw new Error(`unexpected url ${url}`);
         },
         async () => {

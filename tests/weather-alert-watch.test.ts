@@ -221,6 +221,27 @@ describe("weather alert_watch：命中与去重", () => {
     }
   });
 
+  it("级别降级（橙→黄）不重推：只保留更高那条", async () => {
+    const env = makeEnv({}, "default");
+    try {
+      let body = alertBody(alert({ color: { code: "orange" } }));
+      await withFetch(
+        responderFor(() => ({ body })),
+        async () => {
+          await runAlertWatch();
+          env.db.exec("DELETE FROM cache"); // 强制第二次重新请求上游
+          body = alertBody(alert({ color: { code: "yellow" } }));
+          await runAlertWatch();
+        },
+      );
+      const rows = notifications(env, "default");
+      assert.equal(rows.length, 1, "级别降级不该再推一条");
+      assert.equal(rows[0]?.dedupe_key, "weather.alert:a1:橙色");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("无 id 的预警用标题构造去重键，不同预警不互相覆盖", async () => {
     const env = makeEnv({}, "default");
     try {
