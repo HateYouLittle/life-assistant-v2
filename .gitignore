@@ -16,3 +16,12 @@ dist/
 # Command Code：个人/自动管理的状态（taste 学习结果、本地设置）
 .commandcode/taste/
 .commandcode/settings.local.json
+
+# 本机迁移/运维一次性脚本：含绝对路径，cutover 还会读取 .env 密钥做签名，不入库
+/cutover.sh
+/cutover.sh.bak-*
+/.cutover-dispatch.sh
+/.cutover-dispatch.sh.bak-*
+
+# LaunchAgent 调用的 node 解析壳（本机部署胶水，不入库；勿删，daemon/backup 依赖它）
+/node-run.sh
