@@ -8,7 +8,7 @@ import { getRequestListener } from "@hono/node-server";
 import cron from "node-cron";
 import type { DatabaseSync } from "node:sqlite";
 import type { DateTime } from "luxon";
-import { loadConfig, parseProfileId, type ResolvedConfig } from "./config.js";
+import { bindHost, loadConfig, parseProfileId, type ResolvedConfig, urlHost } from "./config.js";
 import { isRequestAuthorized } from "./core/auth.js";
 import { openDatabase } from "./core/database.js";
 import {
@@ -280,9 +280,10 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
   // 监听成功之前不得装配任何定时器（信号处理同理）：端口被占 —— systemd Restart=always
   // 重启时的常见情形 —— 会让旧实现留下一个「启动失败但不退出」的僵尸实例，它的 20s drain
   // 会把在跑实例正处于 sending 的投递复位重投（recoverStaleSending），同一条通知推两次。
+  // listen 用主机必须剥掉 IPv6 方括号（`[::1]` → `::1`），否则 Node 解析失败拒绝启动
   await new Promise<void>((resolve, reject) => {
     httpServer.once("error", reject);
-    httpServer.listen(config.port, config.host, () => resolve());
+    httpServer.listen(config.port, bindHost(config.host), () => resolve());
   }).catch((e: unknown) => {
     db.close();
     throw e;
@@ -313,8 +314,12 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
     sweepSessions();
   }, 20_000);
 
-  logger.info(`life-assistant daemon v${VERSION} 就绪: http://${config.host}:${config.port}`);
-  logger.info(`MCP 端点: http://${config.host}:${config.port}/mcp  数据目录: ${config.dataDir}`);
+  logger.info(
+    `life-assistant daemon v${VERSION} 就绪: http://${urlHost(config.host)}:${config.port}`,
+  );
+  logger.info(
+    `MCP 端点: http://${urlHost(config.host)}:${config.port}/mcp  数据目录: ${config.dataDir}`,
+  );
   logger.info(
     `已注册 ${allTools().length} 个工具、${allJobs().length} 个定时任务、${getModules().length} 个模块` +
       (config.webApiToken === undefined ? "（未启用鉴权，仅回环地址）" : "（已启用 token 鉴权）"),

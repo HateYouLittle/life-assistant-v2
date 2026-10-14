@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
 import { describe, it } from "node:test";
-import { loadConfig, parseProfileId } from "../src/config.js";
+import { bindHost, loadConfig, parseProfileId, urlHost } from "../src/config.js";
 import { SECRET } from "./helpers.js";
 
 const BASE = { DATA_DIR: "/tmp/la-test", HERMES_PROFILE: "default" };
@@ -49,6 +50,28 @@ describe("config", () => {
     assert.throws(() => loadConfig({ ...BASE, HOST: "http://localhost:3080" }), /端口/);
     // IPv6 字面量含多个冒号/方括号，不能被误判成「主机:端口」
     assert.equal(loadConfig({ ...BASE, HOST: "[::1]" }).host, "[::1]");
+  });
+
+  it("IPv6 字面量：listen 用主机剥方括号，展示用主机补方括号（曾让 daemon 起不来）", async () => {
+    // 回归：配置接受 URL 形态的 `[::1]`，但 Node 的 listen 不接受带方括号的字面量
+    // （`getaddrinfo ENOTFOUND`）。这里既钉住两个纯函数，也真的监听一次 ::1，
+    // 让「配置通过但启动即失败」这个回归在单测层面就能复现。
+    const cfg = loadConfig({ ...BASE, HOST: "[::1]" });
+    assert.equal(cfg.host, "[::1]", "配置保留展示形态");
+    assert.equal(bindHost(cfg.host), "::1", "listen 必须剥方括号");
+    assert.equal(urlHost(cfg.host), "[::1]", "URL 展示保留方括号");
+
+    // 不带方括号的写法同样可用；URL 展示会自动补回方括号（否则 http://::1:3080 非法）
+    assert.equal(bindHost("::1"), "::1");
+    assert.equal(urlHost("::1"), "[::1]");
+    assert.equal(bindHost("127.0.0.1"), "127.0.0.1");
+    assert.equal(urlHost("127.0.0.1"), "127.0.0.1");
+
+    await new Promise<void>((resolve, reject) => {
+      const server = createServer();
+      server.once("error", reject);
+      server.listen(0, bindHost(cfg.host), () => server.close(() => resolve()));
+    });
   });
 
   it("QWeather 必须成对配置", () => {

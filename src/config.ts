@@ -320,3 +320,21 @@ export function isLoopbackHost(host: string): boolean {
   const h = host.toLowerCase().replace(/^\[/, "").replace(/\]$/, "");
   return h === "127.0.0.1" || h === "localhost" || h === "::1" || h === "::ffff:127.0.0.1";
 }
+
+/**
+ * listen 用主机：Node 的 `server.listen(port, host)` 不接受 IPv6 字面量的方括号 ——
+ * `listen(port, "[::1]")` 会把它当主机名去解析，直接 `getaddrinfo ENOTFOUND` 拒绝启动。
+ * 配置层允许写 URL 形态的 `[::1]`（也允许 `::1`），这里统一剥掉方括号再交给 listen。
+ */
+export function bindHost(host: string): string {
+  return host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+}
+
+/**
+ * 展示 / 拼 URL 用主机：IPv6 字面量补方括号（`::1` → `[::1]`），否则
+ * `http://::1:3080` 不是合法 URL。已带方括号的原样返回。
+ */
+export function urlHost(host: string): string {
+  if (host === "" || host.startsWith("[")) return host;
+  return host.includes(":") ? `[${host}]` : host;
+}
