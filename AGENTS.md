@@ -33,7 +33,7 @@ CI（`.github/workflows/ci.yml`）在 Node 22 和 24 上按此顺序运行：
 ## 架构
 
 - `src/core/` 是框架层：database/registry/auth/http/logger/settings/notify/render/
-  qweather/qweather-jwt/holiday/recurrence。`src/modules/`（weather/holiday/schedule/bookkeeping/notify）
+  qweather/qweather-jwt/holiday/recurrence/retention。`src/modules/`（weather/holiday/schedule/bookkeeping/notify）
   通过 `src/modules/index.ts` 的副作用 import 接入，遵循 `tools / jobs / tick / onStart`
   四个契约扩展点。
 - **核心层不得 import 模块内部。** 这一点由 `tests/registry.test.ts` 的静态 import 扫描强制，
@@ -47,6 +47,8 @@ CI（`.github/workflows/ci.yml`）在 Node 22 和 24 上按此顺序运行：
   附加式升级；库版本高于程序 `SCHEMA_VERSION` 时拒绝启动（`src/core/database.ts`）。
   `schedules.escalation_json` 走幂等补列且**不**提升版本号（重建 `schedules` 会破坏
   `occurrences` 外键与 `kind` 的 CHECK），因此 `schema_version` 并非表结构的完整指纹。
+  同理，活动账本名的**分范围**唯一索引（`idx_ledgers_scoped_name`，家庭之间 + 每人个人账本内）
+  也是打开时幂等重建并 DROP 掉旧的全局索引 `idx_ledgers_active_name`，不提升版本号。
 - 时区固定 `Asia/Shanghai`（`src/time.ts`），无 DST。数据库存 UTC ISO 瞬间；本地日历日是
   `YYYY-MM-DD` 字符串。
 
@@ -81,5 +83,5 @@ CI（`.github/workflows/ci.yml`）在 Node 22 和 24 上按此顺序运行：
   账号被冻结）。API KEY 是回退；优先 Ed25519 JWT，且四个 `QWEATHER_JWT_*` 变量必须
   同时配置，否则启动失败。
 - `notify.pull` 只能取消 `queued`/`failed` 的投递，无法拦住已处于 `sending` 的那一次。
-- `npm run db:cleanup:preview` 是 occurrence 清理 job（每日 04:30）的只读预演——
-  改清理规则前先用它。
+- `npm run db:cleanup:preview` 是只读预演：occurrence 清理 job（每日 04:30）与保留策略
+  （通知/已取消日程，每日 04:50）会删掉哪些行——改清理规则前先用它。

@@ -43,7 +43,7 @@ npm run build
 | `QWEATHER_JWT_KEY_ID` / `QWEATHER_JWT_PROJECT_ID` / `QWEATHER_JWT_DEVELOPER_ID` / `QWEATHER_JWT_PRIVATE_KEY_PATH` | | **推荐**：Ed25519 JWT 认证。前三个是控制台的凭据 ID / 项目 ID / 开发者 ID，第四个是仓库外的私钥 PEM **绝对路径**（如 `/home/you/.secrets/qweather-ed25519.pem`，权限 600；`~` 不会被展开）。四项**要么全配、要么全不配**：只写一半会启动报错，不会静默退回 API KEY。注意启动阶段只校验"四项是否齐全"——私钥文件不存在/不可读/非 Ed25519 PKCS8 时报错发生在**第一次天气请求**，不在启动时。两者都配时优先 JWT |
 | `QWEATHER_JWT_TTL_SECONDS` | | JWT 有效期，默认 `43200`（12 小时），上限 `86400` |
 | `DEFAULT_CITY` | | Profile 未设位置时的兜底城市，默认 `北京` |
-| `HOST` / `PORT` | | 默认 `127.0.0.1:3080`；**非回环地址必须配 `WEB_API_TOKEN`**，否则拒绝启动。`HOST` 只写主机（可含 scheme，如 `http://127.0.0.1`），端口一律用 `PORT` 指定，误写成 `127.0.0.1:3080` 会报错 |
+| `HOST` / `PORT` | | 默认 `127.0.0.1:3080`；**非回环地址必须配 `WEB_API_TOKEN`**，否则拒绝启动。`HOST` 只写主机（可含 scheme，如 `http://127.0.0.1`；IPv6 回环可写 `[::1]` 或 `::1`），端口一律用 `PORT` 指定，误写成 `127.0.0.1:3080` 会报错 |
 | `WEB_API_TOKEN` | | 非回环地址必填且**至少 32 字符**（回环地址下短 token 只告警不拦截）；保护 `/api/*`（Bearer 或 `?token=`）与 `/mcp`（仅 Bearer） |
 | `MCP_DAEMON_TOKEN` | | stdio 壳访问 daemon 用的 token；缺省复用 `WEB_API_TOKEN` |
 | `PROFILE_ROUTE_SECRETS_JSON` | 主动推送需要 | `'{"default":"<openssl rand -hex 32>"}'`（整段用单引号包裹；每个 secret **至少 32 字符**） |
@@ -254,7 +254,7 @@ npm run db:cleanup:preview   # 零删除预演：occurrence 与保留策略会�
 > `db:backup` / `db:cleanup:preview` / `import:v1` 跑的是 `dist/` 里的构建产物，先
 > `npm run build`（或改用对应的 `dev:*` 变体直接跑源码）。
 
-结构：`src/core`（database/registry/auth/http/logger/settings/notify/render/qweather/qweather-jwt/holiday/recurrence）、`src/modules`（weather/holiday/schedule/bookkeeping/notify，经 `modules/index.ts` 注册，核心不反向依赖）、`src/server`（status/page/details，状态页与只读 API）、`src/daemon.ts`、`src/stdio.ts`、`src/config.ts`、`src/time.ts`、`src/import-v1.ts`、`src/backup.ts`、`src/cleanup-preview.ts`。
+结构：`src/core`（database/registry/auth/http/logger/settings/notify/render/qweather/qweather-jwt/holiday/recurrence/retention）、`src/modules`（weather/holiday/schedule/bookkeeping/notify，经 `modules/index.ts` 注册，核心不反向依赖）、`src/server`（status/page/details，状态页与只读 API）、`src/daemon.ts`、`src/stdio.ts`、`src/config.ts`、`src/time.ts`、`src/import-v1.ts`、`src/backup.ts`、`src/cleanup-preview.ts`。
 
 ## 设计要点
 
@@ -264,10 +264,10 @@ npm run db:cleanup:preview   # 零删除预演：occurrence 与保留策略会�
 - **outbox**：通知 + 投递记录同事务写入；发布即触发投递；静默时段只拦主动推送；带 `expiresAt` 的通知（气象预警）到点仍未投出即作废，不会在静默时段结束后补投一条已经失效的告警（通知本身保留，`notify.pull` 仍可取到）。
 - **时区**：全部调度固定 Asia/Shanghai，无 DST。
 - **QWeather 请求治理**：按数据类型短 TTL 缓存（`CACHE_TTL_MS`：实时 20min / 逐天 2h 且取 `min(2h, 距本地次日 00:00)` / 预警 10min / 空气质量 45min，只有成功响应才写缓存）；同进程并发上限 3；仅对 429/5xx 与网络故障做指数退避（`2^c` 秒 + 抖动，c 上限 10），**4xx 一律立即抛出** —— 官方明确反复重试错误请求会被判定为攻击并冻结账号。认证优先 JWT（EdDSA），API KEY 保留回退。**GeoAPI 结果不得落盘缓存/批量存储/建索引**（官方版权限制），只允许进程内 memo —— 唯一例外是用户经 `weather locate` **显式选定的位置会作为该 Profile 的配置长期保存**（`settings.location`），属用户主动设置而非缓存/批量索引，供后续查询与每日简报复用。
-- **主动推送**：定时任务组装**确定性**通知（无 LLM），走 outbox 投递：每日天气简报与调休/补班提醒 07:00、气象预警巡检每 20 分钟、月报每月 1 号 09:00；节假日数据刷新 02:00、历史 occurrence 回收 04:30、保留策略清理 04:50。预警与补班都靠 `dedupe_key` 去重（预警按「id + 级别」，级别升级会再推一次；补班按「事件 + 日期」），静默时段在投递层统一拦截、不为任何类型开例外。
+- **主动推送**：定时任务组装**确定性**通知（无 LLM），走 outbox 投递：每日天气简报与调休/补班提醒 07:00、气象预警巡检每 20 分钟、月报每月 1 号 09:00；节假日数据刷新 02:00、历史 occurrence 回收 04:30、保留策略清理 04:50。预警与补班都靠 `dedupe_key` 去重（预警按「id + 级别」，级别升级会再推一次、降级不重推；补班按「事件 + 日期」），静默时段在投递层统一拦截、不为任何类型开例外。
 - **用量与保留**：QWeather 上游请求按本地日计数（含重试、缓存命中不计），状态页「今日天气请求」与 `/api/status` 的 `qweather_usage` 可见，daemon 重启从库里的计数继续累加 —— 官方 2027-02-01 起限制 API KEY 日请求量，没有计量就无从判断余量。保留策略（每日 04:50）只删**已读且投递已终结**的通知（含级联的投递记录）与**已取消超 180 天**的日程；未读通知、仍有待投递的通知、使用 `recurrence.count` 的日程一律保留。
 - **记账预算**：账本可设**总额**或**分类**月度预算（`ledger {action:"budget"}`，单位元），按账本每月滚动（对照当月支出）。`expense add` 成功后判定该笔是否**跨越** 80%/100% —— 只推跨越那一刻（而非达到即推）；同一个预算一笔只推**跨过的最高阈值**（一笔从 0% 到 150% 只推 100%，70%→90% 只推 80%），总额与分类各自独立判定；`dedupeKey = budget:<ledger>:<分类|空>:<YYYY-MM>:<80|100>`（总额的分类位是空串、分类用原样名字，分类名恰好叫 `-` 也不会与总额撞键），跨月自动重新判定，同月同阈值不重推。设了预算的账本，月报追加预算对照行（附在 notes）；未设预算的账本行为完全不变。个人账本的支出**不触发任何预算提醒**（不推送、也不入通知）。
-- **账本归属**：`ledgers.owner_profile_id` 为 NULL 表示**家庭账本**（所有 Profile 可见可写，`expense add` 回执与预算提醒走全局推送、月报物化到所有配置了路由的 Profile）；非空为**个人账本**（仅归属人可见可写，他人一律得到「账本不存在」不泄露存在性；不回执、不推预算提醒，月报只发给归属人）。`ledger create` 缺省建家庭账本、`personal: true` 建个人账本；`ledger transfer` 仅当前归属人可把个人账本转给其他 Profile（目标 Profile 须已存在）或省略 `profile` 转回家庭（不可逆）；家庭账本不能转为个人。状态页与 `/api/status`、`/api/expenses` 只统计/展示家庭账本。升级前的既有账本与 v1 导入账本一律为家庭账本（`schema_version` 2→3 时补 `owner_profile_id = NULL`，行为不变）。
+- **账本归属**：`ledgers.owner_profile_id` 为 NULL 表示**家庭账本**（所有 Profile 可见可写，`expense add` 回执与预算提醒走全局推送、月报物化到所有配置了路由的 Profile）；非空为**个人账本**（仅归属人可见可写，他人一律得到「账本不存在」不泄露存在性；不回执、不推预算提醒，月报只发给归属人）。`ledger create` 缺省建家庭账本、`personal: true` 建个人账本；`ledger transfer` 仅当前归属人可把个人账本转给其他 Profile（目标 Profile 须已存在）或省略 `profile` 转回家庭（不可逆）；家庭账本不能转为个人。账本名**分范围唯一**——家庭账本之间唯一、每人自己的个人账本内唯一，跨范围可同名（因此不同人可各用「日常」），也避免「创建失败」泄露他人账本名；转移归属时若目标范围已有同名活跃账本会被拒绝。状态页与 `/api/status`、`/api/expenses` 只统计/展示家庭账本。升级前的既有账本与 v1 导入账本一律为家庭账本（`schema_version` 2→3 时补 `owner_profile_id = NULL`，行为不变）。
 - **「本月」的口径**：状态页看板、预算对照、月报的「本月」= **自然月全月**（月初→月末，**含月内尚未到来的日期**）—— `spent_on` 是已录入的记账事实，指定了未来日期就不该因为日历没到那天就从本月数字里消失（否则同一个「本月」会随日期推移忽增忽减，对不上账）。工具侧 `expense summary` 不传区间时的默认区间是「月初 → 今天」，那是「本月至今」的查询默认。`expense` 的 `month` 与 `from`/`to` 互斥（同时传直接报错，`from > to` 也报错）：两者都表达区间，混着传会让 `list` 与 `summary` 得出相反结论。
 - **物化窗口**：occurrence 只物化到 `now + 62 天`。若某日程此刻一条 `pending` 都没有（远期生日、远期一次性待办），额外豁免**恰好 1 条**越过窗口的 occurrence，保证「下一条」在 `list`/`upcoming`/状态页始终可见（豁免的那条最远可达 400 天，因此远期生日会显示成明年的日期）；豁免资格取自入库状态，补上第一条即失效，因此不会随时间累积增长。
 - **截止型日程（逾期升级）**：给 `todo` 设置 `escalation`（严格升序分钟偏移数组，1-5 项、最大 43200 即 30 天，**首元素必须为 0** 表示截止时刻本身，如 `[0,60,360,1440]`）即可 —— 仅 `kind=todo` 可设，到达截止时刻后按阶梯依次重发升级提醒（第 0 步即截止时刻的提醒，第 1..n 步是逾期加压的 `<event>#N#esc:M`；锚点默认是 `#0`，晚录入/停机导致 `#0` 被 `catchupSweep` 取消时落在保留下来的那条偏移行上），直到 `complete` 才停；设置 `escalation` 时 `resend_minutes` 被忽略。每步各生成一条 occurrence，靠 `INSERT OR IGNORE` + `notified` 状态保证只推一次；改了 `time`/`escalation` 或父事件被删/重排后，残留行在触发前按当前排期校验并作废。`complete` 带 `occurrence_key` 时按**事件前缀**收敛：同一事件的各条提醒偏移（`#0..#4`）与它们的派生行（`:resend`、`#esc:N`）一并终结，因此用哪一条提醒去完成都不会再有同事件的后续推送。`update` 传 `escalation: []` 清除阶梯（空数组在 MCP schema 层合法：长度下限与首元素/升序等语义规则在 service 层判定，否则经真实 MCP 的 `[]` 会在进入 handler 前被拒）。工具/状态页把这类日程的类型显示为「截止」（不新增 `kind` 枚举值，语义由字段表达）。
@@ -275,15 +275,19 @@ npm run db:cleanup:preview   # 零删除预演：occurrence 与保留策略会�
 
 ### 已知取舍与后续优化
 
-第 1、2、4、8、11 条已实施（保留划线记录）；其余为「已识别但未做」，当前实现是正确的、只是不够省：
+第 1、2、3、4、8、11 条已实施（保留划线记录）；其余为「已识别但未做」，当前实现是正确的、只是不够省：
 
 1. ~~**QWeather 天气数据无缓存/限流/退避**~~ —— **已实施（2026-09-18）**：按官方推荐值加短 TTL 缓存、并发上限 3、仅对 429/5xx 指数退避（4xx 绝不重试），并停止把 GeoAPI 结果落盘（官方版权限制）。
 2. ~~**认证方式建议迁移 JWT**~~ —— **已实施（2026-09-18）**：支持 Ed25519 JWT（`Authorization: Bearer`，URL 不再带 `key=`）并优先使用，API KEY 保留回退。官方口径：自 **2027-02-01** 起逐步限制 API KEY 的每日请求量，SDK v5+ 仅支持 JWT。
-3. **v7 城市版端点已宣布弃用**：迁移到 v1 `/weather/v1/...` 时注意 `humidity` 在 v1 是 0–1 小数
-   （v7 是百分数），且数值包在 `{value, unit}` 里 —— 直接换路径会静默错报湿度。
+3. ~~**v7 城市版端点已宣布弃用**~~ —— **已实施（2026-10-14）**：实时/逐天预报改用 v1
+   `GET /weather/v1/current/{lat}/{lon}` 与 `/weather/v1/daily/{lat}/{lon}?days=`（按经纬度，
+   不再用 `location=城市ID`）；数值从 `{value, unit}` 解包，`humidity` 由 0–1 小数换算成百分数、
+   `wind.speed` 由 m/s 换算成 km/h（单位不识别即报错，绝不静默换算错）。**代价：v1 不再返回观测
+   时刻（obsTime）**，天气表改标注「数据获取时间」（数据获取时刻，仍有 20 分钟缓存）。
 4. ~~**`summarizeExpenses` 不是单快照**~~ —— **已实施**：三条语句（合计 / 分类明细 / 按人汇总）包进 `withReadTransaction`（`BEGIN DEFERRED`），并发写入落库时不再出现「合计与分类明细对不上」；已在事务内时复用外层快照，不嵌套 BEGIN。
 5. **`schedules.version` 列未参与并发控制**：每次更新 +1，但没有乐观校验；单写者下风险低，
-   可删列或落实校验。
+   可删列或落实校验。删除列会破坏「只做附加式加列/加表」的迁移约定（见 `AGENTS.md`），
+   故保留现状。
 6. **节假日刷新节奏**：`FETCH_COOLDOWN_MS` 是 6h，但主动重试点仍是每天 02:00 的 job（`requiredYears()` 到 10 月才要求下一年），实际重试间隔为 24h。物化撞到未就绪年份的路径已改为由 `tick()` 触发按需补齐、真正受 6h 冷却约束；若要提前拿到下一年数据，可把 job 改为 `0 */3 * * *`。
 7. **`status` 页面无鉴权**（`/` 只有静态 HTML，数据走受保护的 `/api/status`），
    如需对外暴露建议一并加保护。
@@ -296,3 +300,4 @@ npm run db:cleanup:preview   # 零删除预演：occurrence 与保留策略会�
     仍会收到那一次推送。窗口是单次请求的时长，且 webhook 侧还有 55 分钟幂等窗口兜底，
     暂不为此引入「中断在途请求」的机制。
 11. ~~**`schedules` 的软删行永不回收**~~ —— **已实施**：`delete` 仍只把状态置为 `cancelled` 并删掉其 occurrence，但保留策略会删除已取消超 180 天的行。仍在的唯一豁免是 `countProtectedScheduleIds`：使用 `recurrence.count` 的日程（含已取消的）整条不删 —— 这是必要的（否则取消后再激活会让已达上限的循环复活），代价是这些行永久占用清理豁免。体量小，暂不再细分。
+12. **看板/`/api/schedules` 跨 Profile 展示日程**：状态页是「家庭看板」，`scheduleDetails` 不按 Profile 过滤，任一持有共享 `WEB_API_TOKEN` 的调用方都能看到所有 Profile 的日程标题与备注（`schedule` 工具本身是 Profile 私有的）。这与「个人账本仅归属人可见」并不一致。当前定位是单用户单 token，暂按现状；若确实多用户部署，需要给日程也引入可见性（家庭/个人），或让看板只显示家庭日程。
