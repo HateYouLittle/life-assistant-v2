@@ -308,9 +308,10 @@ registerModule({
           .describe("仅公历；节假日数据缺失时自动暂停"),
         remind_offsets: z
           .array(z.number().int().min(-43200).max(43200))
+          .min(1)
           .max(5)
           .optional()
-          .describe("提醒偏移分钟（相对事件时间，负数=提前），默认 [0]"),
+          .describe("提醒偏移分钟（相对事件时间，负数=提前），1-5 项，默认 [0]"),
         resend_minutes: z
           .number()
           .int()

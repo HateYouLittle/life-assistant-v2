@@ -7,6 +7,7 @@ import {
   collapseLunarInterval,
   describeRecurrence,
   nextDate,
+  recurrenceDeclaresCount,
   type OccurrenceSource,
   type Recurrence,
 } from "../../core/recurrence.js";
@@ -854,15 +855,7 @@ function countProtectedScheduleIds(db: DatabaseSync): string[] {
     id: string;
     recurrence_json: string | null;
   }[];
-  return rows
-    .filter((row) => {
-      try {
-        return parseRecurrence(row.recurrence_json)?.count !== undefined;
-      } catch {
-        return true;
-      }
-    })
-    .map((row) => row.id);
+  return rows.filter((row) => recurrenceDeclaresCount(row.recurrence_json)).map((row) => row.id);
 }
 
 export interface OccurrenceCleanupPreview {

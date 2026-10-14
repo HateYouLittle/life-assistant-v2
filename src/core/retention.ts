@@ -1,5 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { logger } from "./logger.js";
+import { recurrenceDeclaresCount } from "./recurrence.js";
 
 /**
  * 保留策略：状态页与 outbox 的三张只增不减的表需要定期收敛。
@@ -30,14 +31,21 @@ function cutoffIso(days: number, now: number = Date.now()): string {
 }
 
 /**
- * 可清理的「已取消」日程判定（唯一来源）：已取消 + 超期 + 未使用 `recurrence.count`。
- * `count` 日程的 occurrence 整条豁免（见 core/recurrence 与 schedule 的 occurrence 清理），
- * 删掉日程会让已达上限的循环复活。
- * 预演与实删必须共用它 —— 两处各自内联会让判定悄悄漂移成「预演数 ≠ 实删数」。
+ * 可清理的「已取消」日程 id（唯一来源）：已取消 + 超期 + 未声明 `recurrence.count`。
+ * count 判定经 core/recurrence 的 `recurrenceDeclaresCount`（与 schedule 的 occurrence
+ * 清理同一口径，解析失败保守豁免）；删掉 count 日程会让已达上限的循环复活。
+ *
+ * 返回 id 列表而不是 SQL 片段：count 是 JSON 字段，SQL 里只能靠 `LIKE '%"count"%'` 猜，
+ * 与按解析结果的判定会在畸形 JSON 上给出相反结论 —— 改为按解析结果判定后两者一致。
+ * 预演与实删必须共用它，否则会出现「预演数 ≠ 实删数」。
  */
-function cancelledScheduleCleanupWhere(): string {
-  return `status = 'cancelled' AND updated_at < ?
-    AND (recurrence_json IS NULL OR recurrence_json NOT LIKE '%"count"%')`;
+function cancelledScheduleCleanupIds(db: DatabaseSync, cutoff: string): string[] {
+  const rows = db
+    .prepare(
+      "SELECT id, recurrence_json FROM schedules WHERE status = 'cancelled' AND updated_at < ?",
+    )
+    .all(cutoff) as { id: string; recurrence_json: string | null }[];
+  return rows.filter((row) => !recurrenceDeclaresCount(row.recurrence_json)).map((row) => row.id);
 }
 
 /**
@@ -70,12 +78,10 @@ export function cancelledScheduleRetentionPlan(
   db: DatabaseSync,
   days: number = CANCELLED_SCHEDULE_RETENTION_DAYS,
   now: number = Date.now(),
-): { count: number; cutoff: string } {
+): { count: number; cutoff: string; ids: string[] } {
   const cutoff = cutoffIso(days, now);
-  const row = db
-    .prepare(`SELECT COUNT(*) AS n FROM schedules WHERE ${cancelledScheduleCleanupWhere()}`)
-    .get(cutoff) as { n: number };
-  return { count: row.n, cutoff };
+  const ids = cancelledScheduleCleanupIds(db, cutoff);
+  return { count: ids.length, cutoff, ids };
 }
 
 export function retentionPreview(db: DatabaseSync, now: number = Date.now()): RetentionPreview {
@@ -106,14 +112,25 @@ export function runRetention(db: DatabaseSync, now: number = Date.now()): Retent
     .prepare(`DELETE FROM notifications WHERE ${notificationCleanupWhere("notifications")}`)
     .run(cutoffIso(NOTIFICATION_RETENTION_DAYS, now));
 
-  const deletedSchedules = db
-    .prepare(`DELETE FROM schedules WHERE ${cancelledScheduleCleanupWhere()}`)
-    .run(cutoffIso(CANCELLED_SCHEDULE_RETENTION_DAYS, now));
+  // count 判定必须与预演同源（cancelledScheduleCleanupIds）；按 id 删除，
+  // 因为判定走 JS 解析而不是 SQL 片段。
+  const scheduleIds = cancelledScheduleCleanupIds(
+    db,
+    cutoffIso(CANCELLED_SCHEDULE_RETENTION_DAYS, now),
+  );
+  const deletedSchedules =
+    scheduleIds.length === 0
+      ? 0
+      : Number(
+          db
+            .prepare("DELETE FROM schedules WHERE id IN (SELECT value FROM json_each(?))")
+            .run(JSON.stringify(scheduleIds)).changes,
+        );
 
   const result: RetentionPreview = {
     notifications: Number(deletedNotifications.changes),
     deliveries: plan.deliveries,
-    cancelledSchedules: Number(deletedSchedules.changes),
+    cancelledSchedules: deletedSchedules,
   };
   if (result.notifications > 0 || result.cancelledSchedules > 0) {
     logger.info(

@@ -167,6 +167,30 @@ export function collapseLunarInterval(
 }
 
 /**
+ * 该 `recurrence_json` 是否声明了 `count`（发生次数上限）。**count 判定唯一来源**：
+ * schedule 的 occurrence 清理与保留策略（core/retention）都经它，避免两处各写一份判定
+ * 后悄悄漂移（曾是 `NOT LIKE '%"count"%'` 与按解析结果两套口径）。
+ *
+ * 解析失败时保守返回 true：无法确认是否用了 count 时宁可不清理 —— 删历史会让已达上限的
+ * 循环复活（见 modules/schedule 的 existingDates 与 core/retention）。
+ */
+export function recurrenceDeclaresCount(json: string | null): boolean {
+  if (json === null) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return true;
+  }
+  return (
+    typeof parsed === "object" &&
+    parsed !== null &&
+    !Array.isArray(parsed) &&
+    (parsed as { count?: unknown }).count !== undefined
+  );
+}
+
+/**
  * 农历（年, 月, 日）→ 公历零点序列。**每年一次**：`recurrence.interval` 不参与推进
  * （农历年与公历年不等长，「每 2 年」在农历上没有自洽的锚点），写入侧由
  * collapseLunarInterval 收敛、validateScheduleInput 拒掉显式非法值，
