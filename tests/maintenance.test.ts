@@ -73,6 +73,33 @@ describe("保留策略", () => {
     }
   });
 
+  it("月报通知不参与保留清理：dedupe_key 是补发判定的持久证据", () => {
+    const env = makeTestEnv();
+    try {
+      env.db
+        .prepare(
+          "INSERT INTO notifications (id, profile_id, kind, title, body_md, dedupe_key, read, created_at) VALUES ('n-report', 'default', 'bookkeeping.monthly', '2026-09 月度账单 · 家庭账本', 'body', 'report:l1:2026-09', 1, ?)",
+        )
+        .run(OLD);
+      env.db
+        .prepare(
+          `INSERT INTO deliveries (id, notification_id, route_name, status, next_attempt_at, created_at, updated_at)
+           VALUES ('d-report', 'n-report', 'r', 'sent', ?, ?, ?)`,
+        )
+        .run(OLD, OLD, OLD);
+
+      const preview = retentionPreview(env.db);
+      assert.equal(preview.notifications, 0, "月报通知不得进入清理预演");
+      assert.equal(preview.deliveries, 0, "月报投递也不该被计入清理预演");
+
+      runRetention(env.db);
+      const left = env.db.prepare("SELECT COUNT(*) AS n FROM notifications").get() as { n: number };
+      assert.equal(left.n, 1, "删掉月报通知会让 findMissingMonthlyReports 误判为「从未推送过」");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("已取消日程超期回收；使用 recurrence.count 的永不删", () => {
     const env = makeTestEnv();
     try {

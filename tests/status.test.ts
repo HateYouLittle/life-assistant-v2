@@ -602,7 +602,14 @@ describe("看板明细接口", () => {
       const body = (await (await app(env).request("/api/holidays?year=2099")).json()) as {
         year: number;
         days: { date: string }[];
-        upcoming: { date: string; name: string; days_until: number; days: number }[];
+        upcoming: {
+          date: string;
+          end: string;
+          name: string;
+          days_until: number;
+          days: number;
+          in_progress: boolean;
+        }[];
       };
       assert.equal(body.year, 2099);
       assert.ok(
@@ -611,8 +618,58 @@ describe("看板明细接口", () => {
       );
       assert.deepEqual(
         body.upcoming[0],
-        { date: "2099-12-31", name: "元旦", days_until: 16, days: 3 },
+        {
+          date: "2099-12-31",
+          end: "2100-01-02",
+          name: "元旦",
+          days_until: 16,
+          days: 3,
+          in_progress: false,
+        },
         "跨年假期必须按全部日期合并，天数不能被年份边界截断",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("假期进行中：保留完整起始日/总天数并标记 in_progress（不截断为今天起）", async (t: TestContext) => {
+    t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2099-10-03T10:00:00+08:00") });
+    const env = makeTestEnv();
+    try {
+      env.db
+        .prepare(
+          "INSERT INTO cn_holiday_years (year, status, source, fetched_at) VALUES (2099, 'ready', 'test', '2099-01-01T00:00:00.000Z')",
+        )
+        .run();
+      const insertDay = env.db.prepare(
+        "INSERT INTO cn_holiday_days (date, year, day_type, name, source, updated_at) VALUES (?, 2099, 'holiday', '国庆节', 'test', '2099-01-01T00:00:00.000Z')",
+      );
+      for (let day = 1; day <= 7; day += 1) {
+        insertDay.run(`2099-10-0${day}`);
+      }
+
+      const body = (await (await app(env).request("/api/holidays?year=2099")).json()) as {
+        upcoming: {
+          date: string;
+          end: string;
+          name: string;
+          days_until: number;
+          days: number;
+          in_progress: boolean;
+        }[];
+      };
+      assert.deepEqual(
+        body.upcoming[0],
+        {
+          date: "2099-10-01",
+          end: "2099-10-07",
+          name: "国庆节",
+          days_until: 0,
+          days: 7,
+          in_progress: true,
+        },
+        "假期第 3 天仍应给出完整区间与总天数，而不是「今天起、剩余 5 天」",
       );
     } finally {
       cleanupTestEnv(env);

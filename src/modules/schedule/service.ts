@@ -767,7 +767,12 @@ export function deleteSchedule(db: DatabaseSync, profileId: string, id: string):
   const row = getSchedule(db, profileId, id);
   if (row === undefined) throw new Error(`日程不存在: ${id}`);
   withTransaction(db, () => {
-    db.prepare("DELETE FROM occurrences WHERE schedule_id = ?").run(id);
+    // recurrence.count 的次数上限依赖历史 occurrence 行数：删掉它们会让
+    // 「删除后重新激活」的循环复活（与 occurrence 清理/保留策略同一豁免口径）。
+    // 取消状态已能阻止 fireDue/materialize 继续触发，保留行没有行为副作用。
+    if (!recurrenceDeclaresCount(row.recurrence_json)) {
+      db.prepare("DELETE FROM occurrences WHERE schedule_id = ?").run(id);
+    }
     db.prepare("UPDATE schedules SET status = 'cancelled', updated_at = ? WHERE id = ?").run(
       nowIso(),
       id,
@@ -779,6 +784,9 @@ export interface UpcomingItem {
   schedule_id: string;
   title: string;
   kind: ScheduleKind;
+  note: string | null;
+  workday_filter: WorkdayFilter;
+  resend_minutes: number;
   occurrence_key: string;
   event_at: string;
   due_at: string;
@@ -788,7 +796,8 @@ export interface UpcomingItem {
 export function upcoming(db: DatabaseSync, profileId: string, limit: number): UpcomingItem[] {
   return db
     .prepare(
-      `SELECT o.occurrence_key, o.event_at, o.due_at, s.id AS schedule_id, s.title, s.kind, s.escalation_json
+      `SELECT o.occurrence_key, o.event_at, o.due_at, s.id AS schedule_id, s.title, s.kind,
+              s.note, s.workday_filter, s.resend_minutes, s.escalation_json
        FROM occurrences o JOIN schedules s ON s.id = o.schedule_id
        WHERE s.profile_id = ? AND s.status = 'active' AND o.status = 'pending' AND o.due_at >= ?
        ORDER BY o.due_at LIMIT ?`,

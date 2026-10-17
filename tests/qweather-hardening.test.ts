@@ -451,7 +451,14 @@ describe("QWeather：v1 错误体（HTTP 200 + body.error）不被当成空结�
     await withFetch(
       () => jsonResponse({ error: { status: 401, title: "UNAUTHORIZED" } }),
       async (calls) => {
-        await assert.rejects(() => alerts(db, HOST, KEY, LOC), /UNAUTHORIZED|401/);
+        await assert.rejects(
+          () => alerts(db, HOST, KEY, LOC),
+          (e: unknown) =>
+            e instanceof Error &&
+            /UNAUTHORIZED|401/.test(e.message) &&
+            /API KEY 认证失败/.test(e.message),
+          "v1 body.error 的 401 也必须附带认证排查提示（不能只对 HTTP 401 生效）",
+        );
         assert.equal(countCache(db, "qweather:alerts:%"), 0, "错误结果绝不能写缓存");
         assert.equal(calls.length, 1, "401 不可重试");
       },

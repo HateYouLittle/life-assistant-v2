@@ -314,8 +314,13 @@ const SCRIPT = `
 
     var day = Number(s.today.date.slice(8, 10));
     var dim = new Date(Number(s.today.date.slice(0, 4)), Number(s.today.date.slice(5, 7)), 0).getDate();
+    // 「日均（至今）」必须只除到今天：本月合计按自然月全月含未来记账，
+    // 直接用 month_cents / 日号会把提前录入的月末支出摊进「至今」。
+    var spentToDate = (exp.daily || []).reduce(function (a, d) {
+      return d.date <= s.today.date ? a + d.cents : a;
+    }, 0);
     el('exp-stats').innerHTML =
-      '<div class="stat"><div class="n">' + yuan(Math.round(exp.month_cents / Math.max(1, day))) + '</div><div class="l">日均（至今）</div></div>' +
+      '<div class="stat"><div class="n">' + yuan(Math.round(spentToDate / Math.max(1, day))) + '</div><div class="l">日均（至今）</div></div>' +
       '<div class="stat"><div class="n">' + (exp.daily || []).length + '</div><div class="l">记账天数</div></div>' +
       '<div class="stat"><div class="n">' + Math.max(0, dim - day) + '</div><div class="l">本月剩余天</div></div>';
 
@@ -335,7 +340,9 @@ const SCRIPT = `
     var hol = s.holidays.next;
     el('hol-main').innerHTML = hol ? esc(hol.name) + ' <small>' + hol.days + ' 天</small>' : '暂无数据 <small>—</small>';
     el('hol-sub').textContent = hol
-      ? hol.date + ' 起' + (hol.days_until === 0 ? ' · 就是今天' : ' · 还有 ' + hol.days_until + ' 天')
+      ? hol.in_progress
+        ? '进行中 · ' + hol.date + '–' + hol.end + '，共 ' + hol.days + ' 天'
+        : hol.date + ' 起' + (hol.days_until === 0 ? ' · 就是今天' : ' · 还有 ' + hol.days_until + ' 天')
       : '节假日数据未导入';
 
     el('trend-stats').innerHTML =
@@ -352,7 +359,7 @@ const SCRIPT = `
     el('ops').innerHTML =
       row('Profile', esc(s.profiles.join(' · ') || '暂无')) +
       row('账本', s.ledgers.total + ' 个活跃' + (s.ledgers.archived ? ' · ' + s.ledgers.archived + ' 个归档' : ' · 无归档')) +
-      row('定时简报', '<span class="muted">每天 ' + esc(cronTime(s.daily_brief_cron)) + '</span>') +
+      row('定时简报', '<span class="muted">' + esc(cronLabel(s.daily_brief_cron)) + '</span>') +
       row('天气数据源', s.qweather_configured ? '<span class="ok">QWeather 已配置</span>' : '<span class="warn">QWeather 未配置</span>') +
       (s.qweather_usage
         ? row('今日天气请求', s.qweather_usage.requests + ' 次 <span class="muted">（' + esc(s.qweather_usage.day) + '，含重试）</span>')
@@ -375,6 +382,16 @@ const SCRIPT = `
     var parts = raw.trim().split(/\\s+/);
     if (parts.length < 2 || !/^\\d+$/.test(parts[0]) || !/^\\d+$/.test(parts[1])) return raw;
     return ('0' + parts[1]).slice(-2) + ':' + ('0' + parts[0]).slice(-2);
+  }
+  function isDailyCron(expr) {
+    var parts = String(expr === null || expr === undefined ? '' : expr).trim().split(/\\s+/);
+    return parts.length === 5 && parts[2] === '*' && parts[3] === '*' && parts[4] === '*';
+  }
+  function cronLabel(expr) {
+    var raw = String(expr === null || expr === undefined ? '' : expr);
+    if (!isDailyCron(raw)) return raw;
+    var time = cronTime(raw);
+    return time === raw ? raw : '每天 ' + time;
   }
   function sparkline(daily) {
     if (!daily.length) return '';
@@ -566,7 +583,7 @@ const SCRIPT = `
             if (h.upcoming.length) {
               html += '<div class="sect"><h3>接下来的假期</h3><table><tbody>' + h.upcoming.map(function (u) {
                 return '<tr><td>' + esc(u.name) + '</td><td class="muted">' + esc(u.date) + '</td>' +
-                  '<td class="num">' + (u.days_until === 0 ? '<span class="chip teal">今天</span>' : u.days_until + ' 天后') + '</td></tr>';
+                  '<td class="num">' + (u.in_progress ? '<span class="chip teal">进行中</span>' : u.days_until === 0 ? '<span class="chip teal">今天</span>' : u.days_until + ' 天后') + '</td></tr>';
               }).join('') + '</tbody></table></div>';
             }
             html += '<div class="sect"><h3>' + h.year + ' 年安排</h3>' + (h.days.length

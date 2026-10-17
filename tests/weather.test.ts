@@ -3,6 +3,7 @@ import { describe, it, type TestContext } from "node:test";
 import { todayIso } from "../src/time.js";
 import { setPushRoute } from "../src/core/notify.js";
 import { importYear } from "../src/core/holiday.js";
+import { saveLocation } from "../src/core/qweather.js";
 import { runDailyBrief, weatherTool } from "../src/modules/weather/index.js";
 import {
   cleanupTestEnv,
@@ -246,6 +247,35 @@ describe("weather / air_quality", () => {
     }
   });
 
+  it("每日简报复用已保存位置的坐标，不再按城市名重新 Geo 查询", async () => {
+    const env = makeTestEnv(ENV);
+    try {
+      saveLocation(env.db, "default", {
+        city: "自选位置",
+        cityId: "saved-id",
+        lat: 1.23,
+        lon: 4.56,
+      });
+      await withMockFetch(handlerFor, async (calls) => {
+        await runDailyBrief();
+        assert.ok(
+          calls.every((c) => !c.url.includes("/geo/")),
+          `saved location 不应再触发 GeoAPI：${calls.map((c) => c.url).join(" | ")}`,
+        );
+        assert.ok(
+          calls.some((c) => c.url.includes("/weather/v1/current/1.23/4.56")),
+          "天气请求必须使用用户显式选定并保存的坐标",
+        );
+        const row = env.db
+          .prepare("SELECT title FROM notifications WHERE profile_id = 'default'")
+          .get() as { title: string };
+        assert.equal(row.title, "自选位置 每日简报");
+      });
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("每日简报：天气与预报全失败则不发送", async () => {
     const env = makeTestEnv(ENV);
     try {
@@ -304,7 +334,13 @@ describe("weather：v1 预警字段映射", () => {
         const payload = JSON.parse(result.content[0]?.text ?? "{}") as {
           预警: { rows: string[][] };
         };
-        assert.deepEqual(payload.预警.rows[0], ["红色", "大风", "预计阵风 12 级"]);
+        assert.deepEqual(payload.预警.rows[0], [
+          "红色",
+          "大风",
+          "2026-09-13 10:00",
+          "2026-09-14 10:00",
+          "预计阵风 12 级",
+        ]);
       });
     } finally {
       cleanupTestEnv(env);
@@ -321,6 +357,8 @@ describe("weather：v1 预警字段映射", () => {
           .prepare("SELECT body_md FROM notifications WHERE profile_id = 'default'")
           .get() as { body_md: string };
         assert.match(row.body_md, /红色大风/);
+        assert.match(row.body_md, /有气象预警，注意防范/);
+        assert.doesNotMatch(row.body_md, /适宜出行/, "有生效预警时不得给出相反结论");
       });
     } finally {
       cleanupTestEnv(env);

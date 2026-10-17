@@ -3,6 +3,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { monthRange } from "../modules/bookkeeping/service.js";
 import { KIND_LABEL, parseEscalation, type ScheduleKind } from "../modules/schedule/service.js";
 import { withReadTransaction } from "../core/database.js";
+import { holidayPeriods } from "../core/holiday.js";
 import { TZ, todayIso } from "../time.js";
 
 /**
@@ -357,7 +358,15 @@ export interface HolidayDetails {
   years: number[];
   year: number;
   days: Array<{ date: string; name: string; day_type: string; weekday: string }>;
-  upcoming: Array<{ date: string; name: string; days_until: number; days: number }>;
+  upcoming: Array<{
+    date: string;
+    end: string;
+    name: string;
+    days_until: number;
+    days: number;
+    /** 假期已开始且今天不是首日（首日由 days_until === 0 表达） */
+    in_progress: boolean;
+  }>;
 }
 
 const WEEKDAY_CN = ["一", "二", "三", "四", "五", "六", "日"];
@@ -405,41 +414,27 @@ export function holidayDetails(db: DatabaseSync, rawYear: string | undefined): H
     day_type: string;
   }[];
 
-  // 「接下来的假期」按全部日期合并，而不是只看选中/回退年份：
-  // 跨年假期（如 12-31 起的元旦）在年度视图里会被年份边界拆成两段，
-  // 按全量合并才能给出正确的起始日与总天数。
-  const upcomingRows = db
-    .prepare(
-      "SELECT date, name FROM cn_holiday_days WHERE day_type = 'holiday' AND date >= ? ORDER BY date",
-    )
-    .all(today) as { date: string; name: string }[];
-  const upcoming: HolidayDetails["upcoming"] = [];
-  let index = 0;
-  while (index < upcomingRows.length && upcoming.length < 6) {
-    const first = upcomingRows[index] as { date: string; name: string };
-    let span = 1;
-    while (index + span < upcomingRows.length) {
-      const prev = DateTime.fromISO((upcomingRows[index + span - 1] as { date: string }).date, {
-        zone: TZ,
-      });
-      const next = DateTime.fromISO((upcomingRows[index + span] as { date: string }).date, {
-        zone: TZ,
-      });
-      if (next.diff(prev, "days").days !== 1) break;
-      span += 1;
-    }
-    const start = DateTime.fromISO(first.date, { zone: TZ });
-    upcoming.push({
-      date: first.date,
-      name: first.name,
-      days_until: Math.max(
-        0,
-        Math.round(DateTime.fromISO(today, { zone: TZ }).diff(start, "days").days * -1),
-      ),
-      days: span,
+  // 「接下来的假期」复用 core/holiday 的 holidayPeriods：它与 holiday {view:"next"}
+  // 使用同一套「日期相邻即同一假期」的合并口径。不能从 today 开始截断 ——
+  // 假期进行中时会丢掉首日与总天数，把「国庆 10-01 起共 7 天」显示成「10-03 起 5 天」。
+  const upcoming: HolidayDetails["upcoming"] = holidayPeriods(db)
+    .filter((period) => period.end >= today)
+    .slice(0, 6)
+    .map((period) => {
+      const start = DateTime.fromISO(period.start, { zone: TZ });
+      return {
+        date: period.start,
+        end: period.end,
+        name: period.name,
+        days_until: Math.max(
+          0,
+          Math.round(DateTime.fromISO(today, { zone: TZ }).diff(start, "days").days * -1),
+        ),
+        days: period.days,
+        // 首日当天仍显示「就是今天」；只有真正进入假期中间才标「进行中」
+        in_progress: period.start < today,
+      };
     });
-    index += span;
-  }
 
   return {
     years,

@@ -356,11 +356,14 @@ function buildRequest(
  * 转成普通 Error 后不再被 isRetryableError 视为可重试 —— 认证失败重试无意义。
  */
 function withAuthHint(e: unknown, auth: QweatherAuth): unknown {
+  const message = e instanceof Error ? e.message : String(e);
   const unauthorized =
     (e instanceof HttpError && (e.status === 401 || e.status === 403)) ||
-    (e instanceof QweatherApiError && (e.code === "401" || e.code === "403"));
+    (e instanceof QweatherApiError && (e.code === "401" || e.code === "403")) ||
+    // v1 的失败契约是 HTTP 200 + body.error{status,title}，assertNoErrorBody 会抛普通
+    // Error（保留 title/detail）。这类 401/403 也要拿到认证排查提示。
+    /^QWeather .* error (401|403)\b/.test(message);
   if (!unauthorized) return e;
-  const message = e instanceof Error ? e.message : String(e);
   return new Error(`${message}（${auth.mode === "jwt" ? JWT_AUTH_HINT : KEY_AUTH_HINT}）`);
 }
 

@@ -181,12 +181,21 @@ function mapRecurrence(
     typeof parsed.interval === "number" && parsed.interval >= 1
       ? Math.min(parsed.interval, 365)
       : 1;
+  const until = typeof parsed.until === "string" ? parsed.until : undefined;
   const base = {
     interval,
     // until/count 同样只收合法形状：非字符串的 until 会让 recurrence 引擎拿到非法边界
-    until: typeof parsed.until === "string" ? parsed.until : undefined,
+    until,
     count: Number.isInteger(parsed.count) ? parsed.count : undefined,
   };
+  if (until !== undefined && !isDate(until)) {
+    warnings.push(
+      `日程「${title}」的 recurrence.until 不是合法日期（${until}），按原值导入，结束边界可能不生效`,
+    );
+  }
+  if (typeof parsed.count === "number" && Number.isInteger(parsed.count) && parsed.count < 1) {
+    warnings.push(`日程「${title}」的 recurrence.count=${parsed.count}，不会产生任何提醒`);
+  }
   // byWeekday 可能是标量（v1 只选一个星期几时很自然）：非数组按「没有可识别星期」处理，
   // 走下面的回退分支，而不是在 .map 上抛错。
   const weeklyDays = (Array.isArray(parsed.byWeekday) ? parsed.byWeekday : [])
@@ -280,59 +289,6 @@ function mapReminders(raw: string | null, title: string, warnings: string[]): nu
   }
 }
 
-/**
- * --force 的「覆盖」语义：只清除**旧库里存在、本次会重新写入的那些行**（按主键），
- * 不做全库清空，也不按 Profile / 账本整片清空。
- *
- * 为什么必须精确到主键：
- * - 通知与投递历史导入从不写入，删掉就永久丢失（重跑 --force 的动机往往只是「补一条日程」）；
- * - 按账本删账目会连带删掉 v2 期间手工录入的流水，而重导只补 v1 的行；
- * - 无关 Profile / 账本的数据更不应因为一次导入被删掉。
- *
- * 账本行不在这里删：插入改为 upsert（见 insertLedger），于是预算（budgets 外键级联）
- * 不会随重建账本被清空。
- * 删除与插入同事务 —— 中途失败会整体回滚，原数据保持不变。
- */
-function forceClearImported(
-  target: ReturnType<typeof openDatabase>,
-  old: DatabaseSync,
-  report: ImportReport,
-): void {
-  const idsFrom = (sql: string): string[] => {
-    try {
-      return (old.prepare(sql).all() as { id: string }[]).map((r) => r.id);
-    } catch {
-      // 旧库没有该表：本次导入也没有要写的行，无需清理
-      return [];
-    }
-  };
-  const steps: Array<{ label: string; table: string; ids: string[] }> = [
-    { label: "schedules", table: "schedules", ids: idsFrom("SELECT id FROM schedules") },
-    {
-      label: "expenses",
-      table: "expenses",
-      ids: idsFrom("SELECT id FROM ledger_entries WHERE type = 'expense'"),
-    },
-  ];
-
-  let cleared = 0;
-  for (const step of steps) {
-    if (step.ids.length === 0) continue;
-    try {
-      const result = target
-        .prepare(`DELETE FROM ${step.table} WHERE id IN (SELECT value FROM json_each(?))`)
-        .run(JSON.stringify(step.ids));
-      cleared += Number(result.changes);
-    } catch (e) {
-      // 交付表/occurrence 由外键级联清理；这里失败不阻断导入本身
-      warnings(report, `--force 清理 ${step.label} 失败（将按新增处理）：${errorText(e)}`);
-    }
-  }
-  if (cleared > 0) {
-    warnings(report, `--force 已覆盖 ${cleared} 行既有数据（仅限旧库中存在、本次会重写的行）`);
-  }
-}
-
 export function runImport(
   target: ReturnType<typeof openDatabase>,
   oldPath: string,
@@ -362,7 +318,10 @@ export function runImport(
   try {
     withTransaction(target, () => {
       if (force) {
-        forceClearImported(target, old, report);
+        warnings(
+          report,
+          "--force：仅当本次成功写入同主键行时才覆盖目标库原值；读取/校验失败的行保持原样",
+        );
       }
       for (const row of old.prepare("SELECT profile_id FROM profiles").all() as {
         profile_id: string;
@@ -439,8 +398,22 @@ export function runImport(
         `INSERT INTO schedules (id, profile_id, title, note, kind, calendar, start_date, lunar_month, lunar_day,
            leap_policy, lunar_clamp, time, all_day, recurrence_json, remind_offsets_json, resend_minutes,
            workday_filter, status, version, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           profile_id = excluded.profile_id, title = excluded.title, note = excluded.note,
+           kind = excluded.kind, calendar = excluded.calendar, start_date = excluded.start_date,
+           lunar_month = excluded.lunar_month, lunar_day = excluded.lunar_day,
+           leap_policy = excluded.leap_policy, lunar_clamp = excluded.lunar_clamp,
+           time = excluded.time, all_day = excluded.all_day, recurrence_json = excluded.recurrence_json,
+           remind_offsets_json = excluded.remind_offsets_json,
+           resend_minutes = excluded.resend_minutes, workday_filter = excluded.workday_filter,
+           status = excluded.status, version = excluded.version,
+           next_run_at = NULL, escalation_json = NULL,
+           created_at = excluded.created_at, updated_at = excluded.updated_at`,
       );
+      // 覆盖成功后才清掉旧 occurrence：v1 的历史 occurrence 不迁移，v2 会按规则重新物化。
+      // 若本次 upsert 失败（FK/CHECK 等），整条语句回滚，旧行及其 occurrence 保持原样。
+      const clearOccurrences = target.prepare("DELETE FROM occurrences WHERE schedule_id = ?");
       for (const s of schedules) {
         // 整个映射+插入都在逐行 try 内：mapRecurrence/mapReminders 读的是旧库里的
         // 自由文本列，任何未预料到的形状都只会隔离这一行，不带整次导入回滚。
@@ -553,6 +526,8 @@ export function runImport(
             s.created_at,
             s.updated_at,
           );
+          // 先确认日程写入成功，再清历史 occurrence；失败时上面整条 upsert 已回滚。
+          clearOccurrences.run(s.id);
           report.schedules += 1;
         } catch (e) {
           problem(report, "schedules", s.id, `日程「${s.title}」未导入：${errorText(e)}`);
@@ -603,7 +578,7 @@ export function runImport(
       }
       if (report.ledgers > 0) {
         report.scheduleWarnings.push(
-          `${report.ledgers} 个账本已迁移为家庭账本（所有 Profile 可见可编辑；旧角色/成员信息不迁移）`,
+          `${report.ledgers} 个账本已按 id 写入（新账本为家庭账本，所有 Profile 可见可编辑；已存在的同 id 账本保留原归属与预算；旧角色/成员信息不迁移）`,
         );
       }
 
@@ -628,7 +603,11 @@ export function runImport(
       );
       const insertExpense = target.prepare(
         `INSERT INTO expenses (id, ledger_id, amount_cents, category, note, spent_on, created_by_profile, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           ledger_id = excluded.ledger_id, amount_cents = excluded.amount_cents,
+           category = excluded.category, note = excluded.note, spent_on = excluded.spent_on,
+           created_by_profile = excluded.created_by_profile, created_at = excluded.created_at`,
       );
       for (const e of entries) {
         if (e.type !== "expense") {

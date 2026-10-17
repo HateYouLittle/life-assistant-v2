@@ -94,7 +94,10 @@ function normalizeHost(raw: string): string {
  * 只有「恰好一个冒号 + 纯数字端口」才判定为误写。
  */
 function looksLikeHostWithPort(host: string): boolean {
-  if (host.startsWith("[")) return false;
+  if (host.startsWith("[")) {
+    // 带方括号的 IPv6：`[::1]` 合法，`[::1]:3080` 仍是「把端口写进 HOST」
+    return /^\[[^\]]+\]:\d+$/.test(host);
+  }
   const colon = host.lastIndexOf(":");
   if (colon < 0 || host.indexOf(":") !== colon) return false;
   return /^\d+$/.test(host.slice(colon + 1));

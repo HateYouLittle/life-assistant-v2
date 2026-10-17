@@ -222,4 +222,20 @@ describe("/mcp 鉴权", () => {
       await harness.close();
     }
   });
+
+  it("建立 MCP 会话时注册 Profile（只读 Profile 也能收到简报/被转移账本）", async () => {
+    const harness = await startHarness();
+    try {
+      const response = await fetch(`http://127.0.0.1:${harness.port}/mcp`, {
+        method: "POST",
+        headers: { ...headers(), "X-Hermes-Profile": "reader" },
+        body: JSON.stringify(INIT),
+      });
+      await sessionOf(response);
+      const row = harness.env.db.prepare("SELECT id FROM profiles WHERE id = 'reader'").get();
+      assert.ok(row !== undefined, "初始化会话后必须确保 profiles 行存在");
+    } finally {
+      await harness.close();
+    }
+  });
 });

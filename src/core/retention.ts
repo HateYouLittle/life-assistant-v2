@@ -52,10 +52,16 @@ function cancelledScheduleCleanupIds(db: DatabaseSync, cutoff: string): string[]
  * 可清理通知的判定（唯一来源）：已读 + 超期 + 没有任何未终结的投递。
  * 预演的「几条通知/几条投递」与实删必须共用它 —— 否则预演数字会大于实删
  * （按「已读且超期」统计时，会把「仍有待投递所以不会删」的通知的投递也算进去）。
+ *
+ * 月报（bookkeeping.monthly）永不清理：它的 dedupe_key 是 `findMissingMonthlyReports`
+ * 判断「该账本该月是否已推送」的唯一持久证据。通知被 180 天保留策略删掉后，
+ * 7~12 个月前的月报会被误判成「从未推送过」（tooOld 假告警）；极端情况下还可能
+ * 在回看窗口内重复补发。月报每月每账本至多一条，长期保留的体积可忽略。
  */
 function notificationCleanupWhere(table: string): string {
   const statuses = PENDING_DELIVERY_STATUSES.map((s) => `'${s}'`).join(",");
   return `${table}.read = 1 AND ${table}.created_at < ?
+    AND ${table}.kind != 'bookkeeping.monthly'
     AND NOT EXISTS (
       SELECT 1 FROM deliveries d
       WHERE d.notification_id = ${table}.id AND d.status IN (${statuses})

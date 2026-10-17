@@ -131,7 +131,16 @@ export function createStatusApp(config: ResolvedConfig, db: DatabaseSync): Hono 
   // 存活探针：不鉴权、不查明细，只回答「进程还在、库还开着」。
   // systemd / uptime 监控用它，而不是用需要 token 的 /api/status。
   app.get("/healthz", (c) => {
-    const healthy = db.isOpen;
+    // isOpen 只说明连接对象没关；文件被替换/磁盘故障时仍可能为 true。
+    // 真正做一次最轻量的查询，才能把「库已经不可用」反馈成 503。
+    let healthy = db.isOpen;
+    if (healthy) {
+      try {
+        healthy = db.prepare("SELECT 1 AS ok").get() !== undefined;
+      } catch {
+        healthy = false;
+      }
+    }
     return c.json(
       { ok: healthy, version: VERSION, uptime_s: Math.floor(process.uptime()) },
       healthy ? 200 : 503,

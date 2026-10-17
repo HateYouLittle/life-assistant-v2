@@ -229,6 +229,11 @@ describe("weather alert_watch：命中与去重", () => {
         responderFor(() => ({ body })),
         async () => {
           await runAlertWatch();
+          // 模拟长预警：橙色通知已存在超过 24 小时。24h 窗口会让降级判定失效，
+          // 30 天窗口仍应按「已推过更高等级」压掉黄色。
+          env.db
+            .prepare("UPDATE notifications SET created_at = ? WHERE profile_id = 'default'")
+            .run(new Date(Date.now() - 2 * 24 * 3600 * 1000).toISOString());
           env.db.exec("DELETE FROM cache"); // 强制第二次重新请求上游
           body = alertBody(alert({ color: { code: "yellow" } }));
           await runAlertWatch();

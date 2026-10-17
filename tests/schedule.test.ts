@@ -7,6 +7,7 @@ import {
   catchupSweep,
   completeSchedule,
   createSchedule,
+  deleteSchedule,
   fireDue,
   getSchedule,
   materializeSchedule,
@@ -127,6 +128,106 @@ describe("schedule 工具：生命周期", () => {
       const rows = occurrenceRows(env, id);
       assert.ok(rows.length >= 2, "一次性日程应物化 2 个偏移");
       assert.ok(rows.every((r) => (r.occurrence_key as string).startsWith(todayIso())));
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("删除 recurrence.count 日程保留历史计数，重新激活不会复活已耗尽的循环", () => {
+    const env = makeTestEnv();
+    try {
+      const created = createSchedule(env.db, "default", {
+        title: "两次循环",
+        note: null,
+        kind: "todo",
+        calendar: "solar",
+        startDate: day(5),
+        lunarMonth: null,
+        lunarDay: null,
+        leapPolicy: "follow",
+        lunarClamp: true,
+        time: "09:00",
+        allDay: false,
+        recurrence: { freq: "daily", interval: 1, count: 2 },
+        remindOffsets: [0],
+        resendMinutes: 0,
+        escalation: null,
+        workdayFilter: "any",
+      });
+      const before = occurrenceRows(env, created.id);
+      assert.equal(before.length, 2, "count=2 应物化两个事件");
+      const keys = before.map((r) => r.occurrence_key);
+      // 让事件「已经发生」：只有非 pending 行会在 update 的 DELETE 中幸存，
+      // 否则测不到 delete 是否保留了历史（update 本来就会重物化 pending 行）。
+      env.db
+        .prepare("UPDATE occurrences SET status = 'notified' WHERE schedule_id = ?")
+        .run(created.id);
+      // 把起始日改到过去：若历史被删，重新物化会算出今天/明天这类新事件；
+      // 保留历史时 existingDates 已达 count，不会再产生任何新行。
+      env.db.prepare("UPDATE schedules SET start_date = '2020-01-01' WHERE id = ?").run(created.id);
+
+      deleteSchedule(env.db, "default", created.id);
+      updateSchedule(env.db, "default", created.id, { status: "active" });
+
+      const after = occurrenceRows(env, created.id);
+      assert.deepEqual(
+        after.map((r) => r.occurrence_key),
+        keys,
+        "删除/重新激活不得让已达上限的 count 循环补出新事件",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("add/list/upcoming 回执包含备注、工作日筛选与重发分钟", () => {
+    const env = makeTestEnv();
+    try {
+      const created = tool(env, {
+        action: "add",
+        title: "字段回显",
+        date: day(3),
+        time: "09:00",
+        note: "带伞",
+        workday_filter: "workday",
+        resend_minutes: 30,
+      }) as { content: { text: string }[]; isError?: boolean };
+      assert.notEqual(created.isError, true, created.content[0]?.text);
+      const c = (
+        JSON.parse(created.content[0]?.text ?? "{}") as {
+          已创建: Record<string, unknown>;
+        }
+      ).已创建;
+      assert.equal(c.备注, "带伞");
+      assert.equal(c.工作日筛选, "仅工作日");
+      assert.equal(c.重发分钟, 30);
+
+      const listed = JSON.parse(
+        (tool(env, { action: "list" }) as { content: { text: string }[] }).content[0]?.text ?? "{}",
+      ) as { 日程: Record<string, unknown>[] };
+      const fromList = listed.日程.find((r) => r.标题 === "字段回显");
+      assert.equal(fromList?.备注, "带伞");
+      assert.equal(fromList?.工作日筛选, "仅工作日");
+      assert.equal(fromList?.重发分钟, 30);
+
+      // upcoming 需要一条确实物化出来的 pending（workday_filter 在无节假日数据时会暂停）
+      tool(env, {
+        action: "add",
+        title: "即将到来字段",
+        date: day(3),
+        time: "09:00",
+        note: "可见备注",
+        resend_minutes: 15,
+      });
+      const up = JSON.parse(
+        (tool(env, { action: "upcoming", limit: 10 }) as { content: { text: string }[] }).content[0]
+          ?.text ?? "{}",
+      ) as { 即将到来: Record<string, unknown>[] };
+      const item = up.即将到来.find((r) => r.标题 === "即将到来字段");
+      assert.ok(item !== undefined, `应能查到即将到来的日程：${JSON.stringify(up)}`);
+      assert.equal(item?.备注, "可见备注");
+      assert.equal(item?.工作日筛选, "不限");
+      assert.equal(item?.重发分钟, 15);
     } finally {
       cleanupTestEnv(env);
     }

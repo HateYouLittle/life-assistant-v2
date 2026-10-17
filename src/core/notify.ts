@@ -23,6 +23,11 @@ const CONCURRENCY = 5;
 const DRAIN_BUDGET_MS = 45_000;
 export const EVENT_TYPE = "life_assistant.reminder";
 
+/** HTTP header 值只能是可见 ASCII；路由名是用户输入，中文/控制字符会让 fetch 直接抛错 */
+function headerSafe(value: string): string {
+  return value.replace(/[^\x20-\x7e]/g, "_");
+}
+
 export interface PushRoute {
   name: string;
   url: string;
@@ -77,8 +82,10 @@ export function setPushRoute(
   if (!LOOPBACK_HOSTS.has(hostname.toLowerCase())) {
     throw new Error(`推送 URL 仅接受 127.0.0.1 / localhost / [::1] 主机名，收到: ${hostname}`);
   }
+  const name = input.name?.trim() || `life-assistant-${profileId}`;
+  if (name.length > 80) throw new Error(`路由名过长（≤80 字符，当前 ${name.length}）`);
   const route: PushRoute = {
-    name: input.name?.trim() || `life-assistant-${profileId}`,
+    name,
     url: parsed.toString(),
     platform: input.platform?.trim() || null,
     enabled: input.enabled ?? true,
@@ -136,7 +143,23 @@ export function routedProfiles(db: DatabaseSync): string[] {
   return rows
     .map((r) => {
       try {
-        return { profile_id: r.profile_id, route: JSON.parse(r.value_json) as PushRoute };
+        const parsed: unknown = JSON.parse(r.value_json);
+        // 手工改库/迁移残留可能写入 null 或残缺对象：直接取 route.enabled 会
+        // 抛 TypeError，让 publishGlobal 与所有全局 job 一起失败。
+        if (typeof parsed !== "object" || parsed === null) return null;
+        const route = parsed as Partial<PushRoute>;
+        const url = route.url;
+        const enabled = route.enabled;
+        if (typeof enabled !== "boolean" || typeof url !== "string") return null;
+        return {
+          profile_id: r.profile_id,
+          route: {
+            name: typeof route.name === "string" ? route.name : `life-assistant-${r.profile_id}`,
+            url,
+            platform: typeof route.platform === "string" ? route.platform : null,
+            enabled,
+          },
+        };
       } catch {
         return null;
       }
@@ -468,6 +491,7 @@ async function deliverOne(
   if (route === null || secret === undefined) return false;
 
   const claimId = newId();
+  const routeName = headerSafe(row.route_name).slice(0, 80);
   const claimed = db
     .prepare(
       `UPDATE deliveries SET status = 'sending',
@@ -477,7 +501,7 @@ async function deliverOne(
        WHERE id = ? AND status IN ('queued','failed')`,
     )
     .run(
-      `life-assistant:${row.profile_id}:${row.notification_id}:${row.route_name}:a${row.generation}`,
+      `life-assistant:${row.profile_id}:${row.notification_id}:${routeName}:a${row.generation}`,
       nowIso(),
       nowIso(),
       row.id,
@@ -487,7 +511,8 @@ async function deliverOne(
   const current = db
     .prepare("SELECT request_id, generation FROM deliveries WHERE id = ?")
     .get(row.id) as { request_id: string | null; generation: number } | undefined;
-  const requestId = current?.request_id ?? claimId;
+  // 兼容升级前已落库的 request_id（可能含非 ASCII 路由名）：发请求前再清洗一次。
+  const requestId = headerSafe(current?.request_id ?? claimId);
 
   const payload = JSON.stringify({
     event_type: EVENT_TYPE,

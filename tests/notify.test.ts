@@ -186,6 +186,33 @@ describe("outbox 投递", () => {
     }
   });
 
+  it("路由名含非 ASCII 字符时投递仍然成功（X-Request-ID 已清洗）", async () => {
+    const env = makeTestEnv({ PROFILE_ROUTE_SECRETS_JSON: JSON.stringify({ default: SECRET }) });
+    try {
+      await withHookServer(
+        (_req, res) => {
+          res.writeHead(200);
+          res.end("ok");
+        },
+        async (url, captured) => {
+          setPushRoute(env.db, "default", { url, name: "微信通知" });
+          publishProfile(env.db, env.config, "default", {
+            kind: "k",
+            title: "t",
+            blocks: {},
+          });
+          await drainDue(env.db, env.config);
+          assert.equal(captured.length, 1, "路由名不得让 fetch 因非法 header 值直接失败");
+          const first = captured[0];
+          assert.ok(first !== undefined);
+          assert.doesNotMatch(String(first.headers["x-request-id"]), /微信/);
+        },
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("Profile 内 dedupe_key 去重", () => {
     const env = makeTestEnv({ PROFILE_ROUTE_SECRETS_JSON: JSON.stringify({ default: SECRET }) });
     try {
@@ -214,6 +241,22 @@ describe("outbox 投递", () => {
         env.db.prepare("SELECT profile_id FROM notifications").all() as { profile_id: string }[]
       ).map((r) => r.profile_id);
       assert.deepEqual(ids, ["p1"]);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("损坏的 push_route 设置（JSON null/残缺）不会让 publishGlobal 抛错", async () => {
+    const env = makeTestEnv();
+    try {
+      ensureP(env.db, "default");
+      setSetting(env.db, "default", "push_route", null);
+      const result = await publishGlobal(env.db, env.config, {
+        kind: "k",
+        title: "t",
+        blocks: {},
+      });
+      assert.equal(result.materialized, 0, "损坏的路由设置应被忽略，而不是让全局发布失败");
     } finally {
       cleanupTestEnv(env);
     }

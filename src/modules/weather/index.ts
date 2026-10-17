@@ -81,10 +81,23 @@ function forecastTable(days: ForecastDay[]): { columns: string[]; rows: string[]
   };
 }
 
+/** 预警起止时间（库内是 UTC ISO）→ 本地文本；缺失/非法原样保留或显示 — */
+function alertLocalTime(iso: string | undefined): string {
+  if (iso === undefined || iso === "") return "—";
+  const dt = DateTime.fromISO(iso, { zone: TZ });
+  return dt.isValid ? dt.toFormat("yyyy-LL-dd HH:mm") : iso;
+}
+
 function alertTable(list: WeatherAlert[]): { columns: string[]; rows: string[][] } {
   return {
-    columns: ["级别", "类型", "内容"],
-    rows: list.map((a) => [a.level || "—", a.type, a.description]),
+    columns: ["级别", "类型", "生效", "失效", "内容"],
+    rows: list.map((a) => [
+      a.level || "—",
+      a.type,
+      alertLocalTime(a.startsAt),
+      alertLocalTime(a.endsAt),
+      a.description,
+    ]),
   };
 }
 
@@ -200,11 +213,16 @@ export async function runDailyBrief(): Promise<void> {
   const cityCache = new Map<string, LocationInfo>();
   for (const profileId of profiles) {
     try {
+      // 有 saved location 时直接复用（含显式选定时的 lat/lon/cityId）：
+      // 按城市名重新 Geo 查询会重新取「第一个同名结果」，可能偏离用户选定的位置，
+      // 也会在每次进程重启后多消耗一次 GeoAPI 配额。
       const saved = cachedLocation(rt.db, profileId);
-      const city = saved?.city ?? rt.config.defaultCity;
-      let loc = cityCache.get(city);
-      if (loc === undefined) {
-        loc = await geoLookup(rt.db, host, key, city);
+      let loc: LocationInfo;
+      if (saved !== null) {
+        loc = saved;
+      } else {
+        const city = rt.config.defaultCity;
+        loc = cityCache.get(city) ?? (await geoLookup(rt.db, host, key, city));
         cityCache.set(city, loc);
       }
       const [cur, fc, air, alertList] = await Promise.all([
@@ -214,7 +232,7 @@ export async function runDailyBrief(): Promise<void> {
         alerts(rt.db, host, key, loc).catch(() => null),
       ]);
       if (cur === null && fc === null) {
-        logger.warn(`每日简报跳过 ${profileId}(${city})：天气与预报均失败`);
+        logger.warn(`每日简报跳过 ${profileId}(${loc.city})：天气与预报均失败`);
         continue;
       }
       const rows: string[][] = [];
@@ -238,6 +256,8 @@ export async function runDailyBrief(): Promise<void> {
       const notes: string[] = [];
       const calendarNote = holidayNote(rt.db, todayIso());
       if (calendarNote !== null) notes.push(calendarNote);
+      // 有生效预警时绝不能落到「适宜出行」（预警在表格里、默认 note 却给出相反结论）。
+      if (alertList !== null && alertList.length > 0) notes.push("有气象预警，注意防范");
       if (today !== undefined && today.precipMm !== undefined && today.precipMm > 0)
         notes.push("今日有降水，出门带伞");
       if (today !== undefined && today.tMax - today.tMin >= 10)
@@ -329,11 +349,12 @@ function parseAlertDedupeKey(key: string): { contentKey: string; level: string }
 /**
  * 各预警内容键「已推送过的最高级别」。级别降级不重推的依据：去重键含 level，若不查历史，
  * orange→yellow 也会得到新键再推一次，与「只有级别升级才再推」的口径不符。
- * 只看近一天的记录：预警生命周期短，避免用远古同 id 记录误压当前预警。
- * 空级别（未知，按最高优先级处理）不纳入历史，否则会误压后续真实级别。
+ * 回看 30 天：既要覆盖持续数天的长预警（24h 窗口会让降级在窗口外漏判），
+ * 又要避免用极远古的同 id 记录误压当前预警。空级别（未知，按最高优先级处理）
+ * 不纳入历史，否则会误压后续真实级别。
  */
 function notifiedAlertRanks(db: DatabaseSync, profileId: string): Map<string, number> {
-  const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  const since = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
   const rows = db
     .prepare(
       "SELECT dedupe_key FROM notifications WHERE profile_id = ? AND kind = 'weather.alert' AND dedupe_key IS NOT NULL AND created_at >= ?",
@@ -362,8 +383,8 @@ function alertBlocks(alert: WeatherAlert): NotifyBlock {
         [
           alert.level.trim() || "—",
           alert.type,
-          alert.startsAt ?? "—",
-          alert.endsAt ?? "—",
+          alertLocalTime(alert.startsAt),
+          alertLocalTime(alert.endsAt),
           alert.description,
         ],
       ],
@@ -389,10 +410,14 @@ export async function runAlertWatch(): Promise<void> {
   const cityCache = new Map<string, LocationInfo>();
   for (const profileId of listProfiles(rt.db)) {
     try {
-      const city = cachedLocation(rt.db, profileId)?.city ?? rt.config.defaultCity;
-      let loc = cityCache.get(city);
-      if (loc === undefined) {
-        loc = await geoLookup(rt.db, host, key, city);
+      // 与每日简报同口径：显式选定的位置直接复用，不能再按城市名重新 Geo 查询。
+      const saved = cachedLocation(rt.db, profileId);
+      let loc: LocationInfo;
+      if (saved !== null) {
+        loc = saved;
+      } else {
+        const city = rt.config.defaultCity;
+        loc = cityCache.get(city) ?? (await geoLookup(rt.db, host, key, city));
         cityCache.set(city, loc);
       }
       const list = await alerts(rt.db, host, key, loc);

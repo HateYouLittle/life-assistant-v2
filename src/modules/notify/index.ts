@@ -173,7 +173,7 @@ registerModule({
         clear: z.boolean().optional().describe("清除静默时段"),
         url: z.string().optional().describe("推送 webhook 地址（127.0.0.1/localhost/[::1]）"),
         platform: z.string().optional().describe("目标平台标识（如 wechat），仅记录"),
-        name: z.string().optional().describe("路由名，默认 life-assistant-<profile>"),
+        name: z.string().max(80).optional().describe("路由名，默认 life-assistant-<profile>"),
         enabled: z.boolean().optional().describe("启用/停用路由"),
         id: z.string().optional().describe("cancel 的通知 id"),
       },

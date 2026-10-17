@@ -27,7 +27,7 @@ import {
   seedQweatherUsage,
   setQweatherUsageSink,
 } from "./core/qweather.js";
-import { pruneCache } from "./core/settings.js";
+import { ensureProfile, pruneCache } from "./core/settings.js";
 import { logger, setLogLevel } from "./core/logger.js";
 import { TZ, now } from "./time.js";
 import { registerAllModules } from "./modules/index.js";
@@ -47,12 +47,19 @@ interface Session {
 /** 空闲会话回收阈值；stdio 壳不会发 DELETE，只靠 TTL/上限兜底 */
 const SESSION_IDLE_MS = 2 * 3600 * 1000;
 const MAX_SESSIONS = 200;
+/** 停机时等待在途 cron job / tick 的上限（它们可能正在发布通知） */
+const JOB_SHUTDOWN_WAIT_MS = 10_000;
 
 async function buildMcpServer(
   profileId: string,
   db: DatabaseSync,
   config: ResolvedConfig,
 ): Promise<{ server: McpServer; transport: StreamableHTTPServerTransport }> {
+  // 会话一建立就登记 Profile：只调用 notify.pull / 天气等只读工具的 Profile 此前
+  // 永远不会写 profiles 表，而每日简报/预警巡检只遍历 listProfiles()，会导致
+  // 「纯 pull 型 Profile 收不到简报」以及无法把个人账本转给该 Profile。
+  // 放在 buildMcpServer 而非响应之后，保证 initialize 返回时行已落库。
+  ensureProfile(db, profileId);
   const server = new McpServer({ name: "life-assistant", version: VERSION });
   const services = createServices(db, config);
   for (const { def } of allTools()) {
@@ -244,19 +251,29 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
   const httpServer = createServer(createHttpHandler(config, db));
 
   const busy = new Set<string>();
-  async function runExclusive(name: string, fn: () => Promise<void> | void): Promise<void> {
+  /**
+   * 在途 job/tick 的 Promise。停机时必须等它们收敛：job 可能在 await 之后才写库/
+   * 发布通知，直接 db.close() 会留下 "database is not open" 并丢掉当次提醒。
+   * 按 name 存（name 在 busy 保护下唯一），避免在 Promise 初始化器里自引用。
+   */
+  const inFlightJobs = new Map<string, Promise<void>>();
+  function runExclusive(name: string, fn: () => Promise<void> | void): Promise<void> {
     if (busy.has(name)) {
       logger.debug(`跳过重叠触发: ${name}`);
-      return;
+      return Promise.resolve();
     }
     busy.add(name);
-    try {
-      await fn();
-    } catch (e) {
-      logger.error(`${name} 执行失败: ${errorMessage(e)}`);
-    } finally {
-      busy.delete(name);
-    }
+    const task = Promise.resolve()
+      .then(fn)
+      .catch((e) => {
+        logger.error(`${name} 执行失败: ${errorMessage(e)}`);
+      })
+      .finally(() => {
+        busy.delete(name);
+        inFlightJobs.delete(name);
+      });
+    inFlightJobs.set(name, task);
+    return task;
   }
 
   async function tickAll(at: DateTime): Promise<void> {
@@ -345,6 +362,22 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
     try {
       for (const task of tasks) task.stop();
       clearInterval(drainTimer);
+      // 先停止接受新连接（已建立的在途请求继续处理），避免更长的 job/drain 等待期间
+      // 又冒出新请求写库。最后用 closeAllConnections 强制收敛。
+      const serverClosed = new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      // 先等 cron job / tick 收敛：它们可能在 await 网络后发布通知并触发新一轮 drain。
+      // 停止定时器后不会再有新 job 启动；循环是为了兜住「等待期间刚好进入 finally」的窗口。
+      const jobDeadline = Date.now() + JOB_SHUTDOWN_WAIT_MS;
+      while (inFlightJobs.size > 0 && Date.now() < jobDeadline) {
+        await Promise.race([
+          Promise.allSettled([...inFlightJobs.values()]),
+          new Promise<void>((resolve) =>
+            setTimeout(resolve, Math.min(250, Math.max(0, jobDeadline - Date.now()))).unref(),
+          ),
+        ]);
+      }
+      // job 可能刚刚通过 publish 排了一个 100ms drain；在关库前把它取消掉。
+      // 已落库但未投出的行留着，下次启动会由 outbox 继续投递（不丢）。
       cancelPendingDrain();
       // 在途的 outbox 投递也有 10s 级网络超时：不等它收敛就会在关库后继续写。
       // 与 onStart 一样给个上界（这里 10s），避免停机被长时间拖住。
@@ -359,9 +392,11 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
           new Promise<void>((resolve) => setTimeout(resolve, 3000).unref()),
         ]);
       }
+      // onStart 理论上也可能发布；关库前再清一次可能新排的 drain（未投出的行留待下次启动）。
+      cancelPendingDrain();
       for (const [id, session] of [...sessions]) dropSession(id, session);
       httpServer.closeAllConnections();
-      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      await serverClosed;
       db.close();
     } finally {
       // 无论收尾是否失败都要摘掉信号监听：否则同进程内多次 startDaemon/stop
@@ -384,9 +419,9 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
         logger.error(`关闭失败: ${errorMessage(e)}`);
         process.exit(1);
       });
-    // 兜底硬退：必须大于 stop() 内部的等待上界（drain ≤10s + onStart ≤3s + 其余收尾），
-    // 否则在途投递的收敛等待会被这里提前打断，db.close() 也不会执行。
-    setTimeout(() => process.exit(0), 15_000).unref();
+    // 兜底硬退：必须大于 stop() 内部的等待上界（job ≤10s + drain ≤10s + onStart ≤3s + 其余收尾），
+    // 否则在途投递/job 的收敛等待会被这里提前打断，db.close() 也不会执行。
+    setTimeout(() => process.exit(0), 30_000).unref();
   };
   const onSigint = (): void => shutdown("SIGINT");
   const onSigterm = (): void => shutdown("SIGTERM");

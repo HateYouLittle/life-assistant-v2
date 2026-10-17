@@ -165,12 +165,21 @@ function rowToPublic(row: ScheduleRow): Record<string, unknown> {
         ),
     提醒: parseOffsets(row.remind_offsets_json),
     ...(escalation === null ? {} : { 升级提醒: escalation }),
+    工作日筛选: workdayFilterLabel(row.workday_filter),
+    重发分钟: row.resend_minutes,
+    ...(row.note === null ? {} : { 备注: row.note }),
     状态: row.status,
     下次提醒: row.next_run_at,
     // 原「下次提醒」是 UTC ISO（差 8 小时易误读），补本地时区文本；原键保留不动
     "下次提醒(本地)": localStampText(row.next_run_at),
     版本: row.version,
   };
+}
+
+function workdayFilterLabel(value: ScheduleRow["workday_filter"]): string {
+  if (value === "workday") return "仅工作日";
+  if (value === "holiday") return "仅节假日";
+  return "不限";
 }
 
 export function scheduleTool(args: Record<string, unknown>, ctx: ToolContext) {
@@ -259,6 +268,9 @@ function scheduleToolInner(args: Record<string, unknown>, ctx: ToolContext) {
             // 原「提醒时间」是 UTC ISO（差 8 小时易误读），补本地时区文本；原键保留不动
             "提醒时间(本地)": localStampText(i.due_at),
             事件日期: instantToLocalDate(i.event_at),
+            工作日筛选: workdayFilterLabel(i.workday_filter),
+            重发分钟: i.resend_minutes,
+            ...(i.note === null ? {} : { 备注: i.note }),
             occurrence_key: i.occurrence_key,
             ...(escalation === null ? {} : { 升级提醒: escalation }),
           };

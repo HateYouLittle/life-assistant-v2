@@ -83,5 +83,6 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   账号被冻结）。API KEY 是回退；优先 Ed25519 JWT，且四个 `QWEATHER_JWT_*` 变量必须
   同时配置，否则启动失败。
 - `notify.pull` 只能取消 `queued`/`failed` 的投递，无法拦住已处于 `sending` 的那一次。
-- `npm run db:cleanup:preview` 是只读预演：occurrence 清理 job（每日 04:30）与保留策略
+- `npm run db:cleanup:preview` 是**零业务删除**预演（打开旧库时仍可能执行附加式 schema
+  升级，因此不保证零写入）：occurrence 清理 job（每日 04:30）与保留策略
   （通知/已取消日程，每日 04:50）会删掉哪些行——改清理规则前先用它。

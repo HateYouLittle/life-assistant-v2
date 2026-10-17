@@ -1242,4 +1242,84 @@ describe("import:v1", () => {
       cleanupTestEnv(env);
     }
   });
+
+  it("--force 遇到逐行校验失败时，目标库同主键原行必须保留", () => {
+    // 回归：forceClearImported 曾在读取/校验之前按旧库全部 id 删除目标行；
+    // 一条旧行时间非法被跳过时，目标库里的同 id 行已被删掉且不会重插 ——
+    // 报告只说「该行未导入」，不会告诉你原数据被清空。
+    const env = makeTestEnv();
+    try {
+      env.db
+        .prepare(
+          "INSERT INTO schedules (id, profile_id, title, created_at, updated_at) VALUES ('s-bad', 'default', '目标保留', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')",
+        )
+        .run();
+
+      const oldPath = `${env.dir}/old-invalid-row.db`;
+      const old = new DatabaseSync(oldPath);
+      old.exec(OLD_DDL);
+      const ts = "2026-01-01T00:00:00.000Z";
+      old.prepare("INSERT INTO profiles VALUES ('default', ?)").run(ts);
+      old
+        .prepare(
+          `INSERT INTO schedules (profile_id, id, title, calendar, date, time, timezone, recurrence_json, reminders_json, created_at, updated_at)
+           VALUES ('default', 's-bad', '旧行坏时间', 'solar', '2026-01-01', '25:99', 'Asia/Shanghai', '{}', '[]', ?, ?)`,
+        )
+        .run(ts, ts);
+      old.close();
+
+      const report = runImport(env.db, oldPath, true);
+      assert.ok(
+        report.problems.some((p) => p.id === "s-bad" && /时间不合法/.test(p.reason)),
+        `坏行应逐行隔离，实际 ${JSON.stringify(report.problems)}`,
+      );
+      const row = env.db.prepare("SELECT title FROM schedules WHERE id = 's-bad'").get() as
+        | { title: string }
+        | undefined;
+      assert.equal(row?.title, "目标保留", "--force 不得删除一条本次并未成功写入的既有行");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("--force 遇到整表读取失败时，目标库同主键原行必须保留", () => {
+    // 与上一条同源：int64 越界会让 SELECT * 整表失败。旧实现先删目标行再读旧表，
+    // 读取失败被记入 problems（事务照常提交），目标行永久丢失。
+    const env = makeTestEnv();
+    try {
+      env.db
+        .prepare(
+          "INSERT INTO schedules (id, profile_id, title, created_at, updated_at) VALUES ('s1', 'default', '目标保留', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')",
+        )
+        .run();
+
+      const oldPath = `${env.dir}/old-int64.db`;
+      const old = new DatabaseSync(oldPath);
+      old.exec(OLD_DDL);
+      const ts = "2026-01-01T00:00:00.000Z";
+      old.prepare("INSERT INTO profiles VALUES ('default', ?)").run(ts);
+      old
+        .prepare(
+          `INSERT INTO schedules (profile_id, id, title, calendar, date, time, timezone, recurrence_json, reminders_json, created_at, updated_at)
+           VALUES ('default', 's1', '旧行', 'solar', '2026-01-01', '09:00', 'Asia/Shanghai', '{}', '[]', ?, ?)`,
+        )
+        .run(ts, ts);
+      old.prepare("UPDATE schedules SET version = ? WHERE id = 's1'").run(9223372036854775807n);
+      old.close();
+
+      const report = runImport(env.db, oldPath, true);
+      assert.ok(
+        report.problems.some(
+          (p) => p.table === "schedules" && p.reason.includes("无法读取旧库的 schedules 表"),
+        ),
+        `整表读取失败应进 problems，实际 ${JSON.stringify(report.problems)}`,
+      );
+      const row = env.db.prepare("SELECT title FROM schedules WHERE id = 's1'").get() as
+        | { title: string }
+        | undefined;
+      assert.equal(row?.title, "目标保留", "--force 不得在旧表整表读取失败时删除目标库既有行");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
 });

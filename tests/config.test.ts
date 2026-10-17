@@ -48,6 +48,8 @@ describe("config", () => {
     assert.equal(loadConfig({ ...BASE, HOST: "http://127.0.0.1" }).host, "127.0.0.1");
     assert.throws(() => loadConfig({ ...BASE, HOST: "127.0.0.1:3080" }), /端口/);
     assert.throws(() => loadConfig({ ...BASE, HOST: "http://localhost:3080" }), /端口/);
+    // 方括号 IPv6 后面再接端口同样属于「把端口写进 HOST」
+    assert.throws(() => loadConfig({ ...BASE, HOST: "[::1]:3080" }), /端口/);
     // IPv6 字面量含多个冒号/方括号，不能被误判成「主机:端口」
     assert.equal(loadConfig({ ...BASE, HOST: "[::1]" }).host, "[::1]");
   });

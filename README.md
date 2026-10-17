@@ -220,6 +220,8 @@ systemctl start life-assistant                    # 4. 启动并打开状态页�
 npm run import:v1 -- --from /旧/DATA_DIR [--force]
 ```
 
+导入在单个写事务中完成。若目标 daemon 正在运行，建议先停掉它（或留足维护窗口）：导入持锁期间 daemon 的写入可能等满 `busy_timeout`（5s）后报错。
+
 一次性导入旧库的 Profile、静默时段、日程、账本（导入为**家庭账本**，所有 Profile 可编辑）、支出账目、节假日数据。旧 occurrence 不迁移（v2 按规则重新物化）；收入/转账账目、deadline 提醒、共享账本角色不迁移，均会在报告中列明。建议先对旧库做备份。
 
 导入是**逐行隔离**的：单条坏数据（金额非法、日期无法解析、引用不存在的账本、主键冲突等）
@@ -230,10 +232,7 @@ JS 安全整数范围的 int64、或旧库仍被 v1 进程占用），该表会�
 它读不出来时整个导入直接中止（退出码 1、目标库不被修改），而不是在缺 Profile 的前提下
 继续写日程。
 
-`--force` 只覆盖**旧库里存在、本次会重新写入的那些行**（按主键删除后重插）：日程与账目按 id
-精确清除，账本按 id upsert（因此不影响其上的月度预算）。导入从不写入的数据不会被清 ——
-目标库里已有的通知/投递历史、v2 期间新增的日程与账目、以及任意账本的预算都会保留，
-失败时整体回滚。
+`--force` 只覆盖**本次成功写入的同主键行**（日程按 id 精确替换并清掉其旧 occurrence，账目按 id 替换；账本按 id upsert，因此不影响其上的月度预算）。读取失败或逐行校验失败的行不会先删除目标库原行——旧库某行坏掉时，目标库里同 id 的既有数据保持原样。导入从不写入的数据不会被清 —— 目标库里已有的通知/投递历史、v2 期间新增的日程与账目、以及任意账本的预算都会保留；只有整个事务级别的致命失败（例如 profiles 表读不出来）才会整体回滚。
 
 例外是节假日两张表：`cn_holiday_days` / `cn_holiday_years` 始终用 `INSERT OR IGNORE`
 写入，既不参与 `--force` 的清除，也不会覆盖目标库中已由 daemon 抓取的更新数据，
@@ -248,7 +247,7 @@ npm run lint           # Biome lint（error 级诊断才让命令失败；warn �
 npm run format:check   # Biome 格式检查（CI 也跑）
 npm run doctor         # 自检：配置/目录/库完整性/鉴权/JWT 私钥/备份（--network 另有连通性检查：节假日数据源按 requiredYears() 逐年份、仅探测可获取（daemon 导入时还会做数据校验），QWeather 仅探测可达）
 npm run db:backup      # VACUUM INTO 备份，保留最近 14 份
-npm run db:cleanup:preview   # 零删除预演：occurrence 与保留策略会删掉哪些行（数字与 job 同一份判定）
+npm run db:cleanup:preview   # 零业务删除预演：occurrence 与保留策略会删掉哪些行（数字与 job 同一份判定；打开旧库时可能做附加式 schema 升级）
 ```
 
 > `db:backup` / `db:cleanup:preview` / `doctor` / `import:v1` 跑的是 `dist/` 里的构建产物，先
@@ -265,13 +264,13 @@ npm run db:cleanup:preview   # 零删除预演：occurrence 与保留策略会�
 - **时区**：全部调度固定 Asia/Shanghai，无 DST。
 - **QWeather 请求治理**：按数据类型短 TTL 缓存（`CACHE_TTL_MS`：实时 20min / 逐天 2h 且取 `min(2h, 距本地次日 00:00)` / 预警 10min / 空气质量 45min，只有成功响应才写缓存）；同进程并发上限 3；仅对 429/5xx 与网络故障做指数退避（`2^c` 秒 + 抖动，c 上限 10），**4xx 一律立即抛出** —— 官方明确反复重试错误请求会被判定为攻击并冻结账号。认证优先 JWT（EdDSA），API KEY 保留回退。**GeoAPI 结果不得落盘缓存/批量存储/建索引**（官方版权限制），只允许进程内 memo —— 唯一例外是用户经 `weather locate` **显式选定的位置会作为该 Profile 的配置长期保存**（`settings.location`），属用户主动设置而非缓存/批量索引，供后续查询与每日简报复用。
 - **主动推送**：定时任务组装**确定性**通知（无 LLM），走 outbox 投递：每日天气简报与调休/补班提醒 07:00、气象预警巡检每 20 分钟、月报每月 1 号 09:00；节假日数据刷新 02:00、历史 occurrence 回收 04:30、保留策略清理 04:50。预警与补班都靠 `dedupe_key` 去重（预警按「id + 级别」，级别升级会再推一次、降级不重推；补班按「事件 + 日期」），静默时段在投递层统一拦截、不为任何类型开例外。
-- **用量与保留**：QWeather 上游请求按本地日计数（含重试、缓存命中不计），状态页「今日天气请求」与 `/api/status` 的 `qweather_usage` 可见，daemon 重启从库里的计数继续累加 —— 官方 2027-02-01 起限制 API KEY 日请求量，没有计量就无从判断余量。保留策略（每日 04:50）只删**已读且投递已终结**的通知（含级联的投递记录）与**已取消超 180 天**的日程；未读通知、仍有待投递的通知、使用 `recurrence.count` 的日程一律保留。
+- **用量与保留**：QWeather 上游请求按本地日计数（含重试、缓存命中不计），状态页「今日天气请求」与 `/api/status` 的 `qweather_usage` 可见，daemon 重启从库里的计数继续累加 —— 官方 2027-02-01 起限制 API KEY 日请求量，没有计量就无从判断余量。保留策略（每日 04:50）只删**已读且投递已终结**的通知（含级联的投递记录）与**已取消超 180 天**的日程；未读通知、仍有待投递的通知、使用 `recurrence.count` 的日程一律保留。**月报通知也不清理**：它的 `dedupe_key` 是月报补发判定的唯一持久证据，删掉会让 7~12 个月前的月报被误判成「从未推送过」。
 - **记账预算**：账本可设**总额**或**分类**月度预算（`ledger {action:"budget"}`，单位元），按账本每月滚动（对照当月支出）。`expense add` 成功后判定该笔是否**跨越** 80%/100% —— 只推跨越那一刻（而非达到即推）；同一个预算一笔只推**跨过的最高阈值**（一笔从 0% 到 150% 只推 100%，70%→90% 只推 80%），总额与分类各自独立判定；`dedupeKey = budget:<ledger>:<分类|空>:<YYYY-MM>:<80|100>`（总额的分类位是空串、分类用原样名字，分类名恰好叫 `-` 也不会与总额撞键），跨月自动重新判定，同月同阈值不重推。设了预算的账本，月报追加预算对照行（附在 notes）；未设预算的账本行为完全不变。个人账本的支出**不触发任何预算提醒**（不推送、也不入通知）。
 - **账本归属**：`ledgers.owner_profile_id` 为 NULL 表示**家庭账本**（所有 Profile 可见可写，`expense add` 回执与预算提醒走全局推送、月报物化到所有配置了路由的 Profile）；非空为**个人账本**（仅归属人可见可写，他人一律得到「账本不存在」不泄露存在性；不回执、不推预算提醒，月报只发给归属人）。`ledger create` 缺省建家庭账本、`personal: true` 建个人账本；`ledger transfer` 仅当前归属人可把个人账本转给其他 Profile（目标 Profile 须已存在）或省略 `profile` 转回家庭（不可逆）；家庭账本不能转为个人。账本名**分范围唯一**——家庭账本之间唯一、每人自己的个人账本内唯一，跨范围可同名（因此不同人可各用「日常」），也避免「创建失败」泄露他人账本名；转移归属时若目标范围已有同名活跃账本会被拒绝。状态页与 `/api/status`、`/api/expenses` 只统计/展示家庭账本。升级前的既有账本与 v1 导入账本一律为家庭账本（`schema_version` 2→3 时补 `owner_profile_id = NULL`，行为不变）。
 - **「本月」的口径**：状态页看板、预算对照、月报的「本月」= **自然月全月**（月初→月末，**含月内尚未到来的日期**）—— `spent_on` 是已录入的记账事实，指定了未来日期就不该因为日历没到那天就从本月数字里消失（否则同一个「本月」会随日期推移忽增忽减，对不上账）。工具侧 `expense summary` 不传区间时的默认区间是「月初 → 今天」，那是「本月至今」的查询默认。`expense` 的 `month` 与 `from`/`to` 互斥（同时传直接报错，`from > to` 也报错）：两者都表达区间，混着传会让 `list` 与 `summary` 得出相反结论。
 - **物化窗口**：occurrence 只物化到 `now + 62 天`。若某日程此刻一条 `pending` 都没有（远期生日、远期一次性待办），额外豁免**恰好 1 条**越过窗口的 occurrence，保证「下一条」在 `list`/`upcoming`/状态页始终可见（豁免的那条最远可达 400 天，因此远期生日会显示成明年的日期）；豁免资格取自入库状态，补上第一条即失效，因此不会随时间累积增长。
 - **截止型日程（逾期升级）**：给 `todo` 设置 `escalation`（严格升序分钟偏移数组，1-5 项、最大 43200 即 30 天，**首元素必须为 0** 表示截止时刻本身，如 `[0,60,360,1440]`）即可 —— 仅 `kind=todo` 可设，到达截止时刻后按阶梯依次重发升级提醒（第 0 步即截止时刻的提醒，第 1..n 步是逾期加压的 `<event>#N#esc:M`；锚点默认是 `#0`，晚录入/停机导致 `#0` 被 `catchupSweep` 取消时落在保留下来的那条偏移行上），直到 `complete` 才停；设置 `escalation` 时 `resend_minutes` 被忽略。每步各生成一条 occurrence，靠 `INSERT OR IGNORE` + `notified` 状态保证只推一次；改了 `time`/`escalation` 或父事件被删/重排后，残留行在触发前按当前排期校验并作废。`complete` 带 `occurrence_key` 时按**事件前缀**收敛：同一事件的各条提醒偏移（`#0..#4`）与它们的派生行（`:resend`、`#esc:N`）一并终结，因此用哪一条提醒去完成都不会再有同事件的后续推送。`update` 传 `escalation: []` 清除阶梯（空数组在 MCP schema 层合法：长度下限与首元素/升序等语义规则在 service 层判定，否则经真实 MCP 的 `[]` 会在进入 handler 前被拒）。工具/状态页把这类日程的类型显示为「截止」（不新增 `kind` 枚举值，语义由字段表达）。
-- **历史回收**：`schedule.occurrence_cleanup`（每日 04:30）只清理 90 天前的 `notified`/`done`/`cancelled` 行 —— `pending` 永不删；使用 `recurrence.count` 的日程整条豁免（发生次数上限依赖历史行数，删历史会让已达上限的循环复活；漏触发被 `catchupSweep` 收敛为 `cancelled` 的事件同样计入上限——否则漏一次就会补出新事件，上限永远达不到）。上线或调参前用 `npm run db:cleanup:preview` 只读预演将删除的行数与涉及日程（与 job 共用同一份判定）。
+- **历史回收**：`schedule.occurrence_cleanup`（每日 04:30）只清理 90 天前的 `notified`/`done`/`cancelled` 行 —— `pending` 永不删；使用 `recurrence.count` 的日程整条豁免（发生次数上限依赖历史行数，删历史会让已达上限的循环复活；漏触发被 `catchupSweep` 收敛为 `cancelled` 的事件同样计入上限——否则漏一次就会补出新事件，上限永远达不到）。上线或调参前用 `npm run db:cleanup:preview` 零业务删除预演将删除的行数与涉及日程（与 job 共用同一份判定；打开旧库时仍可能做附加式 schema 升级）。
 
 ### 已知取舍与后续优化
 
@@ -291,7 +290,7 @@ npm run db:cleanup:preview   # 零删除预演：occurrence 与保留策略会�
 6. **节假日刷新节奏**：`FETCH_COOLDOWN_MS` 是 6h，但主动重试点仍是每天 02:00 的 job（`requiredYears()` 到 10 月才要求下一年），实际重试间隔为 24h。物化撞到未就绪年份的路径已改为由 `tick()` 触发按需补齐、真正受 6h 冷却约束；若要提前拿到下一年数据，可把 job 改为 `0 */3 * * *`。
 7. **`status` 页面无鉴权**（`/` 只有静态 HTML，数据走受保护的 `/api/status`），
    如需对外暴露建议一并加保护。
-8. ~~**`notifications` / `deliveries` 无保留策略**~~ —— **已实施**：保留策略 job（每日 04:50，`src/core/retention.ts`）删除已读且投递已终结（无 `queued`/`sending`/`failed`）的 180 天前通知，投递随外键级联删除；`npm run db:cleanup:preview` 与 job 共用同一份判定，预演数字与实际删除一致。
+8. ~~**`notifications` / `deliveries` 无保留策略**~~ —— **已实施**：保留策略 job（每日 04:50，`src/core/retention.ts`）删除已读且投递已终结（无 `queued`/`sending`/`failed`）的 180 天前通知，投递随外键级联删除；**月报通知除外**（`dedupe_key` 是补发判定依据）；`npm run db:cleanup:preview` 与 job 共用同一份判定，预演数字与实际删除一致。
 9. **server 层直接引用模块的纯函数**：`src/server/details.ts` import 了
    bookkeeping/schedule 的 `monthRange`、`KIND_LABEL` 等常量与纯函数。契约测试只强制
    `src/core` 不依赖模块，这条方向没人管 —— 改模块内部签名时要记得同步看板。
@@ -299,6 +298,6 @@ npm run db:cleanup:preview   # 零删除预演：occurrence 与保留策略会�
     `cancelled`；若某条正处于 `sending`（请求已发出、最多 10s 超时），用户 pull 读到之后
     仍会收到那一次推送。窗口是单次请求的时长，且 webhook 侧还有 55 分钟幂等窗口兜底，
     暂不为此引入「中断在途请求」的机制。
-11. ~~**`schedules` 的软删行永不回收**~~ —— **已实施**：`delete` 仍只把状态置为 `cancelled` 并删掉其 occurrence，但保留策略会删除已取消超 180 天的行。仍在的唯一豁免是 `countProtectedScheduleIds`：使用 `recurrence.count` 的日程（含已取消的）整条不删 —— 这是必要的（否则取消后再激活会让已达上限的循环复活），代价是这些行永久占用清理豁免。体量小，暂不再细分。
+11. ~~**`schedules` 的软删行永不回收**~~ —— **已实施**：`delete` 仍只把状态置为 `cancelled`（使用 `recurrence.count` 的日程保留其 occurrence 历史，其余日程删掉 occurrence），保留策略会删除已取消超 180 天的行。仍在的唯一豁免是 `countProtectedScheduleIds`：使用 `recurrence.count` 的日程（含已取消的）整条不删 —— 这是必要的（否则取消后再激活会让已达上限的循环复活），代价是这些行永久占用清理豁免。体量小，暂不再细分。
 12. **看板/`/api/schedules` 跨 Profile 展示日程**：状态页是「家庭看板」，`scheduleDetails` 不按 Profile 过滤，任一持有共享 `WEB_API_TOKEN` 的调用方都能看到所有 Profile 的日程标题与备注（`schedule` 工具本身是 Profile 私有的）。这与「个人账本仅归属人可见」并不一致。`/api/deliveries` 同样跨 Profile 展示通知标题；其中**个人账本的月报标题已脱敏**为「（个人账本月报）」，但其它通知（如日程提醒）仍按看板口径展示。当前定位是单用户单 token，暂按现状；若确实多用户部署，需要给日程/通知也引入可见性（家庭/个人），或让看板只显示家庭范围。
 13. **每日简报 / 调休提醒不做错过补发**：node-cron 不会补发错过的触发。daemon 若在 `DAILY_BRIEF_CRON` / `WORKDAY_WATCH_CRON` 的触发时刻停机（升级、重启），当天的简报、补班/放假/假期最后一天提醒不会补发；月报有 6 个月回看补发，这两类没有。需要补发只能等下一次 cron 或手工触发；若在 `onStart` 里按日期去重后补跑，需先可靠判断「自定义 cron 是否已到点」，复杂度较高，暂未实现。
