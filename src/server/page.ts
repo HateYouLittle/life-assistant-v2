@@ -600,11 +600,11 @@ const SCRIPT = `
           '<tr><td>节假日年份</td><td class="num">' + (s.holidays.years.join('、') || '无') + '</td></tr>' +
           '</tbody></table></div>' +
           '<div class="sect"><h3>原始状态</h3><div class="muted" style="font-size:11.5px">' +
-          'GET <a href="/api/status" style="color:inherit">/api/status</a> · ' +
-          'GET <a href="/api/expenses" style="color:inherit">/api/expenses</a> · ' +
-          'GET <a href="/api/schedules" style="color:inherit">/api/schedules</a> · ' +
-          'GET <a href="/api/deliveries" style="color:inherit">/api/deliveries</a> · ' +
-          'GET <a href="/api/holidays" style="color:inherit">/api/holidays</a></div></div>';
+          'GET <a href="#" data-api="/api/status" style="color:inherit">/api/status</a> · ' +
+          'GET <a href="#" data-api="/api/expenses" style="color:inherit">/api/expenses</a> · ' +
+          'GET <a href="#" data-api="/api/schedules" style="color:inherit">/api/schedules</a> · ' +
+          'GET <a href="#" data-api="/api/deliveries" style="color:inherit">/api/deliveries</a> · ' +
+          'GET <a href="#" data-api="/api/holidays" style="color:inherit">/api/holidays</a></div></div>';
       }).catch(fail);
     });
   }
@@ -619,6 +619,20 @@ const SCRIPT = `
   var TITLES = { expenses: '支出明细', schedules: '日程明细', deliveries: '投递明细', holidays: '节假日明细', system: '系统信息' };
 
   document.addEventListener('click', function (ev) {
+    // 原始状态链接不能直接用 href：普通导航不会带 Authorization 头，配了 token
+    // 必然 401。改为走页面已有的 api()（带 Bearer）并把 JSON 渲染在抽屉里。
+    var raw = ev.target.closest('[data-api]');
+    if (raw) {
+      if (typeof ev.preventDefault === 'function') ev.preventDefault();
+      var path = raw.getAttribute('data-api');
+      drawerSub.textContent = path;
+      drawerBody.innerHTML = '<div class="spin">加载中…</div>';
+      api(path).then(function (d) {
+        drawerBody.innerHTML = '<pre style="white-space:pre-wrap;word-break:break-word;font-size:11.5px;margin:0">' +
+          esc(JSON.stringify(d, null, 2)) + '</pre>';
+      }).catch(fail);
+      return;
+    }
     var target = ev.target.closest('[data-drawer]');
     if (target) {
       var kind = target.getAttribute('data-drawer');

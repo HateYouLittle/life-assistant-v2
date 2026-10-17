@@ -6,7 +6,7 @@ outbox 主动推送 + 状态页，共用一个 SQLite 文件。
 
 ## 命令
 
-需要 Node.js **>= 22.13**（使用内置 `node:sqlite`，无外部数据库驱动）。
+需要 Node.js **>= 22.16**（使用内置 `node:sqlite`；`isOpen` 需 22.15、`isTransaction` 需 22.16，无外部数据库驱动）。
 
 ```bash
 npm install
@@ -18,13 +18,13 @@ npm test                           # node:test + tsx 跑 tests/**/*.test.ts
 npm run build                      # tsc -> dist/
 ```
 
-CI（`.github/workflows/ci.yml`）在 Node 22 和 24 上按此顺序运行：
+CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序运行：
 `typecheck -> lint -> format:check -> test -> build`。自称完成前先跑完整链路。
 
 - 只跑单个测试文件：`node --import tsx/esm --test tests/schedule.test.ts`
 - `npm run dev` 用 tsx 跑 `src/daemon.ts`；`npm start` 跑构建产物 `dist/daemon.js`
-  （需先 `npm run build`）。`db:backup` / `db:cleanup:preview` / `import:v1` 同理：
-  无前缀脚本依赖 `dist/`，`dev:*` 变体直接跑 TS 源码。
+  （需先 `npm run build`）。`db:backup` / `db:cleanup:preview` / `doctor` / `import:v1`
+  同理：无前缀脚本依赖 `dist/`，`dev:*` 变体直接跑 TS 源码。
 - `.env` 只会被 `start` / `dev` / `db:backup` / `db:cleanup:preview` / `doctor` /
   `import:v1` 及其 `dev:*` 变体通过 `--env-file-if-exists` 自动读取。其他命令需手动
   `set -a; source .env; set +a`。

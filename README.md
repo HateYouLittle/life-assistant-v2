@@ -18,7 +18,7 @@
 
 ## 安装
 
-要求 Node.js ≥ 22.13。
+要求 Node.js ≥ 22.16（`node:sqlite` 的 `isOpen` / `isTransaction` 需要该版本）。
 
 ```bash
 npm install
@@ -51,7 +51,7 @@ npm run build
 | `ALERT_WATCH_CRON` | | 气象预警巡检时间，默认 `'*/20 * * * *'` |
 | `ALERT_MIN_LEVEL` | | 低于此级别的预警不主动推送，`blue|yellow|orange|red`，默认 `blue`（=全部级别都推） |
 | `WORKDAY_WATCH_CRON` | | 调休/补班提醒巡检时间，默认 `'0 7 * * *'` |
-| `WORKDAY_REMIND_DAYS_BEFORE` | | 假期首日前几天推放假安排，默认 `3`（上限 30） |
+| `WORKDAY_REMIND_DAYS_BEFORE` | | 假期首日前几天推放假安排，默认 `3`（上限 30）；`0` 表示关闭「假期临近」提醒（首日当天也不推） |
 | `MCP_DAEMON_URL` | | stdio 壳连接的 daemon 地址，默认 `http://127.0.0.1:3080` |
 | `LOG_LEVEL` | | `debug`/`info`/`warn`/`error`，默认 `info` |
 
@@ -211,7 +211,7 @@ systemctl start life-assistant                    # 4. 启动并打开状态页�
 | 收不到主动推送 | 依次查：`notify {action:"quiet_hours"}`（静默时段）→ `notify {action:"route"}`（路由与 `secretConfigured`）→ 状态页「投递」卡片的 queued/failed/fallback 计数 |
 | 天气工具报 `UNAUTHORIZED` / `NO CREDIT` | JWT 私钥或 API KEY 问题：换 JWT 前请确认私钥是 Ed25519 PKCS8、路径为绝对路径（首次请求才校验） |
 | `holidays.failed` 列出年份 | 抓取失败（无外网/CDN 不可达/数据校验不通过），原因就在该行；期间 `workday/holiday` 过滤的日程会暂停而不是猜 |
-| 通知明明发出但用户说没收到 | 先 `notify.pull`（静默时段与投递失败都只影响主动推送，通知本身保留） |
+| 通知没收到 | 先 `notify.pull`（只返回未读：静默时段/投递失败/无路由的通知可拉到；已成功投递的通知会被标记已读，pull 不再返回） |
 
 
 ## 从 v1 迁移
@@ -246,12 +246,12 @@ npm run dev            # tsx 直接跑 daemon
 npm test               # node --test（全部用例）
 npm run lint           # Biome lint（error 级诊断才让命令失败；warn 不会）
 npm run format:check   # Biome 格式检查（CI 也跑）
-npm run doctor         # 自检：配置/目录/库完整性/鉴权/JWT 私钥/备份（--network 另有连通性检查：节假日数据源按 requiredYears() 逐年份、与 daemon 同一套判定，QWeather 仅探测可达）
+npm run doctor         # 自检：配置/目录/库完整性/鉴权/JWT 私钥/备份（--network 另有连通性检查：节假日数据源按 requiredYears() 逐年份、仅探测可获取（daemon 导入时还会做数据校验），QWeather 仅探测可达）
 npm run db:backup      # VACUUM INTO 备份，保留最近 14 份
 npm run db:cleanup:preview   # 零删除预演：occurrence 与保留策略会删掉哪些行（数字与 job 同一份判定）
 ```
 
-> `db:backup` / `db:cleanup:preview` / `import:v1` 跑的是 `dist/` 里的构建产物，先
+> `db:backup` / `db:cleanup:preview` / `doctor` / `import:v1` 跑的是 `dist/` 里的构建产物，先
 > `npm run build`（或改用对应的 `dev:*` 变体直接跑源码）。
 
 结构：`src/core`（database/registry/auth/http/logger/settings/notify/render/qweather/qweather-jwt/holiday/recurrence/retention）、`src/modules`（weather/holiday/schedule/bookkeeping/notify，经 `modules/index.ts` 注册，核心不反向依赖）、`src/server`（status/page/details，状态页与只读 API）、`src/daemon.ts`、`src/stdio.ts`、`src/config.ts`、`src/time.ts`、`src/import-v1.ts`、`src/backup.ts`、`src/cleanup-preview.ts`。
@@ -300,4 +300,5 @@ npm run db:cleanup:preview   # 零删除预演：occurrence 与保留策略会�
     仍会收到那一次推送。窗口是单次请求的时长，且 webhook 侧还有 55 分钟幂等窗口兜底，
     暂不为此引入「中断在途请求」的机制。
 11. ~~**`schedules` 的软删行永不回收**~~ —— **已实施**：`delete` 仍只把状态置为 `cancelled` 并删掉其 occurrence，但保留策略会删除已取消超 180 天的行。仍在的唯一豁免是 `countProtectedScheduleIds`：使用 `recurrence.count` 的日程（含已取消的）整条不删 —— 这是必要的（否则取消后再激活会让已达上限的循环复活），代价是这些行永久占用清理豁免。体量小，暂不再细分。
-12. **看板/`/api/schedules` 跨 Profile 展示日程**：状态页是「家庭看板」，`scheduleDetails` 不按 Profile 过滤，任一持有共享 `WEB_API_TOKEN` 的调用方都能看到所有 Profile 的日程标题与备注（`schedule` 工具本身是 Profile 私有的）。这与「个人账本仅归属人可见」并不一致。当前定位是单用户单 token，暂按现状；若确实多用户部署，需要给日程也引入可见性（家庭/个人），或让看板只显示家庭日程。
+12. **看板/`/api/schedules` 跨 Profile 展示日程**：状态页是「家庭看板」，`scheduleDetails` 不按 Profile 过滤，任一持有共享 `WEB_API_TOKEN` 的调用方都能看到所有 Profile 的日程标题与备注（`schedule` 工具本身是 Profile 私有的）。这与「个人账本仅归属人可见」并不一致。`/api/deliveries` 同样跨 Profile 展示通知标题；其中**个人账本的月报标题已脱敏**为「（个人账本月报）」，但其它通知（如日程提醒）仍按看板口径展示。当前定位是单用户单 token，暂按现状；若确实多用户部署，需要给日程/通知也引入可见性（家庭/个人），或让看板只显示家庭范围。
+13. **每日简报 / 调休提醒不做错过补发**：node-cron 不会补发错过的触发。daemon 若在 `DAILY_BRIEF_CRON` / `WORKDAY_WATCH_CRON` 的触发时刻停机（升级、重启），当天的简报、补班/放假/假期最后一天提醒不会补发；月报有 6 个月回看补发，这两类没有。需要补发只能等下一次 cron 或手工触发；若在 `onStart` 里按日期去重后补跑，需先可靠判断「自定义 cron 是否已到点」，复杂度较高，暂未实现。

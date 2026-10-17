@@ -156,6 +156,34 @@ describe("bookkeeping 预算：阈值触达提醒", () => {
     }
   });
 
+  it("无关分类的支出不得触发分类预算提醒（before 只在该笔计入预算时扣减）", () => {
+    const env = makeTestEnv();
+    const tool = makeTools(env);
+    try {
+      const ledger = JSON.parse(text(tool.ledger({ action: "create", name: "无关分类" }))) as {
+        已创建: { id: string };
+      };
+      const ledgerId = ledger.已创建.id;
+      // 先花 500 餐饮，再设 600 预算：模拟「预算在已有支出之后才设置」，
+      // 此时餐饮已占 83.3% 但没有任何历史 80% 提醒。
+      tool.expense({ action: "add", ledger_id: ledgerId, amount: 500, category: "餐饮" });
+      tool.ledger({ action: "budget", ledger_id: ledgerId, amount: 600, category: "餐饮" });
+      assert.equal(tool.budgetAlerts().length, 0, "设置预算本身不推送");
+
+      // 无关的交通支出：旧实现会把它从餐饮的 after 里扣掉，误判跨越 80%。
+      tool.expense({ action: "add", ledger_id: ledgerId, amount: 100, category: "交通" });
+      assert.deepEqual(tool.budgetAlertAttempts(), [], "无关分类不得产生预算提醒尝试");
+
+      // 同分类支出仍然正常判定：500 → 600 跨过 100%（80% 在设预算前就已超过）。
+      tool.expense({ action: "add", ledger_id: ledgerId, amount: 100, category: "餐饮" });
+      const attempts = tool.budgetAlertAttempts();
+      assert.equal(attempts.length, 1, "同分类支出应正常判定一次");
+      assert.match(attempts[0]?.dedupeKey ?? "", /:餐饮:\d{4}-\d{2}:100$/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("总额预算：跨 80% 推一条、跨 100% 推一条，同阈值不重推（dedupeKey）", () => {
     const env = makeTestEnv();
     const tool = makeTools(env);

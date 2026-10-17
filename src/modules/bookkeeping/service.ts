@@ -465,7 +465,11 @@ export function budgetAlertsForEntry(
   for (const budget of budgets) {
     const after =
       budget.category === "" ? summary.total_cents : (spentByCategory.get(budget.category) ?? 0);
-    const before = after - entry.amount_cents;
+    // 只有本笔确实计入该预算范围时，才能用它反推「记账前」：总额预算总是计入；
+    // 分类预算仅当本笔分类与预算分类一致时计入。否则一笔无关分类的支出会把
+    // before 人为压低，制造一次并不存在的「跨越阈值」提醒（如记交通却推餐饮超支）。
+    const countsThisEntry = budget.category === "" || budget.category === entry.category;
+    const before = countsThisEntry ? after - entry.amount_cents : after;
     const crossed = [...BUDGET_THRESHOLDS]
       .reverse()
       .find(

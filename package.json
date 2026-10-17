@@ -4,7 +4,7 @@
   "description": "Life Assistant v2 — single-daemon personal life assistant (MCP + scheduler + outbox) for Hermes Agent",
   "type": "module",
   "engines": {
-    "node": ">=22.13"
+    "node": ">=22.16.0"
   },
   "main": "dist/daemon.js",
   "scripts": {

@@ -481,6 +481,17 @@ describe("QWeather：v1 错误体（HTTP 200 + body.error）不被当成空结�
     db.close();
   });
 
+  it("alerts 存在但不是数组时抛错，不得当成「当前无预警」", async () => {
+    const db = makeDb();
+    await withFetch(
+      () => jsonResponse({ metadata: { zeroResult: true }, alerts: null }),
+      async () => {
+        await assert.rejects(() => alerts(db, HOST, KEY, LOC), /结构不合法/);
+      },
+    );
+    db.close();
+  });
+
   it("空气质量污染物为 null/空串时不产出 0（0 会被当成实测值展示）", async () => {
     const db = makeDb();
     await withFetch(
@@ -620,6 +631,33 @@ describe("QWeather：v1 字段/单位映射（迁移回归）", () => {
       () => jsonResponse({ ...v1Current(), temperature: undefined }),
       async () => {
         await assert.rejects(() => currentWeather(db, HOST, KEY, LOC), /temperature/);
+      },
+    );
+    db.close();
+  });
+
+  it("温度单位不是 °C 时报错，而不是把 °F 静默标成 °C", async () => {
+    const db = makeDb();
+    await withFetch(
+      () => jsonResponse({ ...v1Current(), temperature: { value: 80, unit: "°F" } }),
+      async () => {
+        await assert.rejects(() => currentWeather(db, HOST, KEY, LOC), /单位不支持/);
+      },
+    );
+    db.close();
+  });
+
+  it("降水量单位不是 mm 时报错，而不是把英寸静默标成 mm", async () => {
+    const db = makeDb();
+    const day = v1Day({ start: localDayStart(todayIso()) });
+    const daytime = day.daytime as {
+      precipitation: { amount: { value: number; unit: string } };
+    };
+    daytime.precipitation.amount.unit = "in";
+    await withFetch(
+      () => jsonResponse(v1Daily([day])),
+      async () => {
+        await assert.rejects(() => forecast(db, HOST, KEY, LOC, 7), /单位不支持/);
       },
     );
     db.close();

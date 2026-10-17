@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { describe, it, type TestContext } from "node:test";
 import * as vm from "node:vm";
 import { DateTime } from "luxon";
 import { resolveToken, statusPage } from "../src/server/page.js";
@@ -544,6 +544,81 @@ describe("看板明细接口", () => {
     }
   });
 
+  it("/api/deliveries 对个人账本月报标题脱敏，家庭账本照常展示", async () => {
+    const env = makeTestEnv();
+    try {
+      env.db
+        .prepare(
+          "INSERT INTO ledgers (id, name, created_at, owner_profile_id) VALUES ('lp', '私房钱', '2026-01-01T00:00:00.000Z', 'default')",
+        )
+        .run();
+      env.db
+        .prepare(
+          "INSERT INTO ledgers (id, name, created_at) VALUES ('lf', '家庭账本', '2026-01-01T00:00:00.000Z')",
+        )
+        .run();
+      const insertNotification = env.db.prepare(
+        `INSERT INTO notifications (id, profile_id, kind, title, body_md, dedupe_key, read, created_at)
+         VALUES (?, 'default', 'bookkeeping.monthly', ?, '', ?, 1, '2026-10-01T00:00:00.000Z')`,
+      );
+      insertNotification.run("n-personal", "2026-09 月度账单 · 私房钱", "report:lp:2026-09");
+      insertNotification.run("n-family", "2026-09 月度账单 · 家庭账本", "report:lf:2026-09");
+      const insertDelivery = env.db.prepare(
+        `INSERT INTO deliveries (id, notification_id, route_name, status, next_attempt_at, created_at, updated_at)
+         VALUES (?, ?, 'r', 'sent', '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z')`,
+      );
+      insertDelivery.run("d-personal", "n-personal");
+      insertDelivery.run("d-family", "n-family");
+
+      const body = (await (await app(env).request("/api/deliveries")).json()) as {
+        items: { notification_id: string; title: string }[];
+      };
+      const personal = body.items.find((i) => i.notification_id === "n-personal");
+      const family = body.items.find((i) => i.notification_id === "n-family");
+      assert.equal(personal?.title, "（个人账本月报）", "个人账本标题不得出现在共享看板");
+      assert.equal(family?.title, "2026-09 月度账单 · 家庭账本", "家庭账本标题应保持原样");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("跨年假期条目按日期年份归属：12-31 的元旦出现在当年视图且天数完整", async (t: TestContext) => {
+    t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2099-12-15T10:00:00+08:00") });
+    const env = makeTestEnv();
+    try {
+      const insertYear = env.db.prepare(
+        "INSERT INTO cn_holiday_years (year, status, source, fetched_at) VALUES (?, 'ready', 'test', '2099-01-01T00:00:00.000Z')",
+      );
+      insertYear.run(2099);
+      insertYear.run(2100);
+      const insertDay = env.db.prepare(
+        "INSERT INTO cn_holiday_days (date, year, day_type, name, source, updated_at) VALUES (?, ?, 'holiday', '元旦', 'test', '2099-01-01T00:00:00.000Z')",
+      );
+      // 2100 年度文件里的跨年元旦：12-31 是 2099 日历日，但行内 year 记 2100
+      insertDay.run("2099-12-31", 2100);
+      insertDay.run("2100-01-01", 2100);
+      insertDay.run("2100-01-02", 2100);
+
+      const body = (await (await app(env).request("/api/holidays?year=2099")).json()) as {
+        year: number;
+        days: { date: string }[];
+        upcoming: { date: string; name: string; days_until: number; days: number }[];
+      };
+      assert.equal(body.year, 2099);
+      assert.ok(
+        body.days.some((d) => d.date === "2099-12-31"),
+        "12-31 必须出现在 2099 的年度视图里",
+      );
+      assert.deepEqual(
+        body.upcoming[0],
+        { date: "2099-12-31", name: "元旦", days_until: 16, days: 3 },
+        "跨年假期必须按全部日期合并，天数不能被年份边界截断",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("/api/holidays 合并连续假期为一段", async () => {
     const env = makeTestEnv();
     try {
@@ -606,6 +681,7 @@ describe("看板明细接口", () => {
       assert.match(html, /id="drawer"/);
       assert.match(html, /\/api\/expenses/);
       assert.match(html, /30\d{3}\)/, "应有 30 秒自动刷新");
+      assert.match(html, /data-api="\/api\/status"/, "原始状态入口应走带鉴权的 fetch");
     } finally {
       cleanupTestEnv(env);
     }

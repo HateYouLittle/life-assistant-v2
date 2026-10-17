@@ -310,7 +310,19 @@ export function deliveryDetails(db: DatabaseSync, rawLimit: string | undefined):
 
   const items = db
     .prepare(
-      `SELECT d.id, d.notification_id, COALESCE(n.title, '（通知已删除）') AS title,
+      // 状态页是共享 token 的「家庭看板」，个人账本的月报标题不应出现在这里。
+      // 通知本身没有可见性列，但月报的 dedupe_key 形如 report:<ledgerId>:<YYYY-MM>，
+      // 可据此识别个人账本并只脱敏标题（其余投递仍照常展示）。
+      `SELECT d.id, d.notification_id,
+              CASE
+                WHEN n.kind = 'bookkeeping.monthly' AND EXISTS (
+                  SELECT 1 FROM ledgers l
+                  WHERE l.owner_profile_id IS NOT NULL
+                    AND substr(n.dedupe_key, 1, length('report:' || l.id || ':')) =
+                        'report:' || l.id || ':'
+                ) THEN '（个人账本月报）'
+                ELSE COALESCE(n.title, '（通知已删除）')
+              END AS title,
               COALESCE(n.profile_id, '-') AS profile_id, d.route_name, d.status, d.attempts,
               d.confirmed_failures, d.transport_failures, d.created_at, d.sent_at, d.next_attempt_at, d.last_error
        FROM deliveries d LEFT JOIN notifications n ON n.id = d.notification_id
@@ -381,22 +393,36 @@ export function holidayDetails(db: DatabaseSync, rawYear: string | undefined): H
       ? parsedYear
       : fallbackYear;
 
+  // year 列是「数据文件年份」，跨年条目（如 2027.json 里的 2026-12-31）会记成 2027。
+  // 展示必须按**日期所属年份**筛，否则年末的元旦假期会被从当年视图里漏掉。
   const days = db
-    .prepare("SELECT date, name, day_type FROM cn_holiday_days WHERE year = ? ORDER BY date")
-    .all(year) as { date: string; name: string; day_type: string }[];
+    .prepare(
+      "SELECT date, name, day_type FROM cn_holiday_days WHERE date >= ? AND date <= ? ORDER BY date",
+    )
+    .all(`${year}-01-01`, `${year}-12-31`) as {
+    date: string;
+    name: string;
+    day_type: string;
+  }[];
 
-  // 连续的同名假期日合成一段，取首日作为「下一个假期」
+  // 「接下来的假期」按全部日期合并，而不是只看选中/回退年份：
+  // 跨年假期（如 12-31 起的元旦）在年度视图里会被年份边界拆成两段，
+  // 按全量合并才能给出正确的起始日与总天数。
+  const upcomingRows = db
+    .prepare(
+      "SELECT date, name FROM cn_holiday_days WHERE day_type = 'holiday' AND date >= ? ORDER BY date",
+    )
+    .all(today) as { date: string; name: string }[];
   const upcoming: HolidayDetails["upcoming"] = [];
-  const holidayDays = days.filter((d) => d.day_type === "holiday" && d.date >= today);
   let index = 0;
-  while (index < holidayDays.length && upcoming.length < 6) {
-    const first = holidayDays[index] as { date: string; name: string };
+  while (index < upcomingRows.length && upcoming.length < 6) {
+    const first = upcomingRows[index] as { date: string; name: string };
     let span = 1;
-    while (index + span < holidayDays.length) {
-      const prev = DateTime.fromISO((holidayDays[index + span - 1] as { date: string }).date, {
+    while (index + span < upcomingRows.length) {
+      const prev = DateTime.fromISO((upcomingRows[index + span - 1] as { date: string }).date, {
         zone: TZ,
       });
-      const next = DateTime.fromISO((holidayDays[index + span] as { date: string }).date, {
+      const next = DateTime.fromISO((upcomingRows[index + span] as { date: string }).date, {
         zone: TZ,
       });
       if (next.diff(prev, "days").days !== 1) break;

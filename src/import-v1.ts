@@ -3,10 +3,10 @@ import { existsSync, readdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { DateTime } from "luxon";
 import { loadConfig, PROFILE_ID_RE } from "./config.js";
-import { TZ } from "./time.js";
+import { TIME_RE, TZ, isDate } from "./time.js";
 import { openDatabase, withTransaction } from "./core/database.js";
 import { logger } from "./core/logger.js";
-import { ensureProfile, setSetting } from "./core/settings.js";
+import { ensureProfile, getSetting, setSetting } from "./core/settings.js";
 import { collapseLunarInterval, type Recurrence } from "./core/recurrence.js";
 
 /**
@@ -242,7 +242,7 @@ function mapRecurrence(
       return { recurrence: { freq: "daily", ...base }, workdayFilter: "holiday" };
   }
   warnings.push(
-    `日程「${title}」的循环类型 ${String(parsed.frequency)}（${calendar}）不支持，按每年循环导入`,
+    `日程「${title}」的循环类型 ${String(parsed.frequency)}（${calendar}）无法在 v2 表达，已按每年循环导入`,
   );
   return { recurrence: { freq: "yearly", ...base }, workdayFilter: "any" };
 }
@@ -410,6 +410,16 @@ export function runImport(
           continue;
         }
         try {
+          // 导入只应「补上目标库没有的配置」。目标库已有静默时段时，未加 --force
+          // 不得静默覆盖（非空守卫只检查 schedules/ledgers/notifications，拦不住
+          // 只配过静默时段的 v2 库）。
+          if (!force && getSetting(target, s.profile_id, "quiet_hours") !== undefined) {
+            warnings(
+              report,
+              `Profile ${s.profile_id} 已有静默时段设置，未覆盖（如需覆盖请加 --force）`,
+            );
+            continue;
+          }
           setSetting(target, s.profile_id, "quiet_hours", {
             start: s.quiet_start,
             end: s.quiet_end,
@@ -437,6 +447,26 @@ export function runImport(
         try {
           const kind = ["todo", "birthday", "anniversary"].includes(s.type) ? s.type : "todo";
           const calendar = s.calendar === "lunar" ? "lunar" : "solar";
+          // 公历行必须有真实日期；时间对所有日历都必填。否则会静默导入
+          // 「零 occurrence 的死行」（date=NULL），或让每分钟的物化都抛错（time 非法）。
+          if (!TIME_RE.test(s.time)) {
+            problem(
+              report,
+              "schedules",
+              s.id,
+              `日程「${s.title}」时间不合法（${String(s.time)}），未导入`,
+            );
+            continue;
+          }
+          if (calendar === "solar" && !(typeof s.date === "string" && isDate(s.date))) {
+            problem(
+              report,
+              "schedules",
+              s.id,
+              `日程「${s.title}」公历日期缺失或不合法（${String(s.date)}），未导入`,
+            );
+            continue;
+          }
           const mappedStatus = STATUS_MAP[s.status];
           if (mappedStatus === undefined) {
             report.scheduleWarnings.push(

@@ -1,5 +1,6 @@
 import { z } from "zod";
-import { TIME_RE } from "../../time.js";
+import { DateTime } from "luxon";
+import { TIME_RE, TZ } from "../../time.js";
 import {
   errorMessage,
   fail,
@@ -18,6 +19,12 @@ import {
   setPushRouteEnabled,
 } from "../../core/notify.js";
 import { deleteSetting, getSetting, setSetting } from "../../core/settings.js";
+
+/** UTC ISO → 本地（Asia/Shanghai）文本；解析失败原样返回，不编造 */
+function localTimeText(iso: string): string {
+  const dt = DateTime.fromISO(iso, { zone: TZ });
+  return dt.isValid ? dt.toFormat("yyyy-LL-dd HH:mm") : iso;
+}
 
 export function notifyTool(args: Record<string, unknown>, ctx: ToolContext) {
   try {
@@ -56,9 +63,13 @@ function notifyToolInner(args: Record<string, unknown>, ctx: ToolContext) {
     ).run(profileId, ...rows.map((r) => r.id));
     return okJson({
       未读通知: rows.map((r) => ({
+        // id 是 cancel 的输入；pull 不回传它会让 notify.cancel 无法从工具输出获得 id。
+        id: r.id,
         标题: r.title,
         种类: r.kind,
         时间: r.created_at,
+        // 原「时间」是 UTC ISO（差 8 小时易误读），补本地文本；原键保留不动
+        "时间(本地)": localTimeText(r.created_at),
         内容: r.body_md,
       })),
       数量: rows.length,

@@ -39,6 +39,17 @@ describe("notify 工具", () => {
       const first = tool(env, { action: "pull" });
       assert.match(text(first), /通知一/);
       assert.match(text(first), /通知二/);
+      const pulled = JSON.parse(text(first)) as {
+        未读通知: { id: string; 时间: string; "时间(本地)": string }[];
+      };
+      assert.ok(
+        pulled.未读通知.every((n) => typeof n.id === "string" && n.id.length > 0),
+        "pull 必须回传 id，否则 cancel 无法从工具输出取得通知 id",
+      );
+      assert.ok(
+        pulled.未读通知.every((n) => /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(n["时间(本地)"])),
+        "pull 必须补本地时间，避免 agent 把 UTC 直接报给用户",
+      );
       assert.equal(
         (
           env.db.prepare("SELECT COUNT(*) AS n FROM notifications WHERE read = 0").get() as {

@@ -4,6 +4,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { resolveOldDbPath, runImport } from "../src/import-v1.js";
+import { getSetting, setSetting } from "../src/core/settings.js";
 import { cleanupTestEnv, makeTestEnv } from "./helpers.js";
 
 const OLD_DDL = `
@@ -277,6 +278,81 @@ describe("import:v1", () => {
         ),
         `农历 interval 收敛必须留痕，实际 ${JSON.stringify(report.scheduleWarnings)}`,
       );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("未加 --force 不覆盖目标库已有的静默时段；--force 才覆盖", () => {
+    const env = makeTestEnv();
+    try {
+      const oldPath = `${env.dir}/old-quiet.db`;
+      const old = new DatabaseSync(oldPath);
+      old.exec(OLD_DDL);
+      const ts = "2026-01-01T00:00:00.000Z";
+      old.prepare("INSERT INTO profiles VALUES ('p1', ?)").run(ts);
+      old
+        .prepare("INSERT INTO profile_settings VALUES ('p1', '22:00', '07:00', 'Asia/Shanghai', ?)")
+        .run(ts);
+      old.close();
+
+      // 目标库已配置静默时段（但没有 schedules/ledgers/notifications，非空守卫放行）
+      setSetting(env.db, "p1", "quiet_hours", { start: "23:00", end: "06:00" });
+      const report = runImport(env.db, oldPath);
+      assert.deepEqual(
+        getSetting(env.db, "p1", "quiet_hours"),
+        { start: "23:00", end: "06:00" },
+        "未加 --force 时不得静默覆盖目标库配置",
+      );
+      assert.ok(
+        report.scheduleWarnings.some((w) => w.includes("未覆盖") && w.includes("--force")),
+        `应提示未覆盖及 --force：${JSON.stringify(report.scheduleWarnings)}`,
+      );
+
+      runImport(env.db, oldPath, true);
+      assert.deepEqual(
+        getSetting(env.db, "p1", "quiet_hours"),
+        { start: "22:00", end: "07:00" },
+        "--force 才覆盖目标库静默时段",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("公历日期缺失 / 时间非法的日程逐行隔离，不再静默导入死行", () => {
+    const env = makeTestEnv();
+    try {
+      const oldPath = `${env.dir}/old-bad-solar.db`;
+      const old = new DatabaseSync(oldPath);
+      old.exec(OLD_DDL);
+      const ts = "2026-01-01T00:00:00.000Z";
+      old.prepare("INSERT INTO profiles VALUES ('p1', ?)").run(ts);
+      const insert = old.prepare(
+        `INSERT INTO schedules (profile_id, id, type, title, status, calendar, date, lunar_month, lunar_day,
+           leap_month_policy, time, all_day, timezone, recurrence_json, reminders_json, reminder_interval_minutes,
+           enabled, version, created_at, updated_at)
+         VALUES ('p1', ?, 'todo', ?, 'active', 'solar', ?, NULL, NULL, NULL, ?, 0, 'Asia/Shanghai',
+           '{"frequency":"yearly","interval":1}', '[]', NULL, 1, 1, ?, ?)`,
+      );
+      // 公历 date=NULL：物化永不产出 occurrence（静默死行）
+      insert.run("s-nodate", "无日期", null, "09:00", ts, ts);
+      // 时间非法：物化会每分钟抛「本地时间不合法」
+      insert.run("s-badtime", "坏时间", "2026-02-02", "25:99", ts, ts);
+      old.close();
+
+      const report = runImport(env.db, oldPath);
+      assert.equal(report.schedules, 0, "两条坏行都不应入库");
+      assert.ok(
+        report.problems.some((p) => p.id === "s-nodate" && /公历日期/.test(p.reason)),
+        `date=NULL 必须逐行隔离：${JSON.stringify(report.problems)}`,
+      );
+      assert.ok(
+        report.problems.some((p) => p.id === "s-badtime" && /时间不合法/.test(p.reason)),
+        `time 非法必须逐行隔离：${JSON.stringify(report.problems)}`,
+      );
+      const count = env.db.prepare("SELECT COUNT(*) AS n FROM schedules").get() as { n: number };
+      assert.equal(count.n, 0);
     } finally {
       cleanupTestEnv(env);
     }

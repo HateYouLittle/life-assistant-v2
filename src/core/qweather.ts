@@ -557,12 +557,26 @@ export function saveLocation(db: DatabaseSync, profileId: string, loc: LocationI
  * 解包 v1 的 `{value, unit}` 度量对象。v7 把数值写成裸字符串，v1 一律包一层，
  * 直接取字段会得到对象（`Number({...})` = NaN）——必须先解包再校验。
  */
-function measureValue(value: unknown, field: string): number {
+function measureValue(value: unknown, field: string, units?: readonly string[]): number {
   if (typeof value !== "object" || value === null) {
     throw new Error(`QWeather ${field} 度量对象不合法: ${String(value)}`);
   }
-  return num((value as { value?: unknown }).value, field);
+  const raw = value as { value?: unknown; unit?: unknown };
+  if (units !== undefined) {
+    const unit = String(raw.unit ?? "")
+      .trim()
+      .toLowerCase();
+    // 单位缺失时按上游默认值处理（v1 一直带 unit）；带了不认识的单位必须报错，
+    // 否则 °F 会被静默标成 °C、英寸会被静默标成 mm。
+    if (unit !== "" && !units.includes(unit)) {
+      throw new Error(`QWeather ${field} 单位不支持: ${String(raw.unit)}`);
+    }
+  }
+  return num(raw.value, field);
 }
+
+/** 温度单位白名单（v1 返回 °C；兼容不带符号的写法） */
+const TEMPERATURE_UNITS = ["°c", "c", "℃", "celsius"] as const;
 
 function round1(value: number): number {
   return Math.round(value * 10) / 10;
@@ -585,7 +599,16 @@ function windSpeedKmh(wind: unknown): number {
 
 /** 某半天（daytime/nighttime）的降水量 mm；缺失/非法按 0 计（不是「有降水」） */
 function periodPrecipMm(period: Record<string, unknown> | undefined): number {
-  const amount = (period?.precipitation as { amount?: { value?: unknown } } | undefined)?.amount;
+  const amount = (
+    period?.precipitation as { amount?: { value?: unknown; unit?: unknown } } | undefined
+  )?.amount;
+  const unit = String(amount?.unit ?? "")
+    .trim()
+    .toLowerCase();
+  // 单位缺失时按 mm 处理；带单位就必须是 mm，否则降水量会被静默错报。
+  if (unit !== "" && unit !== "mm" && unit !== "millimeter" && unit !== "millimeters") {
+    throw new Error(`QWeather precipitation 单位不支持: ${String(amount?.unit)}`);
+  }
   const value = amount?.value;
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
 }
@@ -630,8 +653,8 @@ export async function currentWeather(
       );
     }
     return {
-      temp: measureValue(body.temperature, "temperature"),
-      feelsLike: measureValue(body.feelsLike, "feelsLike"),
+      temp: measureValue(body.temperature, "temperature", TEMPERATURE_UNITS),
+      feelsLike: measureValue(body.feelsLike, "feelsLike", TEMPERATURE_UNITS),
       humidity: Math.round(humidity * 100),
       windSpeed: windSpeedKmh(body.wind),
       text: conditionText(body),
@@ -699,8 +722,8 @@ export async function forecast(
           const precip = round1(periodPrecipMm(daytime) + periodPrecipMm(nighttime));
           return {
             date: localDateOf(d.forecastStartTime),
-            tMax: measureValue(d.temperatureMax, "temperatureMax"),
-            tMin: measureValue(d.temperatureMin, "temperatureMin"),
+            tMax: measureValue(d.temperatureMax, "temperatureMax", TEMPERATURE_UNITS),
+            tMin: measureValue(d.temperatureMin, "temperatureMin", TEMPERATURE_UNITS),
             textDay: conditionText(daytime) || conditionText(nighttime),
             precipMm: precip > 0 ? precip : undefined,
           };
@@ -762,7 +785,11 @@ export async function alerts(
     //
     // alerts 缺失时不能一律当成「无预警」：结构异常（如错误响应体）会被静默成空结果，
     // 「无预警」是安全相关的结论，宁可抛错让调用方显示「未知」。
-    // 只有看起来正常的「零结果」响应（带 metadata 或业务码）才当空处理。
+    // 只有看起来正常的「零结果」响应（带 metadata 或业务码）才当空处理；
+    // alerts 字段存在但不是数组同样属于结构异常（如 alerts:null），不得当成零结果。
+    if (body.alerts !== undefined && !Array.isArray(body.alerts)) {
+      throw new Error("QWeather weatheralert 响应结构不合法：alerts 不是数组");
+    }
     if (!Array.isArray(body.alerts)) {
       if (body.metadata !== undefined || body.code !== undefined) return [];
       throw new Error("QWeather weatheralert 响应结构不合法：既无 alerts 也无 metadata/code");

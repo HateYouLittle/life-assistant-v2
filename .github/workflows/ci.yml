@@ -10,7 +10,9 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node: [22, 24]
+        # 22.16.0 是 package.json engines 的下界（isOpen/isTransaction），
+        # 只测最新的 22.x 会漏掉下界回归。
+        node: [22.16.0, 22, 24]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

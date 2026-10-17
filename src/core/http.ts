@@ -55,14 +55,48 @@ export function isTransientNetworkError(e: unknown): boolean {
   return !/redirect|invalid url/i.test(message);
 }
 
+/**
+ * 最多只把前 MAX_ERROR_BODY 字节读进内存。不能先 `response.text()` 再 slice：
+ * 那样巨大错误响应体已经整段进过内存，注释承诺的防护并不成立。
+ * 没有可读流的实现（测试桩/极旧运行时）退化为整体读取，但仍只保留前 MAX 字符。
+ */
 async function readErrorDetail(response: Response): Promise<string> {
   let text = "";
   try {
     if (response.body === null) return "";
-    text = (await response.text()).slice(0, MAX_ERROR_BODY);
+    const body = response.body as unknown as {
+      getReader?: () => ReadableStreamDefaultReader<Uint8Array>;
+    };
+    if (typeof body.getReader !== "function") {
+      return formatErrorDetail((await response.text()).slice(0, MAX_ERROR_BODY));
+    }
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let bytes = 0;
+    let finished = false;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        finished = true;
+        break;
+      }
+      if (value === undefined) continue;
+      const remaining = MAX_ERROR_BODY - bytes;
+      if (remaining <= 0) break;
+      const chunk = value.byteLength > remaining ? value.subarray(0, remaining) : value;
+      text += decoder.decode(chunk, { stream: true });
+      bytes += chunk.byteLength;
+      if (bytes >= MAX_ERROR_BODY) break;
+    }
+    if (!finished) await reader.cancel().catch(() => undefined);
+    text += decoder.decode();
   } catch {
     return "";
   }
+  return formatErrorDetail(text);
+}
+
+function formatErrorDetail(text: string): string {
   if (text.trim() === "") return "";
   try {
     const parsed = JSON.parse(text) as {
