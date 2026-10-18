@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 import { DateTime } from "luxon";
 import { runBackup } from "../src/backup.js";
+import { MissingDatabaseError, runBackup as runCoreBackup } from "../src/core/backup.js";
 import { TZ } from "../src/time.js";
 import { cleanupTestEnv, makeTestEnv } from "./helpers.js";
 
@@ -92,6 +93,55 @@ describe("db:backup", () => {
       for (const kept of names.slice(3)) {
         assert.ok(files.includes(kept), `${kept} 应保留`);
       }
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("BACKUP_KEEP 生效：保留份数取配置而不是写死 14", () => {
+    const env = makeTestEnv({ BACKUP_KEEP: "3" });
+    try {
+      mkdirSync(env.config.backupDir, { recursive: true });
+      // 旧备份文件名按 Asia/Shanghai 本地日期生成，字典序即新旧顺序
+      const names: string[] = [];
+      for (let day = 1; day <= 5; day++) {
+        const name = `life-assistant-2026010${day}-000000.db`;
+        names.push(name);
+        writeFileSync(join(env.config.backupDir, name), "not-a-real-db");
+      }
+      const ms = Date.UTC(2026, 8, 12, 0, 0, 0);
+      const newest = `life-assistant-${stampOf(ms)}.db`;
+      runBackup(env.config, ms);
+
+      const files = readdirSync(env.config.backupDir).filter((f) => f.endsWith(".db"));
+      assert.equal(files.length, 3, "BACKUP_KEEP=3 时应只保留最近 3 份");
+      assert.deepEqual(files.sort(), [...names.slice(3), newest].sort());
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("core/backup 可被模块复用：opts.keep 覆盖配置，非法 keep 直接拒绝", () => {
+    const env = makeTestEnv({ BACKUP_KEEP: "1" });
+    try {
+      mkdirSync(env.config.backupDir, { recursive: true });
+      const old = "life-assistant-20260101-000000.db";
+      writeFileSync(join(env.config.backupDir, old), "not-a-real-db");
+      const ms = Date.UTC(2026, 8, 12, 0, 0, 0);
+      // 配置只留 1 份；显式 keep=2 时旧备份应保留 —— 每日备份 job 走的就是这条核心路径
+      runCoreBackup(env.config, ms, { keep: 2 });
+      const files = readdirSync(env.config.backupDir).filter((f) => f.endsWith(".db"));
+      assert.deepEqual(files.sort(), [old, `life-assistant-${stampOf(ms)}.db`].sort());
+
+      // 保留份数非法时不得静默按 0 处理（那会把所有旧备份删光）
+      assert.throws(() => runCoreBackup(env.config, ms, { keep: 0 }), /保留份数/);
+
+      const missing = { ...env.config, dbPath: join(env.dir, "nope", "life-assistant.db") };
+      assert.throws(
+        () => runCoreBackup(missing),
+        (e: unknown) => e instanceof MissingDatabaseError,
+        "缺库必须是专用错误：每日备份 job 据此降级为 warn 跳过",
+      );
     } finally {
       cleanupTestEnv(env);
     }

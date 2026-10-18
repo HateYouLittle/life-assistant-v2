@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { DateTime } from "luxon";
 import { TIME_RE, TZ } from "../../time.js";
+import { DEFAULT_CHANNEL, getChannel, supportedChannels } from "../../core/channels.js";
 import {
   errorMessage,
   fail,
@@ -101,20 +102,31 @@ function notifyToolInner(args: Record<string, unknown>, ctx: ToolContext) {
 
   if (action === "route") {
     const url = args.url as string | undefined;
+    const channelArg = args.channel as string | undefined;
     const enabled = args.enabled as boolean | undefined;
-    if (url !== undefined) {
-      if (routeSecret(ctx.config, profileId) === undefined) {
+    // 传 url 或 channel 都算「配置路由」：log 通道不需要 url，只传 channel 即可；
+    // 只传 enabled 仍走启用/停用分支。
+    if (url !== undefined || channelArg !== undefined) {
+      // 先解析通道：未知通道名直接失败，不落任何设置
+      const channel = getChannel(channelArg);
+      if (channel.requiresSecret && routeSecret(ctx.config, profileId) === undefined) {
         return fail(
           `PROFILE_ROUTE_SECRETS_JSON 中没有 profile "${profileId}" 的 secret，无法启用推送`,
         );
       }
       const route = setPushRoute(db, profileId, {
         url,
+        channel: channel.name,
         platform: args.platform as string | undefined,
         name: args.name as string | undefined,
         enabled: enabled ?? true,
       });
-      return okJson({ 推送路由: route, 说明: "URL 仅允许回环地址；secret 来自环境变量" });
+      return okJson({
+        推送路由: route,
+        说明: channel.requiresSecret
+          ? "URL 仅允许回环地址；secret 来自环境变量"
+          : "本地日志通道：不需要 URL 与 secret，通知写入进程日志并标记为已投递",
+      });
     }
     if (enabled !== undefined) {
       // 必须走 core 的 setPushRouteEnabled：它在启用时会调 requeueRoute，
@@ -132,12 +144,12 @@ function notifyToolInner(args: Record<string, unknown>, ctx: ToolContext) {
     if (current === null)
       return okJson({
         推送路由: null,
-        说明: "用 url 参数配置（回环地址），secret 在 PROFILE_ROUTE_SECRETS_JSON",
+        说明: `用 url 参数配置（回环地址），secret 在 PROFILE_ROUTE_SECRETS_JSON；channel 可选 ${supportedChannels().join(" / ")}（默认 ${DEFAULT_CHANNEL}）`,
       });
     return okJson({
       推送路由: {
         ...current,
-        url: current.url,
+        channel: getChannel(current.channel).name,
         secretConfigured: routeSecret(ctx.config, profileId) !== undefined,
       },
     });
@@ -158,13 +170,16 @@ function notifyToolInner(args: Record<string, unknown>, ctx: ToolContext) {
   return fail(`未知 action: ${String(action)}`);
 }
 
+/** z.enum 需要非空元组；通道清单以 src/core/channels.ts 为唯一来源 */
+const CHANNEL_NAMES = supportedChannels() as [string, ...string[]];
+
 registerModule({
   name: "notify",
   tools: [
     {
       name: "notify",
       description:
-        "通知管理：action=pull 拉取未读通知（会话开始时调用一次，作为主动推送失败的兜底）；quiet_hours 设置/查看/清除静默时段（HH:MM，支持跨午夜）；route 配置/查看主动推送 webhook（回环地址，secret 在 env）；cancel 取消某条通知的待投递。",
+        "通知管理：action=pull 拉取未读通知（会话开始时调用一次，作为主动推送失败的兜底）；quiet_hours 设置/查看/清除静默时段（HH:MM，支持跨午夜）；route 配置/查看主动推送通道（channel=webhook 默认，HMAC V2 回环 webhook、secret 在 env；channel=log 本地日志通道，不需要 URL/secret）；cancel 取消某条通知的待投递。",
       inputSchema: {
         action: z.enum(["pull", "quiet_hours", "route", "cancel"]),
         limit: z.number().int().min(1).max(100).optional().describe("pull 条数，默认 20"),
@@ -172,6 +187,10 @@ registerModule({
         end: z.string().regex(TIME_RE).optional(),
         clear: z.boolean().optional().describe("清除静默时段"),
         url: z.string().optional().describe("推送 webhook 地址（127.0.0.1/localhost/[::1]）"),
+        channel: z
+          .enum(CHANNEL_NAMES)
+          .optional()
+          .describe("推送通道：webhook（默认，回环 HMAC V2）或 log（本地日志，不需要 URL/secret）"),
         platform: z.string().optional().describe("目标平台标识（如 wechat），仅记录"),
         name: z.string().max(80).optional().describe("路由名，默认 life-assistant-<profile>"),
         enabled: z.boolean().optional().describe("启用/停用路由"),

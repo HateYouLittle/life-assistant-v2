@@ -21,6 +21,9 @@ import {
   createLedger,
   deleteExpense,
   entryReceiptBlocks,
+  EXPENSE_CSV_MAX_ROWS,
+  expenseCsv,
+  expenseCsvFilename,
   findMissingMonthlyReports,
   getBudgets,
   getExpense,
@@ -37,7 +40,9 @@ import {
   setLedgerArchived,
   summarizeExpenses,
   transferLedger,
+  updateExpense,
   type BudgetStatus,
+  type ExpensePatch,
   type LedgerRow,
 } from "./service.js";
 
@@ -329,6 +334,55 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
         })),
       });
     }
+    if (action === "update") {
+      const id = args.id as string | undefined;
+      if (id === undefined) return fail("update 需要 id（可从 expense {action:'list'} 获取）");
+      // 编辑只更正字段，不支持把账目挪到另一个账本；显式传 ledger_id 时给出可操作提示
+      if (args.ledger_id !== undefined) {
+        return fail("update 不支持更换账本（要换账本请删除后重新记账）");
+      }
+      // 与 delete 同口径：先取账目，再按所属账本判可见性；不可见一律报「账本不存在」
+      const existing = getExpense(db, id);
+      if (existing === undefined) return fail(`账目不存在: ${id}`);
+      const ledger = getVisibleLedger(db, existing.ledger_id, ctx.profileId);
+      if (ledger === undefined) return fail(`账本不存在: ${existing.ledger_id}`);
+      const amount = args.amount as number | undefined;
+      const category = args.category as string | undefined;
+      const note = args.note as string | undefined;
+      const date = args.date as string | undefined;
+      if (
+        amount === undefined &&
+        category === undefined &&
+        note === undefined &&
+        date === undefined
+      ) {
+        return fail("update 需要至少一个待改字段：amount / category / note / date");
+      }
+      const patch: ExpensePatch = {};
+      if (amount !== undefined) {
+        // 元 → 分：与 add 同口径（0.01 元起、上限 100 万元），非法值在进入 service 前拦下
+        if (!Number.isFinite(amount) || amount <= 0 || amount > 1_000_000) {
+          return fail(`金额不合法: ${String(amount)}`);
+        }
+        patch.amountCents = Math.round(amount * 100);
+      }
+      if (category !== undefined) patch.category = category;
+      if (note !== undefined) patch.note = note;
+      if (date !== undefined) patch.spentOn = date;
+      const entry = updateExpense(db, id, patch);
+      return okJson({
+        已更新: {
+          id: entry.id,
+          账本: ledger.name,
+          金额: `¥${centsToYuan(entry.amount_cents)}`,
+          分类: entry.category,
+          日期: entry.spent_on,
+          备注: entry.note,
+          记账人: entry.created_by_profile,
+        },
+        说明: "仅更正该笔账目，不会重发记账回执、也不会重新判定预算提醒（记账人与创建时间不变）",
+      });
+    }
     if (action === "delete") {
       const id = args.id as string | undefined;
       if (id === undefined) return fail("delete 需要 id（可从 expense {action:'list'} 获取）");
@@ -348,6 +402,40 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
           记账人: entry.created_by_profile,
         },
         说明: "该笔支出已直接删除，无法恢复",
+      });
+    }
+    if (action === "export") {
+      const ledgerId = args.ledger_id as string | undefined;
+      if (ledgerId === undefined) {
+        return fail('export 需要 ledger_id（先调用 ledger {action:"list"} 取账本 id）');
+      }
+      const ledger = getVisibleLedger(db, ledgerId, ctx.profileId);
+      if (ledger === undefined) return fail(`账本不存在: ${ledgerId}`);
+      // 工具 schema 是各 action 共用的，from/to 只属于 list/summary：静默忽略会让
+      // 「导出这个区间」变成「导出当月」，宁可明确拒绝。
+      if (args.from !== undefined || args.to !== undefined) {
+        return fail("export 只支持按自然月（month）导出，不支持 from/to");
+      }
+      const month = (args.month as string | undefined) ?? todayIso().slice(0, 7);
+      const result = expenseCsv(db, {
+        ledgerId,
+        month,
+        limit: EXPENSE_CSV_MAX_ROWS,
+      });
+      return okJson({
+        账本: ledger.name,
+        月份: month,
+        行数: result.rows,
+        // 截断时补总行数：只给「已截断」布尔，agent 无从判断还剩多少没导
+        ...(result.truncated ? { 总行数: result.total } : {}),
+        文件名: expenseCsvFilename(month),
+        已截断: result.truncated,
+        ...(result.truncated
+          ? {
+              说明: `行数超过 ${EXPENSE_CSV_MAX_ROWS} 上限，已截断；请缩小查询范围（如分月/分账本导出）`,
+            }
+          : {}),
+        CSV: result.csv,
       });
     }
     return fail(`未知 action: ${action}`);
@@ -395,23 +483,32 @@ registerModule({
     {
       name: "expense",
       description:
-        "支出记账：add 记一笔（ledger_id + amount 元，可选 category/note/date；家庭账本回执全局推送，个人账本不回执不提醒）；list 明细（可按 month/from/to/by 过滤）；summary 汇总（按分类与记账人）；delete 删除记错的一笔（id 从 list 获取）。仅能操作当前 Profile 可见的账本（家庭账本或自己的个人账本）。month 与 from/to 互斥（同时传会报错）；from/to 只给一边就是半边区间（只给 from = [from, 将来)，只给 to = (过去, to]），两个 action 口径一致；默认区间只在 month/from/to **都不传**时生效（summary 默认「月初→今天」，list 不传时不限区间）。金额只支持支出，单位为元。",
+        "支出记账：add 记一笔（ledger_id + amount 元，可选 category/note/date；家庭账本回执全局推送，个人账本不回执不提醒）；list 明细（可按 month/from/to/by 过滤）；summary 汇总（按分类与记账人）；update 更正一笔（id + amount/category/note/date 至少一个，只改显式传入的字段，不触发回执与预算提醒）；delete 删除记错的一笔（id 从 list 获取）；export 导出 CSV（ledger_id + 可选 month，默认当月；表头「日期,账本,分类,金额(元),备注,记账人」，UTF-8 BOM；单次上限 2000 行，超出时 已截断=true 并给出总行数）。仅能操作当前 Profile 可见的账本（家庭账本或自己的个人账本）。month 与 from/to 互斥（同时传会报错）；from/to 只给一边就是半边区间（只给 from = [from, 将来)，只给 to = (过去, to]），两个 action 口径一致；默认区间只在 month/from/to **都不传**时生效（summary 默认「月初→今天」，list 不传时不限区间）。金额只支持支出，单位为元。",
       inputSchema: {
-        action: z.enum(["add", "list", "summary", "delete"]),
-        id: z.string().optional().describe("delete 时的账目 id"),
+        action: z.enum(["add", "list", "summary", "update", "delete", "export"]),
+        id: z.string().optional().describe("update/delete 时的账目 id（从 list 获取）"),
         ledger_id: z
           .string()
           .optional()
-          .describe('账本 id；add/list/summary 必填，先调用 ledger {action:"list"} 获取'),
-        amount: z.number().min(0.01).max(1_000_000).optional().describe("金额（元）"),
-        category: z.string().max(20).optional(),
-        note: z.string().max(200).optional(),
-        date: z.string().regex(DATE_RE).optional().describe("花费日期，默认今天"),
+          .describe('账本 id；add/list/summary/export 必填，先调用 ledger {action:"list"} 获取'),
+        amount: z
+          .number()
+          .min(0.01)
+          .max(1_000_000)
+          .optional()
+          .describe("金额（元）；add 必填，update 时不传则不改"),
+        category: z.string().max(20).optional().describe("分类；update 时不传则不改"),
+        note: z.string().max(200).optional().describe("备注；update 传空串可清空，不传则不改"),
+        date: z
+          .string()
+          .regex(DATE_RE)
+          .optional()
+          .describe("花费日期，默认今天；update 时不传则不改"),
         month: z
           .string()
           .regex(/^\d{4}-\d{2}$/)
           .optional()
-          .describe("按自然月过滤/汇总（整月，含月内未来日）；与 from/to 互斥"),
+          .describe("按自然月过滤/汇总/导出（整月，含月内未来日）；与 from/to 互斥"),
         from: z
           .string()
           .regex(DATE_RE)

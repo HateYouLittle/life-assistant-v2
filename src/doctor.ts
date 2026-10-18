@@ -142,17 +142,27 @@ function checkQweather(config: ResolvedConfig, env: NodeJS.ProcessEnv): CheckRes
 
 function checkBackups(config: ResolvedConfig): CheckResult {
   const name = "备份";
+  // daemon 内置每日备份 job（默认 03:00），不再必须配 systemd timer；
+  // 备份目录不存在/为空说明 job 从未成功执行过（daemon 未跑、BACKUP_CRON 未到点或失败）。
   if (!existsSync(config.backupDir)) {
-    return warn(name, `还没有备份目录（${config.backupDir}）：建议配一个每日 db:backup 的 timer`);
+    return warn(
+      name,
+      `还没有备份目录（${config.backupDir}）：daemon 的每日备份 job（BACKUP_CRON=${config.backupCron}）首次成功后才会创建；daemon 长期不运行时请改用外部 timer`,
+    );
   }
   const files = readdirSync(config.backupDir).filter((f) => f.endsWith(".db"));
-  if (files.length === 0) return warn(name, "备份目录是空的");
+  if (files.length === 0) {
+    return warn(name, "备份目录是空的：检查 daemon 是否在运行、BACKUP_CRON 是否已到点");
+  }
   const newest = files
     .map((f) => statSync(join(config.backupDir, f)).mtimeMs)
     .reduce((a, b) => Math.max(a, b), 0);
   const days = (Date.now() - newest) / (24 * 3600 * 1000);
   return days > 7
-    ? warn(name, `最近一份备份在 ${days.toFixed(1)} 天前（建议每天一次）`)
+    ? warn(
+        name,
+        `最近一份备份在 ${days.toFixed(1)} 天前：检查 daemon 是否在运行、BACKUP_CRON=${config.backupCron}，日志搜「每日备份」`,
+      )
     : ok(name, `${files.length} 份，最近一份在 ${days.toFixed(2)} 天前`);
 }
 

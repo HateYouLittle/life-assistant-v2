@@ -21,13 +21,24 @@ interface StubElement {
   className: string;
   dataset: Record<string, string>;
   attrs: Record<string, string>;
+  /** 锚点下载桩：href 是 Blob objectURL，download 是文件名 */
+  href: string;
+  download: string;
+  clicked: boolean;
+  removed: boolean;
+  handlers: Record<string, ((ev?: unknown) => void)[]>;
   classList: { add(): void; remove(): void };
   setAttribute(name: string, value: string): void;
   getAttribute(name: string): string | null;
   closest(selector: string): StubElement | null;
-  addEventListener(): void;
-  querySelectorAll(): StubElement[];
+  addEventListener(type: string, handler: (ev?: unknown) => void): void;
+  querySelectorAll(selector: string): StubElement[];
+  click(): void;
+  remove(): void;
 }
+
+/** 页面脚本通过 querySelectorAll 取到的子控件；抽屉每次重渲染都会重建（runPageScript 清空） */
+let renderedControls: StubElement[] = [];
 
 function stubElement(): StubElement {
   const element: StubElement = {
@@ -36,6 +47,11 @@ function stubElement(): StubElement {
     className: "",
     dataset: {},
     attrs: {},
+    href: "",
+    download: "",
+    clicked: false,
+    removed: false,
+    handlers: {},
     classList: { add() {}, remove() {} },
     setAttribute(name: string, value: string) {
       element.attrs[name] = value;
@@ -46,8 +62,34 @@ function stubElement(): StubElement {
     closest(selector: string) {
       return selector === "[data-drawer]" && element.dataset.drawer !== undefined ? element : null;
     },
-    addEventListener() {},
-    querySelectorAll: () => [],
+    addEventListener(type: string, handler: (ev?: unknown) => void) {
+      const handlers = element.handlers[type];
+      if (handlers === undefined) element.handlers[type] = [handler];
+      else handlers.push(handler);
+    },
+    // 从 innerHTML 里解析出带 data-* 的控件：这样抽屉渲染路径注册的 click 处理器能被真实触发
+    querySelectorAll(selector: string) {
+      const match = /^\[data-([a-z-]+)\]$/.exec(selector);
+      if (match === null) return [];
+      const name = match[1] ?? "";
+      const attr = `data-${name}`;
+      const found: StubElement[] = [];
+      const re = new RegExp(`${attr}="([^"]*)"`, "g");
+      for (const hit of element.innerHTML.matchAll(re)) {
+        const child = stubElement();
+        child.attrs[attr] = hit[1] ?? "";
+        child.dataset[name] = hit[1] ?? "";
+        found.push(child);
+        renderedControls.push(child);
+      }
+      return found;
+    },
+    click() {
+      element.clicked = true;
+    },
+    remove() {
+      element.removed = true;
+    },
   };
   return element;
 }
@@ -84,10 +126,20 @@ export interface PageRun {
   authHeaders: (string | undefined)[];
   stored: Map<string, string>;
   replacedUrls: string[];
+  /** 每次请求的路径与 Authorization（用于断言凭据只走头、不进 URL） */
+  fetchCalls: { path: string; auth: string | undefined }[];
+  /** 已触发的下载（文件名 + objectURL 指向的 Blob） */
+  downloads(): { filename: string; blob: Blob | undefined }[];
+  /** revoke 过的 objectURL */
+  revokedUrls: string[];
   /** 派发一次点击（等价于点击带 data-drawer 的卡片），会跑真正的抽屉渲染路径 */
   clickDrawer(kind: string): void;
-  /** 手动触发一次 30s 自动刷新回调（返回触发了几次） */
+  /** 点击抽屉里某个 data-* 控件（如 data-export），触发页面脚本注册的 click 处理器 */
+  clickControl(attr: string, value: string): void;
+  /** 手动触发 30s 自动刷新回调（返回触发了几次） */
   runIntervals(): number;
+  /** 手动执行 setTimeout 排队项（下载后 revoke objectURL），返回执行条数 */
+  runTimeouts(): number;
 }
 
 /** 在 vm 里跑一遍真实的状态页脚本；`search` 即浏览器地址栏的查询串 */
@@ -100,8 +152,14 @@ export function runPageScript(env: TestEnv, search: string): PageRun {
   const intervals: (() => void)[] = [];
   const elements = new Map<string, StubElement>();
   const authHeaders: (string | undefined)[] = [];
+  const fetchCalls: { path: string; auth: string | undefined }[] = [];
   const stored = new Map<string, string>();
   const replacedUrls: string[] = [];
+  const objectUrls = new Map<string, Blob>();
+  const revokedUrls: string[] = [];
+  const anchors: StubElement[] = [];
+  const timeouts: (() => void)[] = [];
+  renderedControls = [];
   const sandbox = {
     document: {
       getElementById: (id: string): StubElement => {
@@ -114,6 +172,16 @@ export function runPageScript(env: TestEnv, search: string): PageRun {
       },
       addEventListener(type: string, handler: (ev: unknown) => void) {
         if (type === "click") clickHandlers.push(handler);
+      },
+      // 下载桩：a[download].click() 不真正写文件，只记录调用了什么
+      createElement: (): StubElement => {
+        const element = stubElement();
+        anchors.push(element);
+        return element;
+      },
+      body: {
+        appendChild: (child: StubElement): StubElement => child,
+        removeChild: (child: StubElement): StubElement => child,
       },
     },
     localStorage: {
@@ -128,15 +196,32 @@ export function runPageScript(env: TestEnv, search: string): PageRun {
         replacedUrls.push(url);
       },
     },
+    URL: {
+      createObjectURL: (blob: Blob): string => {
+        const url = `blob:test/${objectUrls.size + 1}`;
+        objectUrls.set(url, blob);
+        return url;
+      },
+      revokeObjectURL: (url: string): void => {
+        revokedUrls.push(url);
+      },
+    },
     // 自动刷新会一直挂着：收集回调，由 runIntervals() 在用例里显式触发
     setInterval: (fn: () => void) => {
       intervals.push(fn);
       return intervals.length;
     },
+    // 下载后的 revoke 延后一秒：收集回调，由 runTimeouts() 在用例里显式触发
+    setTimeout: (fn: () => void) => {
+      timeouts.push(fn);
+      return timeouts.length;
+    },
     console,
     URLSearchParams,
     fetch: (path: string, init?: { headers?: Record<string, string> }) => {
-      authHeaders.push(init?.headers?.Authorization);
+      const auth = init?.headers?.Authorization;
+      authHeaders.push(auth);
+      fetchCalls.push({ path, auth });
       return app.fetch(new Request(`http://localhost${path}`, init as RequestInit));
     },
   };
@@ -146,15 +231,35 @@ export function runPageScript(env: TestEnv, search: string): PageRun {
     authHeaders,
     stored,
     replacedUrls,
+    fetchCalls,
+    revokedUrls,
+    downloads() {
+      return anchors
+        .filter((anchor) => anchor.clicked)
+        .map((anchor) => ({ filename: anchor.download, blob: objectUrls.get(anchor.href) }));
+    },
     clickDrawer(kind: string) {
       const target = stubElement();
       target.dataset.drawer = kind;
       target.setAttribute("data-drawer", kind);
       for (const handler of clickHandlers) handler({ target });
     },
+    clickControl(attr: string, value: string) {
+      const control = renderedControls.find(
+        (candidate) =>
+          candidate.attrs[attr] === value && (candidate.handlers.click?.length ?? 0) > 0,
+      );
+      if (control === undefined) throw new Error(`没找到 ${attr}=${value} 的可点击控件`);
+      for (const handler of control.handlers.click ?? []) handler();
+    },
     runIntervals() {
       for (const fn of intervals) fn();
       return intervals.length;
+    },
+    runTimeouts() {
+      const pending = timeouts.splice(0);
+      for (const fn of pending) fn();
+      return pending.length;
     },
   };
 }
@@ -287,6 +392,45 @@ describe("看板抽屉（点击委托 + 明细渲染）", () => {
       assert.ok(rendered, `抽屉没有渲染出内容：${run.elements.get("drawer-body")?.innerHTML}`);
       assert.match(run.elements.get("drawer-body")?.innerHTML ?? "", /Profile/);
       assert.equal(run.elements.get("drawer")?.attrs["aria-hidden"], "false", "抽屉应被打开");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("支出抽屉「导出 CSV」：带 Bearer 取 /api/expenses.csv → Blob 下载 → 延后 revoke", async () => {
+    const token = "t".repeat(32);
+    const env = makeTestEnv({ WEB_API_TOKEN: token, HOST: "0.0.0.0" });
+    try {
+      seedExpense(env);
+      const run = runPageScript(env, `?token=${token}`);
+      run.clickDrawer("expenses");
+      const rendered = await waitFor(() =>
+        (run.elements.get("drawer-body")?.innerHTML ?? "").includes("导出 CSV"),
+      );
+      assert.ok(rendered, "支出抽屉应渲染出「导出 CSV」按钮");
+
+      const month = todayIso().slice(0, 7);
+      run.clickControl("data-export", month);
+      const downloaded = await waitFor(() => run.downloads().length > 0);
+      assert.ok(downloaded, "点击导出后应触发 a[download] 下载");
+      const [download] = run.downloads();
+      assert.ok(download !== undefined, "下载记录缺失");
+      assert.equal(download.filename, `expenses-${month}.csv`, "文件名含当前月份");
+      assert.ok(download.blob instanceof Blob, "下载内容应是 CSV Blob");
+      const bytes = new Uint8Array(await download.blob.arrayBuffer());
+      assert.deepEqual([...bytes.slice(0, 3)], [0xef, 0xbb, 0xbf], "CSV 带 UTF-8 BOM");
+      const csvText = new TextDecoder("utf-8", { ignoreBOM: true }).decode(bytes);
+      assert.match(csvText, /日期,账本,分类,金额\(元\),备注,记账人/);
+      assert.match(csvText, /12\.99/, "应是真实服务端导出的数据（seedExpense 的 1299 分）");
+
+      const csvCalls = run.fetchCalls.filter((call) => call.path.startsWith("/api/expenses.csv"));
+      assert.equal(csvCalls.length, 1, "一次点击只发一次导出请求");
+      assert.equal(csvCalls[0]?.auth, `Bearer ${token}`, "导出请求必须带 Bearer 凭据");
+      assert.match(csvCalls[0]?.path ?? "", new RegExp(`month=${month}`));
+      assert.doesNotMatch(csvCalls[0]?.path ?? "", /token=/, "凭据不得拼进 URL");
+
+      assert.equal(run.runTimeouts(), 1, "下载后应排队一次 revoke");
+      assert.match(run.revokedUrls[0] ?? "", /^blob:test\//, "revoke 的应是刚创建的 objectURL");
     } finally {
       cleanupTestEnv(env);
     }

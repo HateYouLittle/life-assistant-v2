@@ -7,8 +7,15 @@ import type { ResolvedConfig } from "../config.js";
 import { isRequestAuthorized } from "../core/auth.js";
 import { qweatherUsage } from "../core/qweather.js";
 import { TZ, todayIso } from "../time.js";
-import { deliveryDetails, expenseDetails, holidayDetails, scheduleDetails } from "./details.js";
+import {
+  deliveryDetails,
+  expenseDetails,
+  holidayDetails,
+  normalizeMonth,
+  scheduleDetails,
+} from "./details.js";
 import { statusPage } from "./page.js";
+import { expenseCsv, expenseCsvFilename } from "../modules/bookkeeping/service.js";
 
 const require = createRequire(import.meta.url);
 const VERSION = (require("../../package.json") as { version: string }).version;
@@ -125,6 +132,16 @@ export function createStatusApp(config: ResolvedConfig, db: DatabaseSync): Hono 
   app.get("/api/expenses", (c) =>
     c.json(expenseDetails(db, c.req.query("month"), c.req.query("limit"))),
   );
+  // 家庭账本支出 CSV：与 /api/expenses 同口径（只家庭账本、同一「自然月全月」区间），
+  // 鉴权与 no-store 由上面的 /api/* 中间件统一兜住；月份非法/缺省回退当月。
+  app.get("/api/expenses.csv", (c) => {
+    const month = normalizeMonth(c.req.query("month"));
+    const result = expenseCsv(db, { month });
+    return c.body(result.csv, 200, {
+      "Content-Type": "text/csv; charset=utf-8",
+      "Content-Disposition": `attachment; filename="${expenseCsvFilename(month)}"`,
+    });
+  });
   app.get("/api/schedules", (c) => c.json({ items: scheduleDetails(db, c.req.query("limit")) }));
   app.get("/api/deliveries", (c) => c.json(deliveryDetails(db, c.req.query("limit"))));
   app.get("/api/holidays", (c) => c.json(holidayDetails(db, c.req.query("year"))));

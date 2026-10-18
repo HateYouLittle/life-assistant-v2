@@ -24,6 +24,8 @@ describe("config", () => {
     assert.equal(config.alertMinLevel, "blue");
     assert.equal(config.workdayWatchCron, "0 7 * * *");
     assert.equal(config.workdayRemindDaysBefore, 3);
+    assert.equal(config.backupCron, "0 3 * * *");
+    assert.equal(config.backupKeep, 14);
     assert.equal(config.defaultCity, "北京");
     assert.equal(config.webApiToken, undefined);
   });
@@ -101,6 +103,21 @@ describe("config", () => {
     assert.throws(() => loadConfig({ ...BASE, WORKDAY_WATCH_CRON: "not-cron" }), /cron/);
     const config = loadConfig({ ...BASE, WORKDAY_WATCH_CRON: "0 6 * * *" });
     assert.equal(config.workdayWatchCron, "0 6 * * *");
+  });
+
+  it("BACKUP_CRON 非法拒绝启动，合法则生效", () => {
+    assert.throws(() => loadConfig({ ...BASE, BACKUP_CRON: "not-cron" }), /BACKUP_CRON/);
+    const config = loadConfig({ ...BASE, BACKUP_CRON: "30 2 * * *" });
+    assert.equal(config.backupCron, "30 2 * * *");
+  });
+
+  it("BACKUP_KEEP 默认 14，且必须是 1..365 的整数", () => {
+    assert.equal(loadConfig(BASE).backupKeep, 14);
+    for (const bad of ["0", "366", "-1", "1.5", "abc"]) {
+      assert.throws(() => loadConfig({ ...BASE, BACKUP_KEEP: bad }), /BACKUP_KEEP/, bad);
+    }
+    assert.equal(loadConfig({ ...BASE, BACKUP_KEEP: "1" }).backupKeep, 1);
+    assert.equal(loadConfig({ ...BASE, BACKUP_KEEP: "365" }).backupKeep, 365);
   });
 
   it("WORKDAY_REMIND_DAYS_BEFORE 非法拒绝启动，合法则生效", () => {

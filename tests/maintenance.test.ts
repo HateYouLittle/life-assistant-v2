@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { createStatusApp } from "../src/server/status.js";
@@ -11,7 +11,9 @@ import {
   readQweatherUsage,
   seedQweatherUsage,
 } from "../src/core/qweather.js";
-import { todayIso } from "../src/time.js";
+import { allJobs } from "../src/core/registry.js";
+import { registerAllModules } from "../src/modules/index.js";
+import { now, todayIso } from "../src/time.js";
 import { runDoctor } from "../src/doctor.js";
 import { openDatabase } from "../src/core/database.js";
 import { cleanupTestEnv, makeTestEnv, type TestEnv, v1Current } from "./helpers.js";
@@ -326,6 +328,58 @@ describe("doctor 自检", () => {
         !readFileSync(bogus, "utf8").includes("secret"),
         "自检输出不得回显私钥内容（这里只是确认探针文件没被改动）",
       );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
+describe("每日自动备份 job", () => {
+  /** 幂等：modules/index.ts 的副作用 import 已完成注册，这里只是拿真实模块清单 */
+  function dailyBackupJob() {
+    registerAllModules();
+    const job = allJobs().find((j) => j.module === "maintenance" && j.def.name === "daily_backup");
+    assert.ok(job !== undefined, "应注册 maintenance.daily_backup job");
+    return job;
+  }
+
+  it("已注册，cron 来自 BACKUP_CRON 配置", () => {
+    const env = makeTestEnv({ BACKUP_CRON: "15 4 * * *" });
+    try {
+      const job = dailyBackupJob();
+      const cron = typeof job.def.cron === "function" ? job.def.cron() : job.def.cron;
+      assert.equal(cron, "15 4 * * *");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("直接执行 handler 生成备份，保留份数取 BACKUP_KEEP", async () => {
+    const env = makeTestEnv({ BACKUP_KEEP: "1" });
+    try {
+      const job = dailyBackupJob();
+      mkdirSync(env.config.backupDir, { recursive: true });
+      writeFileSync(join(env.config.backupDir, "life-assistant-20260101-000000.db"), "old");
+      await job.def.handler(now());
+
+      const files = readdirSync(env.config.backupDir).filter((f) => f.endsWith(".db"));
+      assert.equal(files.length, 1, "BACKUP_KEEP=1 时旧备份应被新备份挤掉");
+      const latest = files[0] ?? "";
+      assert.match(latest, /^life-assistant-\d{8}-\d{6}\.db$/);
+      assert.ok(statSync(join(env.config.backupDir, latest)).size > 0, "备份不能是空文件");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("数据库文件缺失时只记日志跳过，不抛（daemon 不因备份失败崩溃）", async () => {
+    const env = makeTestEnv();
+    try {
+      const job = dailyBackupJob();
+      // 模拟 DATA_DIR 指错：runBackup 抛 MissingDatabaseError，handler 必须吞掉降级为 warn
+      env.config.dbPath = join(env.dir, "missing", "life-assistant.db");
+      await assert.doesNotReject(async () => job.def.handler(now()));
+      assert.equal(existsSync(env.config.backupDir), false, "缺库时不应留下空备份目录");
     } finally {
       cleanupTestEnv(env);
     }

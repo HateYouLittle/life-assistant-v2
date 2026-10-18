@@ -157,6 +157,36 @@ export function setLedgerArchived(db: DatabaseSync, id: string, archived: boolea
   return getLedger(db, id) as LedgerRow;
 }
 
+/** 金额校验：内部单位为整数分、必须为正整数（新增与编辑共用同一口径） */
+function assertValidAmountCents(amountCents: number): void {
+  if (!Number.isInteger(amountCents) || amountCents <= 0) {
+    throw new Error(`金额不合法: ${String(amountCents)}（分为单位，需为正整数）`);
+  }
+}
+
+/** 分类归一：缺省/空白回落到「其他」；上限 20 字符 */
+function normalizedCategory(category: string | undefined): string {
+  const value = (category ?? DEFAULT_CATEGORY).trim() || DEFAULT_CATEGORY;
+  if (value.length > 20) throw new Error("分类过长（≤20 字符）");
+  return value;
+}
+
+/** 备注归一：缺省/空白 → NULL；上限 200 字符 */
+function normalizedNote(note: string | null | undefined): string | null {
+  const value = note === undefined || note === null || note.trim() === "" ? null : note.trim();
+  if (value !== null && value.length > 200) throw new Error("备注过长（≤200 字符）");
+  return value;
+}
+
+/** 花费日期：本地日历日 YYYY-MM-DD，缺省今天 */
+function normalizedSpentOn(spentOn: string | undefined): string {
+  const value = spentOn ?? todayIso();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value) || !DateTime.fromISO(value, { zone: TZ }).isValid) {
+    throw new Error(`日期不合法: ${value}`);
+  }
+  return value;
+}
+
 export function addExpense(
   db: DatabaseSync,
   profileId: string,
@@ -171,20 +201,10 @@ export function addExpense(
   const ledger = getLedger(db, input.ledgerId);
   if (ledger === undefined) throw new Error(`账本不存在: ${input.ledgerId}`);
   if (ledger.archived_at !== null) throw new Error(`账本已归档: ${ledger.name}`);
-  if (!Number.isInteger(input.amountCents) || input.amountCents <= 0) {
-    throw new Error(`金额不合法: ${String(input.amountCents)}（分为单位，需为正整数）`);
-  }
-  const category = (input.category ?? DEFAULT_CATEGORY).trim() || DEFAULT_CATEGORY;
-  if (category.length > 20) throw new Error("分类过长（≤20 字符）");
-  const note =
-    input.note === undefined || input.note === null || input.note.trim() === ""
-      ? null
-      : input.note.trim();
-  if (note !== null && note.length > 200) throw new Error("备注过长（≤200 字符）");
-  const spentOn = input.spentOn ?? todayIso();
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(spentOn) || !DateTime.fromISO(spentOn, { zone: TZ }).isValid) {
-    throw new Error(`日期不合法: ${spentOn}`);
-  }
+  assertValidAmountCents(input.amountCents);
+  const category = normalizedCategory(input.category);
+  const note = normalizedNote(input.note);
+  const spentOn = normalizedSpentOn(input.spentOn);
   const id = newId();
   db.prepare(
     `INSERT INTO expenses (id, ledger_id, amount_cents, category, note, spent_on, created_by_profile, created_at)
@@ -195,6 +215,50 @@ export function addExpense(
 
 export function getExpense(db: DatabaseSync, id: string): ExpenseRow | undefined {
   return db.prepare("SELECT * FROM expenses WHERE id = ?").get(id) as ExpenseRow | undefined;
+}
+
+export interface ExpensePatch {
+  amountCents?: number;
+  category?: string;
+  note?: string | null;
+  spentOn?: string;
+}
+
+/**
+ * 更正一笔已记支出：只更新显式传入的字段，其余保持原值；校验口径与 addExpense 完全一致
+ * （共用同一组归一函数）。记账人、创建时间与所属账本不参与编辑。
+ *
+ * 编辑只做「更正」：不发布回执、不重新判定预算阈值、不保留修改前值
+ * （见 README「已知取舍」第 14 条）——回执/预算提醒只由 addExpense 的调用方触发。
+ */
+export function updateExpense(db: DatabaseSync, id: string, patch: ExpensePatch): ExpenseRow {
+  const existing = getExpense(db, id);
+  if (existing === undefined) throw new Error(`账目不存在: ${id}`);
+  const sets: string[] = [];
+  const params: (string | number | null)[] = [];
+  if (patch.amountCents !== undefined) {
+    assertValidAmountCents(patch.amountCents);
+    sets.push("amount_cents = ?");
+    params.push(patch.amountCents);
+  }
+  if (patch.category !== undefined) {
+    sets.push("category = ?");
+    params.push(normalizedCategory(patch.category));
+  }
+  if (patch.note !== undefined) {
+    sets.push("note = ?");
+    params.push(normalizedNote(patch.note));
+  }
+  if (patch.spentOn !== undefined) {
+    sets.push("spent_on = ?");
+    params.push(normalizedSpentOn(patch.spentOn));
+  }
+  // 空 patch 不是「无操作成功」：调用方多半是漏传了参数，静默返回原值会让 agent 误以为改成了
+  if (sets.length === 0) {
+    throw new Error("没有需要更新的字段（amount_cents/category/note/spent_on 至少一个）");
+  }
+  db.prepare(`UPDATE expenses SET ${sets.join(", ")} WHERE id = ?`).run(...params, id);
+  return getExpense(db, id) as ExpenseRow;
 }
 
 export function deleteExpense(db: DatabaseSync, id: string): ExpenseRow {
@@ -317,6 +381,114 @@ export function monthRange(ym: string): { from: string; to: string } {
   const from = `${ym}-01`;
   const lastDay = new Date(Date.UTC(year, month, 0)).getUTCDate();
   return { from, to: `${ym}-${String(lastDay).padStart(2, "0")}` };
+}
+
+/** CSV 表头（固定顺序，工具与 HTTP 导出共用） */
+export const EXPENSE_CSV_HEADER = ["日期", "账本", "分类", "金额(元)", "备注", "记账人"] as const;
+/** MCP 单次导出上限：超过时截断并置 已截断=true，提示调用方缩小范围 */
+export const EXPENSE_CSV_MAX_ROWS = 2000;
+/** UTF-8 BOM：Excel 打开中文 CSV 必须靠它识别编码，否则整列乱码 */
+const CSV_BOM = "\uFEFF";
+
+/**
+ * CSV 单元格转义（RFC 4180）：含逗号、双引号、CR 或 LF 的字段整体加双引号，
+ * 字段内部的双引号写成两个。其他字段原样输出（不加不必要的引号）。
+ */
+export function csvField(value: string): string {
+  return /[",\r\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
+}
+
+export interface ExpenseCsvOptions {
+  /** 指定账本；缺省 = 全部家庭账本（看板口径，个人账本不出现） */
+  ledgerId?: string;
+  /** 自然月 YYYY-MM（与看板「本月」同口径：整月，含月内未来日） */
+  month: string;
+  /** 行数上限；缺省不限（HTTP 按月导出不截断，MCP 导出传 EXPENSE_CSV_MAX_ROWS） */
+  limit?: number;
+}
+
+export interface ExpenseCsvResult {
+  /** 带 UTF-8 BOM、CRLF 换行的完整 CSV 文本（每行含末尾 CRLF） */
+  csv: string;
+  /** 实际导出的数据行数（不含表头） */
+  rows: number;
+  /** 匹配的总行数；rows < total 表示已截断 */
+  total: number;
+  truncated: boolean;
+}
+
+/** 下载文件名（只含 ASCII，可直接放进 Content-Disposition 的 filename=） */
+export function expenseCsvFilename(month: string): string {
+  return `expenses-${month}.csv`;
+}
+
+/**
+ * 按月导出支出 CSV。排序固定为 `spent_on ASC, created_at ASC`，同一毫秒写入的多笔
+ * 再按 id 升序，保证同一份数据的导出结果稳定可 diff。
+ *
+ * `ledgerId` 缺省时只导家庭账本（`owner_profile_id IS NULL`），与 `/api/expenses`
+ * 看板口径一致；个人账本必须显式指定 ledgerId（MCP export 走可见性校验）。
+ */
+export function expenseCsv(db: DatabaseSync, opts: ExpenseCsvOptions): ExpenseCsvResult {
+  const { from, to } = monthRange(opts.month);
+  // 下限也要 clamp：SQLite 把负 LIMIT 当作「不限量」，limit:-1 会返回全表
+  const limit = opts.limit === undefined ? undefined : Math.max(1, Math.trunc(opts.limit));
+  const conditions = ["e.spent_on >= ?", "e.spent_on <= ?"];
+  const params: (string | number)[] = [from, to];
+  if (opts.ledgerId === undefined) {
+    conditions.push("l.owner_profile_id IS NULL");
+  } else {
+    conditions.push("e.ledger_id = ?");
+    params.push(opts.ledgerId);
+  }
+  const where = conditions.join(" AND ");
+  // 计数与取数必须读同一快照：否则并发记账落在两条语句之间时，行数/截断标记与 CSV 对不上
+  return withReadTransaction(db, () => {
+    const total = (
+      db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM expenses e JOIN ledgers l ON l.id = e.ledger_id WHERE ${where}`,
+        )
+        .get(...params) as { n: number }
+    ).n;
+    const select = db.prepare(
+      `SELECT e.spent_on, l.name AS ledger_name, e.category, e.amount_cents, e.note,
+              e.created_by_profile
+       FROM expenses e JOIN ledgers l ON l.id = e.ledger_id
+       WHERE ${where}
+       ORDER BY e.spent_on ASC, e.created_at ASC, e.id ASC
+       ${limit === undefined ? "" : "LIMIT ?"}`,
+    );
+    const rows = (limit === undefined
+      ? select.all(...params)
+      : select.all(...params, limit)) as unknown as Array<{
+      spent_on: string;
+      ledger_name: string;
+      category: string;
+      amount_cents: number;
+      note: string | null;
+      created_by_profile: string;
+    }>;
+    const lines = [EXPENSE_CSV_HEADER.map(csvField).join(",")];
+    for (const row of rows) {
+      lines.push(
+        [
+          csvField(row.spent_on),
+          csvField(row.ledger_name),
+          csvField(row.category),
+          centsToYuan(row.amount_cents),
+          csvField(row.note ?? ""),
+          csvField(row.created_by_profile),
+        ].join(","),
+      );
+    }
+    return {
+      csv: `${CSV_BOM}${lines.join("\r\n")}\r\n`,
+      rows: rows.length,
+      total,
+      truncated: total > rows.length,
+    };
+  });
 }
 
 export interface BudgetRow {

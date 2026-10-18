@@ -30,6 +30,10 @@ export interface ResolvedConfig {
   dataDir: string;
   dbPath: string;
   backupDir: string;
+  /** 每日自动备份 cron（Asia/Shanghai，BACKUP_CRON，默认 "0 3 * * *"） */
+  backupCron: string;
+  /** 备份保留份数（BACKUP_KEEP，默认 14，范围 1..365） */
+  backupKeep: number;
   host: string;
   port: number;
   webApiToken?: string;
@@ -288,6 +292,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
     throw new Error(`WORKDAY_REMIND_DAYS_BEFORE 必须是 0..30 之间的整数: ${remindDaysRaw}`);
   }
 
+  const backupCron = env.BACKUP_CRON?.trim() || "0 3 * * *";
+  if (!cron.validate(backupCron)) {
+    throw new Error(`BACKUP_CRON 不是合法 cron 表达式: ${backupCron}`);
+  }
+
+  const backupKeepRaw = env.BACKUP_KEEP?.trim() || "14";
+  const backupKeep = Number(backupKeepRaw);
+  if (!Number.isInteger(backupKeep) || backupKeep < 1 || backupKeep > 365) {
+    throw new Error(`BACKUP_KEEP 必须是 1..365 之间的整数: ${backupKeepRaw}`);
+  }
+
   const portRaw = env.PORT?.trim() || "3080";
   const port = Number(portRaw);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -302,6 +317,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
     dataDir,
     dbPath: join(dataDir, "life-assistant.db"),
     backupDir: join(dataDir, "backups"),
+    backupCron,
+    backupKeep,
     host,
     port,
     webApiToken,

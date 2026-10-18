@@ -4,6 +4,7 @@
  */
 import "./bookkeeping/index.js";
 import "./holiday/index.js";
+import "./maintenance/index.js";
 import "./notify/index.js";
 import "./schedule/index.js";
 import "./weather/index.js";

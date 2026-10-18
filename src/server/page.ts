@@ -169,7 +169,8 @@ const STYLE = `
   .bars { display: flex; align-items: flex-end; gap: 6px; height: 72px; margin: 6px 0 4px; }
   .bars div { flex: 1; background: linear-gradient(180deg, rgba(94,234,212,.85), rgba(94,234,212,.15)); border-radius: 4px 4px 2px 2px; min-height: 3px; position: relative; }
   .bars div span { position: absolute; bottom: -18px; left: 0; right: 0; text-align: center; color: var(--mute); font-size: 10px; }
-  .monthnav { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+  /* flex-wrap：导出按钮让月份导航多一项，窄屏（抽屉 92vw）下不能横向溢出 */
+  .monthnav { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
   .monthnav button {
     background: transparent; border: 1px solid var(--line); color: var(--dim); border-radius: 8px;
     padding: 4px 10px; font-size: 12px; cursor: pointer;
@@ -456,6 +457,7 @@ const SCRIPT = `
           '<button type="button" data-month="' + shiftMonth(expMonth, -1) + '">‹ 上月</button>' +
           '<span class="cur">' + expMonth + '</span>' +
           '<button type="button" data-month="' + shiftMonth(expMonth, 1) + '">下月 ›</button>' +
+          '<button type="button" data-export="' + expMonth + '">导出 CSV</button>' +
           '<span class="muted" style="margin-left:auto">' + yuan(d.total_cents) + '</span></div>';
 
         html += '<div class="sect"><h3>分类</h3>' +
@@ -501,8 +503,33 @@ const SCRIPT = `
         Array.prototype.forEach.call(drawerBody.querySelectorAll('[data-month]'), function (b) {
           b.addEventListener('click', function () { openExpenses(b.getAttribute('data-month')); });
         });
+        Array.prototype.forEach.call(drawerBody.querySelectorAll('[data-export]'), function (b) {
+          b.addEventListener('click', function () { downloadCsv(b.getAttribute('data-export')); });
+        });
       }).catch(fail);
     });
+  }
+  /* 导出当月 CSV：凭据只走 Authorization 头（绝不进 URL）；Blob + a[download] 触发下载，
+     revoke 延后一秒，避免部分浏览器在下载真正开始前就把 objectURL 失效。 */
+  function downloadCsv(month) {
+    fetch('/api/expenses.csv?month=' + encodeURIComponent(month), token ? { headers: { Authorization: 'Bearer ' + token } } : {})
+      .then(function (r) {
+        if (!r.ok) throw new Error(r.status === 401 ? '未授权：在地址栏给本页加上 ?token=<WEB_API_TOKEN> 刷新一次（本页会记住）' : 'HTTP ' + r.status);
+        return r.blob();
+      })
+      .then(function (blob) {
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = 'expenses-' + month + '.csv';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+      })
+      .catch(function (e) {
+        drawerSub.textContent = '导出失败：' + e.message;
+      });
   }
   function shiftMonth(ym, delta) {
     var y = Number(ym.slice(0, 4)), m = Number(ym.slice(5, 7)) + delta;

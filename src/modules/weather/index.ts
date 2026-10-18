@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { DateTime } from "luxon";
-import { TZ, todayIso } from "../../time.js";
+import { TZ, isDate, todayIso } from "../../time.js";
 import {
   errorMessage,
   fail,
@@ -10,10 +10,11 @@ import {
   runtime,
   type NotifyBlock,
   type ToolContext,
+  type ToolResult,
 } from "../../core/registry.js";
 import { publishProfile } from "../../core/notify.js";
 import type { DatabaseSync } from "node:sqlite";
-import { dayType, holidayDayName, holidayPeriods } from "../../core/holiday.js";
+import { dayType, holidayDayName, holidayPeriods, nextHolidayPeriod } from "../../core/holiday.js";
 import { cachedLocation, currentWeather, saveLocation } from "../../core/qweather.js";
 import type {
   AirQuality,
@@ -23,7 +24,7 @@ import type {
   WeatherAlert,
 } from "../../core/qweather.js";
 import { airQuality, alerts, forecast, geoLookup } from "../../core/qweather.js";
-import { listProfiles } from "../../core/settings.js";
+import { deleteSetting, getSetting, listProfiles, setSetting } from "../../core/settings.js";
 import { logger } from "../../core/logger.js";
 
 function requireQweather(ctx: ToolContext): { host: string; key: string } {
@@ -33,12 +34,144 @@ function requireQweather(ctx: ToolContext): { host: string; key: string } {
   return { host: ctx.config.qweatherHost, key: ctx.config.qweatherKey };
 }
 
-async function resolveLocation(ctx: ToolContext, city: string | undefined): Promise<LocationInfo> {
+/**
+ * 出行计划（settings.travel_plan）：用户显式设置的行程，不是 GeoAPI 缓存。
+ * 与 `weather locate` 保存的位置同理，只存解析后的城市/经纬度/城市 ID 与起止日历日
+ * （含首尾），属用户主动配置；生效期间直接复用，绝不再请求 GeoAPI（版权/配额约束）。
+ */
+interface TravelPlan {
+  city: string;
+  cityId: string;
+  lat: number;
+  lon: number;
+  start: string;
+  end: string;
+}
+
+const TRAVEL_PLAN_KEY = "travel_plan";
+
+type TravelPlanState = { kind: "none" } | { kind: "corrupt" } | { kind: "plan"; plan: TravelPlan };
+
+/** MM-DD，用于简报里的紧凑日期区间 */
+function shortDate(date: string): string {
+  return date.slice(5);
+}
+
+/** 校验 settings 里的出行计划；字段缺失/类型不对/日期非法一律视为损坏（调用方安全忽略） */
+function parseTravelPlan(raw: unknown): TravelPlan | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const p = raw as Record<string, unknown>;
+  const city = typeof p.city === "string" ? p.city.trim() : "";
+  const cityId = typeof p.cityId === "string" ? p.cityId.trim() : "";
+  const lat = typeof p.lat === "number" ? p.lat : Number.NaN;
+  const lon = typeof p.lon === "number" ? p.lon : Number.NaN;
+  const start = typeof p.start === "string" ? p.start : "";
+  const end = typeof p.end === "string" ? p.end : "";
+  if (city === "" || cityId === "") return null;
+  if (!Number.isFinite(lat) || lat < -90 || lat > 90) return null;
+  if (!Number.isFinite(lon) || lon < -180 || lon > 180) return null;
+  if (!isDate(start) || !isDate(end) || start > end) return null;
+  return { city, cityId, lat, lon, start, end };
+}
+
+function readTravelPlan(db: DatabaseSync, profileId: string): TravelPlanState {
+  let raw: unknown;
+  try {
+    raw = getSetting<unknown>(db, profileId, TRAVEL_PLAN_KEY);
+  } catch {
+    // settings.value_json 不是合法 JSON：安全忽略，不能让简报/预警巡检整体失败
+    return { kind: "corrupt" };
+  }
+  if (raw === undefined || raw === null) return { kind: "none" };
+  const plan = parseTravelPlan(raw);
+  return plan === null ? { kind: "corrupt" } : { kind: "plan", plan };
+}
+
+/** 出行计划是否在窗口内（本地日历日，含首尾） */
+function isTravelActive(plan: TravelPlan, today: string): boolean {
+  return plan.start <= today && today <= plan.end;
+}
+
+/** 本地日历日差（to - from）；两端都是本地零点，同一时区下为整数天 */
+function calendarDaysBetween(from: string, to: string): number {
+  const diff = DateTime.fromISO(to, { zone: TZ }).diff(
+    DateTime.fromISO(from, { zone: TZ }),
+    "days",
+  );
+  return Math.round(diff.days);
+}
+
+/** weather 回执里的出行模式标注：城市 + 起止日期 */
+function travelModeField(plan: TravelPlan): { 城市: string; 起止: string } {
+  return { 城市: plan.city, 起止: `${plan.start} ~ ${plan.end}` };
+}
+
+/** 简报/预警通知里的紧凑出行模式标注 */
+function travelModeText(plan: TravelPlan): string {
+  return `出行模式：${plan.city} ${shortDate(plan.start)}–${shortDate(plan.end)}`;
+}
+
+/** 简报表格行里的出行模式内容：城市（起–止） */
+function travelModeBrief(plan: TravelPlan): string {
+  return `${plan.city}（${shortDate(plan.start)}–${shortDate(plan.end)}）`;
+}
+
+interface ResolvedPlace {
+  loc: LocationInfo;
+  /** 生效中的出行计划；非 null 表示本次查询使用目的地（而不是家/默认城市） */
+  travel: TravelPlan | null;
+}
+
+/**
+ * 按 Profile 解析当前位置（简报与预警巡检共用，口径与工具查询一致）：
+ * 窗口内 travel_plan > 已保存 location > DEFAULT_CITY。
+ * travel_plan 直接复用保存的 lat/lon/cityId，**绝不**重新请求 GeoAPI。
+ */
+async function resolveProfilePlace(
+  db: DatabaseSync,
+  host: string,
+  key: string,
+  defaultCity: string,
+  profileId: string,
+  cityCache: Map<string, LocationInfo>,
+): Promise<ResolvedPlace> {
+  const state = readTravelPlan(db, profileId);
+  if (state.kind === "plan" && isTravelActive(state.plan, todayIso())) {
+    const plan = state.plan;
+    return {
+      loc: { city: plan.city, cityId: plan.cityId, lat: plan.lat, lon: plan.lon },
+      travel: plan,
+    };
+  }
+  const saved = cachedLocation(db, profileId);
+  if (saved !== null) return { loc: saved, travel: null };
+  const cached = cityCache.get(defaultCity);
+  if (cached !== undefined) return { loc: cached, travel: null };
+  const loc = await geoLookup(db, host, key, defaultCity);
+  cityCache.set(defaultCity, loc);
+  return { loc, travel: null };
+}
+
+/**
+ * 工具侧的位置解析：显式 city 始终优先（即使出行模式生效），此时不标注出行模式；
+ * 否则与简报同口径（窗口内出行计划 > 已保存位置 > DEFAULT_CITY）。
+ */
+async function resolveToolPlace(
+  ctx: ToolContext,
+  city: string | undefined,
+): Promise<ResolvedPlace> {
   const { host, key } = requireQweather(ctx);
-  if (city !== undefined && city.trim() !== "") return geoLookup(ctx.db, host, key, city);
-  const saved = cachedLocation(ctx.db, ctx.profileId);
-  if (saved !== null) return saved;
-  return geoLookup(ctx.db, host, key, ctx.config.defaultCity);
+  if (city !== undefined && city.trim() !== "") {
+    return { loc: await geoLookup(ctx.db, host, key, city), travel: null };
+  }
+  return resolveProfilePlace(
+    ctx.db,
+    host,
+    key,
+    ctx.config.defaultCity,
+    ctx.profileId,
+    new Map<string, LocationInfo>(),
+  );
 }
 
 /** 观测时刻 → 本地「yyyy-MM-dd HH:mm」；解析不了就原样返回（不编造） */
@@ -111,38 +244,117 @@ function airTable(air: AirQuality): { columns: string[]; rows: string[][] } {
   return { columns: ["项目", "内容"], rows };
 }
 
+/** view=travel：出行计划的 set/clear/show（只写该 Profile 的 settings.travel_plan，不新增表） */
+async function travelView(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+  const action = args.action;
+  const today = todayIso();
+  if (action === "show") {
+    const state = readTravelPlan(ctx.db, ctx.profileId);
+    if (state.kind === "corrupt") {
+      return okJson({
+        出行模式: null,
+        说明: "出行计划数据损坏，已忽略；可重新 set 覆盖，或先 clear 清除",
+      });
+    }
+    if (state.kind === "none") return okJson(null);
+    const plan = state.plan;
+    return okJson({
+      出行模式: {
+        城市: plan.city,
+        城市ID: plan.cityId,
+        纬度: plan.lat,
+        经度: plan.lon,
+        开始: plan.start,
+        结束: plan.end,
+      },
+      生效: isTravelActive(plan, today),
+      今天: today,
+    });
+  }
+  if (action === "clear") {
+    deleteSetting(ctx.db, ctx.profileId, TRAVEL_PLAN_KEY);
+    return ok("已清除出行模式");
+  }
+  if (action !== "set") return fail("travel 需要 action 参数（set/clear/show）");
+  const city = typeof args.city === "string" ? args.city.trim() : "";
+  if (city === "") return fail("设置出行计划需要 city 参数");
+  const start = typeof args.start === "string" ? args.start : "";
+  const end = typeof args.end === "string" ? args.end : "";
+  if (!isDate(start) || !isDate(end)) {
+    return fail("设置出行计划需要合法的 start/end 日期（YYYY-MM-DD）");
+  }
+  if (start > end) return fail("出行计划开始日期不能晚于结束日期");
+  if (end < today) return fail(`出行计划结束日期不能早于今天（${today}）`);
+  const windowDays = calendarDaysBetween(start, end) + 1;
+  if (windowDays > 366) return fail(`出行窗口最长 366 天（当前 ${windowDays} 天）`);
+  const { host, key } = requireQweather(ctx);
+  const loc = await geoLookup(ctx.db, host, key, city);
+  const plan: TravelPlan = {
+    city: loc.city,
+    cityId: loc.cityId,
+    lat: loc.lat,
+    lon: loc.lon,
+    start,
+    end,
+  };
+  setSetting(ctx.db, ctx.profileId, TRAVEL_PLAN_KEY, plan);
+  const active = isTravelActive(plan, today);
+  return okJson({
+    已设置出行: { 城市: plan.city, 城市ID: plan.cityId, 开始: start, 结束: end },
+    生效: active,
+    说明: active
+      ? "今天在出行窗口内：天气、空气质量、预警、每日简报与预警巡检将使用目的地"
+      : `今天（${today}）不在出行窗口内，${start} 起自动生效；在此之前仍使用家位置`,
+  });
+}
+
 export async function weatherTool(args: Record<string, unknown>, ctx: ToolContext) {
   try {
     const view = args.view as string;
     const city = args.city as string | undefined;
+    if (view === "travel") return await travelView(args, ctx);
     if (view === "locate") {
       if (city === undefined || city.trim() === "") return fail("locate 需要 city 参数");
-      const loc = await resolveLocation(ctx, city);
-      saveLocation(ctx.db, ctx.profileId, loc);
-      return okJson({ 已设置位置: loc, 说明: "该 Profile 后续天气查询与每日简报将使用此位置" });
+      const place = await resolveToolPlace(ctx, city);
+      saveLocation(ctx.db, ctx.profileId, place.loc);
+      const payload: Record<string, unknown> = {
+        已设置位置: place.loc,
+        说明: "该 Profile 后续天气查询与每日简报将使用此位置",
+      };
+      // locate 设置的始终是「家」的位置；出行生效期间查询仍走目的地，必须明确告知
+      const state = readTravelPlan(ctx.db, ctx.profileId);
+      if (state.kind === "plan" && isTravelActive(state.plan, todayIso())) {
+        payload.出行模式提示 = "出行模式生效中，天气查询仍使用目的地，结束后自动恢复";
+      }
+      return okJson(payload);
     }
-    const loc = await resolveLocation(ctx, city);
+    const place = await resolveToolPlace(ctx, city);
+    const loc = place.loc;
+    const travel = place.travel === null ? {} : { 出行模式: travelModeField(place.travel) };
     if (view === "current") {
       const { host, key } = requireQweather(ctx);
       const cur = await currentWeather(ctx.db, host, key, loc);
-      return okJson({ 城市: loc.city, 天气: weatherTable(cur) });
+      return okJson({ 城市: loc.city, ...travel, 天气: weatherTable(cur) });
     }
     if (view === "forecast") {
       const { host, key } = requireQweather(ctx);
       const days = (args.days as number) === 3 ? 3 : 7;
       const list = await forecast(ctx.db, host, key, loc, days);
-      return okJson({ 城市: loc.city, 预报: forecastTable(list) });
+      return okJson({ 城市: loc.city, ...travel, 预报: forecastTable(list) });
     }
     if (view === "alert") {
       const { host, key } = requireQweather(ctx);
       const list = await alerts(ctx.db, host, key, loc);
-      if (list.length === 0) return ok(`${loc.city}：当前无生效气象预警`);
-      return okJson({ 城市: loc.city, 预警: alertTable(list) });
+      if (list.length === 0) {
+        const suffix = place.travel === null ? "" : `（${travelModeText(place.travel)}）`;
+        return ok(`${loc.city}：当前无生效气象预警${suffix}`);
+      }
+      return okJson({ 城市: loc.city, ...travel, 预警: alertTable(list) });
     }
     if (view === "air") {
       const { host, key } = requireQweather(ctx);
       const air = await airQuality(ctx.db, host, key, loc);
-      return okJson({ 城市: loc.city, 空气质量: airTable(air) });
+      return okJson({ 城市: loc.city, ...travel, 空气质量: airTable(air) });
     }
     return fail(`未知 view: ${view}`);
   } catch (e) {
@@ -163,11 +375,6 @@ function briefAlertText(alert: WeatherAlert): string {
   const end = compactInstant(alert.endsAt);
   if (start === "" && end === "") return `${alert.level}${alert.type}`;
   return `${alert.level}${alert.type}（${start || "?"}–${end || "?"}）`;
-}
-
-/** MM-DD，用于简报里的紧凑日期区间 */
-function shortDate(date: string): string {
-  return date.slice(5);
 }
 
 /**
@@ -197,6 +404,21 @@ function holidayNote(db: DatabaseSync, today: string): string | null {
   return null;
 }
 
+/**
+ * 简报「下个假期」行：未开始 → 倒计时；进行中 → 第几天；无数据 → 明确未知。
+ * 口径完全来自 nextHolidayPeriod（与 holiday 工具同一套区间），不猜调休/假期。
+ */
+function nextHolidayText(db: DatabaseSync, today: string): string {
+  const period = nextHolidayPeriod(db, today);
+  if (period === null) return "未知（节假日数据未就绪）";
+  if (period.inProgress) {
+    const day = calendarDaysBetween(period.start, today) + 1;
+    return `${period.name}（假期中，第 ${day}/${period.days} 天，至 ${shortDate(period.end)}）`;
+  }
+  const daysLeft = calendarDaysBetween(today, period.start);
+  return `${period.name} ${shortDate(period.start)} 起，还有 ${daysLeft} 天（共 ${period.days} 天）`;
+}
+
 /** 每日简报：确定性组装，无 LLM；单边数据失败用另一侧，全部失败不发送 */
 export async function runDailyBrief(): Promise<void> {
   const rt = runtime();
@@ -211,20 +433,21 @@ export async function runDailyBrief(): Promise<void> {
   // 永远收不到简报。
   const profiles = listProfiles(rt.db);
   const cityCache = new Map<string, LocationInfo>();
+  const calendarToday = todayIso();
   for (const profileId of profiles) {
     try {
-      // 有 saved location 时直接复用（含显式选定时的 lat/lon/cityId）：
-      // 按城市名重新 Geo 查询会重新取「第一个同名结果」，可能偏离用户选定的位置，
-      // 也会在每次进程重启后多消耗一次 GeoAPI 配额。
-      const saved = cachedLocation(rt.db, profileId);
-      let loc: LocationInfo;
-      if (saved !== null) {
-        loc = saved;
-      } else {
-        const city = rt.config.defaultCity;
-        loc = cityCache.get(city) ?? (await geoLookup(rt.db, host, key, city));
-        cityCache.set(city, loc);
-      }
+      // 与工具查询同一解析口径：窗口内出行计划 > 已保存位置 > DEFAULT_CITY。
+      // saved location 直接复用（含显式选定时的 lat/lon/cityId）：按城市名重新 Geo 查询
+      // 会重新取「第一个同名结果」，可能偏离用户选定的位置，也会多消耗 GeoAPI 配额。
+      const place = await resolveProfilePlace(
+        rt.db,
+        host,
+        key,
+        rt.config.defaultCity,
+        profileId,
+        cityCache,
+      );
+      const loc = place.loc;
       const [cur, fc, air, alertList] = await Promise.all([
         currentWeather(rt.db, host, key, loc).catch(() => null),
         forecast(rt.db, host, key, loc, 7).catch(() => null),
@@ -236,6 +459,8 @@ export async function runDailyBrief(): Promise<void> {
         continue;
       }
       const rows: string[][] = [];
+      // 出行模式显式标注（标题已用目的地城市，但必须让用户知道这不是「家」的天气）
+      if (place.travel !== null) rows.push(["出行模式", travelModeBrief(place.travel)]);
       if (cur !== null) {
         rows.push(["天气", `${cur.text} ${cur.temp}°C（体感 ${cur.feelsLike}°C）`]);
         rows.push(["湿度/风速", `${cur.humidity}% / ${cur.windSpeed} km/h`]);
@@ -244,6 +469,7 @@ export async function runDailyBrief(): Promise<void> {
       if (today !== undefined)
         rows.push(["今日气温", `${today.tMin}~${today.tMax}°C ${today.textDay}`]);
       if (air !== null) rows.push(["空气质量", `AQI ${air.aqi}（${air.category}）`]);
+      rows.push(["下个假期", nextHolidayText(rt.db, calendarToday)]);
       rows.push([
         "预警",
         alertList === null
@@ -254,7 +480,7 @@ export async function runDailyBrief(): Promise<void> {
       ]);
 
       const notes: string[] = [];
-      const calendarNote = holidayNote(rt.db, todayIso());
+      const calendarNote = holidayNote(rt.db, calendarToday);
       if (calendarNote !== null) notes.push(calendarNote);
       // 有生效预警时绝不能落到「适宜出行」（预警在表格里、默认 note 却给出相反结论）。
       if (alertList !== null && alertList.length > 0) notes.push("有气象预警，注意防范");
@@ -269,7 +495,7 @@ export async function runDailyBrief(): Promise<void> {
         kind: "weather.brief",
         title: `${loc.city} 每日简报`,
         blocks: { table: { columns: ["项目", "内容"], rows }, notes },
-        dedupeKey: `brief:${profileId}:${loc.city}:${todayIso()}`,
+        dedupeKey: `brief:${profileId}:${loc.city}:${calendarToday}`,
       });
     } catch (e) {
       logger.error(`每日简报失败 ${profileId}: ${errorMessage(e)}`);
@@ -375,7 +601,7 @@ function alertTitle(alert: WeatherAlert): string {
   return level === "" ? `⚠️ 气象预警：${alert.type}` : `⚠️ 气象预警：${alert.type} ${level}`;
 }
 
-function alertBlocks(alert: WeatherAlert): NotifyBlock {
+function alertBlocks(alert: WeatherAlert, travel: TravelPlan | null): NotifyBlock {
   return {
     table: {
       columns: ["级别", "类型", "生效", "失效", "说明"],
@@ -389,6 +615,8 @@ function alertBlocks(alert: WeatherAlert): NotifyBlock {
         ],
       ],
     },
+    // 出行模式生效时预警来自目的地，通知必须标注，避免用户误以为是在家乡
+    ...(travel === null ? {} : { notes: [travelModeText(travel)] }),
   };
 }
 
@@ -410,16 +638,16 @@ export async function runAlertWatch(): Promise<void> {
   const cityCache = new Map<string, LocationInfo>();
   for (const profileId of listProfiles(rt.db)) {
     try {
-      // 与每日简报同口径：显式选定的位置直接复用，不能再按城市名重新 Geo 查询。
-      const saved = cachedLocation(rt.db, profileId);
-      let loc: LocationInfo;
-      if (saved !== null) {
-        loc = saved;
-      } else {
-        const city = rt.config.defaultCity;
-        loc = cityCache.get(city) ?? (await geoLookup(rt.db, host, key, city));
-        cityCache.set(city, loc);
-      }
+      // 与每日简报同口径：窗口内出行计划 > 已保存位置 > DEFAULT_CITY。
+      const place = await resolveProfilePlace(
+        rt.db,
+        host,
+        key,
+        rt.config.defaultCity,
+        profileId,
+        cityCache,
+      );
+      const loc = place.loc;
       const list = await alerts(rt.db, host, key, loc);
       const notified = notifiedAlertRanks(rt.db, profileId);
       for (const alert of list) {
@@ -435,7 +663,7 @@ export async function runAlertWatch(): Promise<void> {
           await publishProfile(rt.db, rt.config, profileId, {
             kind: "weather.alert",
             title: alertTitle(alert),
-            blocks: alertBlocks(alert),
+            blocks: alertBlocks(alert, place.travel),
             dedupeKey: alertDedupeKey(alert),
             // 预警失效时刻即投递截止：静默时段结束后不再补投已失效的预警
             expiresAt: alert.endsAt,
@@ -461,10 +689,13 @@ registerModule({
     {
       name: "weather",
       description:
-        "天气查询（QWeather）：view=current 实时天气；view=forecast 七天/三天预报；view=alert 气象预警；view=locate 设置该 Profile 的默认位置（city 参数，如 '上海'）；view=air 空气质量（国标）。city 参数可选，缺省用已设置位置或 DEFAULT_CITY。",
+        "天气查询（QWeather）：view=current 实时天气；view=forecast 七天/三天预报；view=alert 气象预警；view=locate 设置该 Profile 的默认位置（city 参数，如 '上海'）；view=air 空气质量（国标）；view=travel 出行模式（action=set 需 city/start/end，action=clear 清除，action=show 查看）。city 参数可选，缺省按「出行计划（窗口内）> 已设置位置 > DEFAULT_CITY」解析。",
       inputSchema: {
-        view: z.enum(["current", "forecast", "alert", "air", "locate"]),
-        city: z.string().max(64).optional().describe("城市名；locate 时必填"),
+        view: z.enum(["current", "forecast", "alert", "air", "locate", "travel"]),
+        action: z.enum(["set", "clear", "show"]).optional().describe("view=travel 的操作"),
+        city: z.string().max(64).optional().describe("城市名；locate / travel set 时必填"),
+        start: z.string().max(10).optional().describe("出行开始日期 YYYY-MM-DD；travel set 必填"),
+        end: z.string().max(10).optional().describe("出行结束日期 YYYY-MM-DD；travel set 必填"),
         days: z
           .union([z.literal(3), z.literal(7)])
           .optional()
@@ -475,16 +706,20 @@ registerModule({
     {
       name: "air_quality",
       description:
-        "空气质量（QWeather 国标 AQI/PM2.5/PM10）。city 可选，缺省用已设置位置或 DEFAULT_CITY。",
+        "空气质量（QWeather 国标 AQI/PM2.5/PM10）。city 可选，缺省按「出行计划（窗口内）> 已设置位置 > DEFAULT_CITY」解析。",
       inputSchema: {
         city: z.string().max(64).optional(),
       },
       handler: async (args, ctx) => {
         try {
-          const loc = await resolveLocation(ctx, args.city as string | undefined);
+          const place = await resolveToolPlace(ctx, args.city as string | undefined);
           const { host, key } = requireQweather(ctx);
-          const air = await airQuality(ctx.db, host, key, loc);
-          return okJson({ 城市: loc.city, 空气质量: airTable(air) });
+          const air = await airQuality(ctx.db, host, key, place.loc);
+          return okJson({
+            城市: place.loc.city,
+            ...(place.travel === null ? {} : { 出行模式: travelModeField(place.travel) }),
+            空气质量: airTable(air),
+          });
         } catch (e) {
           return fail(errorMessage(e));
         }

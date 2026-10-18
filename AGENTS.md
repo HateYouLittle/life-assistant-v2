@@ -32,14 +32,16 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
 
 ## 架构
 
-- `src/core/` 是框架层：database/registry/auth/http/logger/settings/notify/render/
-  qweather/qweather-jwt/holiday/recurrence/retention。`src/modules/`（weather/holiday/schedule/bookkeeping/notify）
-  通过 `src/modules/index.ts` 的副作用 import 接入，遵循 `tools / jobs / tick / onStart`
-  四个契约扩展点。
+- `src/core/` 是框架层：database/registry/auth/http/logger/settings/notify/channels/render/
+  qweather/qweather-jwt/holiday/recurrence/retention/backup。`src/modules/`
+  （weather/holiday/schedule/bookkeeping/notify/maintenance）通过 `src/modules/index.ts` 的
+  副作用 import 接入，遵循 `tools / jobs / tick / onStart` 四个契约扩展点。`maintenance`
+  只注册每日备份 job（与 `db:backup` CLI 共用 `src/core/backup.ts` 的实现）。
 - **核心层不得 import 模块内部。** 这一点由 `tests/registry.test.ts` 的静态 import 扫描强制，
   而不仅是运行时查重。新模块在 `modules/index.ts` 注册。
-- 例外是 `src/server/details.ts`，它直接 import 了 bookkeeping/schedule 的纯函数（已知技术债）。
-  改模块内部签名可能静默破坏状态页——记得同步检查 `details.ts`。
+- 例外是 `src/server/details.ts`，它直接 import 了 bookkeeping/schedule 的纯函数；
+  `src/server/status.ts` 的 CSV 导出也直接 import 了 bookkeeping 的 `expenseCsv`
+  （同上，已知技术债）。改模块内部签名可能静默破坏状态页——记得同步检查这两个文件。
 - Runtime 是进程级单例（`src/core/registry.ts` 的 `initRuntime`/`runtime`），只能初始化一次。
   测试必须用 `makeTestEnv()` + `cleanupTestEnv()`（`tests/helpers.ts`），后者会重置 runtime
   并调用 `cancelPendingDrain()`。
@@ -78,7 +80,8 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
 
 - QWeather 的 GeoAPI 结果不得缓存/落盘/批量建索引（版权限制）——只允许进程内 memo。
   例外：用户经 `weather locate` 显式选定的位置会作为该 Profile 的配置长期保存，属用户
-  主动设置而非缓存/批量索引。
+  主动设置而非缓存/批量索引；`weather travel` 的出行计划同理（只存城市/经纬度/起止日期，
+  生效期间直接复用、不再请求 GeoAPI）。
   HTTP 错误只对 429/5xx/网络故障重试；**4xx 必须立即抛出**（反复重试错误请求会导致
   账号被冻结）。API KEY 是回退；优先 Ed25519 JWT，且四个 `QWEATHER_JWT_*` 变量必须
   同时配置，否则启动失败。

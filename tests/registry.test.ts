@@ -67,7 +67,14 @@ describe("registry 契约", () => {
     // 回归：此处曾经只断言 length >= N，而那个下限由本文件前面自己 registerModule 的
     // 测试模块满足 —— 真实模块注册整个坏掉也照样绿，且全程没人调用 registerAllModules。
     registerAllModules();
-    const realModules = new Set(["bookkeeping", "holiday", "notify", "schedule", "weather"]);
+    const realModules = new Set([
+      "bookkeeping",
+      "holiday",
+      "maintenance",
+      "notify",
+      "schedule",
+      "weather",
+    ]);
     const tools = allTools()
       .filter((t) => realModules.has(t.module))
       .map((t) => t.def.name)
@@ -90,6 +97,7 @@ describe("registry 契约", () => {
       "bookkeeping.monthly_report",
       "holiday.refresh",
       "holiday.workday_watch",
+      "maintenance.daily_backup",
       "notify.retention",
       "schedule.occurrence_cleanup",
       "weather.alert_watch",

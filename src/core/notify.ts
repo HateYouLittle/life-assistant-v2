@@ -1,7 +1,7 @@
-import { createHmac } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { ResolvedConfig } from "../config.js";
 import { inQuietWindow, nowIso } from "../time.js";
+import { findChannel, getChannel, type NotificationChannel } from "./channels.js";
 import { withTransaction } from "./database.js";
 import { logger } from "./logger.js";
 import { renderBlocks } from "./render.js";
@@ -10,9 +10,12 @@ import { ensureProfile, getSetting, newId, setSetting } from "./settings.js";
 
 /**
  * Outbox：通知 + 投递记录在同一事务写入；单写者进程内投递。
- * 投递协议与 v1 完全兼容（对照旧仓库 src/core/notify-delivery.ts 核对）：
- * deliver-only 回环 webhook、HMAC-SHA256 V2、X-Request-ID、10s 超时、有界重试。
+ * 投递通道由 src/core/channels.ts 抽象：webhook 逐字保留 v1 协议
+ * （deliver-only 回环 webhook、HMAC-SHA256 V2、X-Request-ID、10s 超时、有界重试），
+ * log 只写进程日志；本文件只负责何时投、投几次、失败怎么退避。
  */
+
+export { EVENT_TYPE } from "./channels.js";
 
 const LADDER_SECONDS = [60, 300, 900, 3600];
 const MAX_CONFIRMED_FAILURES = 5;
@@ -21,7 +24,6 @@ const IDEMPOTENCY_WINDOW_MS = 55 * 60 * 1000;
 const BATCH_LIMIT = 100;
 const CONCURRENCY = 5;
 const DRAIN_BUDGET_MS = 45_000;
-export const EVENT_TYPE = "life_assistant.reminder";
 
 /** HTTP header 值只能是可见 ASCII；路由名是用户输入，中文/控制字符会让 fetch 直接抛错 */
 function headerSafe(value: string): string {
@@ -33,6 +35,19 @@ export interface PushRoute {
   url: string;
   platform: string | null;
   enabled: boolean;
+  /** 投递通道名；缺省（改造前的旧数据）等同 DEFAULT_CHANNEL（webhook） */
+  channel?: string;
+}
+
+/** 路由当前可投递时返回它选中的通道；禁用/未知通道/缺 URL 一律视为不可投递 */
+function routableRoute(
+  route: PushRoute | null,
+): { route: PushRoute; channel: NotificationChannel } | null {
+  if (route === null || !route.enabled) return null;
+  const channel = findChannel(route.channel);
+  if (channel === null) return null;
+  if (channel.requiresUrl && route.url === "") return null;
+  return { route, channel };
 }
 
 interface DeliveryRow {
@@ -59,36 +74,31 @@ export function getPushRoute(db: DatabaseSync, profileId: string): PushRoute | n
   return getSetting<PushRoute>(db, profileId, "push_route") ?? null;
 }
 
-const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
-
-/** 路由 URL 仅接受回环主机名（与 v1 一致的安全默认） */
+/**
+ * 配置推送路由。URL 与通道专属参数由通道的 validateRoute 校验：
+ * webhook 仍要求回环 URL，log 不需要 URL（落空串）与 secret；name/platform/enabled 行为不变。
+ */
 export function setPushRoute(
   db: DatabaseSync,
   profileId: string,
-  input: { url: string; platform?: string; name?: string; enabled?: boolean },
+  input: {
+    url?: string;
+    channel?: string;
+    platform?: string;
+    name?: string;
+    enabled?: boolean;
+  },
 ): PushRoute {
-  let parsed: URL;
-  try {
-    parsed = new URL(input.url);
-  } catch {
-    throw new Error(`推送 URL 不合法: ${input.url}`);
-  }
-  // 只允许 http/https：ftp/file 等协议主机名也能过回环检查，但 fetch 对它们一律失败，
-  // 每次都会走满传输重试再进 fallback（用户看到「已配置」却永远收不到推送）。
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw new Error(`推送 URL 仅支持 http/https: ${input.url}`);
-  }
-  const hostname = parsed.hostname.replace(/^\[/, "").replace(/\]$/, "");
-  if (!LOOPBACK_HOSTS.has(hostname.toLowerCase())) {
-    throw new Error(`推送 URL 仅接受 127.0.0.1 / localhost / [::1] 主机名，收到: ${hostname}`);
-  }
+  const channel = getChannel(input.channel);
+  const url = channel.validateRoute({ url: input.url });
   const name = input.name?.trim() || `life-assistant-${profileId}`;
   if (name.length > 80) throw new Error(`路由名过长（≤80 字符，当前 ${name.length}）`);
   const route: PushRoute = {
     name,
-    url: parsed.toString(),
+    url,
     platform: input.platform?.trim() || null,
     enabled: input.enabled ?? true,
+    channel: channel.name,
   };
   setSetting(db, profileId, "push_route", route);
   requeueRoute(db, profileId);
@@ -151,6 +161,7 @@ export function routedProfiles(db: DatabaseSync): string[] {
         const url = route.url;
         const enabled = route.enabled;
         if (typeof enabled !== "boolean" || typeof url !== "string") return null;
+        const channel = typeof route.channel === "string" ? route.channel : undefined;
         return {
           profile_id: r.profile_id,
           route: {
@@ -158,6 +169,7 @@ export function routedProfiles(db: DatabaseSync): string[] {
             url,
             platform: typeof route.platform === "string" ? route.platform : null,
             enabled,
+            ...(channel === undefined ? {} : { channel }),
           },
         };
       } catch {
@@ -165,7 +177,7 @@ export function routedProfiles(db: DatabaseSync): string[] {
       }
     })
     .filter((r): r is { profile_id: string; route: PushRoute } => r !== null)
-    .filter((r) => r.route.enabled && r.route.url !== "")
+    .filter((r) => routableRoute(r.route) !== null)
     .map((r) => r.profile_id)
     .sort();
 }
@@ -190,10 +202,11 @@ export function publishProfile(
   const bodyMd = rendered.body;
   const id = newId();
   const createdAt = nowIso();
-  const route = getPushRoute(db, profileId);
+  const routable = routableRoute(getPushRoute(db, profileId));
   const secret = routeSecret(config, profileId);
-  const routable = route?.enabled === true && route.url !== "";
-  const secretMissing = routable && secret === undefined;
+  // 只有 requiresSecret 的通道（webhook）会因 secret 缺失而投不出去；log 通道不需要 secret
+  const secretMissing = routable?.channel.requiresSecret === true && secret === undefined;
+  const queueable = routable !== null && (!routable.channel.requiresSecret || secret !== undefined);
 
   // notification 与 delivery 必须同事务落库：只写进一半会让「有通知却没投递记录」永久卡住
   const { result, queued } = withTransaction(db, () => {
@@ -220,11 +233,19 @@ export function publishProfile(
       createdAt,
     );
 
-    if (!routable || secret === undefined) return { result: { id, deduped: false }, queued: false };
+    if (!queueable || routable === null) return { result: { id, deduped: false }, queued: false };
     db.prepare(
       `INSERT INTO deliveries (id, notification_id, route_name, status, next_attempt_at, expire_at, created_at, updated_at)
        VALUES (?, ?, ?, 'queued', ?, ?, ?, ?)`,
-    ).run(newId(), id, route.name, createdAt, input.expiresAt ?? null, createdAt, createdAt);
+    ).run(
+      newId(),
+      id,
+      routable.route.name,
+      createdAt,
+      input.expiresAt ?? null,
+      createdAt,
+      createdAt,
+    );
     return { result: { id, deduped: false }, queued: true };
   });
 
@@ -472,9 +493,14 @@ function skipReason(db: DatabaseSync, config: ResolvedConfig, row: DeliveryRow):
     getSetting<{ start: string; end: string }>(db, row.profile_id, "quiet_hours") ?? null;
   if (inQuietWindow(quiet)) return "quiet-hours";
   const route = getPushRoute(db, row.profile_id);
-  if (route === null || !route.enabled || route.url === "") return "route removed";
+  if (route === null || !route.enabled) return "route removed";
+  const channel = findChannel(route.channel);
+  // 未知通道名按路由不可用处理（手工改库/降级回滚）：不能让 drain 每轮抛错卡住别的 Profile
+  if (channel === null || (channel.requiresUrl && route.url === "")) return "route removed";
   if (route.name !== row.route_name) return "route drift";
-  if (routeSecret(config, row.profile_id) === undefined) return "secret missing";
+  if (channel.requiresSecret && routeSecret(config, row.profile_id) === undefined) {
+    return "secret missing";
+  }
   return null;
 }
 
@@ -487,8 +513,11 @@ async function deliverOne(
   // 路由/secret 必须在 claim 之前判定：claim 之后才发现缺失会留下一条持久为
   // 'sending' 的行（下一轮 recoverStaleSending 虽会复位，但先写后弃本身就是脏状态）。
   const route = getPushRoute(db, row.profile_id);
+  const channel = route === null ? null : findChannel(route.channel);
+  if (route === null || channel === null) return false;
+  if (channel.requiresUrl && route.url === "") return false;
   const secret = routeSecret(config, row.profile_id);
-  if (route === null || secret === undefined) return false;
+  if (channel.requiresSecret && secret === undefined) return false;
 
   const claimId = newId();
   const routeName = headerSafe(row.route_name).slice(0, 80);
@@ -514,50 +543,26 @@ async function deliverOne(
   // 兼容升级前已落库的 request_id（可能含非 ASCII 路由名）：发请求前再清洗一次。
   const requestId = headerSafe(current?.request_id ?? claimId);
 
-  const payload = JSON.stringify({
-    event_type: EVENT_TYPE,
-    notification: {
-      profileId: row.profile_id,
-      source: row.kind,
-      title: row.title,
-      body: row.body_md,
-      createdAt: row.n_created_at,
-    },
+  const outcome = await channel.deliver({
+    profileId: row.profile_id,
+    notificationId: row.notification_id,
+    kind: row.kind,
+    title: row.title,
+    bodyMd: row.body_md,
+    createdAt: row.n_created_at,
+    requestId,
+    generation: row.generation,
+    route: { name: route.name, url: route.url },
+    secret,
   });
-
-  const timestamp = Math.floor(Date.now() / 1000).toString();
-  const signature = createHmac("sha256", secret).update(`${timestamp}.${payload}`).digest("hex");
-
-  try {
-    const response = await fetch(route.url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Webhook-Timestamp": timestamp,
-        "X-Webhook-Signature-V2": signature,
-        "X-Request-ID": requestId,
-      },
-      body: payload,
-      signal: AbortSignal.timeout(10_000),
-      redirect: "manual",
-    });
-    if (response.body !== null) response.body.cancel().catch(() => {});
-    if (response.ok) {
-      markSent(db, row);
-      return true;
-    }
-    // 确定性拒绝不重试：4xx（408/429 除外）与 3xx 重定向改不了结果，只会在阶梯上耗到
-    // 1 小时。3xx 尤其如此：redirect: "manual" 下投递请求根本没有被 webhook 处理，
-    // 重试多少次都是同一个重定向。与 QWeather 客户端的「4xx 不重试」保持同一口径。
-    const status = response.status;
-    const retryable = status === 408 || status === 429 || (status >= 500 && status <= 599);
-    if (!retryable) {
-      markTerminalFallback(db, row, `HTTP ${status}`);
-      return true;
-    }
-    markConfirmedFailure(db, row, `HTTP ${status}`);
-  } catch (e) {
-    markTransportFailure(db, row, e instanceof Error ? e.message : String(e));
+  if (outcome.status === "sent") {
+    markSent(db, row);
+  } else if (outcome.status === "terminal_failure") {
+    markTerminalFallback(db, row, outcome.error);
+  } else if (outcome.status === "confirmed_failure") {
+    markConfirmedFailure(db, row, outcome.error);
+  } else {
+    markTransportFailure(db, row, outcome.error);
   }
   // claim 已成功：行无论落到 sent / fallback / 退避重试，都已离开待投集合
   return true;
