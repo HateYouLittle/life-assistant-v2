@@ -1,11 +1,11 @@
-import { DateTime } from "luxon";
 import type { DatabaseSync } from "node:sqlite";
-import { monthRange } from "../modules/bookkeeping/service.js";
-import { KIND_LABEL, parseEscalation, type ScheduleKind } from "../modules/schedule/service.js";
-import { allJobs, type JobDef } from "../core/registry.js";
-import { lastJobRun, recentJobRuns, type JobRunRow, type JobRunStatus } from "../core/jobs.js";
+import { DateTime } from "luxon";
 import { withReadTransaction } from "../core/database.js";
 import { holidayPeriods } from "../core/holiday.js";
+import { type JobRunRow, type JobRunStatus, lastJobRun, recentJobRuns } from "../core/jobs.js";
+import { allJobs, type JobDef } from "../core/registry.js";
+import { monthRange } from "../modules/bookkeeping/service.js";
+import { KIND_LABEL, parseEscalation, type ScheduleKind } from "../modules/schedule/service.js";
 import { TZ, todayIso } from "../time.js";
 
 /**
@@ -38,6 +38,20 @@ function clampLimit(raw: string | undefined, fallback: number, max = 200): numbe
   return Math.max(1, Math.min(Math.trunc(value), max));
 }
 
+/**
+ * 分页 offset：空串/非法/负数一律回退 0。
+ *
+ * 与 clampLimit 的区别是**不回退成某个默认值**：offset 缺省本来就是第一页（0），
+ * 而不是像 limit 那样有个业务默认。上限 100000 只为兜住恶意深分页
+ * （SQLite OFFSET 需要扫过前 N 行，超深分页会拖慢单写者的库）。
+ */
+export function clampOffset(raw: string | undefined, max = 100_000): number {
+  if (raw === undefined || raw.trim() === "") return 0;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(Math.trunc(value), max));
+}
+
 export interface ExpenseEntry {
   id: string;
   ledger_id: string;
@@ -60,16 +74,24 @@ export interface ExpenseDetails {
   ledgers: Array<{ ledger_id: string; ledger_name: string; cents: number; count: number }>;
   entries: ExpenseEntry[];
   entries_total: number;
+  /** 本页起点（= 夹紧后的 offset，便于客户端续页时对照） */
+  offset: number;
+  /** 还有没有下一页：offset + 本页条数 < 总数 */
+  has_more: boolean;
+  /** 下一页 offset；没有更多时为 null（前端据此把按钮切成「已全部加载」） */
+  next_offset: number | null;
 }
 
 export function expenseDetails(
   db: DatabaseSync,
   rawMonth: string | undefined,
   rawLimit: string | undefined,
+  rawOffset?: string,
 ): ExpenseDetails {
   const month = normalizeMonth(rawMonth);
   const { from, to } = monthRange(month);
   const limit = clampLimit(rawLimit, 50);
+  const offset = clampOffset(rawOffset);
 
   // 6 条独立 SELECT 需要一个一致快照：并发写入时否则「合计」与「分类/明细」会对不上
   // （与 bookkeeping 的 summarizeExpenses 同口径）。
@@ -110,15 +132,17 @@ export function expenseDetails(
       .all(from, to) as { ledger_id: string; ledger_name: string; cents: number; count: number }[];
 
     // 状态页只展示家庭账本；个人账本及其支出完全不出现在看板（无 Profile 维度）
+    // 排序补上 e.id 兜底：spent_on + created_at 完全相同的两条在分页时有稳定顺序，
+    // 否则 SQLite 的返回顺序不确定，翻页可能出现重复或漏行。
     const entries = db
       .prepare(
         `SELECT e.id, e.ledger_id, l.name AS ledger_name, e.amount_cents, e.category,
               e.note, e.spent_on, e.created_by_profile
        FROM expenses e JOIN ledgers l ON l.id = e.ledger_id
        WHERE e.spent_on >= ? AND e.spent_on <= ? AND l.owner_profile_id IS NULL
-       ORDER BY e.spent_on DESC, e.created_at DESC LIMIT ?`,
+       ORDER BY e.spent_on DESC, e.created_at DESC, e.id DESC LIMIT ? OFFSET ?`,
       )
-      .all(from, to, limit) as unknown as ExpenseEntry[];
+      .all(from, to, limit, offset) as unknown as ExpenseEntry[];
 
     const prevMonth = previousMonthOf(month);
     const prevRange = monthRange(prevMonth);
@@ -130,6 +154,8 @@ export function expenseDetails(
       )
       .get(prevRange.from, prevRange.to) as { cents: number };
 
+    const entriesTotal = totals.count;
+    const hasMore = offset + entries.length < entriesTotal;
     return {
       month,
       range: { from, to },
@@ -145,7 +171,11 @@ export function expenseDetails(
       daily,
       ledgers,
       entries,
-      entries_total: totals.count,
+      entries_total: entriesTotal,
+      offset,
+      has_more: hasMore,
+      // 用「实际返回条数」推进而不是 offset + limit：越界/末页不满时也不会跳过数据
+      next_offset: hasMore ? offset + entries.length : null,
     };
   });
 }
@@ -279,6 +309,11 @@ export interface DeliveryDetails {
   counts: { queued: number; failed: number; fallback: number; sent_24h: number };
   daily: Array<{ date: string; label: string; sent: number }>;
   items: DeliveryDetailItem[];
+  /** 投递记录总数（不受 limit/offset 影响），前端据此判断还有没有下一页 */
+  items_total: number;
+  offset: number;
+  has_more: boolean;
+  next_offset: number | null;
 }
 
 function localDay(iso: string): string {
@@ -292,8 +327,13 @@ function localShort(iso: string | null): string | null {
   return dt.isValid ? dt.toFormat("MM-dd HH:mm") : null;
 }
 
-export function deliveryDetails(db: DatabaseSync, rawLimit: string | undefined): DeliveryDetails {
+export function deliveryDetails(
+  db: DatabaseSync,
+  rawLimit: string | undefined,
+  rawOffset?: string,
+): DeliveryDetails {
   const limit = clampLimit(rawLimit, 60, 500);
+  const offset = clampOffset(rawOffset);
   const count = (sql: string, ...params: (string | number)[]): number =>
     (db.prepare(sql).get(...params) as { n: number } | undefined)?.n ?? 0;
 
@@ -329,10 +369,12 @@ export function deliveryDetails(db: DatabaseSync, rawLimit: string | undefined):
               COALESCE(n.profile_id, '-') AS profile_id, d.route_name, d.status, d.attempts,
               d.confirmed_failures, d.transport_failures, d.created_at, d.sent_at, d.next_attempt_at, d.last_error
        FROM deliveries d LEFT JOIN notifications n ON n.id = d.notification_id
-       ORDER BY d.created_at DESC LIMIT ?`,
+       ORDER BY d.created_at DESC, d.id DESC LIMIT ? OFFSET ?`,
     )
-    .all(limit) as unknown as DeliveryDetailItem[];
+    .all(limit, offset) as unknown as DeliveryDetailItem[];
 
+  const itemsTotal = count("SELECT COUNT(*) AS n FROM deliveries");
+  const hasMore = offset + items.length < itemsTotal;
   return {
     counts: {
       queued: count("SELECT COUNT(*) AS n FROM deliveries WHERE status = 'queued'"),
@@ -353,6 +395,10 @@ export function deliveryDetails(db: DatabaseSync, rawLimit: string | undefined):
       created_local: localShort(item.created_at) ?? item.created_at,
       sent_local: localShort(item.sent_at),
     })),
+    items_total: itemsTotal,
+    offset,
+    has_more: hasMore,
+    next_offset: hasMore ? offset + items.length : null,
   };
 }
 

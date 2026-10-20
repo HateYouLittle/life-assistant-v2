@@ -180,8 +180,10 @@ export function createStatusApp(config: ResolvedConfig, db: DatabaseSync): Hono<
   });
 
   app.get("/api/status", (c) => c.json(statusPayload(config, db)));
+  // offset/limit 都透传给详情查询：看板明细「加载更多」按 next_offset 续页。
+  // 参数解析与夹紧统一在 details.ts（clampLimit/clampOffset），路由不做业务判断。
   app.get("/api/expenses", (c) =>
-    c.json(expenseDetails(db, c.req.query("month"), c.req.query("limit"))),
+    c.json(expenseDetails(db, c.req.query("month"), c.req.query("limit"), c.req.query("offset"))),
   );
   // 预算看板：每个活跃家庭账本的总额/分类预算对照 + 可执行建议。
   // 月份缺省/非法回退当月（与 /api/expenses 同一 normalizeMonth 口径）；
@@ -201,7 +203,9 @@ export function createStatusApp(config: ResolvedConfig, db: DatabaseSync): Hono<
   // 定时任务全量明细：每 job 的最近运行/最近成功/24h 失败。doctor --live 也读它，
   // 鉴权与 no-store 由上面的 /api/* 中间件统一兜住。
   app.get("/api/jobs", (c) => c.json({ items: jobDetails(db) }));
-  app.get("/api/deliveries", (c) => c.json(deliveryDetails(db, c.req.query("limit"))));
+  app.get("/api/deliveries", (c) =>
+    c.json(deliveryDetails(db, c.req.query("limit"), c.req.query("offset"))),
+  );
   app.get("/api/holidays", (c) => c.json(holidayDetails(db, c.req.query("year"))));
   // 存活探针：不鉴权、不查明细，只回答「进程还在、库还开着」。
   // systemd / uptime 监控用它，而不是用需要 token 的 /api/status。

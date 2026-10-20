@@ -18,7 +18,9 @@ import {
   budgetScopeLabel,
   budgetStatus,
   CLIENT_TOKEN_MAX_LENGTH,
+  categorySummary,
   centsToYuan,
+  changeCategoryAlias,
   clearBudget,
   createLedger,
   deleteExpense,
@@ -29,6 +31,7 @@ import {
   expenseCsvFilename,
   findMissingMonthlyReports,
   getBudgets,
+  getCategoryDictionary,
   getExpense,
   getLedger,
   getVisibleLedger,
@@ -49,7 +52,7 @@ import {
   setLedgerArchived,
   summarizeExpenses,
   transferLedger,
-  updateExpense,
+  updateExpenseChecked,
 } from "./service.js";
 
 /** 账本的工具视图：家庭账本标注「家庭」，个人账本标注「个人 + 归属人」 */
@@ -360,6 +363,43 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
         说明: "之后 expense add 未传 ledger_id 时默认使用该账本；账本归档、转归属他人后该设置自动失效",
       });
     }
+    if (action === "categories") {
+      // 分类治理视图：字典（标准名+别名）+ 近 90 天用量；字典为空时它同时是「常用分类」
+      // 清单，用户可以照着建别名。统计只覆盖当前 Profile 可见的活动账本。
+      const dict = getCategoryDictionary(db, ctx.profileId);
+      const rows = categorySummary(db, ctx.profileId);
+      const hasDict = Object.keys(dict).length > 0;
+      return okJson({
+        分类: rows.map((row) => ({
+          名称: row.name,
+          别名: row.aliases,
+          近90天笔数: row.count,
+          近90天金额: `¥${centsToYuan(row.cents)}`,
+        })),
+        说明: hasDict
+          ? "别名为按 Profile 保存的字典：add/update 时命中别名会自动归一到标准名；统计为近 90 天、当前 Profile 可见账本"
+          : '尚未建立分类别名：以上是近 90 天实际用过的分类（当前 Profile 可见账本），可用 expense {action:"category_alias", category:"餐饮", alias:"吃饭"} 建立别名',
+      });
+    }
+    if (action === "category_alias") {
+      const category = args.category as string | undefined;
+      const alias = args.alias as string | undefined;
+      if (category === undefined || alias === undefined) {
+        return fail("category_alias 需要 category（标准名）和 alias（别名）");
+      }
+      if (typeof category !== "string" || typeof alias !== "string") {
+        return fail("category 与 alias 都必须是字符串");
+      }
+      const remove = args.remove === true;
+      // 校验与冲突判定在 service（同一套口径也服务于 setCategoryDictionary 的写入校验）
+      const state = changeCategoryAlias(db, ctx.profileId, { category, alias, remove });
+      return okJson({
+        分类: { 名称: state.name, 别名: state.aliases },
+        说明: remove
+          ? `已删除别名「${alias}」；之后以该文本记账不再归一到「${state.name}」`
+          : `已把「${alias}」记为「${state.name}」的别名；之后记账命中它会自动归一为标准名`,
+      });
+    }
     if (action === "list") {
       const ledgerId = args.ledger_id as string | undefined;
       if (ledgerId === undefined) {
@@ -368,10 +408,18 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
       if (getVisibleLedger(db, ledgerId, ctx.profileId) === undefined) {
         return fail(`账本不存在: ${ledgerId}`);
       }
+      // offset 非法（负数/NaN/非数字）一律回退 0：分页参数写错不该让整次查询报错，
+      // 但也绝不能静默返回第一页却让调用方以为是别的页（所以把生效值回显成「偏移」）。
+      const rawOffset = args.offset;
+      const offset =
+        typeof rawOffset === "number" && Number.isFinite(rawOffset)
+          ? Math.max(0, Math.trunc(rawOffset))
+          : 0;
       const page = listExpenses(db, ledgerId, {
         ...expenseRange(args),
         by: args.by as string | undefined,
         limit: args.limit as number | undefined,
+        offset,
       });
       return okJson({
         账目: page.rows.map((r) => ({
@@ -385,6 +433,7 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
         // 区分「返回条数」与「匹配总数」：此前 数量 只报返回行数，默认 LIMIT 20
         // 会让调用方以为这就是全部，从而少报笔数/金额。
         已返回: page.rows.length,
+        偏移: offset,
         匹配总数: page.total,
         还有更多: page.hasMore,
       });
@@ -456,7 +505,8 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
       if (category !== undefined) patch.category = category;
       if (note !== undefined) patch.note = note;
       if (date !== undefined) patch.spentOn = date;
-      const entry = updateExpense(db, id, patch);
+      // 与 add 同一套分类字典：update 显式传 category 时也要把别名归一成标准名
+      const entry = updateExpenseChecked(db, ctx.profileId, id, patch);
       return okJson({
         已更新: {
           id: entry.id,
@@ -570,7 +620,7 @@ registerModule({
     {
       name: "expense",
       description:
-        "支出记账：add 记一笔（amount 元必填；ledger_id 可选，缺省按「默认账本 → 唯一可写账本」解析；可选 category/note/date/request_id；家庭账本逐笔回执只发记账人（想恢复逐笔推送可用 notify prefs 打开 bookkeeping.entry），个人账本不回执不提醒；未显式传 category 时回执附「常用分类」）；list 明细（可按 month/from/to/by 过滤）；summary 汇总（按分类与记账人）；update 更正一笔（id + amount/category/note/date 至少一个，只改显式传入的字段，不触发回执与预算提醒）；delete 删除记错的一笔（id 从 list 获取）；export 导出 CSV（ledger_id + 可选 month，默认当月；表头「日期,账本,分类,金额(元),备注,记账人」，UTF-8 BOM；单次上限 2000 行，超出时 已截断=true 并给出总行数）；set_default_ledger 设置/查看默认账本（传 ledger_id 设置，不传则返回当前默认账本）。仅能操作当前 Profile 可见的账本（家庭账本或自己的个人账本）。幂等：add 传 request_id 后，同一人用同一个 request_id 重试不会重复记账，返回原记录并附「已存在: true」（不重复发通知）。month 与 from/to 互斥（同时传会报错）；from/to 只给一边就是半边区间（只给 from = [from, 将来)，只给 to = (过去, to]），两个 action 口径一致；默认区间只在 month/from/to **都不传**时生效（summary 默认「月初→今天」，list 不传时不限区间）。金额只支持支出，单位为元。",
+        "支出记账：add 记一笔（amount 元必填；ledger_id 可选，缺省按「默认账本 → 唯一可写账本」解析；可选 category/note/date/request_id；家庭账本逐笔回执只发记账人（想恢复逐笔推送可用 notify prefs 打开 bookkeeping.entry），个人账本不回执不提醒；未显式传 category 时回执附「常用分类」）；list 明细（可按 month/from/to/by 过滤）；summary 汇总（按分类与记账人）；update 更正一笔（id + amount/category/note/date 至少一个，只改显式传入的字段，不触发回执与预算提醒）；delete 删除记错的一笔（id 从 list 获取）；export 导出 CSV（ledger_id + 可选 month，默认当月；表头「日期,账本,分类,金额(元),备注,记账人」，UTF-8 BOM；单次上限 2000 行，超出时 已截断=true 并给出总行数）；set_default_ledger 设置/查看默认账本（传 ledger_id 设置，不传则返回当前默认账本）；categories 列出分类字典（标准名+别名+近 90 天笔数/金额，字典为空时即近 90 天实际用过的分类）；category_alias 维护别名（category + alias 添加，remove=true 删除；别名命中后 add/update 会自动归一成标准名，未知分类仍按自由文本保存）。list 支持 offset 分页（回执带 已返回/偏移/匹配总数/还有更多）。仅能操作当前 Profile 可见的账本（家庭账本或自己的个人账本）。幂等：add 传 request_id 后，同一人用同一个 request_id 重试不会重复记账，返回原记录并附「已存在: true」（不重复发通知）。CSV 导出对以 = + - @ 或制表符/回车开头的文本单元格做公式注入中和。month 与 from/to 互斥（同时传会报错）；from/to 只给一边就是半边区间（只给 from = [from, 将来)，只给 to = (过去, to]），两个 action 口径一致；默认区间只在 month/from/to **都不传**时生效（summary 默认「月初→今天」，list 不传时不限区间）。金额只支持支出，单位为元。",
       inputSchema: {
         action: z.enum([
           "add",
@@ -580,6 +630,8 @@ registerModule({
           "delete",
           "export",
           "set_default_ledger",
+          "categories",
+          "category_alias",
         ]),
         id: z.string().optional().describe("update/delete 时的账目 id（从 list 获取）"),
         ledger_id: z
@@ -637,6 +689,19 @@ registerModule({
           .max(200)
           .optional()
           .describe("list 返回条数，默认 20，上限 200"),
+        offset: z
+          .number()
+          .optional()
+          .describe("list 分页偏移（默认 0，负数/非法按 0）；配合 limit 翻页"),
+        alias: z
+          .string()
+          .max(20)
+          .optional()
+          .describe("category_alias 的别名，1-20 字符；与任何标准名/别名冲突会被拒绝"),
+        remove: z
+          .boolean()
+          .optional()
+          .describe("category_alias remove=true 删除别名（不存在时幂等成功）"),
       },
       handler: bookkeepingExpenseTool,
     },

@@ -85,6 +85,8 @@ read_when:
 
 ## 通知
 
+- 分类字典：`expense {action:"categories"}` 看标准分类/别名/近 90 天用量；`expense {action:"category_alias", category:"餐饮", alias:"吃饭"}` 建别名（`remove:true` 删除）。建好后 `expense add` 写「吃饭」会自动记成「餐饮」，历史数据不改。
+- 明细翻页：`expense {action:"list", ledger_id, limit: 50, offset: 50}`，回执里有「偏移」「还有更多」；看板明细有「加载更多」按钮。
 - 静默时段内主动推送暂停，`notify.pull` 不受影响——用户说"没收到通知"时先 pull（`pull` 默认 20 条、上限 100；一次拉不完就再拉一次）。
 - 推送路由配置：`notify {action: "route", url: "...", channel: "webhook"}`；secret 由环境变量提供，工具配置失败时检查服务端 env。`channel` 缺省 `webhook`，可选 `log`（只写服务端日志，本地联调）、`bark`（`https://api.day.app/<device_key>`，iOS）、`ntfy`（`https://ntfy.sh/<topic>` 或自建，Android/跨平台）—— `bark`/`ntfy` 的 URL 本身就是凭据，提醒用户别用可猜的 topic。
 - 按类型静音/限通道：`notify {action: "prefs"}` 看当前偏好与内置默认，`notify {action: "prefs", kind: "bookkeeping.entry", push: true}` 恢复逐笔记账回执，`channels: ["ntfy"]` 限定通道。关闭推送的通知仍会入库，`notify.pull` 照样取得到。

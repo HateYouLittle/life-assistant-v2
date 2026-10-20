@@ -70,18 +70,34 @@ function stubElement(): StubElement {
       if (handlers === undefined) element.handlers[type] = [handler];
       else handlers.push(handler);
     },
-    // 从 innerHTML 里解析出带 data-* 的控件：这样抽屉渲染路径注册的 click 处理器能被真实触发
+    // 从 innerHTML 里解析出带 data-* 的控件：这样抽屉渲染路径注册的 click 处理器能被真实触发。
+    // 除了被查询的那个 data-*，还把**整个标签的属性**与标签内文本一起拷进桩：
+    // 真实 DOM 上 getAttribute 能读到全部属性、textContent 能读到按钮文案，测试才能断言
+    // 「按钮带 data-next-offset」「加载更多 → 已全部加载」这类状态变化。
     querySelectorAll(selector: string) {
       const match = /^\[data-([a-z-]+)\]$/.exec(selector);
       if (match === null) return [];
       const name = match[1] ?? "";
       const attr = `data-${name}`;
+      const html = element.innerHTML;
       const found: StubElement[] = [];
-      const re = new RegExp(`${attr}="([^"]*)"`, "g");
-      for (const hit of element.innerHTML.matchAll(re)) {
+      const re = new RegExp(`${attr}="[^"]*"`, "g");
+      for (const hit of html.matchAll(re)) {
+        const index = hit.index ?? 0;
         const child = stubElement();
-        child.attrs[attr] = hit[1] ?? "";
-        child.dataset[name] = hit[1] ?? "";
+        const tagStart = html.lastIndexOf("<", index);
+        const tagEnd = html.indexOf(">", index);
+        const tag = tagStart >= 0 && tagEnd > tagStart ? html.slice(tagStart, tagEnd + 1) : "";
+        for (const attrHit of tag.matchAll(/([a-z][\w-]*)="([^"]*)"/g)) {
+          const key = attrHit[1] ?? "";
+          const value = attrHit[2] ?? "";
+          child.attrs[key] = value;
+          if (key.startsWith("data-")) child.dataset[key.slice(5)] = value;
+        }
+        if (tagEnd >= 0) {
+          const close = html.indexOf("<", tagEnd + 1);
+          child.textContent = html.slice(tagEnd + 1, close >= 0 ? close : undefined);
+        }
         found.push(child);
         renderedControls.push(child);
       }
@@ -137,8 +153,11 @@ export interface PageRun {
   revokedUrls: string[];
   /** 派发一次点击（等价于点击带 data-drawer 的卡片），会跑真正的抽屉渲染路径 */
   clickDrawer(kind: string): void;
-  /** 点击抽屉里某个 data-* 控件（如 data-export），触发页面脚本注册的 click 处理器 */
-  clickControl(attr: string, value: string): void;
+  /** 找到抽屉里某个 data-* 控件（不点击），用于先断言初始状态；找不到抛错 */
+  findControl(attr: string, value: string): StubElement;
+  /** 点击抽屉里某个 data-* 控件（如 data-export），触发页面脚本注册的 click 处理器；
+   *  返回被点击的控件本身，便于断言异步更新后的按钮状态（文案/disabled） */
+  clickControl(attr: string, value: string): StubElement;
   /** 手动触发 30s 自动刷新回调（返回触发了几次） */
   runIntervals(): number;
   /** 手动执行 setTimeout 排队项（下载后 revoke objectURL），返回执行条数 */
@@ -247,6 +266,14 @@ export function runPageScript(env: TestEnv, search: string): PageRun {
       target.setAttribute("data-drawer", kind);
       for (const handler of clickHandlers) handler({ target });
     },
+    findControl(attr: string, value: string) {
+      const control = renderedControls.find(
+        (candidate) =>
+          candidate.attrs[attr] === value && (candidate.handlers.click?.length ?? 0) > 0,
+      );
+      if (control === undefined) throw new Error(`没找到 ${attr}=${value} 的可点击控件`);
+      return control;
+    },
     clickControl(attr: string, value: string) {
       const control = renderedControls.find(
         (candidate) =>
@@ -254,6 +281,7 @@ export function runPageScript(env: TestEnv, search: string): PageRun {
       );
       if (control === undefined) throw new Error(`没找到 ${attr}=${value} 的可点击控件`);
       for (const handler of control.handlers.click ?? []) handler();
+      return control;
     },
     runIntervals() {
       for (const fn of intervals) fn();
@@ -634,6 +662,152 @@ describe("看板「预算」卡片", () => {
       assert.match(drawerHtml, /餐饮/);
       assert.match(drawerHtml, /已超支 ¥70\.00/);
       assert.equal(run.elements.get("drawer")?.attrs["aria-hidden"], "false", "抽屉应被打开");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
+describe("看板明细「加载更多」", () => {
+  function countRows(html: string): number {
+    return (html.match(/<li>/g) ?? []).length;
+  }
+
+  function seedFamilyExpenses(env: TestEnv, count: number): void {
+    env.db
+      .prepare(
+        "INSERT INTO ledgers (id, name, created_at) VALUES ('lf', '家庭账本', '2026-01-01T00:00:00.000Z')",
+      )
+      .run();
+    const insert = env.db.prepare(
+      `INSERT INTO expenses (id, ledger_id, amount_cents, category, note, spent_on, created_by_profile, created_at)
+       VALUES (?, 'lf', 100, '餐饮', ?, ?, 'default', '2026-01-01T00:00:00.000Z')`,
+    );
+    for (let i = 0; i < count; i += 1) {
+      insert.run(`e${String(i).padStart(2, "0")}`, `第 ${i} 笔`, todayIso());
+    }
+  }
+
+  function seedDeliveries(env: TestEnv, count: number): void {
+    env.db
+      .prepare(
+        `INSERT INTO notifications (id, profile_id, kind, title, body_md, created_at)
+         VALUES ('n1', 'default', 'k', '标题', '正文', '2026-10-01T00:00:00.000Z')`,
+      )
+      .run();
+    const insert = env.db.prepare(
+      `INSERT INTO deliveries (id, notification_id, route_name, status, next_attempt_at, created_at, updated_at)
+       VALUES (?, 'n1', 'r', 'sent', ?, ?, ?)`,
+    );
+    for (let i = 0; i < count; i += 1) {
+      const id = `d${String(i).padStart(2, "0")}`;
+      const stamp = new Date(Date.now() - (count - i) * 1000).toISOString();
+      insert.run(id, stamp, stamp, stamp);
+    }
+  }
+
+  it("支出明细：50 行 → 点「加载更多」带 offset=50 追加到 55 行，按钮切成已全部加载", async () => {
+    const env = makeTestEnv();
+    try {
+      seedFamilyExpenses(env, 55);
+      const run = runPageScript(env, "");
+      run.clickDrawer("expenses");
+      const firstPage = await waitFor(
+        () => countRows(run.elements.get("exp-entries")?.innerHTML ?? "") === 50,
+      );
+      assert.ok(
+        firstPage,
+        `首屏应加载 50 行，实际 ${countRows(run.elements.get("exp-entries")?.innerHTML ?? "")}`,
+      );
+      assert.ok(
+        run.fetchCalls.some((call) => call.path === "/api/expenses?limit=50"),
+        `首屏请求应带 limit=50：${JSON.stringify(run.fetchCalls.map((call) => call.path))}`,
+      );
+
+      const btn = run.findControl("data-load-more", "expenses");
+      assert.equal(btn.attrs["data-next-offset"], "50", "按钮要带服务端给的 next_offset");
+      assert.match(btn.textContent, /加载更多（已显示 50\/55）/);
+
+      run.clickControl("data-load-more", "expenses");
+      const appended = await waitFor(
+        () => countRows(run.elements.get("exp-entries")?.innerHTML ?? "") === 55,
+      );
+      assert.ok(
+        appended,
+        `续页后应有 55 行，实际 ${countRows(run.elements.get("exp-entries")?.innerHTML ?? "")}`,
+      );
+      const month = todayIso().slice(0, 7);
+      const moreCall = run.fetchCalls.find(
+        (call) => call.path === `/api/expenses?month=${month}&limit=50&offset=50`,
+      );
+      assert.ok(
+        moreCall !== undefined,
+        `续页请求必须带 month+limit+offset：${JSON.stringify(run.fetchCalls.map((call) => call.path))}`,
+      );
+      assert.equal(btn.textContent, "已全部加载", "到底后按钮文案要变成已全部加载");
+      assert.notEqual(btn.attrs.disabled, undefined, "到底后按钮应 disabled");
+      assert.match(
+        run.elements.get("exp-entries-title")?.textContent ?? "",
+        /^逐笔$/,
+        "到底后标题不再显示（已显示 55/55）",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("首屏就装得下：按钮直接是「已全部加载」并禁用，点击不再发请求", async () => {
+    const env = makeTestEnv();
+    try {
+      seedFamilyExpenses(env, 3);
+      const run = runPageScript(env, "");
+      run.clickDrawer("expenses");
+      const rendered = await waitFor(
+        () => countRows(run.elements.get("exp-entries")?.innerHTML ?? "") === 3,
+      );
+      assert.ok(rendered);
+      const btn = run.findControl("data-load-more", "expenses");
+      assert.equal(btn.textContent, "已全部加载");
+      assert.notEqual(btn.attrs.disabled, undefined);
+      assert.equal(btn.attrs["data-next-offset"], undefined, "没有下一页就不该带 offset");
+
+      const before = run.fetchCalls.length;
+      run.clickControl("data-load-more", "expenses");
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      assert.equal(run.fetchCalls.length, before, "禁用按钮不得再发续页请求");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("投递记录：60 行 → 加载更多带 offset=60 追加到 65 行", async () => {
+    const env = makeTestEnv();
+    try {
+      seedDeliveries(env, 65);
+      const run = runPageScript(env, "");
+      run.clickDrawer("deliveries");
+      const firstPage = await waitFor(
+        () => countRows(run.elements.get("del-entries")?.innerHTML ?? "") === 60,
+      );
+      assert.ok(
+        firstPage,
+        `首屏应有 60 行投递，实际 ${countRows(run.elements.get("del-entries")?.innerHTML ?? "")}`,
+      );
+      const btn = run.findControl("data-load-more", "deliveries");
+      assert.equal(btn.attrs["data-next-offset"], "60");
+      assert.match(btn.textContent, /加载更多（已显示 60\/65）/);
+
+      run.clickControl("data-load-more", "deliveries");
+      const appended = await waitFor(
+        () => countRows(run.elements.get("del-entries")?.innerHTML ?? "") === 65,
+      );
+      assert.ok(appended);
+      assert.ok(
+        run.fetchCalls.some((call) => call.path === "/api/deliveries?limit=60&offset=60"),
+        `续页请求必须带 limit+offset：${JSON.stringify(run.fetchCalls.map((call) => call.path))}`,
+      );
+      assert.equal(btn.textContent, "已全部加载");
+      assert.notEqual(btn.attrs.disabled, undefined);
     } finally {
       cleanupTestEnv(env);
     }

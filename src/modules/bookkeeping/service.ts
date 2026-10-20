@@ -162,6 +162,261 @@ export function setDefaultLedger(db: DatabaseSync, profileId: string, ledgerId: 
   return ledger;
 }
 
+/** 「常用分类」统计窗口（天，含今天）：分类总览与 add 回执共用同一口径 */
+export const RECENT_CATEGORY_DAYS = 90;
+/** 「常用分类」回显条数上限（按出现次数取 top N） */
+export const RECENT_CATEGORY_LIMIT = 5;
+
+/** 分类字典的设置键（按 Profile 存储）：{ 标准名: [别名...] } */
+export const CATEGORY_DICT_SETTING = "expense_categories";
+/** 分类名/别名的长度上限：与 expenses.category 的既有口径一致（normalizedCategory 同值） */
+export const CATEGORY_LABEL_MAX_LENGTH = 20;
+
+/** 分类字典：标准名 → 别名列表（保持写入顺序，便于工具回显） */
+export type CategoryDictionary = Record<string, string[]>;
+
+/**
+ * 分类名/别名的匹配键：trim + 大小写折叠。
+ *
+ * 只用于「查字典」的比较，不改变落库文本 —— 用户写「Food」还是「food」都应命中同一
+ * 标准名，但中文大小写不变，所以折叠对中文没有副作用。
+ */
+function categoryKey(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+/** 分类名/别名校验：1-20 字（与 expense 的 category 上限一致） */
+function assertCategoryLabel(value: string, what: string): void {
+  if (value.trim() === "" || value.trim().length > CATEGORY_LABEL_MAX_LENGTH) {
+    throw new Error(`${what}需为 1-${CATEGORY_LABEL_MAX_LENGTH} 字符: ${value}`);
+  }
+}
+
+/**
+ * 读取分类字典。`getSetting` 已防坏 JSON；这里再防形状（手工改库写出
+ * `{"餐饮": "吃饭"}` / 非字符串别名时按缺省处理，不能让记账写路径因一条坏设置整体失败）。
+ */
+export function getCategoryDictionary(db: DatabaseSync, profileId: string): CategoryDictionary {
+  const raw = getSetting<unknown>(db, profileId, CATEGORY_DICT_SETTING);
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const dict: CategoryDictionary = {};
+  for (const [name, aliases] of Object.entries(raw as Record<string, unknown>)) {
+    const trimmed = name.trim();
+    if (trimmed === "" || !Array.isArray(aliases)) continue;
+    dict[trimmed] = aliases.filter(
+      (alias): alias is string => typeof alias === "string" && alias.trim() !== "",
+    );
+  }
+  return dict;
+}
+
+/**
+ * 覆盖写入分类字典。写入前统一校验（标准名/别名 1-20 字、折叠后全局唯一）：
+ * 同一串文本既是某标准名又是另一类别名时，normalizeCategory 的匹配结果会变成
+ * 「按对象键顺序先到先得」，同一句话在不同 Profile 上归到不同分类，必须在这里拒绝。
+ */
+export function setCategoryDictionary(
+  db: DatabaseSync,
+  profileId: string,
+  dict: CategoryDictionary,
+): void {
+  const nameKeys = new Map<string, string>();
+  const entries: Array<{ name: string; aliases: string[] }> = [];
+  for (const [rawName, rawAliases] of Object.entries(dict)) {
+    const name = rawName.trim();
+    assertCategoryLabel(name, "分类名");
+    const key = categoryKey(name);
+    if (nameKeys.has(key)) {
+      throw new Error(`分类名重复（忽略大小写/空白）：${nameKeys.get(key) ?? ""} / ${name}`);
+    }
+    nameKeys.set(key, name);
+    entries.push({ name, aliases: rawAliases.map((alias) => alias.trim()) });
+  }
+  const aliasOwners = new Map<string, string>();
+  for (const { name, aliases } of entries) {
+    for (const alias of aliases) {
+      assertCategoryLabel(alias, "别名");
+      const key = categoryKey(alias);
+      if (nameKeys.has(key)) {
+        throw new Error(`别名与标准名冲突：「${alias}」已是分类名`);
+      }
+      const owner = aliasOwners.get(key);
+      if (owner !== undefined) {
+        throw new Error(`别名重复（忽略大小写/空白）：「${alias}」已属于「${owner}」`);
+      }
+      aliasOwners.set(key, name);
+    }
+  }
+  // 写的是 trim 后的规范形状：读路径虽然也会 trim，但写入时就规整，回显不会带多余空白
+  const normalized: CategoryDictionary = {};
+  for (const { name, aliases } of entries) normalized[name] = aliases;
+  setSetting(db, profileId, CATEGORY_DICT_SETTING, normalized);
+}
+
+/**
+ * 把分类文本归一成字典里的标准名：trim + 大小写折叠后
+ * ① 命中某个标准名 → 返回该标准名（保留字典里的写法）；
+ * ② 命中某个别名 → 返回对应标准名；
+ * ③ 都没命中 → 返回 trim 后的原值（自由文本仍允许，字典只是可选的「路由表」）。
+ *
+ * 空/纯空白返回空串，交给 normalizedCategory 回落默认分类「其他」。
+ * 只作用于**新写入/显式更新**的分类，不改动已存在账目的分类文本。
+ */
+export function normalizeCategory(db: DatabaseSync, profileId: string, input: string): string {
+  const trimmed = input.trim();
+  if (trimmed === "") return "";
+  const key = categoryKey(trimmed);
+  const dict = getCategoryDictionary(db, profileId);
+  for (const name of Object.keys(dict)) {
+    if (categoryKey(name) === key) return name;
+  }
+  for (const [name, aliases] of Object.entries(dict)) {
+    if (aliases.some((alias) => categoryKey(alias) === key)) return name;
+  }
+  return trimmed;
+}
+
+/** 分类别名的当前状态（工具回显用） */
+export interface CategoryAliasState {
+  name: string;
+  aliases: string[];
+}
+
+/**
+ * 新增 / 删除分类别名，返回更新后的标准名与别名列表。
+ *
+ * - category 折叠后命中已有标准名时沿用原写法（不会因为大小写不同建出第二个分类）；
+ * - 新增时 alias 不能与**任何**标准名或其它分类的别名冲突（本分类内重复添加幂等）；
+ * - remove=true 删除别名：不存在时幂等返回、不报错，也不会凭空建出一个空分类；
+ * - 删除后该文本不再被归一（字典里已经没有它了）。
+ */
+export function changeCategoryAlias(
+  db: DatabaseSync,
+  profileId: string,
+  input: { category: string; alias: string; remove?: boolean },
+): CategoryAliasState {
+  const category = input.category.trim();
+  const alias = input.alias.trim();
+  assertCategoryLabel(category, "分类名");
+  assertCategoryLabel(alias, "别名");
+  const categoryFold = categoryKey(category);
+  const aliasFold = categoryKey(alias);
+  if (categoryFold === aliasFold)
+    throw new Error(`别名与标准名冲突：别名不能与分类名相同（${category}）`);
+
+  const dict = getCategoryDictionary(db, profileId);
+  const existingName = Object.keys(dict).find((name) => categoryKey(name) === categoryFold);
+  const name = existingName ?? category;
+
+  if (input.remove === true) {
+    if (existingName === undefined) return { name, aliases: [] };
+    const next = (dict[name] ?? []).filter((item) => categoryKey(item) !== aliasFold);
+    dict[name] = next;
+    setCategoryDictionary(db, profileId, dict);
+    return { name, aliases: next };
+  }
+
+  if (existingName === undefined) {
+    // 新标准名不能与已有别名撞车（否则同一文本既是标准名又是别名，归一结果不确定）
+    for (const [otherName, aliases] of Object.entries(dict)) {
+      const clash = aliases.find((item) => categoryKey(item) === categoryFold);
+      if (clash !== undefined) {
+        throw new Error(`分类名与已有别名冲突：「${clash}」是「${otherName}」的别名`);
+      }
+    }
+  }
+  const nameClash = Object.keys(dict).find((item) => categoryKey(item) === aliasFold);
+  if (nameClash !== undefined) throw new Error(`别名与标准名冲突：「${alias}」已是分类名`);
+  for (const [otherName, aliases] of Object.entries(dict)) {
+    if (categoryKey(otherName) === categoryFold) continue;
+    const clash = aliases.find((item) => categoryKey(item) === aliasFold);
+    if (clash !== undefined) {
+      throw new Error(`别名与「${otherName}」的别名冲突：「${clash}」`);
+    }
+  }
+  const current = dict[name] ?? [];
+  if (current.some((item) => categoryKey(item) === aliasFold)) {
+    return { name, aliases: [...current] }; // 已存在（同一分类）：幂等
+  }
+  dict[name] = [...current, alias];
+  setCategoryDictionary(db, profileId, dict);
+  return { name, aliases: [...(dict[name] ?? [])] };
+}
+
+/** 分类总览行（工具层再翻译成中文键） */
+export interface CategorySummaryRow {
+  name: string;
+  aliases: string[];
+  count: number;
+  cents: number;
+}
+
+/**
+ * 分类总览：分类字典里的标准名（含从未使用过的）+ 近 N 天实际用过、但不在字典里的分类。
+ *
+ * 统计口径：**当前 Profile 可见的活动账本**（家庭 + 自己的个人），与 ledger list 一致 ——
+ * 别人的个人账本里的分类不能出现在我的分类治理视图里。历史数据若以别名形式记账，
+ * 会按折叠值计入对应标准名（否则「吃饭」记了 20 笔、标准名却显示 0 笔，用户会以为丢账）。
+ * 字典为空时结果就是「近 90 天实际用过的分类」，供一键建别名。
+ */
+export function categorySummary(
+  db: DatabaseSync,
+  profileId: string,
+  opts: { today?: string; days?: number } = {},
+): CategorySummaryRow[] {
+  const today = opts.today ?? todayIso();
+  const days = Math.max(1, opts.days ?? RECENT_CATEGORY_DAYS);
+  const from = DateTime.fromISO(today, { zone: TZ })
+    .minus({ days: days - 1 })
+    .toISODate();
+  const usage = new Map<string, { raw: string; count: number; cents: number }>();
+  if (from !== null) {
+    const rows = db
+      .prepare(
+        `SELECT e.category AS category, COUNT(*) AS n, SUM(e.amount_cents) AS cents
+         FROM expenses e JOIN ledgers l ON l.id = e.ledger_id
+         WHERE (l.owner_profile_id IS NULL OR l.owner_profile_id = ?)
+           AND l.archived_at IS NULL
+           AND e.spent_on >= ? AND e.spent_on <= ?
+         GROUP BY e.category`,
+      )
+      .all(profileId, from, today) as { category: string; n: number; cents: number }[];
+    for (const row of rows) {
+      const key = categoryKey(row.category);
+      const hit = usage.get(key);
+      if (hit === undefined) {
+        usage.set(key, { raw: row.category.trim(), count: row.n, cents: row.cents });
+      } else {
+        hit.count += row.n;
+        hit.cents += row.cents;
+      }
+    }
+  }
+  const dict = getCategoryDictionary(db, profileId);
+  const matchedKeys = new Set<string>();
+  const items: CategorySummaryRow[] = [];
+  for (const [name, aliases] of Object.entries(dict)) {
+    let count = 0;
+    let cents = 0;
+    for (const key of [categoryKey(name), ...aliases.map(categoryKey)]) {
+      const hit = usage.get(key);
+      if (hit === undefined) continue;
+      count += hit.count;
+      cents += hit.cents;
+      matchedKeys.add(key);
+    }
+    items.push({ name, aliases: [...aliases], count, cents });
+  }
+  for (const [key, hit] of usage) {
+    if (matchedKeys.has(key)) continue;
+    items.push({ name: hit.raw, aliases: [], count: hit.count, cents: hit.cents });
+  }
+  // 金额降序 + 名称升序：同一份数据两次调用的顺序一致（可 diff、可断言）
+  return items.sort(
+    (a, b) => b.cents - a.cents || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0),
+  );
+}
+
 /**
  * 转移账本归属：仅个人账本可转移（家庭 → 个人永不允许）。
  * targetOwnerId 为 null 表示转回家庭（不可逆）；非 null 时该 Profile 必须已存在。
@@ -317,7 +572,11 @@ export function addExpenseChecked(
   if (ledger === undefined) throw new Error(`账本不存在: ${input.ledgerId}`);
   if (ledger.archived_at !== null) throw new Error(`账本已归档: ${ledger.name}`);
   assertValidAmountCents(input.amountCents);
-  const category = normalizedCategory(input.category);
+  // 先过分类字典（别名 → 标准名），再走既有归一（空白 → 「其他」、≤20 字）：
+  // 字典是「可选路由表」，未命中的自由文本原样保留。
+  const category = normalizedCategory(
+    input.category === undefined ? undefined : normalizeCategory(db, profileId, input.category),
+  );
   const note = normalizedNote(input.note);
   const spentOn = normalizedSpentOn(input.spentOn);
   if (input.clientToken !== undefined) assertValidClientToken(input.clientToken);
@@ -407,6 +666,25 @@ export function updateExpense(db: DatabaseSync, id: string, patch: ExpensePatch)
   return getExpense(db, id) as ExpenseRow;
 }
 
+/**
+ * 更正一笔支出（带分类字典归一）。`updateExpense` 不知道 Profile（导入/测试直接调用），
+ * 因此把「别名 → 标准名」放在这一层：MCP 工具与 /api/quick 等写路径都走它。
+ *
+ * 只归一**本次显式传入**的 category；不传 category 时原值不动（不改已存在数据的分类）。
+ */
+export function updateExpenseChecked(
+  db: DatabaseSync,
+  profileId: string,
+  id: string,
+  patch: ExpensePatch,
+): ExpenseRow {
+  if (patch.category === undefined) return updateExpense(db, id, patch);
+  return updateExpense(db, id, {
+    ...patch,
+    category: normalizeCategory(db, profileId, patch.category),
+  });
+}
+
 export function deleteExpense(db: DatabaseSync, id: string): ExpenseRow {
   const row = db.prepare("SELECT * FROM expenses WHERE id = ?").get(id) as ExpenseRow | undefined;
   if (row === undefined) throw new Error(`账目不存在: ${id}`);
@@ -417,7 +695,7 @@ export function deleteExpense(db: DatabaseSync, id: string): ExpenseRow {
 export function listExpenses(
   db: DatabaseSync,
   ledgerId: string,
-  opts: { from?: string; to?: string; by?: string; limit?: number } = {},
+  opts: { from?: string; to?: string; by?: string; limit?: number; offset?: number } = {},
 ): { rows: ExpenseRow[]; total: number; hasMore: boolean } {
   const conditions = ["ledger_id = ?"];
   const params: (string | number)[] = [ledgerId];
@@ -436,21 +714,22 @@ export function listExpenses(
   const where = conditions.join(" AND ");
   // 下限也要 clamp：SQLite 把负 LIMIT 当作「不限量」，limit:-1 会返回全表
   const limit = Math.max(1, Math.min(opts.limit ?? 20, 200));
+  // offset 同样兜底：NaN/负数会让 SQLite 绑定失败或行为怪异（负 OFFSET 被当成 0，
+  // 但 NaN 不是合法绑定值），非法输入一律回退 0，分页翻页不能因此报错。
+  const rawOffset = opts.offset ?? 0;
+  const offset = Number.isFinite(rawOffset) ? Math.max(0, Math.trunc(rawOffset)) : 0;
   const totalRow = db
     .prepare(`SELECT COUNT(*) AS n FROM expenses WHERE ${where}`)
     .get(...params) as { n: number };
   const rows = db
     .prepare(
-      `SELECT * FROM expenses WHERE ${where} ORDER BY spent_on DESC, created_at DESC LIMIT ?`,
+      `SELECT * FROM expenses WHERE ${where} ORDER BY spent_on DESC, created_at DESC LIMIT ? OFFSET ?`,
     )
-    .all(...params, limit) as unknown as ExpenseRow[];
-  return { rows, total: totalRow.n, hasMore: totalRow.n > rows.length };
+    .all(...params, limit, offset) as unknown as ExpenseRow[];
+  // 还有更多必须按「本次窗口末尾」判断：offset>0 时 total > rows.length 恒成立，
+  // 只看这两个数会把最后一页也标成还有更多，调用方会一直空翻。
+  return { rows, total: totalRow.n, hasMore: offset + rows.length < totalRow.n };
 }
-
-/** 「常用分类」统计窗口（天，含今天）：只回显最近记过什么，与预算/报表无关 */
-export const RECENT_CATEGORY_DAYS = 90;
-/** 「常用分类」回显条数上限（按出现次数取 top N） */
-export const RECENT_CATEGORY_LIMIT = 5;
 
 /**
  * 该账本最近 N 天出现次数最多的分类（按笔数降序；同频按分类名升序，结果稳定可测）。
@@ -605,6 +884,22 @@ export function csvField(value: string): string {
   return /[",\r\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
 }
 
+/** 会被 Excel/Sheets 当公式起始的字符：= + - @，以及制表符/回车（前导空白绕过） */
+const CSV_FORMULA_PREFIX_RE = /^[=+\-@\t\r]/;
+
+/**
+ * CSV 公式注入中和（CSV injection）：Excel / Google Sheets 会把以 `= + - @` 或制表符/
+ * 回车开头的单元格当**公式**执行 —— `=HYPERLINK("http://evil","点我")` 打开即触发，
+ * `+1`/`-1` 也会被改写。做法是在**原值**前加一个单引号（视为纯文本），不需要转义的
+ * 普通文本原样返回（不影响既有 CSV 断言）。
+ *
+ * 判断前先 `trimStart`：前导空格/制表符绕过是这类过滤最常见的绕过手法
+ * （` =1` 在 Excel 里仍会按公式解析）。金额/日期等数字列不以这些字符开头，行为不变。
+ */
+export function sanitizeCsvCell(value: string): string {
+  return CSV_FORMULA_PREFIX_RE.test(value.trimStart()) ? `'${value}` : value;
+}
+
 export interface ExpenseCsvOptions {
   /** 指定账本；缺省 = 全部家庭账本（看板口径，个人账本不出现） */
   ledgerId?: string;
@@ -680,12 +975,14 @@ export function expenseCsv(db: DatabaseSync, opts: ExpenseCsvOptions): ExpenseCs
     for (const row of rows) {
       lines.push(
         [
+          // 日期/金额是数字列，不做公式中和（它们不以 = + - @ 开头）；
+          // 文本列统一 sanitize 后再做 RFC 转义，防注入不能靠调用方自觉。
           csvField(row.spent_on),
-          csvField(row.ledger_name),
-          csvField(row.category),
+          csvField(sanitizeCsvCell(row.ledger_name)),
+          csvField(sanitizeCsvCell(row.category)),
           centsToYuan(row.amount_cents),
-          csvField(row.note ?? ""),
-          csvField(row.created_by_profile),
+          csvField(sanitizeCsvCell(row.note ?? "")),
+          csvField(sanitizeCsvCell(row.created_by_profile)),
         ].join(","),
       );
     }

@@ -208,6 +208,14 @@ const STYLE = `
   .monthnav button:hover { color: var(--fg); border-color: rgba(255,255,255,.2); }
   .monthnav .cur { font-weight: 600; }
   .sel { background: transparent; border: 1px solid var(--line); color: var(--fg); border-radius: 8px; padding: 4px 8px; font-size: 12px; }
+  /* 「加载更多」：横贯抽屉底部的一行按钮；已全部加载时保持占位（不跳版） */
+  .morebtn {
+    display: block; width: 100%; margin-top: 10px; padding: 8px 10px; border-radius: 9px;
+    background: transparent; border: 1px solid var(--line); color: var(--dim);
+    font-size: 12.5px; cursor: pointer;
+  }
+  .morebtn:hover:not(:disabled) { color: var(--fg); border-color: rgba(255,255,255,.2); }
+  .morebtn:disabled { color: var(--mute); cursor: default; opacity: .7; }
   .spin { color: var(--mute); font-size: 12.5px; padding: 8px 0; }
 
   @media (max-width: 820px) {
@@ -270,6 +278,11 @@ const SCRIPT = `
   var drawerTitle = document.getElementById('drawer-title');
   var drawerSub = document.getElementById('drawer-sub');
   var expMonth = null;
+  /* 分页累积状态：expEntries/delItems 是「已加载」的行，expTotal/delTotal 是服务端总数 */
+  var expEntries = [];
+  var expTotal = 0;
+  var delItems = [];
+  var delTotal = 0;
   var holYear = null;
   var drawerOpen = false;
   var drawerRender = null;
@@ -576,67 +589,157 @@ const SCRIPT = `
     drawerBody.innerHTML = '<div class="empty bad">' + esc(e.message) + '</div>';
   }
 
+  /* ── 分页（加载更多） ──
+     逐笔/投递行渲染在首屏与续页共用，避免两处转义或字段漂移；
+     分页状态（has_more/next_offset）全部来自服务端，前端不自己算「还有没有下一页」。 */
+  function expenseRow(e) {
+    return '<li><div class="top"><span class="t">' + esc(e.note || e.category) + '</span>' +
+      '<span style="flex:none">' + yuan(e.amount_cents) + '</span></div>' +
+      '<div class="meta"><span>' + esc(e.spent_on.slice(5)) + '</span><span class="chip">' + esc(e.category) + '</span>' +
+      '<span>' + esc(e.ledger_name) + '</span><span>' + esc(e.created_by_profile) + '</span></div></li>';
+  }
+  function deliveryRow(i) {
+    var cls = i.status === 'sent' ? 'green' : i.status === 'failed' ? 'red' : i.status === 'fallback' ? 'amber' : '';
+    return '<li><div class="top"><span class="t">' + esc(i.title) + '</span>' +
+      '<span class="chip ' + cls + '">' + esc(i.status) + '</span></div>' +
+      '<div class="meta"><span>' + esc(i.sent_local || i.created_local) + '</span>' +
+      '<span class="chip">' + esc(i.route_name) + '</span>' +
+      '<span>' + esc(i.profile_id) + '</span>' +
+      (i.attempts ? '<span>尝试 ' + i.attempts + ' 次</span>' : '') +
+      '</div>' + (i.last_error ? '<div class="meta bad">' + esc(i.last_error.slice(0, 160)) + '</div>' : '') + '</li>';
+  }
+  function pagedTitle(label, loaded, total) {
+    return label + (total > loaded ? '（已显示 ' + loaded + '/' + total + '）' : '');
+  }
+  function moreButton(id, kind, payload, loaded, total) {
+    if (payload.has_more === true && payload.next_offset !== null && payload.next_offset !== undefined) {
+      return '<button type="button" class="morebtn" id="' + id + '" data-load-more="' + kind +
+        '" data-next-offset="' + payload.next_offset + '">加载更多（已显示 ' + loaded + '/' + total + '）</button>';
+    }
+    // 没有下一页（含首屏就装得下）：文案明确说「已全部加载」，按钮禁用避免无意义点击
+    return '<button type="button" class="morebtn" id="' + id + '" data-load-more="' + kind +
+      '" disabled="disabled">已全部加载</button>';
+  }
+  function setMoreState(btn, hasMore, nextOffset, loaded, total) {
+    if (hasMore === true && nextOffset !== null && nextOffset !== undefined) {
+      btn.setAttribute('data-next-offset', String(nextOffset));
+      btn.textContent = '加载更多（已显示 ' + loaded + '/' + total + '）';
+      btn.disabled = false;
+    } else {
+      btn.textContent = '已全部加载';
+      btn.disabled = true;
+      btn.setAttribute('disabled', 'disabled');
+    }
+  }
+  function bindLoadMore() {
+    Array.prototype.forEach.call(drawerBody.querySelectorAll('[data-load-more]'), function (btn) {
+      btn.addEventListener('click', function () { loadMore(btn); });
+    });
+  }
+  function loadMore(btn) {
+    var kind = btn.getAttribute('data-load-more');
+    var raw = btn.getAttribute('data-next-offset');
+    if (raw === null) return; // 「已全部加载」：没有下一页
+    var offset = Number(raw);
+    if (!isFinite(offset) || offset <= 0) return;
+    // 续页参数由服务端的 next_offset 提供；limit 与首屏一致，否则页边界会错位
+    var path = kind === 'expenses'
+      ? '/api/expenses?month=' + encodeURIComponent(expMonth || '') + '&limit=50&offset=' + offset
+      : '/api/deliveries?limit=60&offset=' + offset;
+    btn.disabled = true;
+    btn.textContent = '加载中…';
+    api(path).then(function (d) {
+      if (kind === 'expenses') {
+        var fresh = d.entries || [];
+        expEntries = expEntries.concat(fresh);
+        expTotal = d.entries_total;
+        var list = el('exp-entries');
+        if (list) list.innerHTML += fresh.map(expenseRow).join('');
+        var title = el('exp-entries-title');
+        if (title) title.textContent = pagedTitle('逐笔', expEntries.length, expTotal);
+        setMoreState(btn, d.has_more, d.next_offset, expEntries.length, expTotal);
+      } else {
+        var freshItems = d.items || [];
+        delItems = delItems.concat(freshItems);
+        delTotal = d.items_total;
+        var itemList = el('del-entries');
+        if (itemList) itemList.innerHTML += freshItems.map(deliveryRow).join('');
+        var itemTitle = el('del-entries-title');
+        if (itemTitle) itemTitle.textContent = pagedTitle('记录', delItems.length, delTotal);
+        setMoreState(btn, d.has_more, d.next_offset, delItems.length, delTotal);
+      }
+    }).catch(function (e) {
+      // 失败时保留当前页并恢复按钮：不能让一次网络抖动把已加载内容清空
+      btn.disabled = false;
+      if (kind === 'expenses') setMoreState(btn, true, Number(raw), expEntries.length, expTotal);
+      else setMoreState(btn, true, Number(raw), delItems.length, delTotal);
+      drawerSub.textContent = '加载更多失败：' + e.message;
+    });
+  }
+
   function openExpenses(month) {
     openDrawer('expenses', '支出明细', function () {
-      api('/api/expenses' + (month ? '?month=' + month : '')).then(function (d) {
-        expMonth = d.month;
-        drawerSub.textContent = d.count + ' 笔';
-        var max = Math.max.apply(null, d.categories.map(function (c) { return c.cents; }).concat([1]));
-        var html = '<div class="monthnav">' +
-          '<button type="button" data-month="' + shiftMonth(expMonth, -1) + '">‹ 上月</button>' +
-          '<span class="cur">' + expMonth + '</span>' +
-          '<button type="button" data-month="' + shiftMonth(expMonth, 1) + '">下月 ›</button>' +
-          '<button type="button" data-export="' + expMonth + '">导出 CSV</button>' +
-          '<span class="muted" style="margin-left:auto">' + yuan(d.total_cents) + '</span></div>';
-
-        html += '<div class="sect"><h3>分类</h3>' +
-          (d.categories.length
-            ? '<table><tbody>' + d.categories.map(function (c, i) {
-                return '<tr><td><i style="display:inline-block;width:7px;height:7px;border-radius:2px;margin-right:8px;background:' +
-                  COLORS[i % COLORS.length] + '"></i>' + esc(c.category) + '</td>' +
-                  '<td class="num muted">' + c.count + ' 笔</td>' +
-                  '<td class="num">' + yuan(c.cents) + '</td>' +
-                  '<td class="num muted">' + (c.share * 100).toFixed(1) + '%</td></tr>';
-              }).join('') + '</tbody></table>'
-            : '<div class="empty">本月没有记账</div>') + '</div>';
-
-        if (d.daily.length) {
-          var dmax = Math.max.apply(null, d.daily.map(function (x) { return x.cents; }));
-          html += '<div class="sect"><h3>按天</h3><div class="bars">' +
-            d.daily.map(function (x) {
-              return '<div style="height:' + Math.max(4, (x.cents / dmax) * 100) + '%" title="' + esc(x.date) + ' ' + yuan(x.cents) + '"></div>';
-            }).join('') + '</div>' +
-            '<div class="spark-axis"><span>' + esc(d.daily[0].date.slice(5)) + '</span><span>' +
-            esc(d.daily[d.daily.length - 1].date.slice(5)) + '</span></div>' +
-            '<div class="muted" style="font-size:11.5px;margin-top:10px">柱高为该日金额 · ' + d.daily.length + ' 天有记账</div></div>';
-        }
-
-        if (d.ledgers.length > 1) {
-          html += '<div class="sect"><h3>账本</h3><table><tbody>' + d.ledgers.map(function (l) {
-            return '<tr><td>' + esc(l.ledger_name) + '</td><td class="num muted">' + l.count + ' 笔</td><td class="num">' +
-              yuan(l.cents) + '</td></tr>';
-          }).join('') + '</tbody></table></div>';
-        }
-
-        html += '<div class="sect"><h3>逐笔' + (d.entries_total > d.entries.length ? '（最近 ' + d.entries.length + '/' + d.entries_total + '）' : '') + '</h3>' +
-          (d.entries.length
-            ? '<ul class="rowlist">' + d.entries.map(function (e) {
-                return '<li><div class="top"><span class="t">' + esc(e.note || e.category) + '</span>' +
-                  '<span style="flex:none">' + yuan(e.amount_cents) + '</span></div>' +
-                  '<div class="meta"><span>' + esc(e.spent_on.slice(5)) + '</span><span class="chip">' + esc(e.category) + '</span>' +
-                  '<span>' + esc(e.ledger_name) + '</span><span>' + esc(e.created_by_profile) + '</span></div></li>';
-              }).join('') + '</ul>'
-            : '<div class="empty">没有记录</div>') + '</div>';
-
-        drawerBody.innerHTML = html;
-        Array.prototype.forEach.call(drawerBody.querySelectorAll('[data-month]'), function (b) {
-          b.addEventListener('click', function () { openExpenses(b.getAttribute('data-month')); });
-        });
-        Array.prototype.forEach.call(drawerBody.querySelectorAll('[data-export]'), function (b) {
-          b.addEventListener('click', function () { downloadCsv(b.getAttribute('data-export')); });
-        });
-      }).catch(fail);
+      var query = '/api/expenses?limit=50' + (month ? '&month=' + encodeURIComponent(month) : '');
+      api(query).then(renderExpenses).catch(fail);
     });
+  }
+  function renderExpenses(d) {
+    expMonth = d.month;
+    expEntries = d.entries || [];
+    expTotal = d.entries_total;
+    drawerSub.textContent = d.count + ' 笔';
+    var html = '<div class="monthnav">' +
+      '<button type="button" data-month="' + shiftMonth(expMonth, -1) + '">‹ 上月</button>' +
+      '<span class="cur">' + expMonth + '</span>' +
+      '<button type="button" data-month="' + shiftMonth(expMonth, 1) + '">下月 ›</button>' +
+      '<button type="button" data-export="' + expMonth + '">导出 CSV</button>' +
+      '<span class="muted" style="margin-left:auto">' + yuan(d.total_cents) + '</span></div>';
+
+    html += '<div class="sect"><h3>分类</h3>' +
+      (d.categories.length
+        ? '<table><tbody>' + d.categories.map(function (c, i) {
+            return '<tr><td><i style="display:inline-block;width:7px;height:7px;border-radius:2px;margin-right:8px;background:' +
+              COLORS[i % COLORS.length] + '"></i>' + esc(c.category) + '</td>' +
+              '<td class="num muted">' + c.count + ' 笔</td>' +
+              '<td class="num">' + yuan(c.cents) + '</td>' +
+              '<td class="num muted">' + (c.share * 100).toFixed(1) + '%</td></tr>';
+          }).join('') + '</tbody></table>'
+        : '<div class="empty">本月没有记账</div>') + '</div>';
+
+    if (d.daily.length) {
+      var dmax = Math.max.apply(null, d.daily.map(function (x) { return x.cents; }));
+      html += '<div class="sect"><h3>按天</h3><div class="bars">' +
+        d.daily.map(function (x) {
+          return '<div style="height:' + Math.max(4, (x.cents / dmax) * 100) + '%" title="' + esc(x.date) + ' ' + yuan(x.cents) + '"></div>';
+        }).join('') + '</div>' +
+        '<div class="spark-axis"><span>' + esc(d.daily[0].date.slice(5)) + '</span><span>' +
+        esc(d.daily[d.daily.length - 1].date.slice(5)) + '</span></div>' +
+        '<div class="muted" style="font-size:11.5px;margin-top:10px">柱高为该日金额 · ' + d.daily.length + ' 天有记账</div></div>';
+    }
+
+    if (d.ledgers.length > 1) {
+      html += '<div class="sect"><h3>账本</h3><table><tbody>' + d.ledgers.map(function (l) {
+        return '<tr><td>' + esc(l.ledger_name) + '</td><td class="num muted">' + l.count + ' 笔</td><td class="num">' +
+          yuan(l.cents) + '</td></tr>';
+      }).join('') + '</tbody></table></div>';
+    }
+
+    // 逐笔行先渲染到独立容器：续页只追加这个 <ul>，不必整抽屉重绘（保留滚动位置）
+    html += '<div class="sect"><h3 id="exp-entries-title">' + pagedTitle('逐笔', expEntries.length, expTotal) + '</h3>' +
+      '<ul class="rowlist" id="exp-entries"></ul>' +
+      (expTotal === 0 ? '<div class="empty">没有记录</div>' : '') +
+      moreButton('exp-more', 'expenses', d, expEntries.length, expTotal) + '</div>';
+
+    drawerBody.innerHTML = html;
+    var list = el('exp-entries');
+    if (list) list.innerHTML = expEntries.map(expenseRow).join('');
+    Array.prototype.forEach.call(drawerBody.querySelectorAll('[data-month]'), function (b) {
+      b.addEventListener('click', function () { openExpenses(b.getAttribute('data-month')); });
+    });
+    Array.prototype.forEach.call(drawerBody.querySelectorAll('[data-export]'), function (b) {
+      b.addEventListener('click', function () { downloadCsv(b.getAttribute('data-export')); });
+    });
+    bindLoadMore();
   }
   /* 导出当月 CSV：凭据只走 Authorization 头（绝不进 URL）；Blob + a[download] 触发下载，
      revoke 延后一秒，避免部分浏览器在下载真正开始前就把 objectURL 失效。 */
@@ -691,36 +794,34 @@ const SCRIPT = `
 
   function openDeliveries() {
     openDrawer('deliveries', '投递明细', function () {
-      api('/api/deliveries').then(function (d) {
-        var c = d.counts;
-        drawerSub.textContent = c.sent_24h + ' 条 / 24h';
-        var max = Math.max.apply(null, d.daily.map(function (x) { return x.sent; }).concat([1]));
-        var html = '<div class="sect"><h3>近 7 天</h3><div class="bars">' +
-          d.daily.map(function (x) {
-            return '<div style="height:' + Math.max(4, (x.sent / max) * 100) + '%" title="' + esc(x.date) + ' ' + x.sent + ' 条">' +
-              '<span>' + esc(x.label) + '</span></div>';
-          }).join('') + '</div><div style="height:16px"></div>' +
-          '<table><tbody>' +
-          '<tr><td>待投递</td><td class="num ' + (c.queued ? 'warn' : '') + '">' + c.queued + '</td></tr>' +
-          '<tr><td>失败</td><td class="num ' + (c.failed ? 'bad' : '') + '">' + c.failed + '</td></tr>' +
-          '<tr><td>兜底</td><td class="num ' + (c.fallback ? 'bad' : '') + '">' + c.fallback + '</td></tr>' +
-          '</tbody></table></div>';
-
-        html += '<div class="sect"><h3>记录</h3>' + (d.items.length
-          ? '<ul class="rowlist">' + d.items.map(function (i) {
-              var cls = i.status === 'sent' ? 'green' : i.status === 'failed' ? 'red' : i.status === 'fallback' ? 'amber' : '';
-              return '<li><div class="top"><span class="t">' + esc(i.title) + '</span>' +
-                '<span class="chip ' + cls + '">' + esc(i.status) + '</span></div>' +
-                '<div class="meta"><span>' + esc(i.sent_local || i.created_local) + '</span>' +
-                '<span class="chip">' + esc(i.route_name) + '</span>' +
-                '<span>' + esc(i.profile_id) + '</span>' +
-                (i.attempts ? '<span>尝试 ' + i.attempts + ' 次</span>' : '') +
-                '</div>' + (i.last_error ? '<div class="meta bad">' + esc(i.last_error.slice(0, 160)) + '</div>' : '') + '</li>';
-            }).join('') + '</ul>'
-          : '<div class="empty">没有投递记录</div>') + '</div>';
-        drawerBody.innerHTML = html;
-      }).catch(fail);
+      api('/api/deliveries?limit=60').then(renderDeliveries).catch(fail);
     });
+  }
+  function renderDeliveries(d) {
+    delItems = d.items || [];
+    delTotal = d.items_total;
+    var c = d.counts;
+    drawerSub.textContent = c.sent_24h + ' 条 / 24h';
+    var max = Math.max.apply(null, d.daily.map(function (x) { return x.sent; }).concat([1]));
+    var html = '<div class="sect"><h3>近 7 天</h3><div class="bars">' +
+      d.daily.map(function (x) {
+        return '<div style="height:' + Math.max(4, (x.sent / max) * 100) + '%" title="' + esc(x.date) + ' ' + x.sent + ' 条">' +
+          '<span>' + esc(x.label) + '</span></div>';
+      }).join('') + '</div><div style="height:16px"></div>' +
+      '<table><tbody>' +
+      '<tr><td>待投递</td><td class="num ' + (c.queued ? 'warn' : '') + '">' + c.queued + '</td></tr>' +
+      '<tr><td>失败</td><td class="num ' + (c.failed ? 'bad' : '') + '">' + c.failed + '</td></tr>' +
+      '<tr><td>兜底</td><td class="num ' + (c.fallback ? 'bad' : '') + '">' + c.fallback + '</td></tr>' +
+      '</tbody></table></div>';
+
+    html += '<div class="sect"><h3 id="del-entries-title">' + pagedTitle('记录', delItems.length, delTotal) + '</h3>' +
+      '<ul class="rowlist" id="del-entries"></ul>' +
+      (delTotal === 0 ? '<div class="empty">没有投递记录</div>' : '') +
+      moreButton('del-more', 'deliveries', d, delItems.length, delTotal) + '</div>';
+    drawerBody.innerHTML = html;
+    var list = el('del-entries');
+    if (list) list.innerHTML = delItems.map(deliveryRow).join('');
+    bindLoadMore();
   }
 
   function openHolidays() {
