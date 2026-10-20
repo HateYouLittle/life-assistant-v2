@@ -36,14 +36,16 @@ CI 在 Node 22.16.0 / 22 / 24 三档矩阵全绿（`.github/workflows/ci.yml`）
 
 ## 阶段二：触达与家庭 —— 🔲 未开始（3–6 周）
 
-> 决策（2026-10-20）：远程入口用 **公网 IPv6 + DDNS + Caddy HTTPS 反向代理**（daemon 保持回环）；
+> 决策（2026-10-20）：服务只跑局域网，公网入口由 **NAS 上的 Lucky 反向代理**（TLS 终止、DDNS、路径控制）；
+> daemon 绑 `0.0.0.0` + `WEB_API_TOKEN` + `REQUIRE_AUTH`，Mac 不做公网直连、不装证书。
 > 手机端（OPPO/ColorOS）用 **`/quick` PWA**（主路径）+ **HTTP Shortcuts**（一键直达）+ 小布指令/NFC（触发器）。
-> 施工清单、配置示例与暴露前安全门槛见 [docs/remote-access.md](docs/remote-access.md)。
+> 施工清单、Lucky 配置要点与安全门槛见 [docs/remote-access.md](docs/remote-access.md)。
 
 **前置（阻塞手机端与 ICS）**
 
-0. **远程访问基线**：DDNS 更新 AAAA、路由器只放行反代端口、HTTPS 证书（80/443 可用走 Caddy 自动签发，
-   否则 acme.sh DNS-01 + 8443）、固定 Mac 的 IPv6 地址；**暴露前必须先完成 per-profile token 与写 API 限流**。
+0. **局域网 + NAS Lucky 反代**：Mac 固定 LAN IP、daemon 改绑 `0.0.0.0`、`WEB_ALLOWED_HOSTS` 覆盖
+   Lucky 前端域名与 LAN 地址；Lucky 侧只放必要路径（公网不暴露 `/mcp`，SSE 缓冲会卡）。
+   **暴露前必须先完成 per-profile token 与写 API 限流**。
 
 **功能项**
 
