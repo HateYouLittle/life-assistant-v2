@@ -27,36 +27,58 @@ const VERSION = (require("../../package.json") as { version: string }).version;
 
 const WEEKDAY_CN = ["一", "二", "三", "四", "五", "六", "日"];
 
-export function statusPayload(config: ResolvedConfig, db: DatabaseSync): Record<string, unknown> {
+/**
+ * 当前请求可见的 Profile：master = undefined（家庭看板，全部 Profile）；
+ * profile token = 只允许自己的数据（过滤下推到每条 SQL，响应里不出现别人的记录）。
+ */
+function visibleProfileId(identity: Identity): string | undefined {
+  return identity.kind === "profile" ? identity.profileId : undefined;
+}
+
+export function statusPayload(
+  config: ResolvedConfig,
+  db: DatabaseSync,
+  identity: Identity = { kind: "master" },
+): Record<string, unknown> {
   const at = DateTime.now().setZone(TZ);
   const today = todayIso();
   const month = today.slice(0, 7);
+  const profileId = visibleProfileId(identity);
 
   const count = (sql: string, ...params: (string | number)[]): number => {
     const row = db.prepare(sql).get(...params) as { n: number } | undefined;
     return row?.n ?? 0;
   };
 
-  const expenses = expenseDetails(db, month, "1");
-  const deliveries = deliveryDetails(db, "1");
-  const schedules = scheduleDetails(db, "50");
+  const expenses = expenseDetails(db, month, "1", undefined, { profileId });
+  const deliveries = deliveryDetails(db, "1", undefined, profileId);
+  const schedules = scheduleDetails(db, "50", profileId);
   const holidays = holidayDetails(db, undefined);
   const jobs = jobDetails(db);
-  // 预算卡片首屏数据源：与支出卡片同一个月（自然月全月），卡片内容因此不必额外拉接口
+  // 预算卡片首屏数据源：与支出卡片同一个月（自然月全月），卡片内容因此不必额外拉接口。
+  // 预算仍只统计家庭账本（见 budget.ts 的口径），Profile 视图不额外暴露个人账本预算。
   const budget = budgetPayload(db, month);
 
   return {
     ok: true,
     name: "life-assistant",
     version: VERSION,
+    // 当前请求身份：页面据此渲染「家庭看板 / 个人视图 · <profile>」。
+    // 只出现在受鉴权保护的 /api/status 里；静态页 `/` 依旧是没有任何身份信息的壳。
+    identity:
+      profileId === undefined ? { kind: "master" } : { kind: "profile", profile_id: profileId },
     uptime_s: Math.floor(process.uptime()),
     qweather_configured: config.qweatherKey !== undefined && config.qweatherHost !== undefined,
     // 当日上游请求数（含重试）：官方自 2027-02-01 起限制 API KEY 日请求量，用量必须可见
     qweather_usage: qweatherUsage(),
     daily_brief_cron: config.dailyBriefCron,
-    profiles: (db.prepare("SELECT id FROM profiles ORDER BY id").all() as { id: string }[]).map(
-      (r) => r.id,
-    ),
+    // 个人视图只列自己：Profile 列表本身也是「其他用户存在」的元数据
+    profiles:
+      profileId === undefined
+        ? (db.prepare("SELECT id FROM profiles ORDER BY id").all() as { id: string }[]).map(
+            (r) => r.id,
+          )
+        : [profileId],
     today: {
       date: today,
       weekday: `周${WEEKDAY_CN[at.weekday - 1] ?? ""}`,
@@ -64,27 +86,44 @@ export function statusPayload(config: ResolvedConfig, db: DatabaseSync): Record<
       label: `${at.toFormat("yyyy年L月d日")} 周${WEEKDAY_CN[at.weekday - 1] ?? ""}`,
     },
     schedules: {
-      active: count("SELECT COUNT(*) AS n FROM schedules WHERE status = 'active'"),
+      active:
+        profileId === undefined
+          ? count("SELECT COUNT(*) AS n FROM schedules WHERE status = 'active'")
+          : count(
+              "SELECT COUNT(*) AS n FROM schedules WHERE status = 'active' AND profile_id = ?",
+              profileId,
+            ),
       // 概览只带最近 5 条；完整列表走 /api/schedules
       next: schedules.slice(0, 5),
     },
     notifications: {
-      queued: count("SELECT COUNT(*) AS n FROM deliveries WHERE status = 'queued'"),
-      failed: count("SELECT COUNT(*) AS n FROM deliveries WHERE status = 'failed'"),
-      fallback: count("SELECT COUNT(*) AS n FROM deliveries WHERE status = 'fallback'"),
-      sent_24h: count(
-        "SELECT COUNT(*) AS n FROM deliveries WHERE status = 'sent' AND sent_at >= ?",
-        new Date(Date.now() - 24 * 3600 * 1000).toISOString(),
-      ),
+      // 计数与 deliveries 明细同口径：Profile 视图只数自己的投递，
+      // 否则「别人的待投递/失败数」会作为元数据泄漏出来
+      ...deliveries.counts,
       daily: deliveries.daily,
     },
     ledgers: {
-      total: count(
-        "SELECT COUNT(*) AS n FROM ledgers WHERE archived_at IS NULL AND owner_profile_id IS NULL",
-      ),
-      archived: count(
-        "SELECT COUNT(*) AS n FROM ledgers WHERE archived_at IS NOT NULL AND owner_profile_id IS NULL",
-      ),
+      // Profile 视图把自己可见的账本都算上（家庭 + 自己的个人账本），与支出卡片口径一致
+      total:
+        profileId === undefined
+          ? count(
+              "SELECT COUNT(*) AS n FROM ledgers WHERE archived_at IS NULL AND owner_profile_id IS NULL",
+            )
+          : count(
+              `SELECT COUNT(*) AS n FROM ledgers
+               WHERE archived_at IS NULL AND (owner_profile_id IS NULL OR owner_profile_id = ?)`,
+              profileId,
+            ),
+      archived:
+        profileId === undefined
+          ? count(
+              "SELECT COUNT(*) AS n FROM ledgers WHERE archived_at IS NOT NULL AND owner_profile_id IS NULL",
+            )
+          : count(
+              `SELECT COUNT(*) AS n FROM ledgers
+               WHERE archived_at IS NOT NULL AND (owner_profile_id IS NULL OR owner_profile_id = ?)`,
+              profileId,
+            ),
     },
     expenses: {
       month: expenses.month,
@@ -148,8 +187,7 @@ export function createStatusApp(config: ResolvedConfig, db: DatabaseSync): Hono<
   });
   app.use("/api/*", async (c, next) => {
     // `/api/quick/*` 是手机快捷入口（记账/提醒），由 Profile token 授权、按身份过滤，
-    // 自己在路由里解析 identity；其余只读看板接口仍然只允许 master token ——
-    // 单 Profile 的 token 不该看到全家账本/所有日程。
+    // 自己在路由里解析 identity。
     if (c.req.path.startsWith("/api/quick/")) {
       await next();
       return;
@@ -165,32 +203,30 @@ export function createStatusApp(config: ResolvedConfig, db: DatabaseSync): Hono<
       logger.warn(`鉴权失败: ${c.req.path} from ${c.req.header("x-forwarded-for") ?? "unknown"}`);
       return c.json({ error: "unauthorized" }, 401);
     }
-    if (identity.kind === "profile") {
-      incCounter("auth_forbidden_total");
-      return c.json(
-        {
-          error: "forbidden",
-          message: "看板/只读接口仅 master token 可访问；手机请用 /api/quick/*",
-        },
-        403,
-      );
-    }
+    // Profile token 也放行看板：数据范围由各路由按 identity 下推到 SQL 过滤
+    // （家庭账本 + 自己个人账本 / 自己的日程 / 自己的通知），不是 403 后前端隐藏。
     c.set("identity", identity);
     await next();
   });
 
-  app.get("/api/status", (c) => c.json(statusPayload(config, db)));
+  app.get("/api/status", (c) => c.json(statusPayload(config, db, c.get("identity"))));
   // offset/limit 都透传给详情查询：看板明细「加载更多」按 next_offset 续页。
-  // 参数解析与夹紧统一在 details.ts（clampLimit/clampOffset），路由不做业务判断。
+  // 参数解析与夹紧统一在 details.ts（clampLimit/clampOffset），路由不做业务判断；
+  // profile token 时用 scope 把账本范围限定为「家庭 + 本人个人」。
   app.get("/api/expenses", (c) =>
-    c.json(expenseDetails(db, c.req.query("month"), c.req.query("limit"), c.req.query("offset"))),
+    c.json(
+      expenseDetails(db, c.req.query("month"), c.req.query("limit"), c.req.query("offset"), {
+        profileId: visibleProfileId(c.get("identity")),
+      }),
+    ),
   );
   // 预算看板：每个活跃家庭账本的总额/分类预算对照 + 可执行建议。
   // 月份缺省/非法回退当月（与 /api/expenses 同一 normalizeMonth 口径）；
   // 鉴权与 no-store 由上面的 /api/* master 中间件统一兜住。
   app.get("/api/budget", (c) => c.json(budgetPayload(db, c.req.query("month"))));
-  // 家庭账本支出 CSV：与 /api/expenses 同口径（只家庭账本、同一「自然月全月」区间），
-  // 鉴权与 no-store 由上面的 /api/* 中间件统一兜住；月份非法/缺省回退当月。
+  // 家庭账本支出 CSV：固定只导出家庭账本（不随 Profile 视图扩大到个人账本 —— 导出是
+  // 共享看板能力，个人账本导出走 MCP expense {action:"export"}），区间与 /api/expenses
+  // 同为「自然月全月」；鉴权与 no-store 由上面的 /api/* 中间件统一兜住。
   app.get("/api/expenses.csv", (c) => {
     const month = normalizeMonth(c.req.query("month"));
     const result = expenseCsv(db, { month });
@@ -199,12 +235,23 @@ export function createStatusApp(config: ResolvedConfig, db: DatabaseSync): Hono<
       "Content-Disposition": `attachment; filename="${expenseCsvFilename(month)}"`,
     });
   });
-  app.get("/api/schedules", (c) => c.json({ items: scheduleDetails(db, c.req.query("limit")) }));
+  app.get("/api/schedules", (c) =>
+    c.json({
+      items: scheduleDetails(db, c.req.query("limit"), visibleProfileId(c.get("identity"))),
+    }),
+  );
   // 定时任务全量明细：每 job 的最近运行/最近成功/24h 失败。doctor --live 也读它，
-  // 鉴权与 no-store 由上面的 /api/* 中间件统一兜住。
+  // 鉴权与 no-store 由上面的 /api/* 中间件统一兜住（运维数据不含 Profile 隐私）。
   app.get("/api/jobs", (c) => c.json({ items: jobDetails(db) }));
   app.get("/api/deliveries", (c) =>
-    c.json(deliveryDetails(db, c.req.query("limit"), c.req.query("offset"))),
+    c.json(
+      deliveryDetails(
+        db,
+        c.req.query("limit"),
+        c.req.query("offset"),
+        visibleProfileId(c.get("identity")),
+      ),
+    ),
   );
   app.get("/api/holidays", (c) => c.json(holidayDetails(db, c.req.query("year"))));
   // 存活探针：不鉴权、不查明细，只回答「进程还在、库还开着」。

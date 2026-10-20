@@ -183,7 +183,7 @@ describe("状态接口", () => {
     }
   });
 
-  it("Profile token 只能走 /api/quick/*：看板接口返回 403（不泄露全家数据）", async () => {
+  it("Profile token 可读看板（不再 403）：/api/status 带个人身份且不列其他 Profile", async () => {
     const master = "m".repeat(64);
     const bestie = "b".repeat(64);
     const env = makeTestEnv({
@@ -192,16 +192,33 @@ describe("状态接口", () => {
       PROFILE_TOKENS_JSON: JSON.stringify({ bestie }),
     });
     try {
+      env.db
+        .prepare(
+          "INSERT INTO profiles (id, created_at) VALUES ('bestie', '2026-01-01T00:00:00.000Z')",
+        )
+        .run();
       const a = app(env);
-      assert.equal(
-        (await a.request("/api/status", { headers: { Authorization: `Bearer ${bestie}` } })).status,
-        403,
-        "Profile token 看板必须 403",
-      );
-      assert.equal(
-        (await a.request("/api/status", { headers: { Authorization: `Bearer ${master}` } })).status,
-        200,
-      );
+      const profileRes = await a.request("/api/status", {
+        headers: { Authorization: `Bearer ${bestie}` },
+      });
+      assert.equal(profileRes.status, 200, "Profile token 应能打开自己的看板");
+      const profileBody = (await profileRes.json()) as {
+        identity: { kind: string; profile_id?: string };
+        profiles: string[];
+      };
+      assert.deepEqual(profileBody.identity, { kind: "profile", profile_id: "bestie" });
+      assert.deepEqual(profileBody.profiles, ["bestie"], "个人视图不应列出其他 Profile");
+
+      const masterRes = await a.request("/api/status", {
+        headers: { Authorization: `Bearer ${master}` },
+      });
+      assert.equal(masterRes.status, 200);
+      const masterBody = (await masterRes.json()) as {
+        identity: { kind: string };
+        profiles: string[];
+      };
+      assert.deepEqual(masterBody.identity, { kind: "master" });
+      assert.deepEqual(masterBody.profiles, ["bestie", "default"], "master 仍是家庭看板");
     } finally {
       cleanupTestEnv(env);
     }
@@ -937,6 +954,211 @@ describe("定时任务接口", () => {
       assert.ok(body.jobs.runs.length <= 20, "概览只带 20 个 job，全量走 /api/jobs");
       const brief = body.jobs.runs.find((run) => run.name === "daily_brief");
       assert.equal(brief?.last_run?.status, "failed");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
+describe("Profile 看板可见性（隔离）", () => {
+  const MASTER = "m".repeat(64);
+  const BESTIE = "b".repeat(64);
+
+  /**
+   * 两个 Profile（default / bestie）+ 家庭账本、各自个人账本、各自日程/通知/投递。
+   * 预算故意给家庭和个人各设一份：看板预算口径必须仍只统计家庭账本。
+   */
+  function makeIsolatedEnv(): TestEnv {
+    const env = makeTestEnv({
+      WEB_API_TOKEN: MASTER,
+      HOST: "0.0.0.0",
+      PROFILE_TOKENS_JSON: JSON.stringify({ bestie: BESTIE }),
+    });
+    env.db
+      .prepare(
+        "INSERT INTO profiles (id, created_at) VALUES ('bestie', '2026-01-01T00:00:00.000Z')",
+      )
+      .run();
+    const insertLedger = env.db.prepare(
+      `INSERT INTO ledgers (id, name, created_at, owner_profile_id)
+       VALUES (?, ?, '2026-01-01T00:00:00.000Z', ?)`,
+    );
+    insertLedger.run("lf", "家庭账本", null);
+    insertLedger.run("lp-default", "默认私人账本", "default");
+    insertLedger.run("lp-bestie", "闺蜜私人账本", "bestie");
+
+    const today = todayIso();
+    const insertExpense = env.db.prepare(
+      `INSERT INTO expenses (id, ledger_id, amount_cents, category, note, spent_on, created_by_profile, created_at)
+       VALUES (?, ?, ?, '餐饮', ?, ?, 'default', '2026-01-01T00:00:00.000Z')`,
+    );
+    insertExpense.run("e-family", "lf", 1000, "家庭午餐", today);
+    insertExpense.run("e-default", "lp-default", 2000, "default 私房", today);
+    insertExpense.run("e-bestie", "lp-bestie", 4000, "bestie 私房", today);
+
+    const insertSchedule = env.db.prepare(
+      `INSERT INTO schedules (id, profile_id, title, kind, calendar, start_date, time, all_day, created_at, updated_at)
+       VALUES (?, ?, ?, 'todo', 'solar', ?, '09:00', 1, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`,
+    );
+    insertSchedule.run("s-default", "default", "default 的日程", today);
+    insertSchedule.run("s-bestie", "bestie", "bestie 的日程", today);
+
+    const nowIso = new Date().toISOString();
+    const insertNotification = env.db.prepare(
+      `INSERT INTO notifications (id, profile_id, kind, title, body_md, created_at)
+       VALUES (?, ?, 'k', ?, '正文', ?)`,
+    );
+    insertNotification.run("n-default", "default", "default 的通知", nowIso);
+    insertNotification.run("n-bestie", "bestie", "bestie 的通知", nowIso);
+    const insertDelivery = env.db.prepare(
+      `INSERT INTO deliveries (id, notification_id, route_name, status, next_attempt_at, created_at, sent_at, updated_at)
+       VALUES (?, ?, 'r', 'sent', ?, ?, ?, ?)`,
+    );
+    insertDelivery.run("d-default", "n-default", nowIso, nowIso, nowIso, nowIso);
+    insertDelivery.run("d-bestie", "n-bestie", nowIso, nowIso, nowIso, nowIso);
+
+    const insertBudget = env.db.prepare(
+      `INSERT INTO budgets (id, ledger_id, category, amount_cents, created_at, updated_at)
+       VALUES (?, ?, '', 10000, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`,
+    );
+    insertBudget.run("b-family", "lf");
+    insertBudget.run("b-bestie", "lp-bestie");
+    return env;
+  }
+
+  function withToken(token: string): { headers: { Authorization: string } } {
+    return { headers: { Authorization: `Bearer ${token}` } };
+  }
+
+  it("个人视图：自己的日程/通知/投递 + 家庭与本人个人账本支出，看不到别人的", async () => {
+    const env = makeIsolatedEnv();
+    try {
+      const a = app(env);
+
+      const statusRes = await a.request("/api/status", withToken(BESTIE));
+      assert.equal(statusRes.status, 200);
+      const status = (await statusRes.json()) as {
+        identity: { kind: string; profile_id: string };
+        expenses: { month_cents: number; count: number };
+        schedules: { active: number; next: { title: string }[] };
+        notifications: { sent_24h: number };
+        ledgers: { total: number };
+      };
+      assert.deepEqual(status.identity, { kind: "profile", profile_id: "bestie" });
+      assert.equal(
+        status.expenses.month_cents,
+        1000 + 4000,
+        "家庭 + 本人个人账本，不含 default 个人",
+      );
+      assert.equal(status.expenses.count, 2);
+      assert.equal(status.schedules.active, 1, "只数自己的活跃日程");
+      assert.deepEqual(
+        status.schedules.next.map((item) => item.title),
+        ["bestie 的日程"],
+      );
+      assert.equal(status.notifications.sent_24h, 1, "只数自己的投递");
+      assert.equal(status.ledgers.total, 2, "可见账本 = 家庭 + 本人个人");
+      const statusText = JSON.stringify(status);
+      assert.ok(!statusText.includes("default 的日程"), "不得泄露其他 Profile 的日程标题");
+      assert.ok(!statusText.includes("默认私人账本"), "不得泄露其他 Profile 的个人账本名");
+
+      const expensesRes = await a.request("/api/expenses", withToken(BESTIE));
+      const expenses = (await expensesRes.json()) as {
+        entries: { note: string; ledger_name: string }[];
+        entries_total: number;
+      };
+      assert.deepEqual(
+        expenses.entries.map((entry) => entry.note).sort(),
+        ["bestie 私房", "家庭午餐"],
+        "只能看到家庭账本与本人个人账本的支出",
+      );
+      assert.equal(expenses.entries_total, 2);
+      assert.ok(!JSON.stringify(expenses).includes("默认私人账本"));
+      assert.ok(!JSON.stringify(expenses).includes("default 私房"));
+
+      const schedulesRes = await a.request("/api/schedules", withToken(BESTIE));
+      const schedules = (await schedulesRes.json()) as { items: { title: string }[] };
+      assert.deepEqual(
+        schedules.items.map((item) => item.title),
+        ["bestie 的日程"],
+        "个人视图只返回自己的日程",
+      );
+
+      const deliveriesRes = await a.request("/api/deliveries", withToken(BESTIE));
+      const deliveries = (await deliveriesRes.json()) as {
+        items: { title: string; notification_id: string }[];
+        items_total: number;
+        counts: { sent_24h: number };
+      };
+      assert.deepEqual(
+        deliveries.items.map((item) => item.notification_id),
+        ["n-bestie"],
+        "个人视图只返回自己的投递记录",
+      );
+      assert.equal(deliveries.items_total, 1);
+      assert.equal(deliveries.counts.sent_24h, 1);
+      assert.ok(!JSON.stringify(deliveries).includes("default 的通知"));
+
+      // 预算口径不变：仍只统计家庭账本（个人账本预算不出现在看板）
+      const budget = (await (await a.request("/api/budget", withToken(BESTIE))).json()) as {
+        ledgers: { ledger_name: string }[];
+      };
+      assert.deepEqual(
+        budget.ledgers.map((ledger) => ledger.ledger_name),
+        ["家庭账本"],
+        "预算只统计家庭账本，个人账本预算不出现",
+      );
+
+      // CSV 与预算同口径：只导出家庭账本（行为不变）
+      const csvRes = await a.request("/api/expenses.csv", withToken(BESTIE));
+      assert.equal(csvRes.status, 200);
+      const csv = await csvRes.text();
+      assert.match(csv, /家庭账本/);
+      assert.ok(!csv.includes("闺蜜私人账本"), "CSV 不得导出个人账本");
+      assert.ok(!csv.includes("默认私人账本"));
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("master 行为不变：所有 Profile 的日程/通知 + 家庭账本支出", async () => {
+    const env = makeIsolatedEnv();
+    try {
+      const a = app(env);
+      const status = (await (await a.request("/api/status", withToken(MASTER))).json()) as {
+        identity: { kind: string };
+        expenses: { month_cents: number; count: number };
+        schedules: { active: number; next: { title: string }[] };
+        notifications: { sent_24h: number };
+        ledgers: { total: number };
+        profiles: string[];
+      };
+      assert.deepEqual(status.identity, { kind: "master" });
+      assert.equal(status.expenses.month_cents, 1000, "master 仍只统计家庭账本支出（现状）");
+      assert.equal(status.expenses.count, 1);
+      assert.equal(status.schedules.active, 2, "master 看全部 Profile 的日程");
+      assert.deepEqual(status.schedules.next.map((item) => item.title).sort(), [
+        "bestie 的日程",
+        "default 的日程",
+      ]);
+      assert.equal(status.notifications.sent_24h, 2, "master 看全部 Profile 的通知");
+      assert.equal(status.ledgers.total, 1, "账本计数仍是家庭账本口径");
+      assert.deepEqual(status.profiles, ["bestie", "default"]);
+
+      const schedules = (await (await a.request("/api/schedules", withToken(MASTER))).json()) as {
+        items: { title: string }[];
+      };
+      assert.equal(schedules.items.length, 2, "master 的 /api/schedules 仍是跨 Profile");
+
+      const deliveries = (await (await a.request("/api/deliveries", withToken(MASTER))).json()) as {
+        items: { notification_id: string }[];
+        items_total: number;
+      };
+      assert.deepEqual(deliveries.items.map((item) => item.notification_id).sort(), [
+        "n-bestie",
+        "n-default",
+      ]);
+      assert.equal(deliveries.items_total, 2);
     } finally {
       cleanupTestEnv(env);
     }

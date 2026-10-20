@@ -82,16 +82,36 @@ export interface ExpenseDetails {
   next_offset: number | null;
 }
 
+export interface ExpenseScope {
+  /**
+   * 给了 Profile 时：可见账本 = 家庭账本（owner_profile_id IS NULL）+ 该 Profile 的个人账本；
+   * 缺省 = 只家庭账本（master 的「家庭看板」口径，保持历史行为）。
+   *
+   * 为什么账本过滤要下推到每一条 SQL：合计/分类/按天/按账本/逐笔/上月对照共用同一口径，
+   * 只在 entries 上过滤会让卡片合计与明细对不上（且会把别人的个人账本金额算进总额）。
+   */
+  profileId?: string;
+}
+
 export function expenseDetails(
   db: DatabaseSync,
   rawMonth: string | undefined,
   rawLimit: string | undefined,
   rawOffset?: string,
+  scope?: ExpenseScope,
 ): ExpenseDetails {
   const month = normalizeMonth(rawMonth);
   const { from, to } = monthRange(month);
   const limit = clampLimit(rawLimit, 50);
   const offset = clampOffset(rawOffset);
+  // SQL 片段只由本文件拼出（不含用户输入），Profile id 始终走参数绑定
+  const ledgerFilter =
+    scope?.profileId === undefined
+      ? { sql: "l.owner_profile_id IS NULL", params: [] as string[] }
+      : {
+          sql: "(l.owner_profile_id IS NULL OR l.owner_profile_id = ?)",
+          params: [scope.profileId],
+        };
 
   // 6 条独立 SELECT 需要一个一致快照：并发写入时否则「合计」与「分类/明细」会对不上
   // （与 bookkeeping 的 summarizeExpenses 同口径）。
@@ -100,38 +120,47 @@ export function expenseDetails(
       .prepare(
         `SELECT COALESCE(SUM(e.amount_cents), 0) AS cents, COUNT(*) AS count
        FROM expenses e JOIN ledgers l ON l.id = e.ledger_id
-       WHERE e.spent_on >= ? AND e.spent_on <= ? AND l.owner_profile_id IS NULL`,
+       WHERE e.spent_on >= ? AND e.spent_on <= ? AND ${ledgerFilter.sql}`,
       )
-      .get(from, to) as { cents: number; count: number };
+      .get(from, to, ...ledgerFilter.params) as { cents: number; count: number };
 
     const categories = db
       .prepare(
         `SELECT e.category, SUM(e.amount_cents) AS cents, COUNT(*) AS count FROM expenses e
        JOIN ledgers l ON l.id = e.ledger_id
-       WHERE e.spent_on >= ? AND e.spent_on <= ? AND l.owner_profile_id IS NULL
+       WHERE e.spent_on >= ? AND e.spent_on <= ? AND ${ledgerFilter.sql}
        GROUP BY e.category ORDER BY cents DESC`,
       )
-      .all(from, to) as { category: string; cents: number; count: number }[];
+      .all(from, to, ...ledgerFilter.params) as {
+      category: string;
+      cents: number;
+      count: number;
+    }[];
 
     const daily = db
       .prepare(
         `SELECT e.spent_on AS date, SUM(e.amount_cents) AS cents FROM expenses e
        JOIN ledgers l ON l.id = e.ledger_id
-       WHERE e.spent_on >= ? AND e.spent_on <= ? AND l.owner_profile_id IS NULL
+       WHERE e.spent_on >= ? AND e.spent_on <= ? AND ${ledgerFilter.sql}
        GROUP BY e.spent_on ORDER BY e.spent_on`,
       )
-      .all(from, to) as { date: string; cents: number }[];
+      .all(from, to, ...ledgerFilter.params) as { date: string; cents: number }[];
 
     const ledgers = db
       .prepare(
         `SELECT e.ledger_id AS ledger_id, l.name AS ledger_name, SUM(e.amount_cents) AS cents, COUNT(*) AS count
        FROM expenses e JOIN ledgers l ON l.id = e.ledger_id
-       WHERE e.spent_on >= ? AND e.spent_on <= ? AND l.owner_profile_id IS NULL
+       WHERE e.spent_on >= ? AND e.spent_on <= ? AND ${ledgerFilter.sql}
        GROUP BY e.ledger_id ORDER BY cents DESC`,
       )
-      .all(from, to) as { ledger_id: string; ledger_name: string; cents: number; count: number }[];
+      .all(from, to, ...ledgerFilter.params) as {
+      ledger_id: string;
+      ledger_name: string;
+      cents: number;
+      count: number;
+    }[];
 
-    // 状态页只展示家庭账本；个人账本及其支出完全不出现在看板（无 Profile 维度）
+    // 家庭看板只展示家庭账本；带 Profile 作用域时额外含**本人**个人账本（他人个人账本永不出现）。
     // 排序补上 e.id 兜底：spent_on + created_at 完全相同的两条在分页时有稳定顺序，
     // 否则 SQLite 的返回顺序不确定，翻页可能出现重复或漏行。
     const entries = db
@@ -139,10 +168,10 @@ export function expenseDetails(
         `SELECT e.id, e.ledger_id, l.name AS ledger_name, e.amount_cents, e.category,
               e.note, e.spent_on, e.created_by_profile
        FROM expenses e JOIN ledgers l ON l.id = e.ledger_id
-       WHERE e.spent_on >= ? AND e.spent_on <= ? AND l.owner_profile_id IS NULL
+       WHERE e.spent_on >= ? AND e.spent_on <= ? AND ${ledgerFilter.sql}
        ORDER BY e.spent_on DESC, e.created_at DESC, e.id DESC LIMIT ? OFFSET ?`,
       )
-      .all(from, to, limit, offset) as unknown as ExpenseEntry[];
+      .all(from, to, ...ledgerFilter.params, limit, offset) as unknown as ExpenseEntry[];
 
     const prevMonth = previousMonthOf(month);
     const prevRange = monthRange(prevMonth);
@@ -150,9 +179,9 @@ export function expenseDetails(
       .prepare(
         `SELECT COALESCE(SUM(e.amount_cents), 0) AS cents FROM expenses e
        JOIN ledgers l ON l.id = e.ledger_id
-       WHERE e.spent_on >= ? AND e.spent_on <= ? AND l.owner_profile_id IS NULL`,
+       WHERE e.spent_on >= ? AND e.spent_on <= ? AND ${ledgerFilter.sql}`,
       )
-      .get(prevRange.from, prevRange.to) as { cents: number };
+      .get(prevRange.from, prevRange.to, ...ledgerFilter.params) as { cents: number };
 
     const entriesTotal = totals.count;
     const hasMore = offset + entries.length < entriesTotal;
@@ -227,11 +256,17 @@ function localStamp(iso: string | null, allDay: boolean): string | null {
   return allDay ? dt.toFormat("yyyy-LL-dd") : dt.toFormat("yyyy-LL-dd HH:mm");
 }
 
+/**
+ * 跨 Profile 的活跃日程（master 看板）；给了 `profileId` 时只返回该 Profile 自己的日程
+ * （Profile token 打开看板时的个人视图）。日程是 Profile 私有数据，不能靠前端过滤。
+ */
 export function scheduleDetails(
   db: DatabaseSync,
   rawLimit: string | undefined,
+  profileId?: string,
 ): ScheduleDetailItem[] {
   const limit = clampLimit(rawLimit, 50, 500);
+  const profileFilter = profileId === undefined ? "" : " AND s.profile_id = ?";
   const rows = db
     .prepare(
       `SELECT s.id, s.profile_id, s.title, s.kind, s.calendar, s.time, s.all_day, s.note,
@@ -246,11 +281,13 @@ export function scheduleDetails(
            WHERE o2.schedule_id = s.id AND o2.status = 'pending'
            ORDER BY o2.event_at ASC, o2.due_at ASC LIMIT 1
          )
-       WHERE s.status = 'active'
+       WHERE s.status = 'active'${profileFilter}
        ORDER BY COALESCE(o.event_at, '9999') ASC, s.created_at ASC
        LIMIT ?`,
     )
-    .all(limit) as unknown as ScheduleJoinRow[];
+    .all(
+      ...(profileId === undefined ? [limit] : [profileId, limit]),
+    ) as unknown as ScheduleJoinRow[];
 
   const todayStart = DateTime.fromISO(todayIso(), { zone: TZ });
   return rows.map((r) => {
@@ -327,20 +364,35 @@ function localShort(iso: string | null): string | null {
   return dt.isValid ? dt.toFormat("MM-dd HH:mm") : null;
 }
 
+/**
+ * 投递明细：master 看板给全部 Profile；给了 `profileId` 时只返回该 Profile 的通知投递。
+ *
+ * 通知标题/正文属于 Profile 私有数据，过滤必须落在 SQL（连接 notifications 过滤），
+ * 不能靠前端隐藏 —— /api/* 的响应本身就是证据。
+ */
 export function deliveryDetails(
   db: DatabaseSync,
   rawLimit: string | undefined,
   rawOffset?: string,
+  profileId?: string,
 ): DeliveryDetails {
   const limit = clampLimit(rawLimit, 60, 500);
   const offset = clampOffset(rawOffset);
+  // Profile 视图要连 notifications 过滤；家庭看板保持「全部投递」的历史口径
+  const profileFilter =
+    profileId === undefined
+      ? { sql: "", params: [] as string[] }
+      : { sql: " AND n.profile_id = ?", params: [profileId] };
   const count = (sql: string, ...params: (string | number)[]): number =>
     (db.prepare(sql).get(...params) as { n: number } | undefined)?.n ?? 0;
 
   const since = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
   const sentRows = db
-    .prepare("SELECT sent_at FROM deliveries WHERE status = 'sent' AND sent_at >= ?")
-    .all(since) as { sent_at: string }[];
+    .prepare(
+      `SELECT d.sent_at FROM deliveries d JOIN notifications n ON n.id = d.notification_id
+       WHERE d.status = 'sent' AND d.sent_at >= ?${profileFilter.sql}`,
+    )
+    .all(since, ...profileFilter.params) as { sent_at: string }[];
   const buckets = new Map<string, number>();
   const today = DateTime.fromISO(todayIso(), { zone: TZ });
   for (let i = 6; i >= 0; i -= 1) {
@@ -369,20 +421,39 @@ export function deliveryDetails(
               COALESCE(n.profile_id, '-') AS profile_id, d.route_name, d.status, d.attempts,
               d.confirmed_failures, d.transport_failures, d.created_at, d.sent_at, d.next_attempt_at, d.last_error
        FROM deliveries d LEFT JOIN notifications n ON n.id = d.notification_id
+       ${profileId === undefined ? "" : "WHERE n.profile_id = ?"}
        ORDER BY d.created_at DESC, d.id DESC LIMIT ? OFFSET ?`,
     )
-    .all(limit, offset) as unknown as DeliveryDetailItem[];
+    .all(
+      ...(profileId === undefined ? [limit, offset] : [profileId, limit, offset]),
+    ) as unknown as DeliveryDetailItem[];
 
-  const itemsTotal = count("SELECT COUNT(*) AS n FROM deliveries");
+  const itemsTotal =
+    profileId === undefined
+      ? count("SELECT COUNT(*) AS n FROM deliveries")
+      : count(
+          `SELECT COUNT(*) AS n FROM deliveries d
+           JOIN notifications n ON n.id = d.notification_id WHERE n.profile_id = ?`,
+          profileId,
+        );
+  const countByStatus = (status: string): number =>
+    count(
+      `SELECT COUNT(*) AS n FROM deliveries d JOIN notifications n ON n.id = d.notification_id
+       WHERE d.status = ?${profileFilter.sql}`,
+      status,
+      ...profileFilter.params,
+    );
   const hasMore = offset + items.length < itemsTotal;
   return {
     counts: {
-      queued: count("SELECT COUNT(*) AS n FROM deliveries WHERE status = 'queued'"),
-      failed: count("SELECT COUNT(*) AS n FROM deliveries WHERE status = 'failed'"),
-      fallback: count("SELECT COUNT(*) AS n FROM deliveries WHERE status = 'fallback'"),
+      queued: countByStatus("queued"),
+      failed: countByStatus("failed"),
+      fallback: countByStatus("fallback"),
       sent_24h: count(
-        "SELECT COUNT(*) AS n FROM deliveries WHERE status = 'sent' AND sent_at >= ?",
+        `SELECT COUNT(*) AS n FROM deliveries d JOIN notifications n ON n.id = d.notification_id
+         WHERE d.status = 'sent' AND d.sent_at >= ?${profileFilter.sql}`,
         new Date(Date.now() - 24 * 3600 * 1000).toISOString(),
+        ...profileFilter.params,
       ),
     },
     daily: [...buckets.entries()].map(([date, sent]) => ({

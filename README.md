@@ -262,7 +262,7 @@ systemctl start life-assistant
 | `doctor --live` 报任务停更 / 备份过期 | 看状态页「定时任务」卡片或 `GET /api/jobs`：任务停更说明 cron 没在跑（daemon 未运行/系统时间异常）；备份 >36h 是 warn、>7 天是 fail |
 | 日志 `节假日刷新失败: 2027: 数据尚未发布` | 次年安排通常 11 月后才公布：该年份现在是 `pending`（不是失败），状态页只列 `failed`；数据发布后自动升级为 ready |
 | `db:restore` 报「daemon 仍在运行」 | 先停 daemon；锁文件里的 pid 必须真的不存活才允许恢复（防止 WAL 里还有未合并数据时被覆盖） |
-| `/api/status` 用 Profile token 返回 403 | 预期行为：看板只认 master token；手机端请用 `/api/quick/*` |
+| Profile token 打开看板 | 预期行为：Profile token 现在是「个人视图」——只看到家庭账本 + 自己的个人账本支出、自己的日程、自己的通知；master 才是家庭看板。若仍 403/401，检查 token 是否写错或已轮换 |
 | `/readyz` 返回 503 | `reasons` 是原因标识：`db_not_writable`（库打不开/只读）、`wal_too_large`（>512MB）、`outbox_stalled`（最老 queued >30 分钟）；结合 `/metrics` 与日志定位 |
 | 日历订阅 401 / 403 / 503 | 401=缺参、链接过期或 Profile 名非法（重新生成）；403=签名被改过；503=未配置 `WEB_API_TOKEN`，签名功能不可用 |
 | 手机快捷页 401 | token 写错或已被轮换：用 `?token=<新 token>` 重新引导一次 |
@@ -317,7 +317,7 @@ npm run db:cleanup:preview   # 零业务删除预演：occurrence 与保留策�
 - **模块契约**：模块注册 `tools / jobs / tick / onStart` 四个扩展点；调度保证 tick 不重叠；核心不 import 模块内部。
 - **recurrence 引擎**：自研纯函数替代 rrule，只覆盖 daily/weekly/monthly/yearly × 农历 + 工作日过滤；漏触发只补最近一次。
 - **outbox**：通知 + 投递记录同事务写入；发布即触发投递；静默时段只拦主动推送；带 `expiresAt` 的通知（气象预警）到点仍未投出即作废，不会在静默时段结束后补投一条已经失效的告警（通知本身保留，`notify.pull` 仍可取到）。投递通道由 `src/core/channels.ts` 抽象：`webhook` 逐字保留原 HMAC V2 协议与重试语义，`log` 只写进程日志（本地联调用）；路由的 `channel` 字段缺省为 `webhook`，旧 `push_route` 数据不需要迁移。
-- **身份与限流**：`WEB_API_TOKEN` 是 master（看板、运维、doctor、Hermes stdio 壳）；`PROFILE_TOKENS_JSON` 给每人一个 token，MCP 与 `/api/quick/*` 按 token 反查 Profile（不再信任 `X-Hermes-Profile`），会话与 token 所属 Profile 不一致直接 403。除 `/healthz`、`/readyz` 外的请求按身份做固定窗口限流（429 + `Retry-After`），鉴权失败写 warn 日志并计入 `/metrics`。
+- **身份与可见性**：`WEB_API_TOKEN` 是 master（家庭看板、运维、doctor、Hermes stdio 壳）；`PROFILE_TOKENS_JSON` 给每人一个 token，MCP、`/api/quick/*` 与看板 `/api/*` 都按 token 反查 Profile（不再信任 `X-Hermes-Profile`），会话与 token 所属 Profile 不一致直接 403。看板可见性矩阵：支出（master=家庭账本；profile=家庭+本人个人）、日程/通知/投递/Profile 列表（master=全部；profile=仅自己）、预算与 CSV（始终家庭账本）、jobs/holidays（共享）；`/api/status` 返回 `identity` 字段供页面渲染「家庭看板 / 个人视图」。除 `/healthz`、`/readyz` 外的请求按身份做固定窗口限流（429 + `Retry-After`），鉴权失败写 warn 日志并计入 `/metrics`。
 - **手机快捷入口**：`/quick` 是零构建 PWA（记一笔 / 设提醒，token 引导、常用分类 chips、`?type=&amount=&category=&title=` 预填），写接口 `POST /api/quick/expenses|schedules` 复用 MCP 同一份 service —— 幂等键、家庭账本回执、预算提醒、occurrence 物化语义完全一致；`GET /api/quick/bootstrap` 只返回该 Profile 可见账本与常用分类。OPPO/ColorOS 的 PWA、HTTP Shortcuts（可粘贴 cURL 导入）、小布指令/NFC 三种用法见 [docs/quick-entry.md](docs/quick-entry.md)。
 - **日历订阅**：`GET /calendar.ics?p=&exp=&sig=` 用 HMAC-SHA256(master, `"<profile>.<exp>"`) 签发**只读单个 Profile、带有效期**的链接（日历客户端无法附加请求头，所以不能直接用 token）；`npm run calendar:url -- --profile bestie --days 30 --base https://<域名>` 生成。只导出该 Profile **活跃**日程在未来 62 天内、状态为 `pending/notified` 的 occurrence；空数据也返回合法空日历。
 - **运维端点**：`GET /metrics`（Prometheus 文本：鉴权/限流计数器、投递六状态、outbox 最老排队秒数、每个 job 最近成功时间、备份年龄、DB/WAL 大小、今日 QWeather 用量）仅 master token；`GET /readyz` 无需凭据，做 DB 可写探针、WAL 阈值与 outbox 卡住判定，异常 503 + `reasons`。两者与 `/healthz` 一样对外可用，但只有 `/readyz`/`/healthz` 豁免限流。
@@ -373,7 +373,7 @@ npm run db:cleanup:preview   # 零业务删除预演：occurrence 与保留策�
     仍会收到那一次推送。窗口是单次请求的时长，且 webhook 侧还有 55 分钟幂等窗口兜底，
     暂不为此引入「中断在途请求」的机制。
 11. ~~**`schedules` 的软删行永不回收**~~ —— **已实施**：`delete` 仍只把状态置为 `cancelled`（使用 `recurrence.count` 的日程保留其 occurrence 历史，其余日程删掉 occurrence），保留策略会删除已取消超 180 天的行。仍在的唯一豁免是 `countProtectedScheduleIds`：使用 `recurrence.count` 的日程（含已取消的）整条不删 —— 这是必要的（否则取消后再激活会让已达上限的循环复活），代价是这些行永久占用清理豁免。体量小，暂不再细分。
-12. **看板/`/api/schedules` 跨 Profile 展示日程**：状态页是「家庭看板」，`scheduleDetails` 不按 Profile 过滤，任一持有共享 `WEB_API_TOKEN` 的调用方都能看到所有 Profile 的日程标题与备注（`schedule` 工具本身是 Profile 私有的）。这与「个人账本仅归属人可见」并不一致。`/api/deliveries` 同样跨 Profile 展示通知标题；其中**个人账本的月报标题已脱敏**为「（个人账本月报）」，但其它通知（如日程提醒）仍按看板口径展示。当前定位是单用户单 token，暂按现状；若确实多用户部署，需要给日程/通知也引入可见性（家庭/个人），或让看板只显示家庭范围。
+12. ~~**看板/`/api/schedules` 跨 Profile 展示日程**~~ —— **已实施（2026-10-20）**：`/api/*` 按 token 身份过滤——Profile token 只看自己的日程/通知/投递与家庭+本人个人账本支出，master 仍看全部（家庭看板）。仍保留：家庭账本的逐笔记录对全家可见（含记账人），个人账本的月报标题对本人仍脱敏为「（个人账本月报）」；CSV/预算始终 family-only。
 13. ~~**每日简报 / 调休提醒不做错过补发**~~ —— **已实施（2026-10-20）**：`job_runs` 记录 + 启动补发。daemon 启动时对 `CATCHUP_POLICY` 白名单内的 job 反向求值 cron、算出上一次应触发时刻：停机错过且在窗口内（日报/晚报/补班 6h、预警 1h、备份 24h 等）就补跑一次，job 自身的 `dedupeKey` 保证同一天不推两遍；已有成功运行覆盖则不补、超出窗口不补、执行前二次确认。限制：cron 的日/月/星期字段非 `*`（如 `0 7 * * 1-5`）时不做反向求值，宁可漏补不猜，`doctor --live` 会给 warn。
 14. **记账编辑只做「更正」，不触发推送、不保留历史**：`expense {action:"update"}` 改金额/分类/备注/日期后不会补发回执、也不会重新判定 80%/100% 预算阈值（避免修正金额时凭空多推一条），且不记录修改前值；如需按新金额触发提醒，只能等下一笔支出或人工核对预算。编辑也不能把账目挪到另一个账本。
 15. **出行模式一个 Profile 同时只保留一份计划**：`weather {view:"travel"}` 覆盖式保存，不支持多段行程/多城市串联，也没有历史行程查询；显式传 `city` 的查询始终优先于出行计划。计划只按本地日历日判断生效，跨时区行程仍以 Asia/Shanghai 为准；窗口结束后计划不会自动删除（`show` 显示未生效、可 `clear`）。简报的 `dedupeKey` 含城市名：同一天内把目的地改到另一个城市会再发一条新城市简报（旧城市那条已发出，无法撤回）。
@@ -387,7 +387,7 @@ npm run db:cleanup:preview   # 零业务删除预演：occurrence 与保留策�
 22. **`db:restore` 的运行中检测只认锁**：若有人绕过锁直接跑旧版 daemon，恢复无法感知；同理恢复后删除 `-wal`/`-shm` 依赖「已停机」这个前提。
 23. **Host/Origin 守卫对回环主机名不限端口**（Host 头端口不参与路由，DNS rebinding 的边界是主机名），但 Origin 始终要求端口精确 —— 本机其它端口上的页面不会被当成同源。绑定 `0.0.0.0` 时局域网 IP/域名必须显式写进 `WEB_ALLOWED_HOSTS`，否则 403 是预期行为。
 
-24. **Profile token 的权限边界**：目前覆盖 MCP 与 `/api/quick/*`；看板 `/api/*` 仍只认 master，日程/通知的「按 Profile 过滤」尚未做（状态页定位仍是家庭看板）。真正多用户部署前应把看板可见性补齐。
+24. ~~**Profile token 的权限边界**~~ —— **已实施（2026-10-20）**：MCP、`/api/quick/*`、看板 `/api/*` 都按 Profile 过滤（见「身份与可见性」）。仍保留：家庭账本支出对全家可见（含记账人字段），预算/CSV 只覆盖家庭账本；`/` 静态壳不含身份信息，身份只来自受鉴权的 `/api/status`。
 25. **`/metrics` 是进程内计数器**：daemon 重启归零，没有直方图/耗时分布，也不持久化（持久事实看 `job_runs` 与 `deliveries`）。`/readyz` 的阈值（WAL 512MB、outbox 30 分钟）是代码常量，调整口径需要改代码。
 26. **ICS 未做 RFC 5545 的 75 octet 行折叠**：超长 `DESCRIPTION` 仍输出为一行，主流客户端可接受；严格合规可后续补。订阅链接一旦泄露等于该 Profile 的日程只读泄露，请用 `--days` 控制有效期并定期轮换。
 27. **`/quick` 没有离线缓存 / service worker**：「添加到主屏幕」只是快捷方式，断网时是空白页；弱网下靠 `request_id` 幂等，重复提交不会重复记账。

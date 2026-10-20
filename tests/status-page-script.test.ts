@@ -813,3 +813,49 @@ describe("看板明细「加载更多」", () => {
     }
   });
 });
+
+describe("看板身份 chip", () => {
+  it("master / 无 token：显示「家庭看板」", async () => {
+    const env = makeTestEnv();
+    try {
+      const run = runPageScript(env, "");
+      const rendered = await waitFor(
+        () => (run.elements.get("identity-chip")?.textContent ?? "") !== "",
+      );
+      assert.ok(rendered, "身份 chip 没有渲染");
+      assert.equal(run.elements.get("identity-chip")?.textContent, "家庭看板");
+      assert.equal(run.elements.get("identity-chip")?.className, "pill");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("Profile token：显示「个人视图 · bestie」；静态页 / 不含身份信息", async () => {
+    const master = "m".repeat(64);
+    const bestie = "b".repeat(64);
+    const env = makeTestEnv({
+      WEB_API_TOKEN: master,
+      HOST: "0.0.0.0",
+      PROFILE_TOKENS_JSON: JSON.stringify({ bestie }),
+    });
+    try {
+      // 安全红线：`/` 是未鉴权静态壳，任何身份信息都只能来自受保护的 /api/status
+      const html = await (await createStatusApp(env.config, env.db).request("/")).text();
+      assert.ok(!html.includes("bestie"), "静态页不得出现 Profile 身份");
+      assert.ok(!html.includes(master), "静态页不得出现凭据");
+
+      const run = runPageScript(env, `?token=${bestie}`);
+      const rendered = await waitFor(() =>
+        (run.elements.get("identity-chip")?.textContent ?? "").startsWith("个人视图"),
+      );
+      assert.ok(
+        rendered,
+        `身份 chip 应显示个人视图：${run.elements.get("identity-chip")?.textContent}`,
+      );
+      assert.equal(run.elements.get("identity-chip")?.textContent, "个人视图 · bestie");
+      assert.match(run.elements.get("identity-chip")?.className ?? "", /pill info/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});

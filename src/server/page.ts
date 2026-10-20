@@ -58,6 +58,9 @@ const STYLE = `
   }
   .pill.warn { background: rgba(251,191,36,.08); border-color: rgba(251,191,36,.25); color: #fcd34d; }
   .pill.bad { background: rgba(248,113,113,.1); border-color: rgba(248,113,113,.28); color: #fca5a5; }
+  .pill.info { background: rgba(125,211,252,.08); border-color: rgba(125,211,252,.25); color: #7dd3fc; }
+  /* 身份 chip 在首屏数据回来前是空的：不占位避免先闪一个空胶囊（拿到 /api/status 后再显示） */
+  #identity-chip:empty { display: none; }
   .pill i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; box-shadow: 0 0 0 3px rgba(255,255,255,.06); }
   .stamp { color: var(--mute); font-size: 12px; }
 
@@ -326,6 +329,18 @@ const SCRIPT = `
     health.className = 'pill' + (alerts > 0 ? ' bad' : s.notifications.queued > 0 ? ' warn' : '');
     health.innerHTML = '<i></i>' + (alerts > 0 ? alerts + ' 项投递异常' : s.notifications.queued > 0 ? s.notifications.queued + ' 项待投递' : '运行正常');
     el('stamp').textContent = s.today.time + ' 更新 · 30s 自动刷新';
+
+    // 身份 chip：master = 家庭看板（全部 Profile），profile = 个人视图（只有自己的数据）。
+    // 身份来自受鉴权保护的 /api/status，静态页 / 本身不含任何身份信息。
+    var ident = s.identity || { kind: 'master' };
+    var identityChip = el('identity-chip');
+    if (identityChip) {
+      identityChip.className = 'pill' + (ident.kind === 'profile' ? ' info' : '');
+      identityChip.textContent = ident.kind === 'profile' ? '个人视图 · ' + ident.profile_id : '家庭看板';
+      identityChip.title = ident.kind === 'profile'
+        ? '只显示该 Profile 的日程/通知，以及家庭 + 自己个人账本的支出'
+        : '家庭看板：所有 Profile 的日程/通知 + 家庭账本支出';
+    }
 
     var exp = s.expenses;
     var whole = Math.floor(exp.month_cents / 100).toLocaleString('zh-CN');
@@ -1017,6 +1032,7 @@ export function statusPage(version: string, nonce?: string): string {
       </div>
     </div>
     <div class="head-right">
+      <span class="pill" id="identity-chip"></span>
       <span class="pill" id="health"><i></i>连接中</span>
       <span class="stamp" id="stamp"></span>
     </div>
