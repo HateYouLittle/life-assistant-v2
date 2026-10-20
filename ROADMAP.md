@@ -36,9 +36,21 @@ CI 在 Node 22.16.0 / 22 / 24 三档矩阵全绿（`.github/workflows/ci.yml`）
 
 ## 阶段二：触达与家庭 —— 🔲 未开始（3–6 周）
 
+> 决策（2026-10-20）：远程入口用 **公网 IPv6 + DDNS + Caddy HTTPS 反向代理**（daemon 保持回环）；
+> 手机端（OPPO/ColorOS）用 **`/quick` PWA**（主路径）+ **HTTP Shortcuts**（一键直达）+ 小布指令/NFC（触发器）。
+> 施工清单、配置示例与暴露前安全门槛见 [docs/remote-access.md](docs/remote-access.md)。
+
+**前置（阻塞手机端与 ICS）**
+
+0. **远程访问基线**：DDNS 更新 AAAA、路由器只放行反代端口、HTTPS 证书（80/443 可用走 Caddy 自动签发，
+   否则 acme.sh DNS-01 + 8443）、固定 Mac 的 IPv6 地址；**暴露前必须先完成 per-profile token 与写 API 限流**。
+
+**功能项**
+
 1. **通知通道**：Bark / ntfy / SMTP 邮件 + 按 `kind` 偏好、回执聚合、家庭级去重
    （当前 172 条记账回执按 Profile 各发一遍，是最大噪声源）
-2. **写 API + iOS 快捷指令示例**：把「随手记一笔」从打开对话降到点一下（复用现有 service 与幂等键）
+2. **写 API + 手机快捷入口**：`POST /api/expenses`、`POST /api/schedules`（复用 `request_id` 幂等）+ `/quick` PWA（添加到主屏幕，记账/提醒两个大按钮）+ HTTP Shortcuts 导出 JSON；iOS 快捷指令作为可选备用。
+   目标：从打开对话降到点一下 / 两下。
 3. **ICS 日历订阅**：导出/订阅 `.ics`（前置：解决远程可达——反代或 Tailscale）
 4. **per-profile token + 看板可见性**：当前单 token 下状态页跨 Profile 展示日程/通知，与「个人账本仅归属人可见」不一致
 5. **预算看板/趋势/引导** + 可执行月报 + 周日周报
