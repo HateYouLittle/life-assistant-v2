@@ -51,13 +51,13 @@ CI 在 Node 22.16.0 / 22 / 24 三档矩阵全绿（`.github/workflows/ci.yml`）
 
 1. **通知通道**：Bark / ntfy / SMTP 邮件 + 按 `kind` 偏好、回执聚合、家庭级去重
    （当前 172 条记账回执按 Profile 各发一遍，是最大噪声源）
-2. **写 API + 手机快捷入口**：`POST /api/expenses`、`POST /api/schedules`（复用 `request_id` 幂等）+ `/quick` PWA（添加到主屏幕，记账/提醒两个大按钮）+ HTTP Shortcuts 导出 JSON；iOS 快捷指令作为可选备用。
+2. **写 API + 手机快捷入口** ✅（2026-10-20）：`POST /api/quick/expenses|schedules`（复用 `request_id` 幂等）+ `GET /api/quick/bootstrap` + `/quick` PWA（记账/提醒、token 引导、预填参数）；HTTP Shortcuts/小布指令/NFC 用法见 [docs/quick-entry.md](docs/quick-entry.md)。仍待办：HTTP Shortcuts 的导出 JSON 文件（文档目前给的是 cURL 导入）。
    目标：从打开对话降到点一下 / 两下。
-3. **ICS 日历订阅**：导出/订阅 `.ics`（前置：解决远程可达——反代或 Tailscale）
-4. **per-profile token + 看板可见性**：当前单 token 下状态页跨 Profile 展示日程/通知，与「个人账本仅归属人可见」不一致
+3. **ICS 日历订阅** ✅（2026-10-20）：`GET /calendar.ics` 签名 URL（HMAC + 有效期，只读单个 Profile）、`npm run calendar:url` 生成；未做 RFC 5545 的 75 octet 行折叠。
+4. **per-profile token + 看板可见性**：身份部分 ✅（2026-10-20，`PROFILE_TOKENS_JSON` + `/mcp` 强绑定 + `/api/quick/*`）；看板可见性仍待办（`/api/*` 只认 master，日程/通知按 Profile 过滤未做）。
 5. **预算看板/趋势/引导** + 可执行月报 + 周日周报
 6. **分类字典/别名**、CSV 公式注入修复、明细分页（`expense list` 200 条上限无游标）
-7. **可观测性**：`notify test/history/retry`、`/metrics`、`/readyz`、日志轮转与本地时区
+7. **可观测性**：`/metrics` + `/readyz` ✅（2026-10-20：鉴权/限流计数器、投递状态、outbox 排队、job 最近成功、备份年龄、DB/WAL、QWeather 用量）；仍待办：`notify test/history/retry`、日志轮转与本地时区。
 8. **迁移结构指纹 + 审计日志**（补 `schema_version` 不是完整结构指纹的缺口）
 
 ## 阶段三：新领域 —— 🔲 未开始（6–12 周）

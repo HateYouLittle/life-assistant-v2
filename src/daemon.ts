@@ -42,6 +42,9 @@ import {
 import { applySecureUmask, createRequestGuard, hardenDataDir } from "./core/security.js";
 import { ensureProfile, pruneCache } from "./core/settings.js";
 import { registerAllModules } from "./modules/index.js";
+import { createCalendarApp } from "./server/calendar.js";
+import { createOpsApp } from "./server/ops.js";
+import { createQuickApp } from "./server/quick.js";
 import { createStatusApp } from "./server/status.js";
 import { now, TZ } from "./time.js";
 
@@ -262,7 +265,13 @@ export function createHttpHandler(
   config: ResolvedConfig,
   db: DatabaseSync,
 ): (req: IncomingMessage, res: ServerResponse) => void {
-  const honoListener = getRequestListener(createStatusApp(config, db).fetch);
+  // 手机入口（/quick、/api/quick/*）、日历订阅（/calendar.ics）与运维端点（/metrics、/readyz）
+  // 都是独立子应用，挂在同一个 Hono 上：共享 createHttpHandler 的 Host/Origin 守卫与限流。
+  const app = createStatusApp(config, db)
+    .route("/", createQuickApp(config, db))
+    .route("/", createCalendarApp(config, db))
+    .route("/", createOpsApp(config, db));
+  const honoListener = getRequestListener(app.fetch);
   // Host/Origin 守卫：状态页与 /mcp 都没有 CSRF token，浏览器跨站请求（含 DNS rebinding：
   // 攻击者把域名解析到 127.0.0.1）会带着伪造 Host 直接读写个人数据。没有 Origin 的
   // 非浏览器客户端（Hermes/CLI/curl）照常放行。
@@ -278,7 +287,9 @@ export function createHttpHandler(
       return;
     }
     const url = req.url ?? "/";
-    if (!url.startsWith("/healthz")) {
+    // 探针豁免限流：/healthz 给 systemd/uptime，/readyz 给外部监控（高频轮询），
+    // 被 429 会误判成「服务不健康」。/metrics 带凭据且较重，仍参与限流。
+    if (!url.startsWith("/healthz") && !url.startsWith("/readyz")) {
       const decision = limiter.take(rateLimitKey(req, config.trustProxy));
       if (!decision.allowed) {
         incCounter("rate_limited_total");

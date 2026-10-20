@@ -25,19 +25,26 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
 - 只跑单个测试文件：`node --import tsx/esm --test tests/schedule.test.ts`
 - `npm run dev` 用 tsx 跑 `src/daemon.ts`；`npm start` 跑构建产物 `dist/daemon.js`
   （需先 `npm run build`）。`db:backup` / `db:cleanup:preview` / `db:restore` / `doctor` /
-  `import:v1` 同理：无前缀脚本依赖 `dist/`，`dev:*` 变体直接跑 TS 源码。
+  `import:v1` / `calendar:url` 同理：无前缀脚本依赖 `dist/`，`dev:*` 变体直接跑 TS 源码。
 - `.env` 只会被 `start` / `dev` / `db:backup` / `db:cleanup:preview` / `db:restore` /
-  `doctor` / `import:v1` 及其 `dev:*` 变体通过 `--env-file-if-exists` 自动读取。其他命令需手动
-  `set -a; source .env; set +a`。
+  `calendar:url` / `doctor` / `import:v1` 及其 `dev:*` 变体通过 `--env-file-if-exists` 自动读取。
+  其他命令需手动 `set -a; source .env; set +a`。
 - 首次运行会创建 `$DATA_DIR/life-assistant.db`；测试使用一次性临时目录。
 
 ## 架构
 
 - `src/core/` 是框架层：database/registry/jobs/lock/security/auth/http/logger/settings/notify/
-  channels/render/qweather/qweather-jwt/holiday/recurrence/retention/backup。`src/modules/`
+  channels/render/qweather/qweather-jwt/holiday/recurrence/retention/backup/ratelimit/metrics/ics。`src/modules/`
   （weather/holiday/schedule/bookkeeping/notify/maintenance）通过 `src/modules/index.ts` 的
   副作用 import 接入，遵循 `tools / jobs / tick / onStart` 四个契约扩展点。`maintenance`
   注册每日备份（与 `db:backup` CLI 共用 `src/core/backup.ts`）与每日 WAL checkpoint 两个 job。
+- `src/core/ratelimit.ts`：`FixedWindowLimiter` + `clientAddress`/`rateLimitKey`（带 Bearer 时按 token
+  指纹归并，否则按来源 IP；只有 `TRUST_PROXY=1` 才采信 `X-Forwarded-For`）。
+  `src/core/metrics.ts`：进程内计数器（`auth_failed_total` / `auth_forbidden_total` / `rate_limited_total`）。
+  `src/core/ics.ts`：日历订阅的签名 URL（HMAC-SHA256(master, `"<profile>.<exp>"`)）与 ICS 文本工具。
+  `src/server/quick.ts`（`/quick` + `/api/quick/*`）、`src/server/calendar.ts`（`/calendar.ics`）、
+  `src/server/ops.ts`（`/metrics` + `/readyz`）是三个独立子应用，由 `createHttpHandler` 挂到
+  同一个 Hono 上（共享 Host/Origin 守卫与限流）。
 - `src/core/jobs.ts`：`job_runs` 运行记录（running→ok/failed/skipped）、`CATCHUP_POLICY`
   启动补发白名单、`previousFireTime`（自写 cron 反向求值，只支持日/月/星期为 `*`）、
   `runStartupCatchups`；daemon 在 listen 之后非阻塞调用，停机时与 onStart 一起收敛。
@@ -115,6 +122,13 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
 - 启动补发只覆盖 `CATCHUP_POLICY` 白名单内的 job，且只补最近一次、只支持日/月/星期为 `*`
   的 cron。新增「每天必须发生一次」的任务时记得加进策略表；`tests/jobs.test.ts` 会校验
   键名必须对应真实注册的 `module.job`。
+- **鉴权矩阵**：`/api/*`（看板/只读）只认 master `WEB_API_TOKEN`（Profile token → 403）；
+  `/api/quick/*` 认 master 或 Profile token，身份由 `resolveIdentity` 反查（**绝不读
+  `X-Hermes-Profile`**）；`/mcp` 两者都认，但 Profile token 强绑定自己的 Profile，会话与
+  token 不一致 → 403；`/metrics` 只认 master；`/readyz`、`/healthz` 无需凭据；`/calendar.ics`
+  用签名 URL（`src/core/ics.ts`），不使用 header。新增接口时先想清楚属于哪一档。
+- **限流豁免**：`/healthz` 与 `/readyz` 不参与限流（外部监控高频轮询会被 429 误判）；
+  `/metrics` 与业务接口一样受限流。改 `createHttpHandler` 的豁免名单要同步 `docs/remote-access.md`。
 - `daemon.lock` 存在表示同机已有实例；stale 锁（pid 已死/内容损坏）会自动接管。`db:restore`
   在锁内 pid 仍存活时拒绝执行，别绕过它直接覆盖库文件。
 - `notify.pull` 只能取消 `queued`/`failed` 的投递，无法拦住已处于 `sending` 的那一次。

@@ -61,9 +61,9 @@ curl -s http://192.168.31.20:3080/healthz          # 局域网内应通
      `WEB_ALLOWED_HOSTS` 已包含它；
    - **改写为后端地址**：Lucky 把 Host 改成 `192.168.31.20:3080` → 白名单里的 LAN 项生效。
    - 两者都在白名单里，任选其一都不会 403。
-4. **响应缓冲**：`/quick` 与 `/api/*` 是普通请求，无需特殊处理；
+4. **响应缓冲**：`/quick`、`/api/quick/*`、`/calendar.ics`、`/readyz` 都是普通请求，无需特殊处理；
    **`/mcp` 是 Streamable HTTP + SSE，需要关闭 Lucky 的响应缓冲/超时改写**，否则 MCP 会卡住。
-   建议公网**不要暴露 `/mcp`**（Hermes 走内网或 stdio 壳即可），只放 `/`、`/quick`、`/api/*`。
+   建议公网**不要暴露 `/mcp`**（Hermes 走内网或 stdio 壳即可），只放 `/`、`/quick`、`/api/quick/*`、`/calendar.ics`、`/readyz`。
 5. **可选加固**（Lucky 侧）：Basic Auth/访问控制作为第二道门；只反代必要路径；
    如果有多个家庭站点，给这个服务单独的子域名。
 6. **HTTPS 强制**：Lucky 前端只开 HTTPS，HTTP 跳转或直接拒绝。
@@ -92,7 +92,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' -H 'Origin: https://evil.example.com' 
    localStorage、地址栏抹掉），「添加到主屏幕」。记账 = 金额 + 常用分类 chips；提醒 = 标题 +
    时间 chips。纯前台页面，不受 ColorOS 后台查杀影响。
 2. **HTTP Shortcuts（一键直达）**：安装 [Waboodoo/HTTP-Shortcuts](https://github.com/Waboodoo/HTTP-Shortcuts)，
-   导入我们导出的 JSON（`POST https://life.example.com/api/expenses`，Header
+   按 [quick-entry.md](quick-entry.md) 配置（`POST https://life.example.com/api/quick/expenses`，Header
    `Authorization: Bearer <每人 token>`，body 带 `request_id`）。可做桌面小组件/快捷设置磁贴。
    固定动作（如「咖啡 ¥20」）一键完成；变量动作弹输入框要金额。
 3. **小布指令 / NFC（触发器，可选）**：小布指令「打开网页」指向 `/quick?type=expense`；
@@ -105,7 +105,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' -H 'Origin: https://evil.example.com' 
 - [ ] 写 API 限流：按 token + 来源 IP 的固定窗口，超限 429；Lucky 后面的真实来源 IP 走
       `X-Forwarded-For`，只在 `TRUST_PROXY=1` 时采信（且只信任 NAS 的 LAN 地址）
 - [ ] `WEB_ALLOWED_HOSTS` 精确覆盖 Lucky 前端域名（含端口）与 LAN 地址
-- [ ] 公网只放必要路径：`/`、`/quick`、`/api/*`；`/mcp` 不暴露（或单独子域 + 关缓冲）
+- [ ] 公网只放必要路径：`/`、`/quick`、`/api/quick/*`、`/calendar.ics`、`/readyz`；`/mcp` 不暴露（或单独子域 + 关缓冲）
 - [ ] 失败鉴权写 warn 日志并计入 `/metrics`（公网暴露后会立刻有扫描）
 - [ ] 审计日志（阶段二 #8）与写 API 同批上线，至少记录账本/预算/删除类操作
 - [ ] 回滚：停用 Lucky 的这条反代规则即断开公网；daemon 与数据不受影响
@@ -120,4 +120,4 @@ curl -sS -o /dev/null -w '%{http_code}\n' -H 'Origin: https://evil.example.com' 
 
 1. Lucky 前端**域名与端口**（证书是否已签发、是否用 443）。
 2. Lucky 反代时 **Host 头是保留还是改写**（决定白名单最终保留哪几项；两者都写也无害）。
-3. 是否同意**公网不暴露 `/mcp`**（只放 `/`、`/quick`、`/api/*`）。
+3. 是否同意**公网不暴露 `/mcp`**（只放 `/`、`/quick`、`/api/quick/*`、`/calendar.ics`、`/readyz`）。

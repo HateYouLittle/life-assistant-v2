@@ -16,6 +16,9 @@
 | 备份 | daemon 内置每日 03:00 `VACUUM INTO` 备份（保留 14 份，时间与份数可配），产物自校验；schema 升级前自动留快照；`npm run db:restore` 校验并留底后一键恢复 |
 | 任务可靠性 | 每个定时任务写 `job_runs`（running→ok/failed/skipped）；停机期间错过的每日任务在启动时按白名单补发；状态页「定时任务」卡片与 `doctor --live` 可见 |
 | 部署安全 | 单实例锁、umask 077（库/备份 0600）、Host/Origin 守卫（DNS rebinding 防护）、`REQUIRE_AUTH` 强制鉴权、`WEB_ALLOWED_HOSTS` 放行名单 |
+| 手机入口 | `/quick` PWA（记一笔 / 设提醒，Profile token 鉴权）+ `POST /api/quick/expenses\|schedules`；HTTP Shortcuts、小布指令、NFC 用法见 [docs/quick-entry.md](docs/quick-entry.md) |
+| 日历订阅 | `GET /calendar.ics` 签名 URL（HMAC + 有效期），iOS/Android 日历可订阅；`npm run calendar:url` 生成 |
+| 运维端点 | `GET /metrics`（Prometheus 文本，master token）与 `GET /readyz`（外部监控，无需凭据） |
 
 相对 v1 的主要变化：**单守护进程**（去掉 stdio 查询进程与 scheduler 的双进程并发防护）；**46 个工具收敛为 7 个**（域内 action 参数化）；**舍弃**油价、共享账本角色、生活指数、自动化 DSL、Open-Meteo 多源回退、React 仪表盘；通知改为 **Markdown 表格**渲染（微信/企业微信）。
 
@@ -34,7 +37,7 @@ npm run build
 ```
 
 `npm start` / `npm run dev` / `npm run db:backup` / `npm run db:cleanup:preview` /
-`npm run db:restore` / `npm run doctor` / `npm run import:v1` 会用 Node 的 `--env-file-if-exists=.env` 自动读取同目录 `.env`
+`npm run db:restore` / `npm run calendar:url` / `npm run doctor` / `npm run import:v1` 会用 Node 的 `--env-file-if-exists=.env` 自动读取同目录 `.env`
 （已存在的环境变量优先，systemd 的 `EnvironmentFile` 不受影响）。手工执行其他命令时可
 `set -a; source .env; set +a`。
 
@@ -54,6 +57,9 @@ npm run build
 | `MCP_DAEMON_TOKEN` | | stdio 壳访问 daemon 用的 token；缺省复用 `WEB_API_TOKEN` |
 | `REQUIRE_AUTH` | | 设为 `1` 时即使只绑回环也强制要求 `WEB_API_TOKEN`，缺失则拒绝启动（默认关闭，保留本地零配置） |
 | `WEB_ALLOWED_HOSTS` | | 额外放行的 Host 名单（逗号分隔；带端口则精确匹配，裸主机不限端口）。绑定 `0.0.0.0` 或经反代/DNS 名访问时必须配置，否则请求被 403 |
+| `PROFILE_TOKENS_JSON` | | 每人一个 token：`'{"default":"…","bestie":"…"}'`（各自 ≥32 字符，不能与 master 相同）。Profile token 绑定身份：MCP 与 `/api/quick/*` 用它；看板/运维接口仍只认 `WEB_API_TOKEN` |
+| `RATE_LIMIT_PER_MINUTE` | | 每身份每分钟请求上限，默认 `120`；`0` 关闭（仅本地调试）。超限 429 + `Retry-After`；`/healthz`、`/readyz` 豁免 |
+| `TRUST_PROXY` | | `1` 时采信 `X-Forwarded-For`（Lucky/nginx 反代后限流与日志用真实客户端 IP）；默认 `0` |
 | `PROFILE_ROUTE_SECRETS_JSON` | 主动推送需要 | `'{"default":"<openssl rand -hex 32>"}'`（整段用单引号包裹；每个 secret **至少 32 字符**） |
 | `DAILY_BRIEF_CRON` | | 每日简报时间，默认 `'0 7 * * *'`（含空格需单引号，Asia/Shanghai） |
 | `EVENING_BRIEF_CRON` | | 晚报时间，默认 `'0 21 * * *'`；内容为明日天气/明日日程/今日未完成/明天补班或放假 |
@@ -249,6 +255,10 @@ systemctl start life-assistant
 | `doctor --live` 报任务停更 / 备份过期 | 看状态页「定时任务」卡片或 `GET /api/jobs`：任务停更说明 cron 没在跑（daemon 未运行/系统时间异常）；备份 >36h 是 warn、>7 天是 fail |
 | 日志 `节假日刷新失败: 2027: 数据尚未发布` | 次年安排通常 11 月后才公布：该年份现在是 `pending`（不是失败），状态页只列 `failed`；数据发布后自动升级为 ready |
 | `db:restore` 报「daemon 仍在运行」 | 先停 daemon；锁文件里的 pid 必须真的不存活才允许恢复（防止 WAL 里还有未合并数据时被覆盖） |
+| `/api/status` 用 Profile token 返回 403 | 预期行为：看板只认 master token；手机端请用 `/api/quick/*` |
+| `/readyz` 返回 503 | `reasons` 是原因标识：`db_not_writable`（库打不开/只读）、`wal_too_large`（>512MB）、`outbox_stalled`（最老 queued >30 分钟）；结合 `/metrics` 与日志定位 |
+| 日历订阅 401 / 403 / 503 | 401=缺参、链接过期或 Profile 名非法（重新生成）；403=签名被改过；503=未配置 `WEB_API_TOKEN`，签名功能不可用 |
+| 手机快捷页 401 | token 写错或已被轮换：用 `?token=<新 token>` 重新引导一次 |
 
 
 ## 从 v1 迁移
@@ -285,10 +295,11 @@ npm run format:check   # Biome 格式检查（CI 也跑）
 npm run doctor         # 自检：配置/目录/库完整性/鉴权/JWT 私钥/备份（--network 另有连通性检查；--live 连运行中的 daemon：/healthz、任务新鲜度 /api/jobs、备份新鲜度）
 npm run db:backup      # VACUUM INTO 备份，按 BACKUP_KEEP 保留（默认 14 份），产物自校验
 npm run db:restore     # 从备份恢复（--latest 缺省 / --file 指定 / --dry-run 预演；daemon 运行中拒绝）
+npm run calendar:url   # 生成日历订阅签名 URL：--profile bestie --days 30 [--base https://<域名>]
 npm run db:cleanup:preview   # 零业务删除预演：occurrence 与保留策略会删掉哪些行（数字与 job 同一份判定；打开旧库时可能做附加式 schema 升级）
 ```
 
-> `db:backup` / `db:restore` / `db:cleanup:preview` / `doctor` / `import:v1` 跑的是 `dist/` 里的构建产物，先
+> `db:backup` / `db:restore` / `calendar:url` / `db:cleanup:preview` / `doctor` / `import:v1` 跑的是 `dist/` 里的构建产物，先
 > `npm run build`（或改用对应的 `dev:*` 变体直接跑源码）。
 
 结构：`src/core`（database/registry/jobs/lock/security/auth/http/logger/settings/notify/channels/render/qweather/qweather-jwt/holiday/recurrence/retention/backup）、`src/modules`（weather/holiday/schedule/bookkeeping/notify/maintenance，经 `modules/index.ts` 注册，核心不反向依赖）、`src/server`（status/page/details，状态页与只读 API）、`src/daemon.ts`、`src/stdio.ts`、`src/config.ts`、`src/time.ts`、`src/import-v1.ts`、`src/backup.ts`、`src/restore.ts`、`src/cleanup-preview.ts`。
@@ -299,6 +310,10 @@ npm run db:cleanup:preview   # 零业务删除预演：occurrence 与保留策�
 - **模块契约**：模块注册 `tools / jobs / tick / onStart` 四个扩展点；调度保证 tick 不重叠；核心不 import 模块内部。
 - **recurrence 引擎**：自研纯函数替代 rrule，只覆盖 daily/weekly/monthly/yearly × 农历 + 工作日过滤；漏触发只补最近一次。
 - **outbox**：通知 + 投递记录同事务写入；发布即触发投递；静默时段只拦主动推送；带 `expiresAt` 的通知（气象预警）到点仍未投出即作废，不会在静默时段结束后补投一条已经失效的告警（通知本身保留，`notify.pull` 仍可取到）。投递通道由 `src/core/channels.ts` 抽象：`webhook` 逐字保留原 HMAC V2 协议与重试语义，`log` 只写进程日志（本地联调用）；路由的 `channel` 字段缺省为 `webhook`，旧 `push_route` 数据不需要迁移。
+- **身份与限流**：`WEB_API_TOKEN` 是 master（看板、运维、doctor、Hermes stdio 壳）；`PROFILE_TOKENS_JSON` 给每人一个 token，MCP 与 `/api/quick/*` 按 token 反查 Profile（不再信任 `X-Hermes-Profile`），会话与 token 所属 Profile 不一致直接 403。除 `/healthz`、`/readyz` 外的请求按身份做固定窗口限流（429 + `Retry-After`），鉴权失败写 warn 日志并计入 `/metrics`。
+- **手机快捷入口**：`/quick` 是零构建 PWA（记一笔 / 设提醒，token 引导、常用分类 chips、`?type=&amount=&category=&title=` 预填），写接口 `POST /api/quick/expenses|schedules` 复用 MCP 同一份 service —— 幂等键、家庭账本回执、预算提醒、occurrence 物化语义完全一致；`GET /api/quick/bootstrap` 只返回该 Profile 可见账本与常用分类。OPPO/ColorOS 的 PWA、HTTP Shortcuts（可粘贴 cURL 导入）、小布指令/NFC 三种用法见 [docs/quick-entry.md](docs/quick-entry.md)。
+- **日历订阅**：`GET /calendar.ics?p=&exp=&sig=` 用 HMAC-SHA256(master, `"<profile>.<exp>"`) 签发**只读单个 Profile、带有效期**的链接（日历客户端无法附加请求头，所以不能直接用 token）；`npm run calendar:url -- --profile bestie --days 30 --base https://<域名>` 生成。只导出该 Profile **活跃**日程在未来 62 天内、状态为 `pending/notified` 的 occurrence；空数据也返回合法空日历。
+- **运维端点**：`GET /metrics`（Prometheus 文本：鉴权/限流计数器、投递六状态、outbox 最老排队秒数、每个 job 最近成功时间、备份年龄、DB/WAL 大小、今日 QWeather 用量）仅 master token；`GET /readyz` 无需凭据，做 DB 可写探针、WAL 阈值与 outbox 卡住判定，异常 503 + `reasons`。两者与 `/healthz` 一样对外可用，但只有 `/readyz`/`/healthz` 豁免限流。
 - **时区**：全部调度固定 Asia/Shanghai，无 DST。
 - **任务运行记录与启动补发**：每次 job 执行写一行 `job_runs`（cron/startup/catchup/manual，running→ok/failed/skipped；进程崩溃遗留的 running 行在下次启动收敛为 failed），状态页「定时任务」卡片、`GET /api/jobs` 与 `doctor --live` 共用这份事实。启动补发只针对 `CATCHUP_POLICY` 白名单内的每日任务（早报、晚报、预警巡检、调休提醒、节假日刷新、备份、WAL checkpoint、occurrence 清理、保留策略）：用自写的 cron 反向求值算出「上一次应触发时刻」，超窗口不补、已有成功记录不补，执行前再确认一次以避开与 cron 的竞态；单个失败只记日志。`job_runs` 由保留策略顺带清理 30 天前的行。cron 的日/月/星期字段不是 `*` 时不做反向求值（宁可漏补，不猜）。
 - **部署安全基线**：启动先取 `daemon.lock`（`open(..., "wx")` + PID 存活探测，死进程/损坏锁自动接管）再开库 —— 两个 daemon 同时跑会让 outbox 重复投递；`umask(0o077)` 并把数据目录/库/备份收紧到 0700/0600；HTTP 入口统一校验 Host（缺失或不在允许名单即 403）与 Origin（存在时必须同源，CLI/agent 这类无 Origin 的请求放行），挡 DNS rebinding 与跨站请求；`REQUIRE_AUTH=1` 让回环部署也强制 token。
@@ -357,3 +372,8 @@ npm run db:cleanup:preview   # 零业务删除预演：occurrence 与保留策�
 21. **单实例锁按本机 PID 判断**：`daemon.lock` 用 `process.kill(pid, 0)` 探测存活，NFS/多主机共享同一个 `DATA_DIR` 时，另一台主机的同号进程可能被误判为「仍存活」（锁里记了 hostname 仅供排障，未参与判定）。单机部署不受影响。
 22. **`db:restore` 的运行中检测只认锁**：若有人绕过锁直接跑旧版 daemon，恢复无法感知；同理恢复后删除 `-wal`/`-shm` 依赖「已停机」这个前提。
 23. **Host/Origin 守卫对回环主机名不限端口**（Host 头端口不参与路由，DNS rebinding 的边界是主机名），但 Origin 始终要求端口精确 —— 本机其它端口上的页面不会被当成同源。绑定 `0.0.0.0` 时局域网 IP/域名必须显式写进 `WEB_ALLOWED_HOSTS`，否则 403 是预期行为。
+
+24. **Profile token 的权限边界**：目前覆盖 MCP 与 `/api/quick/*`；看板 `/api/*` 仍只认 master，日程/通知的「按 Profile 过滤」尚未做（状态页定位仍是家庭看板）。真正多用户部署前应把看板可见性补齐。
+25. **`/metrics` 是进程内计数器**：daemon 重启归零，没有直方图/耗时分布，也不持久化（持久事实看 `job_runs` 与 `deliveries`）。`/readyz` 的阈值（WAL 512MB、outbox 30 分钟）是代码常量，调整口径需要改代码。
+26. **ICS 未做 RFC 5545 的 75 octet 行折叠**：超长 `DESCRIPTION` 仍输出为一行，主流客户端可接受；严格合规可后续补。订阅链接一旦泄露等于该 Profile 的日程只读泄露，请用 `--days` 控制有效期并定期轮换。
+27. **`/quick` 没有离线缓存 / service worker**：「添加到主屏幕」只是快捷方式，断网时是空白页；弱网下靠 `request_id` 幂等，重复提交不会重复记账。
