@@ -49,7 +49,7 @@ CI 在 Node 22.16.0 / 22 / 24 三档矩阵全绿（`.github/workflows/ci.yml`）
 
 **功能项**
 
-1. **通知通道**：Bark / ntfy / SMTP 邮件 + 按 `kind` 偏好、回执聚合、家庭级去重
+1. **通知通道/偏好/聚合/受众** ✅（2026-10-20）：Bark + ntfy 通道、按 kind 的 `notify_prefs`（默认逐笔回执不推）、家庭账本回执只发记账人、每晚 21:30 记账摘要、`notify prefs|test`。仍待办：SMTP/邮件与 Telegram 通道、按通道渲染格式、聚合窗口（当前只支持「推/不推」）。原计划：：Bark / ntfy / SMTP 邮件 + 按 `kind` 偏好、回执聚合、家庭级去重
    （当前 172 条记账回执按 Profile 各发一遍，是最大噪声源）
 2. **写 API + 手机快捷入口** ✅（2026-10-20）：`POST /api/quick/expenses|schedules`（复用 `request_id` 幂等）+ `GET /api/quick/bootstrap` + `/quick` PWA（记账/提醒、token 引导、预填参数）；HTTP Shortcuts/小布指令/NFC 用法见 [docs/quick-entry.md](docs/quick-entry.md)。仍待办：HTTP Shortcuts 的导出 JSON 文件（文档目前给的是 cURL 导入）。
    目标：从打开对话降到点一下 / 两下。

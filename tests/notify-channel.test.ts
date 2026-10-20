@@ -4,9 +4,9 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { describe, it } from "node:test";
 import {
   DEFAULT_CHANNEL,
-  supportedChannels,
-  type NotificationChannel,
   getChannel,
+  type NotificationChannel,
+  supportedChannels,
 } from "../src/core/channels.js";
 import {
   drainDue,
@@ -85,7 +85,7 @@ function text(result: { content: { text: string }[] }): string {
 describe("投递通道抽象", () => {
   it("通道清单与默认通道稳定（工具 schema 与文档共用这份清单）", () => {
     assert.equal(DEFAULT_CHANNEL, "webhook");
-    assert.deepEqual(supportedChannels(), ["webhook", "log"]);
+    assert.deepEqual(supportedChannels(), ["webhook", "log", "bark", "ntfy"]);
     const channel: NotificationChannel = getChannel(undefined);
     assert.equal(channel.name, DEFAULT_CHANNEL, "缺省 channel 必须解析为 webhook");
   });

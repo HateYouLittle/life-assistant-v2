@@ -3,11 +3,11 @@ import { describe, it } from "node:test";
 import { bookkeepingExpenseTool, bookkeepingLedgerTool } from "../src/modules/bookkeeping/index.js";
 import {
   addExpenseChecked,
+  createLedger,
   findExpenseByClientToken,
   getExpense,
   listExpenses,
   setBudget,
-  createLedger,
 } from "../src/modules/bookkeeping/service.js";
 import { cleanupTestEnv, makeTestEnv, type Published, type TestEnv } from "./helpers.js";
 
@@ -25,7 +25,12 @@ function tools(env: TestEnv, profileId = "default") {
     db: env.db,
     config: env.config,
     services: {
-      publishProfile: async () => ({ id: "x", deduped: false }),
+      // 回执走 publishProfile（只发记账人），预算/月报仍走 publishGlobal：
+      // 两个入口都记进 env.published，断言才看得到「谁收到了什么」
+      publishProfile: async (profileId: string, input: { kind: string; dedupeKey?: string }) => {
+        env.published.push({ profileId, input: input as never });
+        return { id: "x", deduped: false };
+      },
       publishGlobal: async (input: { kind: string; dedupeKey?: string }) => {
         env.published.push({ profileId: "*", input: input as never });
         return { materialized: 1 };

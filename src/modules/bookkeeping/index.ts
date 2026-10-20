@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { DATE_RE, todayIso } from "../../time.js";
+import { logger } from "../../core/logger.js";
 import {
   errorMessage,
   fail,
@@ -8,21 +8,23 @@ import {
   runtime,
   type ToolContext,
 } from "../../core/registry.js";
-import { logger } from "../../core/logger.js";
 import { ensureProfile } from "../../core/settings.js";
+import { DATE_RE, todayIso } from "../../time.js";
 import {
   addExpenseChecked,
+  type BudgetStatus,
   budgetAlertsForEntry,
   budgetComparison,
   budgetScopeLabel,
   budgetStatus,
-  centsToYuan,
   CLIENT_TOKEN_MAX_LENGTH,
+  centsToYuan,
   clearBudget,
   createLedger,
   deleteExpense,
-  entryReceiptBlocks,
   EXPENSE_CSV_MAX_ROWS,
+  type ExpensePatch,
+  entryReceiptBlocks,
   expenseCsv,
   expenseCsvFilename,
   findMissingMonthlyReports,
@@ -31,10 +33,12 @@ import {
   getLedger,
   getVisibleLedger,
   isLedgerVisible,
+  type LedgerRow,
   listExpenses,
   listLedgers,
   monthRange,
   previousMonth,
+  pushDailyDigests,
   pushMonthlyReports,
   recentCategories,
   renameLedger,
@@ -45,9 +49,6 @@ import {
   summarizeExpenses,
   transferLedger,
   updateExpense,
-  type BudgetStatus,
-  type ExpensePatch,
-  type LedgerRow,
 } from "./service.js";
 
 /** 账本的工具视图：家庭账本标注「家庭」，个人账本标注「个人 + 归属人」 */
@@ -287,13 +288,17 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
           `记账幂等命中，返回原记录: profile=${ctx.profileId} request_id=${requestId ?? ""} expense=${entry.id}`,
         );
       } else if (ledger.owner_profile_id === null) {
-        // 个人账本：不回执、不推预算提醒（连归属人也不推，保持记账私密）；家庭账本维持全局推送
+        // 家庭账本逐笔回执**只发记账人**（publishProfile，不再 publishGlobal）：
+        // 真实库里 172 条回执 = 86 笔 × 2 人，同一笔钱把不相关的人也打扰了一遍。
+        // 逐笔回执本身已由每晚 21:30 的 bookkeeping.digest 摘要取代；想恢复逐笔推送的人
+        // 可以用 notify prefs 把 bookkeeping.entry 的 push 打开。
+        // 个人账本依旧不回执、不推预算提醒（连归属人也不推，保持记账私密）。
         // 回执的 dedupeKey 用 request_id 派生（同一次请求重试得到同一个键，不含随机 id）；
         // 未带 request_id 时只能退回 entry:<id> —— 那个 id 是首次写入时生成的，重试返回的也是它。
         const receiptDedupeKey =
           requestId === undefined ? `entry:${entry.id}` : `entry:req:${ctx.profileId}:${requestId}`;
         void ctx.services
-          .publishGlobal({
+          .publishProfile(ctx.profileId, {
             kind: "bookkeeping.entry",
             title: `记账：¥${centsToYuan(entry.amount_cents)}（${ledger.name}）`,
             blocks: entryReceiptBlocks(ledger, entry),
@@ -531,7 +536,7 @@ registerModule({
     {
       name: "ledger",
       description:
-        "账本管理：create 创建（personal=true 建个人账本，仅归属人可见可写；缺省建家庭账本，所有 Profile 共享）、list 列出当前 Profile 可见的账本（家庭账本 + 自己的个人账本；含归档需 include_archived）、rename 重命名、archive 归档/恢复（unarchive=true）、transfer 转移个人账本归属（带 profile 转给该 Profile，缺省转回家庭且不可逆；仅当前归属人可操作）、budget 月度预算（传 ledger_id 查看全部预算与本月对照；带 amount 设置/覆盖，单位元，带 category 为分类预算、缺省为账本总额；clear=true 删除该范围）。家庭账本的回执与预算提醒全局推送（跨越 80%/100% 时，同一预算一笔只推跨过的最高阈值那一条）；个人账本不回执、不推送预算提醒，月报只发给归属人。",
+        "账本管理：create 创建（personal=true 建个人账本，仅归属人可见可写；缺省建家庭账本，所有 Profile 共享）、list 列出当前 Profile 可见的账本（家庭账本 + 自己的个人账本；含归档需 include_archived）、rename 重命名、archive 归档/恢复（unarchive=true）、transfer 转移个人账本归属（带 profile 转给该 Profile，缺省转回家庭且不可逆；仅当前归属人可操作）、budget 月度预算（传 ledger_id 查看全部预算与本月对照；带 amount 设置/覆盖，单位元，带 category 为分类预算、缺省为账本总额；clear=true 删除该范围）。家庭账本逐笔回执只发记账人（不再全局推送，其他人改由每晚 21:30 的每日摘要汇总），预算提醒仍全局推送（跨越 80%/100% 时，同一预算一笔只推跨过的最高阈值那一条）；个人账本不回执、不推送预算提醒，月报只发给归属人。",
       inputSchema: {
         action: z.enum(["create", "list", "rename", "archive", "transfer", "budget"]),
         name: z.string().min(1).max(40).optional(),
@@ -564,7 +569,7 @@ registerModule({
     {
       name: "expense",
       description:
-        "支出记账：add 记一笔（amount 元必填；ledger_id 可选，缺省按「默认账本 → 唯一可写账本」解析；可选 category/note/date/request_id；家庭账本回执全局推送，个人账本不回执不提醒；未显式传 category 时回执附「常用分类」）；list 明细（可按 month/from/to/by 过滤）；summary 汇总（按分类与记账人）；update 更正一笔（id + amount/category/note/date 至少一个，只改显式传入的字段，不触发回执与预算提醒）；delete 删除记错的一笔（id 从 list 获取）；export 导出 CSV（ledger_id + 可选 month，默认当月；表头「日期,账本,分类,金额(元),备注,记账人」，UTF-8 BOM；单次上限 2000 行，超出时 已截断=true 并给出总行数）；set_default_ledger 设置/查看默认账本（传 ledger_id 设置，不传则返回当前默认账本）。仅能操作当前 Profile 可见的账本（家庭账本或自己的个人账本）。幂等：add 传 request_id 后，同一人用同一个 request_id 重试不会重复记账，返回原记录并附「已存在: true」（不重复发通知）。month 与 from/to 互斥（同时传会报错）；from/to 只给一边就是半边区间（只给 from = [from, 将来)，只给 to = (过去, to]），两个 action 口径一致；默认区间只在 month/from/to **都不传**时生效（summary 默认「月初→今天」，list 不传时不限区间）。金额只支持支出，单位为元。",
+        "支出记账：add 记一笔（amount 元必填；ledger_id 可选，缺省按「默认账本 → 唯一可写账本」解析；可选 category/note/date/request_id；家庭账本逐笔回执只发记账人（想恢复逐笔推送可用 notify prefs 打开 bookkeeping.entry），个人账本不回执不提醒；未显式传 category 时回执附「常用分类」）；list 明细（可按 month/from/to/by 过滤）；summary 汇总（按分类与记账人）；update 更正一笔（id + amount/category/note/date 至少一个，只改显式传入的字段，不触发回执与预算提醒）；delete 删除记错的一笔（id 从 list 获取）；export 导出 CSV（ledger_id + 可选 month，默认当月；表头「日期,账本,分类,金额(元),备注,记账人」，UTF-8 BOM；单次上限 2000 行，超出时 已截断=true 并给出总行数）；set_default_ledger 设置/查看默认账本（传 ledger_id 设置，不传则返回当前默认账本）。仅能操作当前 Profile 可见的账本（家庭账本或自己的个人账本）。幂等：add 传 request_id 后，同一人用同一个 request_id 重试不会重复记账，返回原记录并附「已存在: true」（不重复发通知）。month 与 from/to 互斥（同时传会报错）；from/to 只给一边就是半边区间（只给 from = [from, 将来)，只给 to = (过去, to]），两个 action 口径一致；默认区间只在 month/from/to **都不传**时生效（summary 默认「月初→今天」，list 不传时不限区间）。金额只支持支出，单位为元。",
       inputSchema: {
         action: z.enum([
           "add",
@@ -636,6 +641,24 @@ registerModule({
     },
   ],
   jobs: [
+    {
+      name: "ledger_digest",
+      // cron 从 config 惰性读取（LEDGER_DIGEST_CRON，默认 21:30）：与月报不同，
+      // 摘要必须每晚都跑，错过一天的「今天记了什么」补发也没有意义。
+      cron: () => runtime().config.ledgerDigestCron,
+      handler: async () => {
+        const rt = runtime();
+        try {
+          const pushed = await pushDailyDigests(rt.db, rt.services);
+          logger.info(`每日记账摘要：发布 ${pushed} 条`);
+        } catch (e) {
+          // 摘要失败不影响记账本身（账已落库），但必须让运维看得见：rethrow 交给 job_runs
+          // 记 failed（状态页/doctor --live 可见），否则「摘要静默不推」会被当成一切正常。
+          logger.error(`每日记账摘要发布失败: ${errorMessage(e)}`);
+          throw e;
+        }
+      },
+    },
     {
       name: "monthly_report",
       cron: "0 9 1 * *",

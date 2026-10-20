@@ -1,10 +1,33 @@
-import { z } from "zod";
+import { randomUUID } from "node:crypto";
 import { DateTime } from "luxon";
-import { TIME_RE, TZ } from "../../time.js";
-import { DEFAULT_CHANNEL, getChannel, supportedChannels } from "../../core/channels.js";
+import { z } from "zod";
+import {
+  DEFAULT_CHANNEL,
+  findChannel,
+  getChannel,
+  supportedChannels,
+} from "../../core/channels.js";
+import { pruneJobRuns } from "../../core/jobs.js";
+import { logger } from "../../core/logger.js";
+import {
+  cancelPendingDeliveries,
+  getPushRoute,
+  publishProfile,
+  routeSecret,
+  setPushRoute,
+  setPushRouteEnabled,
+} from "../../core/notify.js";
+import {
+  DEFAULT_KIND_PREFS,
+  getNotifyPrefs,
+  type NotifyKindPref,
+  type NotifyPrefs,
+  setNotifyPrefs,
+} from "../../core/notify-prefs.js";
 import {
   errorMessage,
   fail,
+  type NotifyBlock,
   ok,
   okJson,
   registerModule,
@@ -12,21 +35,32 @@ import {
   type ToolContext,
 } from "../../core/registry.js";
 import { runRetention } from "../../core/retention.js";
-import { pruneJobRuns } from "../../core/jobs.js";
-import { logger } from "../../core/logger.js";
-import {
-  cancelPendingDeliveries,
-  getPushRoute,
-  routeSecret,
-  setPushRoute,
-  setPushRouteEnabled,
-} from "../../core/notify.js";
 import { deleteSetting, getSetting, setSetting } from "../../core/settings.js";
+import { nowIso, TIME_RE, TZ } from "../../time.js";
 
 /** UTC ISO → 本地（Asia/Shanghai）文本；解析失败原样返回，不编造 */
 function localTimeText(iso: string): string {
   const dt = DateTime.fromISO(iso, { zone: TZ });
   return dt.isValid ? dt.toFormat("yyyy-LL-dd HH:mm") : iso;
+}
+
+/** 通知 kind 的合法形状（如 bookkeeping.entry / notify.test）；拒绝乱写的键，避免偏好表变垃圾场 */
+const KIND_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+
+/**
+ * 偏好视图：把「内置默认 + 已保存」合并成**最终生效值**。
+ * push=false 表示不主动推送（通知仍入库，可 pull）；channels=null 表示不限通道。
+ */
+function prefsView(
+  prefs: NotifyPrefs,
+): Record<string, { push: boolean; channels: string[] | null }> {
+  const kinds = [...new Set([...Object.keys(DEFAULT_KIND_PREFS), ...Object.keys(prefs)])].sort();
+  const out: Record<string, { push: boolean; channels: string[] | null }> = {};
+  for (const kind of kinds) {
+    const merged: NotifyKindPref = { ...DEFAULT_KIND_PREFS[kind], ...prefs[kind] };
+    out[kind] = { push: merged.push !== false, channels: merged.channels ?? null };
+  }
+  return out;
 }
 
 export function notifyTool(args: Record<string, unknown>, ctx: ToolContext) {
@@ -157,6 +191,113 @@ function notifyToolInner(args: Record<string, unknown>, ctx: ToolContext) {
     });
   }
 
+  if (action === "prefs") {
+    // 读：不带 kind 时给出「已保存 / 内置默认 / 最终生效」三份，便于 agent 解释当前行为；
+    // 写：带 kind + push 或 kind + channels，写入后立刻回显合并默认后的生效值。
+    const kindRaw = args.kind;
+    if (kindRaw !== undefined && (typeof kindRaw !== "string" || !KIND_RE.test(kindRaw))) {
+      return fail(`kind 不合法: ${String(kindRaw)}（形如 bookkeeping.entry）`);
+    }
+    const stored = getNotifyPrefs(db, profileId);
+    if (kindRaw === undefined) {
+      return okJson({
+        已保存: stored,
+        内置默认: DEFAULT_KIND_PREFS,
+        生效: prefsView(stored),
+        说明: "push=false 表示不主动推送（通知仍入库，可 notify.pull 取回）；channels=null 表示不限通道",
+      });
+    }
+    const kind = kindRaw;
+    const pushRaw = args.push;
+    const channelsRaw = args.channels;
+    if (pushRaw === undefined && channelsRaw === undefined) {
+      return fail(
+        "prefs 带 kind 时需要 push（true/false）或 channels（通道名数组）；查看全部偏好请不要传 kind",
+      );
+    }
+    if (pushRaw !== undefined && typeof pushRaw !== "boolean") {
+      return fail("push 需要布尔值 true/false");
+    }
+    let channels: string[] | undefined;
+    if (channelsRaw !== undefined) {
+      if (!Array.isArray(channelsRaw)) return fail("channels 需要通道名数组");
+      if (channelsRaw.some((item) => typeof item !== "string" || item.trim() === "")) {
+        return fail("channels 只能包含非空通道名");
+      }
+      const names = (channelsRaw as string[]).map((item) => item.trim());
+      const unknown = names.find((name) => !supportedChannels().includes(name));
+      if (unknown !== undefined) {
+        return fail(`不支持的通道: ${unknown}（可选 ${supportedChannels().join(" / ")}）`);
+      }
+      channels = [...new Set(names)];
+    }
+    const next: NotifyKindPref = { ...(stored[kind] ?? {}) };
+    if (pushRaw !== undefined) next.push = pushRaw;
+    if (channels !== undefined) {
+      // 空数组 = 清除通道限制；若落成 `channels: []` 会被读回成「没有限制」，
+      // 但存一份空数组在偏好里容易让人误以为「哪个通道都不允许」，所以直接删键。
+      if (channels.length === 0) delete next.channels;
+      else next.channels = channels;
+    }
+    stored[kind] = next;
+    setNotifyPrefs(db, profileId, stored);
+    const merged: NotifyKindPref = { ...DEFAULT_KIND_PREFS[kind], ...next };
+    return okJson({
+      已保存: { [kind]: next },
+      生效: { push: merged.push !== false, channels: merged.channels ?? null },
+      内置默认: DEFAULT_KIND_PREFS[kind] ?? null,
+      说明: "push=false 表示不主动推送（通知仍入库，可 notify.pull 取回）；channels=null 表示不限通道",
+    });
+  }
+
+  if (action === "test") {
+    // dedupeKey 带时间戳 + 随机后缀：同一毫秒内连点两次不该被去重吞掉 —— 测试通知的意义
+    // 就是「每次都真的发一次」，否则用户会以为通道坏了。
+    const dedupeKey = `test:${Date.now()}-${randomUUID().slice(0, 8)}`;
+    const blocks: NotifyBlock = {
+      table: {
+        columns: ["项目", "内容"],
+        rows: [
+          ["Profile", profileId],
+          ["时间", localTimeText(nowIso())],
+        ],
+      },
+      notes: ["这是一条通道测试通知；收到即表示推送路由可用。"],
+    };
+    // 直接用 core 的同步 publishProfile：与 ctx.services.publishProfile 是同一个实现
+    // （createServices 只是把它包成 async），但同步返回让 test 与其它 action 一样
+    // 直接给出结果，不必把整个工具改成 async（既有 action 的调用方都是同步取值的）。
+    const result = publishProfile(db, ctx.config, profileId, {
+      kind: "notify.test",
+      title: "🔔 通知通道测试",
+      blocks,
+      dedupeKey,
+    });
+    const delivery = db
+      .prepare(
+        "SELECT route_name, status FROM deliveries WHERE notification_id = ? ORDER BY created_at DESC LIMIT 1",
+      )
+      .get(result.id) as { route_name: string; status: string } | undefined;
+    const route = getPushRoute(db, profileId);
+    const channel = route === null ? null : (findChannel(route.channel)?.name ?? null);
+    return okJson({
+      已发送测试通知: {
+        id: result.id,
+        标题: "🔔 通知通道测试",
+        种类: "notify.test",
+        "时间(本地)": localTimeText(nowIso()),
+        已建投递: delivery !== undefined,
+        ...(delivery === undefined
+          ? {}
+          : { 通道: channel, 路由: delivery.route_name, 状态: delivery.status }),
+      },
+      说明:
+        delivery === undefined
+          ? "仅入库，未建立投递：没有启用中的推送路由，或该类型已关闭主动推送；可用 notify.pull 取回"
+          : "已建立投递（结果见状态页，或稍后用 notify.pull 确认）",
+    });
+  }
+
   if (action === "cancel") {
     const id = args.id as string | undefined;
     if (id === undefined) return fail("cancel 需要 id（可从 pull 结果获取）");
@@ -181,9 +322,9 @@ registerModule({
     {
       name: "notify",
       description:
-        "通知管理：action=pull 拉取未读通知（会话开始时调用一次，作为主动推送失败的兜底）；quiet_hours 设置/查看/清除静默时段（HH:MM，支持跨午夜）；route 配置/查看主动推送通道（channel=webhook 默认，HMAC V2 回环 webhook、secret 在 env；channel=log 本地日志通道，不需要 URL/secret）；cancel 取消某条通知的待投递。",
+        "通知管理：action=pull 拉取未读通知（会话开始时调用一次，作为主动推送失败的兜底）；quiet_hours 设置/查看/清除静默时段（HH:MM，支持跨午夜）；route 配置/查看主动推送通道（channel=webhook 默认，HMAC V2 回环 webhook、secret 在 env；channel=log 本地日志通道，不需要 URL/secret）；prefs 查看/设置按类型的推送偏好（不带 kind 返回已保存+内置默认+最终生效值；带 kind+push 或 kind+channels 写入，push=false 表示不主动推送但通知仍入库、可用 pull 取回；bookkeeping.entry 默认不推，由每日摘要取代）；test 发一条测试通知验证通道（返回是否建立投递与所用通道，无路由时仅入库）；cancel 取消某条通知的待投递。",
       inputSchema: {
-        action: z.enum(["pull", "quiet_hours", "route", "cancel"]),
+        action: z.enum(["pull", "quiet_hours", "route", "prefs", "test", "cancel"]),
         limit: z.number().int().min(1).max(100).optional().describe("pull 条数，默认 20"),
         start: z.string().regex(TIME_RE).optional(),
         end: z.string().regex(TIME_RE).optional(),
@@ -197,6 +338,20 @@ registerModule({
         name: z.string().max(80).optional().describe("路由名，默认 life-assistant-<profile>"),
         enabled: z.boolean().optional().describe("启用/停用路由"),
         id: z.string().optional().describe("cancel 的通知 id"),
+        kind: z
+          .string()
+          .max(64)
+          .optional()
+          .describe("prefs 的通知类型（如 bookkeeping.entry / schedule.reminder）"),
+        push: z
+          .boolean()
+          .optional()
+          .describe("prefs 设置该类型是否主动推送：false = 不打扰（通知仍入库，可 pull）"),
+        channels: z
+          .array(z.string())
+          .max(10)
+          .optional()
+          .describe('prefs 限定该类型允许推送的通道（如 ["log"]）；传空数组清除限制，缺省不限通道'),
       },
       handler: notifyTool,
     },

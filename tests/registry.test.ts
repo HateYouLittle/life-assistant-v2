@@ -14,8 +14,8 @@ import {
   registerModule,
   runtime,
 } from "../src/core/registry.js";
-import { cleanupTestEnv, makeTestEnv } from "./helpers.js";
 import { registerAllModules } from "../src/modules/index.js";
+import { cleanupTestEnv, makeTestEnv } from "./helpers.js";
 
 const noopHandler = () => ok("noop");
 
@@ -94,6 +94,8 @@ describe("registry 契约", () => {
       .map((j) => `${j.module}.${j.def.name}`)
       .sort();
     assert.deepEqual(jobs, [
+      // 每晚 21:30 的每日记账摘要（LEDGER_DIGEST_CRON），取代家庭账本的逐笔回执
+      "bookkeeping.ledger_digest",
       "bookkeeping.monthly_report",
       "holiday.refresh",
       "holiday.workday_watch",

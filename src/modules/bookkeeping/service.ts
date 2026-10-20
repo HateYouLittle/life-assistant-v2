@@ -1,9 +1,9 @@
 import type { DatabaseSync } from "node:sqlite";
 import { DateTime } from "luxon";
-import { nowIso, todayIso, TZ } from "../../time.js";
 import { withReadTransaction } from "../../core/database.js";
 import type { NotifyBlock } from "../../core/registry.js";
 import { getSetting, newId, setSetting } from "../../core/settings.js";
+import { nowIso, TZ, todayIso } from "../../time.js";
 
 /** 账本归属：owner_profile_id = NULL 为家庭账本（所有 Profile 共享）；非空为个人账本（仅归属人可见可写） */
 export interface LedgerRow {
@@ -987,6 +987,78 @@ export function monthlyReportPublished(db: DatabaseSync, ledgerId: string, ym: s
     .prepare("SELECT 1 FROM notifications WHERE dedupe_key = ? LIMIT 1")
     .get(`report:${ledgerId}:${ym}`);
   return row !== undefined;
+}
+
+/** 摘要表格里最多列几个分类（其余合并成一行 note，避免表格无限长） */
+export const DIGEST_TOP_CATEGORIES = 5;
+
+/** pushDailyDigests 需要的最小 services 形状（与 pushMonthlyReports 同口径，便于测试注入桩） */
+export interface DigestServices {
+  publishProfile(
+    profileId: string,
+    input: { kind: string; title: string; blocks: NotifyBlock; dedupeKey?: string },
+  ): Promise<{ deduped: boolean }>;
+}
+
+/**
+ * 每日记账摘要：按**记账人**汇总当天（spent_on = date）的支出，每人一条。
+ *
+ * 为什么按记账人而不是按账本：家庭账本里两个人的支出混在一起，逐笔回执曾经是
+ * 「一笔 × 每人」的噪声源（真实库 172 条回执 = 86 笔 × 2 人）。改成每人每晚一条
+ * 「今天你记了几笔、花在哪」后，同一笔钱只打扰记账的那个人，家庭账本也不再重复推送。
+ *
+ * 只对当天真有记账的 Profile 发布：没记账的人不该收到一条「今天 0 笔」的提醒。
+ * dedupeKey 固定为 `digest:<profile>:<date>`，因此同一天重复触发（手动补跑、启动补发
+ * 与 cron 撞车）只会物化一条 —— 幂等由 notifications 的 (profile_id, dedupe_key) 唯一约束保证。
+ *
+ * 返回「实际物化」的条数（被去重吞掉的不计），供 job 日志与测试断言使用。
+ */
+export async function pushDailyDigests(
+  db: DatabaseSync,
+  services: DigestServices,
+  date: string = todayIso(),
+): Promise<number> {
+  const totals = db
+    .prepare(
+      `SELECT created_by_profile AS profile, COUNT(*) AS n, COALESCE(SUM(amount_cents), 0) AS total
+       FROM expenses WHERE spent_on = ? GROUP BY created_by_profile ORDER BY created_by_profile`,
+    )
+    .all(date) as { profile: string; n: number; total: number }[];
+  let pushed = 0;
+  for (const row of totals) {
+    // 分类按金额降序；同额按分类名升序，保证同一天重复生成的内容完全一致（可测）
+    const categories = db
+      .prepare(
+        `SELECT category, COUNT(*) AS n, SUM(amount_cents) AS cents FROM expenses
+         WHERE spent_on = ? AND created_by_profile = ?
+         GROUP BY category ORDER BY cents DESC, category ASC`,
+      )
+      .all(date, row.profile) as { category: string; n: number; cents: number }[];
+    const top = categories.slice(0, DIGEST_TOP_CATEGORIES);
+    const rest = categories.slice(DIGEST_TOP_CATEGORIES);
+    const notes = [`共 ${row.n} 笔`];
+    if (rest.length > 0) {
+      const restCents = rest.reduce((sum, c) => sum + c.cents, 0);
+      notes.push(`其余 ${rest.length} 类：¥${centsToYuan(restCents)}`);
+    }
+    const result = await services.publishProfile(row.profile, {
+      kind: "bookkeeping.digest",
+      title: `🧾 今日记账 ${row.n} 笔 · ¥${centsToYuan(row.total)}`,
+      blocks: {
+        table: {
+          columns: ["分类", "金额", "笔数"],
+          rows: [
+            ...top.map((c) => [c.category, `¥${centsToYuan(c.cents)}`, `${c.n} 笔`]),
+            ["合计", `¥${centsToYuan(row.total)}`, `${row.n} 笔`],
+          ],
+        },
+        notes,
+      },
+      dedupeKey: `digest:${row.profile}:${date}`,
+    });
+    if (!result.deduped) pushed += 1;
+  }
+  return pushed;
 }
 
 export interface MonthlyCatchup {

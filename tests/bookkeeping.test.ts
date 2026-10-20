@@ -1,21 +1,21 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { DateTime } from "luxon";
+import { bookkeepingExpenseTool, bookkeepingLedgerTool } from "../src/modules/bookkeeping/index.js";
 import {
   addExpense,
   createLedger,
   findMissingMonthlyReports,
   listExpenses,
   listLedgers,
-  monthRange,
   monthlyReportPublished,
+  monthRange,
   previousMonth,
+  pushMonthlyReports,
   setLedgerArchived,
   summarizeExpenses,
-  pushMonthlyReports,
 } from "../src/modules/bookkeeping/service.js";
-import { bookkeepingLedgerTool, bookkeepingExpenseTool } from "../src/modules/bookkeeping/index.js";
 import { TZ, todayIso } from "../src/time.js";
-import { DateTime } from "luxon";
 import { cleanupTestEnv, makeTestEnv, type Published, type TestEnv } from "./helpers.js";
 
 function tools(env: TestEnv, profileId = "default") {
@@ -24,7 +24,12 @@ function tools(env: TestEnv, profileId = "default") {
     db: env.db,
     config: env.config,
     services: {
-      publishProfile: async () => ({ id: "x", deduped: false }),
+      // 回执走 publishProfile（只发记账人），预算/月报仍走 publishGlobal：
+      // 两个入口都记进 env.published，断言才看得到「谁收到了什么」
+      publishProfile: async (profileId: string, input: { kind: string; dedupeKey?: string }) => {
+        env.published.push({ profileId, input: input as never });
+        return { id: "x", deduped: false };
+      },
       publishGlobal: async (input: { kind: string; dedupeKey?: string }) => {
         env.published.push({ profileId: "*", input: input as never });
         return { materialized: 1 };
@@ -67,7 +72,7 @@ describe("bookkeeping：账本", () => {
 });
 
 describe("bookkeeping：支出", () => {
-  it("记账（元转分）+ 回执全局推送 + 跨 Profile 可写", () => {
+  it("记账（元转分）+ 回执只发记账人 + 跨 Profile 可写", () => {
     const env = makeTestEnv();
     const t = tools(env);
     try {
@@ -91,11 +96,14 @@ describe("bookkeeping：支出", () => {
       assert.equal(env.published.length, 1);
       const receipt = env.published[0] as Published;
       assert.equal(receipt.input.kind, "bookkeeping.entry");
+      assert.equal(receipt.profileId, "default", "家庭账本回执只发给记账人，不再全局推送");
       assert.match((receipt.input as { dedupeKey?: string }).dedupeKey ?? "", /^entry:/);
 
-      // 另一个 Profile 直接记账（无授权限制）
+      // 另一个 Profile 直接记账（无授权限制）：回执同样只发给他
       const t2 = tools(env, "partner");
       t2.expense({ action: "add", ledger_id: ledgerId, amount: 30, category: "交通" });
+      assert.equal(env.published.length, 2);
+      assert.equal(env.published[1]?.profileId, "partner");
       // 用本地（Asia/Shanghai）月份：addExpense 默认 spent_on 走 todayIso()，
       // 若这里取 UTC 月份，每月 1 号 00:00–08:00 的 8 小时窗口内断言必然失败。
       const month = todayIso().slice(0, 7);

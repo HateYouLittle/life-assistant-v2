@@ -4,8 +4,9 @@ import { inQuietWindow, nowIso } from "../time.js";
 import { findChannel, getChannel, type NotificationChannel } from "./channels.js";
 import { withTransaction } from "./database.js";
 import { logger } from "./logger.js";
-import { renderBlocks } from "./render.js";
+import { getNotifyPrefs, kindPushDecision } from "./notify-prefs.js";
 import type { PublishInput, PublishResult, Services } from "./registry.js";
+import { renderBlocks } from "./render.js";
 import { ensureProfile, getSetting, newId, setSetting } from "./settings.js";
 
 /**
@@ -206,7 +207,18 @@ export function publishProfile(
   const secret = routeSecret(config, profileId);
   // 只有 requiresSecret 的通道（webhook）会因 secret 缺失而投不出去；log 通道不需要 secret
   const secretMissing = routable?.channel.requiresSecret === true && secret === undefined;
-  const queueable = routable !== null && (!routable.channel.requiresSecret || secret !== undefined);
+  // 按 kind 的通知偏好：判定必须发生在**建 delivery 之前**。关闭推送的语义是「不打扰，但记录还在」——
+  // 若改成「建了 delivery 再投失败」，通知会被投递成功路径标已读、notify.pull 也取不到，
+  // 用户既没收到推送也看不到通知。通道白名单用当前路由的通道名判定（无路由时为空串，必然不匹配）。
+  const decision = kindPushDecision(
+    getNotifyPrefs(db, profileId),
+    input.kind,
+    routable?.channel.name ?? "",
+  );
+  const queueable =
+    routable !== null &&
+    (!routable.channel.requiresSecret || secret !== undefined) &&
+    decision.push;
 
   // notification 与 delivery 必须同事务落库：只写进一半会让「有通知却没投递记录」永久卡住
   const { result, queued } = withTransaction(db, () => {
@@ -249,9 +261,19 @@ export function publishProfile(
     return { result: { id, deduped: false }, queued: true };
   });
 
-  if (secretMissing) {
+  // 关闭推送的 kind 不该再为「缺 secret」刷 warn：那是用户主动选择的安静，不是配置错误
+  if (secretMissing && decision.push) {
     logger.warn(
       `Profile ${profileId} 已配置推送路由但 PROFILE_ROUTE_SECRETS_JSON 缺少对应 secret，通知仅保留可 pull`,
+    );
+  }
+  if (!decision.push) {
+    // 关闭推送时投递队列里没有任何痕迹（没有 delivery 行、也不会进 drain），
+    // 日志是回答「为什么这条通知没发出去」的唯一线索；debug 级避免刷屏。
+    logger.debug(
+      `通知 ${input.kind} 不主动推送（Profile ${profileId}）：${decision.reason ?? "按通知偏好"}${
+        result.deduped ? "；命中去重键，未新建通知" : ""
+      }`,
     );
   }
   if (queued) drainSoon(db, config);
