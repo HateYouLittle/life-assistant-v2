@@ -1,14 +1,14 @@
 import { isAbsolute, join } from "node:path";
-import { z } from "zod";
 import cron from "node-cron";
+import { z } from "zod";
 import { logger } from "./core/logger.js";
+import { type QweatherAuth, setQweatherAuth } from "./core/qweather.js";
 import {
+  createJwtSigner,
   JWT_DEFAULT_TTL_SECONDS,
   JWT_IAT_SKEW_SECONDS,
   JWT_MAX_TTL_SECONDS,
-  createJwtSigner,
 } from "./core/qweather-jwt.js";
-import { type QweatherAuth, setQweatherAuth } from "./core/qweather.js";
 
 export const PROFILE_ID_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 
@@ -37,6 +37,17 @@ export interface ResolvedConfig {
   host: string;
   port: number;
   webApiToken?: string;
+  /**
+   * 强制鉴权（REQUIRE_AUTH，1/true/yes/on）。为 true 时没有 WEB_API_TOKEN 直接拒绝启动；
+   * 默认 false 保留「回环地址零配置可用」的行为。
+   */
+  requireAuth: boolean;
+  /**
+   * 额外放行的 Host 名单（WEB_ALLOWED_HOSTS，逗号分隔）。条目可带端口（`host:3080`，
+   * 精确匹配）也可裸主机（`host`，不限端口）；大小写不敏感。用于反代/DNS 名访问与
+   * DNS rebinding 防护的显式白名单。
+   */
+  allowedHosts: string[];
   qweatherHost?: string;
   qweatherKey?: string;
   /** 实际使用的认证方式：JWT 优先，其次 API KEY；未配置 QWeather 时为 undefined。 */
@@ -52,6 +63,8 @@ export interface ResolvedConfig {
   workdayWatchCron: string;
   /** 假期首日提前提醒天数（WORKDAY_REMIND_DAYS_BEFORE） */
   workdayRemindDaysBefore: number;
+  /** 每日晚报 cron（EVENING_BRIEF_CRON，默认 "0 21 * * *"，Asia/Shanghai） */
+  eveningBriefCron: string;
   logLevel: LogLevel;
 }
 
@@ -89,6 +102,34 @@ function normalizeHost(raw: string): string {
     .replace(/^https?:\/\//i, "")
     .replace(/\/+$/, "");
   return host;
+}
+
+const TRUE_FLAGS = new Set(["1", "true", "yes", "on"]);
+const FALSE_FLAGS = new Set(["0", "false", "no", "off"]);
+
+/**
+ * 布尔开关解析（REQUIRE_AUTH）。只接受明确的 1/true/yes/on 与 0/false/no/off：
+ * 写成 `REQUIRE_AUTH=treu` 时静默按 false 处理等于把安全开关关掉，必须拒绝启动。
+ * 空值（未设置）取默认值。
+ */
+function parseBooleanFlag(raw: string | undefined, name: string, fallback: boolean): boolean {
+  const value = raw?.trim().toLowerCase() ?? "";
+  if (value === "") return fallback;
+  if (TRUE_FLAGS.has(value)) return true;
+  if (FALSE_FLAGS.has(value)) return false;
+  throw new Error(`${name} 不合法: ${raw}（可选 1/true/yes/on 或 0/false/no/off）`);
+}
+
+/**
+ * WEB_ALLOWED_HOSTS：逗号分隔。归一化与 HOST 同口径（剥 scheme/尾斜杠/空项），
+ * 大小写与端口的语义交给 core/security.ts 的守卫在比较时处理。
+ */
+function parseAllowedHosts(raw: string | undefined): string[] {
+  if (raw === undefined) return [];
+  return raw
+    .split(",")
+    .map((entry) => normalizeHost(entry))
+    .filter((entry) => entry !== "");
 }
 
 /**
@@ -250,6 +291,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
     );
   }
 
+  // 严格模式：显式要求鉴权却拿不到 token 时拒绝启动，避免「以为开了鉴权、实际裸奔」
+  const requireAuth = parseBooleanFlag(env.REQUIRE_AUTH, "REQUIRE_AUTH", false);
+  if (requireAuth && webApiToken === undefined) {
+    throw new Error("REQUIRE_AUTH=1 但未设置 WEB_API_TOKEN（严格模式拒绝无鉴权启动）");
+  }
+  const allowedHosts = parseAllowedHosts(env.WEB_ALLOWED_HOSTS);
+
   const { host: qweatherHost, key: qweatherKey, auth: qweatherAuth } = resolveQweather(env);
   // 注入给 qweather 客户端（模块级）：天气工具按旧签名只传 host+key，JWT 签名器走这里
   setQweatherAuth(qweatherAuth ?? null);
@@ -264,6 +312,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
   const dailyBriefCron = env.DAILY_BRIEF_CRON?.trim() || "0 7 * * *";
   if (!cron.validate(dailyBriefCron)) {
     throw new Error(`DAILY_BRIEF_CRON 不是合法 cron 表达式: ${dailyBriefCron}`);
+  }
+
+  // 晚报与早报同一套 cron 校验：非法表达式在启动期拒绝，而不是等 21:00 才静默不触发
+  const eveningBriefCron = env.EVENING_BRIEF_CRON?.trim() || "0 21 * * *";
+  if (!cron.validate(eveningBriefCron)) {
+    throw new Error(`EVENING_BRIEF_CRON 不是合法 cron 表达式: ${eveningBriefCron}`);
   }
 
   const alertWatchCron = env.ALERT_WATCH_CRON?.trim() || "*/20 * * * *";
@@ -322,6 +376,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
     host,
     port,
     webApiToken,
+    requireAuth,
+    allowedHosts,
     qweatherHost,
     qweatherKey,
     qweatherAuth,
@@ -332,6 +388,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
     alertMinLevel: alertMinLevel.data,
     workdayWatchCron,
     workdayRemindDaysBefore,
+    eveningBriefCron,
     logLevel: logLevel.data,
   };
 }

@@ -1,6 +1,22 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { nowIso } from "../time.js";
+import { logger } from "./logger.js";
+
+/**
+ * 坏 JSON 的防御：settings / cache 的 value_json 可能被手工改库、磁盘位翻转或
+ * 旧版本写入的截断行污染。旧实现直接 JSON.parse，异常会沿着调用链炸掉整轮 outbox
+ * （notify 的静默时段读取）或整次天气查询 —— 一条坏行不该让推送停摆。
+ * 这里降级为「当作没有这个设置/缓存」并告警，调用方走默认值/重新抓取。
+ */
+function parseJsonOrWarn<T>(valueJson: string, where: string): T | undefined {
+  try {
+    return JSON.parse(valueJson) as T;
+  } catch (e) {
+    logger.warn(`${where} 的 JSON 已损坏，按缺省值处理: ${e instanceof Error ? e.message : e}`);
+    return undefined;
+  }
+}
 
 /** 返回是否真的新建了 Profile（false = 已存在）。调用方可用它统计「实际写入」而非调用次数 */
 export function ensureProfile(db: DatabaseSync, profileId: string): boolean {
@@ -16,12 +32,35 @@ export function listProfiles(db: DatabaseSync): string[] {
   );
 }
 
-export function getSetting<T>(db: DatabaseSync, profileId: string, key: string): T | undefined {
+/** 设置读取结果：区分「没有」「有但坏了」「正常」三种，供需要报告损坏的调用方使用 */
+export type SettingRead<T> =
+  | { kind: "missing" }
+  | { kind: "corrupt"; error: string }
+  | { kind: "ok"; value: T };
+
+/**
+ * 与 getSetting 同源，但把「坏 JSON」显式返回而不是静默降级。
+ * 典型用途：出行计划的 show 视图要告诉用户「数据损坏、可重新 set」——
+ * 若只看 getSetting 的 undefined，会把损坏误报成「没有设置」。
+ */
+export function readSetting<T>(db: DatabaseSync, profileId: string, key: string): SettingRead<T> {
   const row = db
     .prepare("SELECT value_json FROM settings WHERE profile_id = ? AND key = ?")
     .get(profileId, key) as { value_json: string } | undefined;
-  if (row === undefined) return undefined;
-  return JSON.parse(row.value_json) as T;
+  if (row === undefined) return { kind: "missing" };
+  try {
+    return { kind: "ok", value: JSON.parse(row.value_json) as T };
+  } catch (e) {
+    logger.warn(
+      `settings(${profileId}, ${key}) 的 JSON 已损坏: ${e instanceof Error ? e.message : e}`,
+    );
+    return { kind: "corrupt", error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+export function getSetting<T>(db: DatabaseSync, profileId: string, key: string): T | undefined {
+  const read = readSetting<T>(db, profileId, key);
+  return read.kind === "ok" ? read.value : undefined;
 }
 
 export function setSetting(db: DatabaseSync, profileId: string, key: string, value: unknown): void {
@@ -45,7 +84,7 @@ export function getCache<T>(db: DatabaseSync, key: string): T | undefined {
     .prepare("SELECT value_json FROM cache WHERE key = ? AND expires_at > ?")
     .get(key, nowIso()) as { value_json: string } | undefined;
   if (row === undefined) return undefined;
-  return JSON.parse(row.value_json) as T;
+  return parseJsonOrWarn<T>(row.value_json, `cache(${key})`);
 }
 
 export function setCache(db: DatabaseSync, key: string, value: unknown, ttlMs: number): void {

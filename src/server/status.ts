@@ -5,12 +5,14 @@ import { DateTime } from "luxon";
 import type { DatabaseSync } from "node:sqlite";
 import type { ResolvedConfig } from "../config.js";
 import { isRequestAuthorized } from "../core/auth.js";
+import { allJobs } from "../core/registry.js";
 import { qweatherUsage } from "../core/qweather.js";
 import { TZ, todayIso } from "../time.js";
 import {
   deliveryDetails,
   expenseDetails,
   holidayDetails,
+  jobDetails,
   normalizeMonth,
   scheduleDetails,
 } from "./details.js";
@@ -36,6 +38,7 @@ export function statusPayload(config: ResolvedConfig, db: DatabaseSync): Record<
   const deliveries = deliveryDetails(db, "1");
   const schedules = scheduleDetails(db, "50");
   const holidays = holidayDetails(db, undefined);
+  const jobs = jobDetails(db);
 
   return {
     ok: true,
@@ -102,6 +105,17 @@ export function statusPayload(config: ResolvedConfig, db: DatabaseSync): Record<
       })),
       next: holidays.upcoming[0] ?? null,
     },
+    jobs: {
+      // job 数量取注册表（而未运行的 job 也要显示成「未运行」，不能因为没记录就消失）
+      total: allJobs().length,
+      // 直接按 job_runs 统计：与看板上「24 小时失败」同口径，不受 runs 被截断影响
+      failed_24h: count(
+        "SELECT COUNT(*) AS n FROM job_runs WHERE status = 'failed' AND started_at >= ?",
+        new Date(Date.now() - 24 * 3600 * 1000).toISOString(),
+      ),
+      // 概览只带 20 个 job；完整列表（含每 job 最近几次运行）走 /api/jobs
+      runs: jobs.slice(0, 20),
+    },
   };
 }
 
@@ -143,6 +157,9 @@ export function createStatusApp(config: ResolvedConfig, db: DatabaseSync): Hono 
     });
   });
   app.get("/api/schedules", (c) => c.json({ items: scheduleDetails(db, c.req.query("limit")) }));
+  // 定时任务全量明细：每 job 的最近运行/最近成功/24h 失败。doctor --live 也读它，
+  // 鉴权与 no-store 由上面的 /api/* 中间件统一兜住。
+  app.get("/api/jobs", (c) => c.json({ items: jobDetails(db) }));
   app.get("/api/deliveries", (c) => c.json(deliveryDetails(db, c.req.query("limit"))));
   app.get("/api/holidays", (c) => c.json(holidayDetails(db, c.req.query("year"))));
   // 存活探针：不鉴权、不查明细，只回答「进程还在、库还开着」。

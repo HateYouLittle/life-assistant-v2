@@ -19,29 +19,39 @@ npm run build                      # tsc -> dist/
 ```
 
 CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序运行：
-`typecheck -> lint -> format:check -> test -> build`。自称完成前先跑完整链路。
+`audit（仅生产依赖，high/critical 即失败）-> typecheck -> lint -> format:check -> test -> build`。
+自称完成前先跑完整链路；`npm audit fix` 升级锁定版本后必须重跑全链路（MCP SDK 等在运行时里）。
 
 - 只跑单个测试文件：`node --import tsx/esm --test tests/schedule.test.ts`
 - `npm run dev` 用 tsx 跑 `src/daemon.ts`；`npm start` 跑构建产物 `dist/daemon.js`
-  （需先 `npm run build`）。`db:backup` / `db:cleanup:preview` / `doctor` / `import:v1`
-  同理：无前缀脚本依赖 `dist/`，`dev:*` 变体直接跑 TS 源码。
-- `.env` 只会被 `start` / `dev` / `db:backup` / `db:cleanup:preview` / `doctor` /
-  `import:v1` 及其 `dev:*` 变体通过 `--env-file-if-exists` 自动读取。其他命令需手动
+  （需先 `npm run build`）。`db:backup` / `db:cleanup:preview` / `db:restore` / `doctor` /
+  `import:v1` 同理：无前缀脚本依赖 `dist/`，`dev:*` 变体直接跑 TS 源码。
+- `.env` 只会被 `start` / `dev` / `db:backup` / `db:cleanup:preview` / `db:restore` /
+  `doctor` / `import:v1` 及其 `dev:*` 变体通过 `--env-file-if-exists` 自动读取。其他命令需手动
   `set -a; source .env; set +a`。
 - 首次运行会创建 `$DATA_DIR/life-assistant.db`；测试使用一次性临时目录。
 
 ## 架构
 
-- `src/core/` 是框架层：database/registry/auth/http/logger/settings/notify/channels/render/
-  qweather/qweather-jwt/holiday/recurrence/retention/backup。`src/modules/`
+- `src/core/` 是框架层：database/registry/jobs/lock/security/auth/http/logger/settings/notify/
+  channels/render/qweather/qweather-jwt/holiday/recurrence/retention/backup。`src/modules/`
   （weather/holiday/schedule/bookkeeping/notify/maintenance）通过 `src/modules/index.ts` 的
   副作用 import 接入，遵循 `tools / jobs / tick / onStart` 四个契约扩展点。`maintenance`
-  只注册每日备份 job（与 `db:backup` CLI 共用 `src/core/backup.ts` 的实现）。
+  注册每日备份（与 `db:backup` CLI 共用 `src/core/backup.ts`）与每日 WAL checkpoint 两个 job。
+- `src/core/jobs.ts`：`job_runs` 运行记录（running→ok/failed/skipped）、`CATCHUP_POLICY`
+  启动补发白名单、`previousFireTime`（自写 cron 反向求值，只支持日/月/星期为 `*`）、
+  `runStartupCatchups`；daemon 在 listen 之后非阻塞调用，停机时与 onStart 一起收敛。
+  `src/core/lock.ts`：`daemon.lock` 单实例锁（PID 存活探测、stale 接管）。
+  `src/core/security.ts`：`applySecureUmask`/`hardenDataDir`/`createRequestGuard`
+  （Host/Origin 守卫，daemon 的 `createHttpHandler` 对所有路径统一调用）。`src/restore.ts`
+  是 `npm run db:restore` 的实现（校验/留底/替换，复用 `backupStatus` 的规范文件口径）。
 - **核心层不得 import 模块内部。** 这一点由 `tests/registry.test.ts` 的静态 import 扫描强制，
   而不仅是运行时查重。新模块在 `modules/index.ts` 注册。
 - 例外是 `src/server/details.ts`，它直接 import 了 bookkeeping/schedule 的纯函数；
   `src/server/status.ts` 的 CSV 导出也直接 import 了 bookkeeping 的 `expenseCsv`
-  （同上，已知技术债）。改模块内部签名可能静默破坏状态页——记得同步检查这两个文件。
+  （同上，已知技术债）。模块间还有一条：`src/modules/weather` 直接 import
+  `schedule/service.ts` 的 `agendaForDate`（早报/晚报的「今日/明日日程」）。改这些签名
+  可能静默破坏状态页或简报——记得同步检查这几处。
 - Runtime 是进程级单例（`src/core/registry.ts` 的 `initRuntime`/`runtime`），只能初始化一次。
   测试必须用 `makeTestEnv()` + `cleanupTestEnv()`（`tests/helpers.ts`），后者会重置 runtime
   并调用 `cancelPendingDrain()`。
@@ -51,6 +61,11 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   `occurrences` 外键与 `kind` 的 CHECK），因此 `schema_version` 并非表结构的完整指纹。
   同理，活动账本名的**分范围**唯一索引（`idx_ledgers_scoped_name`，家庭之间 + 每人个人账本内）
   也是打开时幂等重建并 DROP 掉旧的全局索引 `idx_ledgers_active_name`，不提升版本号。
+  v4 新增 `job_runs` 表与 `expenses.client_token` / `schedules.client_token`（写路径幂等键，
+  分范围部分唯一索引 `idx_expenses_client_token` / `idx_schedules_client_token`，NULL 不参与约束）。
+  迁移整体包在单个事务里（失败整笔回滚）；升级前若 `openDatabase` 传了 `backupDir` 会先
+  `VACUUM INTO` 一份 `life-assistant-pre-v<旧版本>-<时间戳>.db`，备份失败拒绝启动。
+  活动账本名唯一索引建不出来现在**拒绝启动**（旧实现只告警；缺索引会让同名账本串范围）。
 - 时区固定 `Asia/Shanghai`（`src/time.ts`），无 DST。数据库存 UTC ISO 瞬间；本地日历日是
   `YYYY-MM-DD` 字符串。
 
@@ -64,6 +79,9 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   务必在 `finally` 里 `cleanupTestEnv(env)`。
 - 状态页内联 JS 在 `node:vm` + DOM 桩里做端到端测试（`tests/status-page-script.test.ts`），
   因为纯字符串断言看不出整页渲染故障。
+- 走 `createHttpHandler` 的测试会经过 Host/Origin 守卫：用 `http.request` 指向 `127.0.0.1`
+  时 Host 自动放行（回环主机名不限端口）；要测拒绝路径就直接构造 `IncomingMessage` 风格的
+  `{ headers }` 调 `createRequestGuard(config)`。
 
 ## 约定
 
@@ -85,6 +103,20 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   HTTP 错误只对 429/5xx/网络故障重试；**4xx 必须立即抛出**（反复重试错误请求会导致
   账号被冻结）。API KEY 是回退；优先 Ed25519 JWT，且四个 `QWEATHER_JWT_*` 变量必须
   同时配置，否则启动失败。
+- 写路径幂等：`expense add` / `schedule add` 的可选 `request_id` 落 `client_token`（分范围唯一）。
+  新增有副作用的写工具应沿用同一模式——插入撞唯一索引后按 token 查回原记录并标 `已存在`，
+  不要只在应用层「先查后写」（并发/MCP 重试下不可靠）。
+- 打开老库可能升级 schema 的入口（daemon、`doctor`、`db:cleanup:preview`、`import:v1`）都传
+  `openDatabase(dbPath, { backupDir: config.backupDir })`；新增 CLI 若会打开主库也要这样传，
+  否则前滚不会有迁移前快照（仅 warn）。
+- 所有 HTTP 请求都过 Host/Origin 守卫：缺 Host 或不在允许名单 → 403；带 Origin 时必须同源
+  （无 Origin 的 CLI/agent 放行）。绑定 `0.0.0.0` 或经反代/域名访问时，把实际 Host 写进
+  `WEB_ALLOWED_HOSTS`，否则是预期内的 403。
+- 启动补发只覆盖 `CATCHUP_POLICY` 白名单内的 job，且只补最近一次、只支持日/月/星期为 `*`
+  的 cron。新增「每天必须发生一次」的任务时记得加进策略表；`tests/jobs.test.ts` 会校验
+  键名必须对应真实注册的 `module.job`。
+- `daemon.lock` 存在表示同机已有实例；stale 锁（pid 已死/内容损坏）会自动接管。`db:restore`
+  在锁内 pid 仍存活时拒绝执行，别绕过它直接覆盖库文件。
 - `notify.pull` 只能取消 `queued`/`failed` 的投递，无法拦住已处于 `sending` 的那一次。
 - `npm run db:cleanup:preview` 是**零业务删除**预演（打开旧库时仍可能执行附加式 schema
   升级，因此不保证零写入）：occurrence 清理 job（每日 04:30）与保留策略

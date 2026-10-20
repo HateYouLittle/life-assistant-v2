@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { DateTime } from "luxon";
+import type { DatabaseSync } from "node:sqlite";
 import { DATE_RE, TIME_RE, TZ, instantToLocalDate } from "../../time.js";
 import { describeRecurrence, lunarMonthDayProblem } from "../../core/recurrence.js";
 import type { Recurrence } from "../../core/recurrence.js";
@@ -15,7 +16,7 @@ import {
 import { logger } from "../../core/logger.js";
 import {
   completeSchedule,
-  createSchedule,
+  createScheduleIdempotent,
   deleteSchedule,
   getSchedule,
   KIND_LABEL,
@@ -23,7 +24,10 @@ import {
   parseEscalation,
   parseOffsets,
   parseRecurrence,
+  pendingOccurrences,
   runOccurrenceCleanup,
+  skipSchedule,
+  snoozeSchedule,
   tickSchedules,
   upcoming,
   updateSchedule,
@@ -118,6 +122,27 @@ function localStampText(iso: string | null): string | null {
   if (iso === null) return null;
   const dt = DateTime.fromISO(iso, { zone: TZ });
   return dt.isValid ? dt.toFormat("yyyy-LL-dd HH:mm") : null;
+}
+
+/** list 的「待办发生」：给 agent 直接可用的 occurrence_key（complete/snooze/skip 都要它） */
+function rowWithPendingOccurrences(db: DatabaseSync, row: ScheduleRow): Record<string, unknown> {
+  const published = rowToPublic(row);
+  const pending = pendingOccurrences(db, row.id, 5);
+  if (pending.length === 0) return published;
+  return {
+    ...published,
+    待办发生: pending.map((item) => {
+      // 事件时刻与提醒时刻都给本地文本，与 list/upcoming 的「(本地)」口径一致；
+      // 脏数据（event_at 不是合法 ISO）时整键省略，绝不让 null 漏进 list 的字符串输出
+      const eventAt = localStampText(item.event_at);
+      const dueAt = localStampText(item.due_at);
+      return {
+        occurrence_key: item.occurrence_key,
+        ...(eventAt === null ? {} : { 事件时间: eventAt }),
+        ...(dueAt === null ? {} : { 提醒时间: dueAt }),
+      };
+    }),
+  };
 }
 
 /**
@@ -218,14 +243,21 @@ function scheduleToolInner(args: Record<string, unknown>, ctx: ToolContext) {
         escalation: patch.escalation ?? null,
         workdayFilter: patch.workdayFilter ?? "any",
       };
-      const row = createSchedule(db, ctx.profileId, input);
-      return okJson({ 已创建: rowToPublic(row) });
+      // request_id 是 add 的幂等键（写 schedules.client_token）：MCP 超时重试带同一个值
+      // 会返回首次创建的**原日程**，不重建 occurrence、不重复发提醒。
+      const requestId =
+        args.request_id === undefined || args.request_id === null ? null : String(args.request_id);
+      const { row, existed } = createScheduleIdempotent(db, ctx.profileId, input, requestId);
+      return okJson({ 已创建: rowToPublic(row), ...(existed ? { 已存在: true } : {}) });
     }
     case "list": {
       const status = (args.status as string) ?? "active";
       const limit = (args.limit as number) ?? 20;
       const rows = listSchedules(db, ctx.profileId, status, limit);
-      return okJson({ 日程: rows.map(rowToPublic), 数量: rows.length });
+      return okJson({
+        日程: rows.map((row) => rowWithPendingOccurrences(db, row)),
+        数量: rows.length,
+      });
     }
     case "update": {
       const id = args.id as string;
@@ -243,9 +275,61 @@ function scheduleToolInner(args: Record<string, unknown>, ctx: ToolContext) {
     case "complete": {
       const id = args.id as string;
       if (id === undefined) return fail("complete 需要 id");
-      const occurrenceKey = args.occurrence_key === undefined ? null : String(args.occurrence_key);
-      const row = completeSchedule(db, ctx.profileId, id, occurrenceKey);
+      // null / 未提供都表示「不指定单次」（HTTP JSON 里 null 很常见，不要落成字符串 "null"）
+      const occurrenceKey =
+        args.occurrence_key === undefined || args.occurrence_key === null
+          ? null
+          : String(args.occurrence_key);
+      // all=true 才结束整个系列（循环日程裸调 complete 会在 service 层被拒，防误点终止系列）
+      const row = completeSchedule(db, ctx.profileId, id, occurrenceKey, {
+        all: args.all === true,
+      });
       return okJson({ 已完成: rowToPublic(row) });
+    }
+    case "snooze": {
+      const id = args.id as string;
+      if (id === undefined) return fail("snooze 需要 id");
+      const result = snoozeSchedule(db, ctx.profileId, id, {
+        occurrenceKey:
+          args.occurrence_key === undefined || args.occurrence_key === null
+            ? null
+            : String(args.occurrence_key),
+        minutes: args.minutes === undefined || args.minutes === null ? null : Number(args.minutes),
+        until: args.until === undefined || args.until === null ? null : String(args.until),
+      });
+      return okJson({
+        已推迟: {
+          id: result.row.id,
+          标题: result.row.title,
+          occurrence_key: result.occurrenceKey,
+          // 与 list/upcoming 同口径：「提醒时间」是 UTC ISO，另给本地文本
+          提醒时间: result.dueAt,
+          "提醒时间(本地)": localStampText(result.dueAt),
+          状态: "pending",
+          版本: result.row.version,
+        },
+      });
+    }
+    case "skip": {
+      const id = args.id as string;
+      if (id === undefined) return fail("skip 需要 id");
+      const result = skipSchedule(
+        db,
+        ctx.profileId,
+        id,
+        args.occurrence_key === undefined || args.occurrence_key === null
+          ? null
+          : String(args.occurrence_key),
+      );
+      return okJson({
+        已跳过: {
+          id: result.row.id,
+          标题: result.row.title,
+          occurrence_key: result.occurrenceKey,
+          剩余未完成: result.remaining,
+          版本: result.row.version,
+        },
+      });
     }
     case "delete": {
       const id = args.id as string;
@@ -290,10 +374,22 @@ registerModule({
       description:
         "Profile 私有日程：待办/生日/纪念日，支持公历与农历（闰月策略、腊月三十顺延）、循环（每天/每周/每月/每年 + until/count）、按法定工作日/节假日重复、多级提醒与到点重发。" +
         "带 escalation 的待办即「截止型日程」：到达截止时刻后按阶梯依次重发升级提醒（逾期越久提醒越频繁），直到 complete；阶梯首元素固定为 0（截止时刻本身），且仅 kind=todo 可设；设置 escalation 后 resend_minutes 被忽略（不再产生到点重发）。" +
-        "action=add 创建（calendar=lunar 时需 lunar_month/lunar_day 且按年循环；生日/纪念日默认按年循环）；list 查询；update 修改（escalation 传 [] 清除阶梯）；complete 完成待办（可带 occurrence_key 只完成单次）；delete 删除；upcoming 查即将提醒。",
+        "action=add 创建（calendar=lunar 时需 lunar_month/lunar_day 且按年循环；生日/纪念日默认按年循环；可选 request_id 幂等键，重试不会重复创建）；" +
+        "list 查询（每行「待办发生」给出可用的 occurrence_key）；update 修改（escalation 传 [] 清除阶梯）；" +
+        "complete 完成：一次性日程直接完成；循环日程必须带 occurrence_key 只完成该次，结束整个系列请显式传 all=true；" +
+        "snooze 推迟单次提醒（minutes 或 until）；skip 跳过单次发生（系列继续）；delete 删除；upcoming 查即将提醒。",
       inputSchema: {
-        action: z.enum(["add", "list", "update", "complete", "delete", "upcoming"]),
-        id: z.string().optional().describe("update/complete/delete 时必填"),
+        action: z.enum([
+          "add",
+          "list",
+          "update",
+          "complete",
+          "snooze",
+          "skip",
+          "delete",
+          "upcoming",
+        ]),
+        id: z.string().optional().describe("update/complete/snooze/skip/delete 时必填"),
         title: z.string().min(1).max(120).optional(),
         note: z.string().max(500).optional(),
         kind: z.enum(["todo", "birthday", "anniversary"]).optional().describe("默认 todo"),
@@ -337,7 +433,36 @@ registerModule({
           .optional()
           .describe("list 过滤 / update 修改"),
         limit: z.number().int().min(1).max(100).optional(),
-        occurrence_key: z.string().optional().describe("complete 时可选，只完成该次发生"),
+        occurrence_key: z
+          .string()
+          .optional()
+          .describe(
+            "complete/snooze/skip 可选：指定单次发生（形如 <日期>T<时刻>#N，可从 list 的「待办发生」或 upcoming 取）；缺省取该日程最早未完成的一次",
+          ),
+        all: z
+          .boolean()
+          .optional()
+          .describe("complete 时结束整个系列（循环日程必须显式传 true 才会终止系列）"),
+        minutes: z
+          .number()
+          .int()
+          .min(1)
+          .max(10080)
+          .optional()
+          .describe("snooze 时必填（与 until 二选一）：顺延的分钟数，1-10080"),
+        until: z
+          .string()
+          .regex(TIME_RE)
+          .optional()
+          .describe("snooze 时必填（与 minutes 二选一）：顺延到下一个该本地时刻 HH:mm"),
+        request_id: z
+          .string()
+          .min(1)
+          .max(128)
+          .optional()
+          .describe(
+            "add 的幂等键（1-128 字符）：MCP 超时重试时带同一个值不会重复创建日程，返回首次创建的原日程并附 已存在: true",
+          ),
       },
       handler: scheduleTool,
     },

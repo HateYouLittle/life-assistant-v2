@@ -199,15 +199,33 @@ export function importYear(db: DatabaseSync, payload: HolidayYearPayload, source
   });
 }
 
-function recordFailure(db: DatabaseSync, year: number, error: string): void {
+/**
+ * 「未来年份数据尚未发布」写进 last_error 的固定原因。
+ * 区分真故障的唯一依据是 status（failed / pending），而不是这行文案。
+ */
+export const HOLIDAY_PENDING_REASON = "数据尚未发布（通常每年 11 月后公布）";
+
+/**
+ * 记录年份抓取结果。两种非就绪状态语义不同：
+ * - `failed`：真的坏了（网络/结构非法/年份错配），进 failed 列表、每天告警、状态页展示；
+ * - `pending`：目标年份是「未来年份」，上游按惯例每年 11 月后才发布数据 ——
+ *   抓取 404、days 为空、结构未公布都属于这一类，不算故障，不计入 failed。
+ * 两者共用 last_attempt_at，ensureYears 因此对它们都做 6 小时冷却。
+ */
+function recordYearStatus(
+  db: DatabaseSync,
+  year: number,
+  status: "failed" | "pending",
+  error: string,
+): void {
   const now = new Date().toISOString();
   db.prepare(
     `INSERT INTO cn_holiday_years (year, status, source, fetched_at, last_attempt_at, last_error)
-     VALUES (?, 'failed', '', ?, ?, ?)
-     ON CONFLICT (year) DO UPDATE SET status = 'failed', last_attempt_at = excluded.last_attempt_at,
+     VALUES (?, ?, '', ?, ?, ?)
+     ON CONFLICT (year) DO UPDATE SET status = excluded.status, last_attempt_at = excluded.last_attempt_at,
        last_error = excluded.last_error
      WHERE cn_holiday_years.status != 'ready'`,
-  ).run(year, now, now, error);
+  ).run(year, status, now, now, error);
 }
 
 export async function fetchYearPayload(
@@ -229,7 +247,7 @@ export async function fetchYearPayload(
 /** 正在抓取的年份：同一进程内避免 refresh job 与 schedule tick 并发抓同一年 */
 const inflightYears = new Set<number>();
 
-/** 确保指定年份就绪：ready 跳过；失败后 6 小时冷却；返回本次更新的年份 */
+/** 确保指定年份就绪：ready 跳过；failed / pending 失败后 6 小时冷却；返回本次更新的年份 */
 export async function ensureYears(
   db: DatabaseSync,
   years: number[],
@@ -254,7 +272,13 @@ export async function ensureYears(
       skipped.push(year);
       continue;
     }
-    if (meta?.status === "failed" && meta.last_attempt_at !== null) {
+    // pending 与 failed 同样要冷却：pending 的含义就是「现在还没有」，每个 onStart/refresh
+    // 都去打上游没有任何收益（下一年数据通常 11 月后才发布）。6 小时后自然重试。
+    if (
+      meta !== undefined &&
+      (meta.status === "failed" || meta.status === "pending") &&
+      meta.last_attempt_at !== null
+    ) {
       const since = Date.now() - new Date(meta.last_attempt_at).getTime();
       if (since >= 0 && since < FETCH_COOLDOWN_MS) {
         skipped.push(year);
@@ -278,9 +302,19 @@ export async function ensureYears(
       logger.info(`节假日数据导入 ${year} 年 ${count} 天`);
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
-      // recordFailure 带 status != 'ready' 守卫：失败不能覆盖已经就绪的年份
-      recordFailure(db, year, message);
-      failed.push(`${year}: ${message}`);
+      // 未来年份的数据每年 11 月后才发布：抓取 404 / days 为空 / 结构未公布都属「尚未发布」，
+      // 记为 pending 而不是 failed —— 旧实现把它们记成 failed，于是每天 02:00 一条 warn、
+      // 状态页 holidays.failed 常驻一条「失败」，真正的故障反而被淹没。
+      // 例外是「年份错配」：请求年与文件年不一致说明上游/CDN 真有问题，仍按 failed 处理。
+      const currentYear = Number(todayIso().slice(0, 4));
+      if (year > currentYear && !message.includes("年度数据错配")) {
+        recordYearStatus(db, year, "pending", HOLIDAY_PENDING_REASON);
+        logger.debug(`节假日数据尚未发布 ${year}（${message}），记为 pending`);
+      } else {
+        // recordYearStatus 带 status != 'ready' 守卫：失败不能覆盖已经就绪的年份
+        recordYearStatus(db, year, "failed", message);
+        failed.push(`${year}: ${message}`);
+      }
     } finally {
       inflightYears.delete(year);
     }

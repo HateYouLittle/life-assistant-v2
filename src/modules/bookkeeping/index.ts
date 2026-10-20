@@ -11,12 +11,13 @@ import {
 import { logger } from "../../core/logger.js";
 import { ensureProfile } from "../../core/settings.js";
 import {
-  addExpense,
+  addExpenseChecked,
   budgetAlertsForEntry,
   budgetComparison,
   budgetScopeLabel,
   budgetStatus,
   centsToYuan,
+  CLIENT_TOKEN_MAX_LENGTH,
   clearBudget,
   createLedger,
   deleteExpense,
@@ -35,8 +36,11 @@ import {
   monthRange,
   previousMonth,
   pushMonthlyReports,
+  recentCategories,
   renameLedger,
+  resolveAddLedger,
   setBudget,
+  setDefaultLedger,
   setLedgerArchived,
   summarizeExpenses,
   transferLedger,
@@ -219,36 +223,81 @@ function expenseRange(
   return range;
 }
 
+/**
+ * add 的 request_id（写路径幂等键）：缺省 undefined；非字符串/纯空白/超长一律报错。
+ * 不静默截断或忽略 —— 让调用方以为「带上了幂等键」，实际每次重试都在重复记账。
+ */
+function requestIdOf(args: Record<string, unknown>): string | undefined {
+  const raw = args.request_id;
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "string" || raw.trim() === "" || raw.length > CLIENT_TOKEN_MAX_LENGTH) {
+    throw new Error(`request_id 不合法（需为 1-${CLIENT_TOKEN_MAX_LENGTH} 个非空白字符）`);
+  }
+  return raw;
+}
+
+/** 未传 ledger_id 且无法确定默认账本时的可操作报错：列出可选账本 + 如何设置默认账本 */
+function noDefaultLedgerMessage(candidates: LedgerRow[]): string {
+  if (candidates.length === 0) {
+    return 'add 需要 ledger_id：当前 Profile 没有可写的活动账本，请先用 ledger {action:"create", name:"…"} 建一个';
+  }
+  const list = candidates.map((row) => `${row.name}（id=${row.id}）`).join("、");
+  return `add 未传 ledger_id，且无法确定默认账本；当前可写账本：${list}。请传 ledger_id，或用 expense {action:"set_default_ledger", ledger_id:"<账本 id>"} 指定默认账本`;
+}
+
 export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolContext) {
   try {
     const action = args.action as string;
     const db = ctx.db;
     if (action === "add") {
-      const ledgerId = args.ledger_id as string | undefined;
+      const ledgerIdArg = args.ledger_id;
       const amount = args.amount as number | undefined;
-      if (ledgerId === undefined || amount === undefined) {
-        return fail('add 需要 ledger_id（先调用 ledger {action:"list"} 取账本 id）和 amount（元）');
+      if (amount === undefined) {
+        return fail("add 需要 amount（元）；ledger_id 可选，缺省走默认账本");
       }
-      const ledger = getVisibleLedger(db, ledgerId, ctx.profileId);
-      if (ledger === undefined) return fail(`账本不存在: ${ledgerId}`);
+      const requestId = requestIdOf(args);
+      // 账本解析：显式 ledger_id 优先；未传时按 设置里的默认账本 → 唯一可写账本 的顺序确定，
+      // 都不成立就报错列出候选（绝不随手挑一个账本记进去）。
+      let ledger: LedgerRow;
+      if (ledgerIdArg !== undefined) {
+        if (typeof ledgerIdArg !== "string") return fail(`账本不存在: ${String(ledgerIdArg)}`);
+        const found = getVisibleLedger(db, ledgerIdArg, ctx.profileId);
+        if (found === undefined) return fail(`账本不存在: ${ledgerIdArg}`);
+        ledger = found;
+      } else {
+        const resolved = resolveAddLedger(db, ctx.profileId);
+        if (resolved.ledger === null) return fail(noDefaultLedgerMessage(resolved.candidates));
+        ledger = resolved.ledger;
+      }
       if (!Number.isFinite(amount) || amount <= 0 || amount > 1_000_000)
         return fail(`金额不合法: ${String(amount)}`);
       const cents = Math.round(amount * 100);
-      const entry = addExpense(db, ctx.profileId, {
-        ledgerId,
+      const result = addExpenseChecked(db, ctx.profileId, {
+        ledgerId: ledger.id,
         amountCents: cents,
         category: args.category as string | undefined,
         note: args.note as string | undefined,
         spentOn: args.date as string | undefined,
+        clientToken: requestId,
       });
-      // 个人账本：不回执、不推预算提醒（连归属人也不推，保持记账私密）；家庭账本维持全局推送
-      if (ledger.owner_profile_id === null) {
+      const entry = result.entry;
+      // 幂等命中：行是首次写入的那一条，本次不再发回执/预算提醒（否则重试会重复打扰用户）
+      if (result.reused) {
+        logger.debug(
+          `记账幂等命中，返回原记录: profile=${ctx.profileId} request_id=${requestId ?? ""} expense=${entry.id}`,
+        );
+      } else if (ledger.owner_profile_id === null) {
+        // 个人账本：不回执、不推预算提醒（连归属人也不推，保持记账私密）；家庭账本维持全局推送
+        // 回执的 dedupeKey 用 request_id 派生（同一次请求重试得到同一个键，不含随机 id）；
+        // 未带 request_id 时只能退回 entry:<id> —— 那个 id 是首次写入时生成的，重试返回的也是它。
+        const receiptDedupeKey =
+          requestId === undefined ? `entry:${entry.id}` : `entry:req:${ctx.profileId}:${requestId}`;
         void ctx.services
           .publishGlobal({
             kind: "bookkeeping.entry",
             title: `记账：¥${centsToYuan(entry.amount_cents)}（${ledger.name}）`,
             blocks: entryReceiptBlocks(ledger, entry),
-            dedupeKey: `entry:${entry.id}`,
+            dedupeKey: receiptDedupeKey,
           })
           .catch((e) => logger.error(`记账回执发布失败（记账已成功）: ${errorMessage(e)}`));
         // 预算阈值提醒：只在本笔「跨越」80%/100% 时推；失败绝不影响记账成功。
@@ -271,6 +320,38 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
           日期: entry.spent_on,
           记账人: entry.created_by_profile,
         },
+        ...(result.reused ? { 已存在: true } : {}),
+        // 只在调用方没指定分类时给「常用分类」：已显式给分类的人不需要被推荐，
+        // 多出来的字段只会是噪声（也会让固定的 分类 回显看起来像被改写）。
+        ...(args.category === undefined
+          ? { 常用分类: recentCategories(db, entry.ledger_id, { excludeId: entry.id }) }
+          : {}),
+      });
+    }
+    if (action === "set_default_ledger") {
+      // 参数兼容 ledger_id 与简写 ledger（文档里把这一视图描述为「参数 ledger」）
+      const raw = args.ledger_id ?? args.ledger;
+      if (raw === undefined) {
+        // 不传账本 = 查询当前默认账本（以及 add 实际会用的那个），便于设置后回读确认
+        const resolved = resolveAddLedger(db, ctx.profileId);
+        return okJson({
+          默认账本: resolved.ledger === null ? null : ledgerView(resolved.ledger),
+          ...(resolved.source === null
+            ? {}
+            : { 来源: resolved.source === "setting" ? "默认设置" : "唯一可写账本" }),
+          可写账本: resolved.candidates.map(ledgerView),
+          ...(resolved.ledger === null && resolved.candidates.length > 1
+            ? {
+                提示: "存在多个可写账本：请传 ledger_id 指定，或用 set_default_ledger 设置默认账本",
+              }
+            : {}),
+        });
+      }
+      if (typeof raw !== "string") return fail(`账本不存在或不可写: ${String(raw)}`);
+      const ledger = setDefaultLedger(db, ctx.profileId, raw);
+      return okJson({
+        已设置: { 默认账本: ledgerView(ledger) },
+        说明: "之后 expense add 未传 ledger_id 时默认使用该账本；账本归档、转归属他人后该设置自动失效",
       });
     }
     if (action === "list") {
@@ -483,14 +564,33 @@ registerModule({
     {
       name: "expense",
       description:
-        "支出记账：add 记一笔（ledger_id + amount 元，可选 category/note/date；家庭账本回执全局推送，个人账本不回执不提醒）；list 明细（可按 month/from/to/by 过滤）；summary 汇总（按分类与记账人）；update 更正一笔（id + amount/category/note/date 至少一个，只改显式传入的字段，不触发回执与预算提醒）；delete 删除记错的一笔（id 从 list 获取）；export 导出 CSV（ledger_id + 可选 month，默认当月；表头「日期,账本,分类,金额(元),备注,记账人」，UTF-8 BOM；单次上限 2000 行，超出时 已截断=true 并给出总行数）。仅能操作当前 Profile 可见的账本（家庭账本或自己的个人账本）。month 与 from/to 互斥（同时传会报错）；from/to 只给一边就是半边区间（只给 from = [from, 将来)，只给 to = (过去, to]），两个 action 口径一致；默认区间只在 month/from/to **都不传**时生效（summary 默认「月初→今天」，list 不传时不限区间）。金额只支持支出，单位为元。",
+        "支出记账：add 记一笔（amount 元必填；ledger_id 可选，缺省按「默认账本 → 唯一可写账本」解析；可选 category/note/date/request_id；家庭账本回执全局推送，个人账本不回执不提醒；未显式传 category 时回执附「常用分类」）；list 明细（可按 month/from/to/by 过滤）；summary 汇总（按分类与记账人）；update 更正一笔（id + amount/category/note/date 至少一个，只改显式传入的字段，不触发回执与预算提醒）；delete 删除记错的一笔（id 从 list 获取）；export 导出 CSV（ledger_id + 可选 month，默认当月；表头「日期,账本,分类,金额(元),备注,记账人」，UTF-8 BOM；单次上限 2000 行，超出时 已截断=true 并给出总行数）；set_default_ledger 设置/查看默认账本（传 ledger_id 设置，不传则返回当前默认账本）。仅能操作当前 Profile 可见的账本（家庭账本或自己的个人账本）。幂等：add 传 request_id 后，同一人用同一个 request_id 重试不会重复记账，返回原记录并附「已存在: true」（不重复发通知）。month 与 from/to 互斥（同时传会报错）；from/to 只给一边就是半边区间（只给 from = [from, 将来)，只给 to = (过去, to]），两个 action 口径一致；默认区间只在 month/from/to **都不传**时生效（summary 默认「月初→今天」，list 不传时不限区间）。金额只支持支出，单位为元。",
       inputSchema: {
-        action: z.enum(["add", "list", "summary", "update", "delete", "export"]),
+        action: z.enum([
+          "add",
+          "list",
+          "summary",
+          "update",
+          "delete",
+          "export",
+          "set_default_ledger",
+        ]),
         id: z.string().optional().describe("update/delete 时的账目 id（从 list 获取）"),
         ledger_id: z
           .string()
           .optional()
-          .describe('账本 id；add/list/summary/export 必填，先调用 ledger {action:"list"} 获取'),
+          .describe(
+            "账本 id；list/summary/export 必填，add 可选（缺省走默认账本），set_default_ledger 时传它指定默认账本",
+          ),
+        ledger: z.string().optional().describe("set_default_ledger 的简写参数，等价于 ledger_id"),
+        request_id: z
+          .string()
+          .min(1)
+          .max(128)
+          .optional()
+          .describe(
+            "add 的幂等键（1-128 字符）：超时重试时带同一个值不会重复记账，返回原记录并附「已存在: true」",
+          ),
         amount: z
           .number()
           .min(0.01)

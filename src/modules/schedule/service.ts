@@ -12,7 +12,7 @@ import {
   type Recurrence,
 } from "../../core/recurrence.js";
 import { errorMessage, type NotifyBlock, type Services } from "../../core/registry.js";
-import { withTransaction } from "../../core/database.js";
+import { withReadTransaction, withTransaction } from "../../core/database.js";
 import { ensureProfile } from "../../core/settings.js";
 import { logger } from "../../core/logger.js";
 
@@ -82,6 +82,10 @@ export const MAX_ESCALATION_STEPS = 5;
 export const MAX_ESCALATION_MINUTES = 43200;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+/** add 幂等键（client_token）长度上限：与工具 schema 对齐，服务层再兜一道 */
+const REQUEST_ID_MAX = 128;
+/** snooze 上限：7 天。再长就不该用「推迟一次」，而应改整个日程 */
+const SNOOZE_MAX_MINUTES = 10080;
 
 /** 工作日过滤暂停时的告警去重：scheduleId → 已告警的日期，避免每分钟刷屏 */
 const pausedWarned = new Map<string, string>();
@@ -331,13 +335,14 @@ function insertSchedule(
   profileId: string,
   input: ScheduleInput,
   id: string,
+  clientToken: string | null = null,
 ): void {
   const ts = nowIso();
   db.prepare(
     `INSERT INTO schedules (id, profile_id, title, note, kind, calendar, start_date, lunar_month, lunar_day,
        leap_policy, lunar_clamp, time, all_day, recurrence_json, remind_offsets_json, resend_minutes,
-       escalation_json, workday_filter, status, version, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?)`,
+       escalation_json, workday_filter, status, version, created_at, updated_at, client_token)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?, ?)`,
   ).run(
     id,
     profileId,
@@ -361,6 +366,7 @@ function insertSchedule(
     input.workdayFilter,
     ts,
     ts,
+    clientToken,
   );
 }
 
@@ -573,6 +579,7 @@ export function createSchedule(
   db: DatabaseSync,
   profileId: string,
   input: ScheduleInput,
+  clientToken: string | null = null,
 ): ScheduleRow {
   validateScheduleInput(input);
   ensureProfile(db, profileId);
@@ -583,7 +590,7 @@ export function createSchedule(
       // 插入与首次物化同事务：物化失败（规则不可满足等）时整体回滚，
       // 不留「报错但日程已入库」的半成品 —— 用户重试会造出第二条同名日程。
       withTransaction(db, () => {
-        insertSchedule(db, profileId, input, id);
+        insertSchedule(db, profileId, input, id, clientToken);
         const created = getSchedule(db, profileId, id);
         if (created === undefined) throw new Error("日程创建后读取失败");
         materializeSchedule(db, created);
@@ -591,6 +598,9 @@ export function createSchedule(
       return getSchedule(db, profileId, id) as ScheduleRow;
     } catch (e) {
       if (e instanceof Error && e.message.includes("UNIQUE")) {
+        // request_id 撞上已有行是**幂等命中**而不是瞬时 id 冲突：立刻抛出，
+        // 由 createScheduleIdempotent 查回原日程；继续重试只会换 id 再撞同一个键。
+        if (clientToken !== null && e.message.includes("client_token")) throw e;
         lastError = e;
         continue;
       }
@@ -598,6 +608,57 @@ export function createSchedule(
     }
   }
   throw lastError ?? new Error("日程创建失败");
+}
+
+export interface CreateScheduleOutcome {
+  row: ScheduleRow;
+  /** true = 同 request_id 的重复调用，返回的是首次创建的原日程（未重建 occurrence、未重复提醒） */
+  existed: boolean;
+}
+
+/** 校验 add 幂等键：1-128 字符（工具 schema 之外的第二道，直接调服务层也拦得住） */
+export function validateRequestId(value: string): string {
+  if (value.length < 1 || value.length > REQUEST_ID_MAX) {
+    throw new Error(`request_id 不合法：需 1-${REQUEST_ID_MAX} 个字符`);
+  }
+  return value;
+}
+
+/** 按 (profile_id, client_token) 查回首次创建的日程；跨 Profile 天然隔离 */
+export function getScheduleByClientToken(
+  db: DatabaseSync,
+  profileId: string,
+  clientToken: string,
+): ScheduleRow | undefined {
+  return db
+    .prepare("SELECT * FROM schedules WHERE profile_id = ? AND client_token = ?")
+    .get(profileId, clientToken) as ScheduleRow | undefined;
+}
+
+/**
+ * 带幂等键的创建：MCP 超时/网络抖动后 agent 用同一 request_id 重试时，
+ * 返回首次创建的**原日程**（并标记 existed），不重建 occurrence、不重复发提醒。
+ * 先查后插；并发窗口里撞唯一索引（idx_schedules_client_token）再查回，两步都走索引。
+ */
+export function createScheduleIdempotent(
+  db: DatabaseSync,
+  profileId: string,
+  input: ScheduleInput,
+  requestId: string | null,
+): CreateScheduleOutcome {
+  if (requestId === null) return { row: createSchedule(db, profileId, input), existed: false };
+  validateRequestId(requestId);
+  const existing = getScheduleByClientToken(db, profileId, requestId);
+  if (existing !== undefined) return { row: existing, existed: true };
+  try {
+    return { row: createSchedule(db, profileId, input, requestId), existed: false };
+  } catch (e) {
+    if (e instanceof Error && e.message.includes("client_token")) {
+      const row = getScheduleByClientToken(db, profileId, requestId);
+      if (row !== undefined) return { row, existed: true };
+    }
+    throw e;
+  }
 }
 
 export interface SchedulePatch extends Partial<Omit<ScheduleInput, "calendar">> {
@@ -708,15 +769,33 @@ export function updateSchedule(
   return getSchedule(db, profileId, id) as ScheduleRow;
 }
 
+export interface CompleteOptions {
+  /**
+   * 结束整个系列（含循环日程）。循环日程裸调 complete（既无 occurrence_key 又不传 all）
+   * 一律拒绝：不带 key 的「完成」会终止整条循环，而用户点「完成」绝大多数只想完成这一次。
+   */
+  all?: boolean;
+}
+
 export function completeSchedule(
   db: DatabaseSync,
   profileId: string,
   id: string,
   occurrenceKey: string | null,
+  opts: CompleteOptions = {},
 ): ScheduleRow {
   const row = getSchedule(db, profileId, id);
   if (row === undefined) throw new Error(`日程不存在: ${id}`);
   if (row.status !== "active") throw new Error(`日程当前状态为 ${row.status}，无需完成`);
+  // 循环判定只看「是否声明了 recurrence」：recurrence_json 损坏时也按循环处理
+  // （保守：无法解析时宁可要求显式 all=true，也不能一次误点清空整个系列）。
+  const recurring = row.recurrence_json !== null;
+  if (occurrenceKey === null && recurring && opts.all !== true) {
+    throw new Error(
+      "循环日程需带 occurrence_key 完成单次；结束整个系列请显式传 all=true。" +
+        "可用 occurrence 列表从 schedule list 的「待办发生」或 schedule upcoming 获取。",
+    );
+  }
   if (occurrenceKey !== null) {
     const result = db
       .prepare(
@@ -763,6 +842,264 @@ export function completeSchedule(
   return getSchedule(db, profileId, id) as ScheduleRow;
 }
 
+interface OccurrenceRow {
+  occurrence_key: string;
+  event_at: string;
+  due_at: string;
+  status: "pending" | "notified" | "done" | "cancelled";
+}
+
+/**
+ * 正常提醒行 key 形如 `<日期>T<时刻>#<偏移序号>`；`:resend` 与 `#esc:N` 是派生行。
+ * 派生行的 due_at 由触发前校验按父事件重新计算（见 resendDueOrNull / escalationDueOrNull），
+ * 手工改期会被下一次校验覆盖，因此 snooze/skip 的单次处置只面向正常提醒行。
+ */
+function isNormalReminderKey(key: string): boolean {
+  return /#\d+$/.test(key);
+}
+
+function getOccurrence(
+  db: DatabaseSync,
+  scheduleId: string,
+  occurrenceKey: string,
+): OccurrenceRow | undefined {
+  return db
+    .prepare(
+      `SELECT occurrence_key, event_at, due_at, status FROM occurrences
+       WHERE schedule_id = ? AND occurrence_key = ?`,
+    )
+    .get(scheduleId, occurrenceKey) as OccurrenceRow | undefined;
+}
+
+/**
+ * 缺省目标：该日程「最早未完成」的普通提醒行（pending/notified）。
+ * 不取派生行的原因同上；同一事件有多个偏移行时取 due_at 最早的那条，
+ * 它才是这次发生对用户最先可见的提醒。
+ */
+function earliestUnfinishedOccurrence(
+  db: DatabaseSync,
+  scheduleId: string,
+): OccurrenceRow | undefined {
+  const rows = db
+    .prepare(
+      `SELECT occurrence_key, event_at, due_at, status FROM occurrences
+       WHERE schedule_id = ? AND status IN ('pending','notified')
+       ORDER BY due_at, event_at`,
+    )
+    .all(scheduleId) as unknown as OccurrenceRow[];
+  return rows.find((row) => isNormalReminderKey(row.occurrence_key));
+}
+
+function resolveDisposalTarget(
+  db: DatabaseSync,
+  schedule: ScheduleRow,
+  occurrenceKey: string | null,
+): OccurrenceRow {
+  if (occurrenceKey !== null) {
+    const occ = getOccurrence(db, schedule.id, occurrenceKey);
+    if (occ === undefined) throw new Error(`occurrence 不存在: ${occurrenceKey}`);
+    return occ;
+  }
+  const occ = earliestUnfinishedOccurrence(db, schedule.id);
+  if (occ === undefined) {
+    throw new Error(`日程「${schedule.title}」没有未完成的提醒可处置（可能已完成或已取消）`);
+  }
+  return occ;
+}
+
+/** 该日程剩余未完成的发生次数（按事件前缀去重；同一事件的多个提醒行只算一次） */
+function countUnfinishedEvents(db: DatabaseSync, scheduleId: string): number {
+  const rows = db
+    .prepare(
+      "SELECT occurrence_key FROM occurrences WHERE schedule_id = ? AND status IN ('pending','notified')",
+    )
+    .all(scheduleId) as { occurrence_key: string }[];
+  const events = new Set(
+    rows.map((row) => eventPrefixOf(row.occurrence_key) ?? row.occurrence_key),
+  );
+  return events.size;
+}
+
+/** snooze/skip 的写路径与 updateSchedule 同口径：version 自增 + updated_at 前进 */
+function touchSchedule(db: DatabaseSync, scheduleId: string): void {
+  db.prepare("UPDATE schedules SET version = version + 1, updated_at = ? WHERE id = ?").run(
+    nowIso(),
+    scheduleId,
+  );
+}
+
+/** 未完成的「待办发生」：按事件前缀去重，供 list 回执给 agent 拿 occurrence_key */
+export interface PendingOccurrence {
+  occurrence_key: string;
+  event_at: string;
+  due_at: string;
+}
+
+export function pendingOccurrences(
+  db: DatabaseSync,
+  scheduleId: string,
+  limit: number,
+): PendingOccurrence[] {
+  const rows = db
+    .prepare(
+      `SELECT occurrence_key, event_at, due_at FROM occurrences
+       WHERE schedule_id = ? AND status IN ('pending','notified')
+       ORDER BY event_at, due_at, occurrence_key`,
+    )
+    .all(scheduleId) as unknown as OccurrenceRow[];
+  const seen = new Set<string>();
+  const items: PendingOccurrence[] = [];
+  for (const row of rows) {
+    const event = eventPrefixOf(row.occurrence_key) ?? row.occurrence_key;
+    if (seen.has(event)) continue;
+    seen.add(event);
+    items.push({
+      occurrence_key: row.occurrence_key,
+      event_at: row.event_at,
+      due_at: row.due_at,
+    });
+    if (items.length >= limit) break;
+  }
+  return items;
+}
+
+export interface SnoozeOptions {
+  /** 指定单次发生；缺省取该日程最早未完成的普通提醒行 */
+  occurrenceKey?: string | null;
+  /** 从现在起（原提醒更晚时从原提醒时刻起）顺延的分钟数，1-10080 */
+  minutes?: number | null;
+  /** 绝对时刻 HH:mm：解析为下一个该本地时刻 */
+  until?: string | null;
+}
+
+export interface SnoozeOutcome {
+  row: ScheduleRow;
+  occurrenceKey: string;
+  /** 顺延后的提醒时刻（UTC ISO，与 occurrences.due_at 同值） */
+  dueAt: string;
+}
+
+/**
+ * 把一次发生的提醒顺延（snooze）：
+ * - 只改该行的 due_at 并重置为 pending，事件本身（event_at）不动；
+ * - fireDue 按新 due_at 触发，并把通知里的时间显示改为 due_at（见 reminderBlocks 的 displayAt）；
+ * - 物化用 INSERT OR IGNORE，tick 不会覆盖这一行；
+ * - 通知 dedupeKey 带 due_at 后缀（见 fireDue），否则同 key 的二次提醒会被 outbox 去重吞掉。
+ */
+export function snoozeSchedule(
+  db: DatabaseSync,
+  profileId: string,
+  id: string,
+  opts: SnoozeOptions,
+): SnoozeOutcome {
+  const row = getSchedule(db, profileId, id);
+  if (row === undefined) throw new Error(`日程不存在: ${id}`);
+  if (row.status !== "active") throw new Error(`日程当前状态为 ${row.status}，无法推迟提醒`);
+  const hasMinutes = opts.minutes !== null && opts.minutes !== undefined;
+  const hasUntil = opts.until !== null && opts.until !== undefined;
+  if (hasMinutes === hasUntil) throw new Error("snooze 需要且只能提供 minutes 或 until 之一");
+  const target = resolveDisposalTarget(db, row, opts.occurrenceKey ?? null);
+  if (target.status === "done" || target.status === "cancelled") {
+    throw new Error(
+      `occurrence ${target.occurrence_key} 已是${target.status === "done" ? "完成" : "取消"}状态，不能 snooze`,
+    );
+  }
+  if (!isNormalReminderKey(target.occurrence_key)) {
+    throw new Error(
+      `snooze 只支持普通提醒行（occurrence_key 形如 <日期>T<时刻>#N）；${target.occurrence_key} 是派生提醒行，请对同一事件的原提醒行操作`,
+    );
+  }
+  let newDue: DateTime;
+  if (hasMinutes) {
+    const minutes = opts.minutes as number;
+    if (!Number.isInteger(minutes) || minutes < 1 || minutes > SNOOZE_MAX_MINUTES) {
+      throw new Error(`snooze 的 minutes 需为 1-${SNOOZE_MAX_MINUTES} 的整数（分钟）`);
+    }
+    const at = now();
+    // 「顺延」的基准取 max(现在, 原提醒)：未到点的提醒按原时刻后移，
+    // 已经到点/提醒过的则从此刻起算，避免推迟到一个仍然过期的时刻。
+    const original = DateTime.fromISO(target.due_at, { zone: TZ });
+    const base = original > at ? original : at;
+    newDue = base.plus({ minutes });
+  } else {
+    const until = opts.until as string;
+    if (!TIME_RE.test(until)) throw new Error(`snooze 的 until 不合法: ${until}（需为 HH:mm）`);
+    const [hour, minute] = until.split(":").map(Number) as [number, number];
+    const at = now();
+    let next = at.set({ hour, minute, second: 0, millisecond: 0 });
+    // 「下一个该时刻」：今天这个点已过（或正好是现在）就落到明天
+    if (next <= at) next = next.plus({ days: 1 });
+    newDue = next;
+  }
+  const dueAt = newDue.toUTC().toISO() as string;
+  withTransaction(db, () => {
+    db.prepare(
+      "UPDATE occurrences SET due_at = ?, status = 'pending' WHERE schedule_id = ? AND occurrence_key = ?",
+    ).run(dueAt, id, target.occurrence_key);
+    touchSchedule(db, id);
+    updateNextRunAt(db, id);
+  });
+  return {
+    row: getSchedule(db, profileId, id) as ScheduleRow,
+    occurrenceKey: target.occurrence_key,
+    dueAt,
+  };
+}
+
+export interface SkipOutcome {
+  row: ScheduleRow;
+  occurrenceKey: string;
+  /** 跳过这次发生之后，该日程剩余未完成的发生次数（按事件去重） */
+  remaining: number;
+}
+
+/**
+ * 跳过单次发生：把该事件的提醒行（含同事件的兄弟偏移与派生行）置为 cancelled。
+ * 只动 occurrence 行、不改 schedules.status —— 系列继续，下一次仍会照常物化/提醒。
+ * cancelled 是终态：materialize 的 INSERT OR IGNORE 不会复活它，catchupSweep 只碰 pending。
+ */
+export function skipSchedule(
+  db: DatabaseSync,
+  profileId: string,
+  id: string,
+  occurrenceKey: string | null,
+): SkipOutcome {
+  const row = getSchedule(db, profileId, id);
+  if (row === undefined) throw new Error(`日程不存在: ${id}`);
+  if (row.status !== "active") throw new Error(`日程当前状态为 ${row.status}，无法跳过提醒`);
+  const target = resolveDisposalTarget(db, row, occurrenceKey);
+  if (target.status === "done" || target.status === "cancelled") {
+    throw new Error(
+      `occurrence ${target.occurrence_key} 已是${target.status === "done" ? "完成" : "取消"}状态，无需跳过`,
+    );
+  }
+  const eventPrefix = eventPrefixOf(target.occurrence_key);
+  let remaining = 0;
+  withTransaction(db, () => {
+    if (eventPrefix === null) {
+      // 脏 key（不符合事件前缀形态）：只能取消它自己
+      db.prepare(
+        "UPDATE occurrences SET status = 'cancelled' WHERE schedule_id = ? AND occurrence_key = ? AND status IN ('pending','notified')",
+      ).run(id, target.occurrence_key);
+    } else {
+      // 同一事件的各偏移行与派生行一并取消，否则兄弟偏移仍会再推一次
+      db.prepare(
+        `UPDATE occurrences SET status = 'cancelled'
+         WHERE schedule_id = ? AND status IN ('pending','notified')
+           AND substr(occurrence_key, 1, ?) = ?`,
+      ).run(id, eventPrefix.length + 1, `${eventPrefix}#`);
+    }
+    touchSchedule(db, id);
+    updateNextRunAt(db, id);
+    remaining = countUnfinishedEvents(db, id);
+  });
+  return {
+    row: getSchedule(db, profileId, id) as ScheduleRow,
+    occurrenceKey: target.occurrence_key,
+    remaining,
+  };
+}
+
 export function deleteSchedule(db: DatabaseSync, profileId: string, id: string): void {
   const row = getSchedule(db, profileId, id);
   if (row === undefined) throw new Error(`日程不存在: ${id}`);
@@ -803,6 +1140,96 @@ export function upcoming(db: DatabaseSync, profileId: string, limit: number): Up
        ORDER BY o.due_at LIMIT ?`,
     )
     .all(profileId, nowIso(), limit) as unknown as UpcomingItem[];
+}
+
+/**
+ * 简报议程条目（天气模块的每日简报直接 import；字段名是跨模块契约，别改名）。
+ */
+export interface AgendaItem {
+  title: string;
+  /** 事件本地时刻 HH:mm（all_day 时调用方按 all_day 显示「全天」） */
+  time: string;
+  all_day: boolean;
+  /** todo | birthday | anniversary */
+  kind: string;
+  schedule_id: string;
+  /** 可直接用于 complete / snooze / skip 的 occurrence_key */
+  occurrence_key: string;
+  /** 事件本地日期 < 查询日 */
+  overdue: boolean;
+  /** 事件本地日期 YYYY-MM-DD */
+  event_date: string;
+}
+
+/**
+ * 某 Profile 在 `date` 当天的议程：事件本地日期 <= date 且 occurrence 未结束
+ * （pending/notified）的条目 —— 即「当天待办 + 逾期未完成」。
+ * 按 event_at 升序（逾期的天生排在前面，同日按时刻）。
+ *
+ * - 同一事件有多个提醒偏移行（#0..#4）与派生行（:resend / #esc:N），按事件前缀去重，
+ *   只返回一条，`occurrence_key` 优先取普通提醒行（可直接 complete/snooze/skip）；
+ * - 已完成/已取消的 occurrence 不出现；日程本身非 active（已结束/已删除）也不出现；
+ * - `withReadTransaction` 保证与其它读多条的报表一致的快照；查询走
+ *   schedules(profile_id,status) 与 occurrences(schedule_id,status) 索引。
+ */
+export function agendaForDate(db: DatabaseSync, profileId: string, date: string): AgendaItem[] {
+  if (!DATE_RE.test(date) || !DateTime.fromISO(date, { zone: TZ }).isValid) {
+    throw new Error(`日期不合法: ${date}`);
+  }
+  // 本地日期 <= date ⟺ event_at < (date+1) 的本地零点。用瞬间比较，
+  // 不把 +08:00 偏移硬编码进 SQL（时区常量只在 src/time.ts 维护一份）。
+  const end = DateTime.fromISO(date, { zone: TZ })
+    .plus({ days: 1 })
+    .startOf("day")
+    .toUTC()
+    .toISO() as string;
+  return withReadTransaction(db, () => {
+    const rows = db
+      .prepare(
+        `SELECT s.id AS schedule_id, s.title AS title, s.kind AS kind, s.all_day AS all_day,
+                o.occurrence_key AS occurrence_key, o.event_at AS event_at
+         FROM occurrences o JOIN schedules s ON s.id = o.schedule_id
+         WHERE s.profile_id = ? AND s.status = 'active'
+           AND o.status IN ('pending','notified') AND o.event_at < ?
+         ORDER BY o.event_at, o.occurrence_key`,
+      )
+      .all(profileId, end) as unknown as {
+      schedule_id: string;
+      title: string;
+      kind: string;
+      all_day: number;
+      occurrence_key: string;
+      event_at: string;
+    }[];
+    const items = new Map<string, AgendaItem>();
+    for (const row of rows) {
+      const local = DateTime.fromISO(row.event_at, { zone: TZ });
+      const eventDate = local.toISODate() ?? "";
+      // 同一日程内按事件前缀去重；不同日程即使时刻相同也各算一条，故 identity 带上 schedule_id
+      const event = `${row.schedule_id}|${eventPrefixOf(row.occurrence_key) ?? row.occurrence_key}`;
+      const existing = items.get(event);
+      if (existing === undefined) {
+        items.set(event, {
+          title: row.title,
+          time: local.toFormat("HH:mm"),
+          all_day: row.all_day === 1,
+          kind: row.kind,
+          schedule_id: row.schedule_id,
+          occurrence_key: row.occurrence_key,
+          overdue: eventDate < date,
+          event_date: eventDate,
+        });
+      } else if (
+        // 同一事件的代表 key 优先用普通提醒行（能直接 complete/snooze/skip）：
+        // 极端情况下该事件只剩派生行仍 pending，first-pass 可能先拿到 `:resend`
+        !isNormalReminderKey(existing.occurrence_key) &&
+        isNormalReminderKey(row.occurrence_key)
+      ) {
+        existing.occurrence_key = row.occurrence_key;
+      }
+    }
+    return [...items.values()];
+  });
 }
 
 /** 错过补发清理：每个日程只保留最近一次过期的 pending，其余取消 */
@@ -941,14 +1368,23 @@ export function reminderBlocks(
   row: ScheduleRow,
   eventAt: string,
   note: string | null,
+  /**
+   * 手工改期（snooze）后的提醒时刻：提醒里的「时间」改用它，而不是物化时的旧快照。
+   * 不传 = 常规提醒，沿用 event_at + 日程时刻（既有形状不变）。
+   */
+  displayAt?: string,
 ): NotifyBlock {
+  let timeText: string;
+  if (row.all_day === 1) {
+    timeText = `${instantToLocalDate(displayAt ?? eventAt)} 全天`;
+  } else if (displayAt === undefined) {
+    timeText = `${instantToLocalDate(eventAt)} ${row.time}`;
+  } else {
+    const local = DateTime.fromISO(displayAt, { zone: TZ });
+    timeText = `${instantToLocalDate(displayAt)} ${local.toFormat("HH:mm")}`;
+  }
   const rows: string[][] = [
-    [
-      "时间",
-      row.all_day === 1
-        ? `${instantToLocalDate(eventAt)} 全天`
-        : `${instantToLocalDate(eventAt)} ${row.time}`,
-    ],
+    ["时间", timeText],
     ["类型", KIND_LABEL[row.kind]],
     ["重复", repeatTextOf(row)],
   ];
@@ -984,6 +1420,21 @@ interface DueRow {
 function parentMatchesScheduleTime(key: string, time: string): boolean {
   const matched = /T(\d{2}:\d{2})#\d+$/.exec(key);
   return matched !== null && matched[1] === time;
+}
+
+/**
+ * 该正常提醒行是否被手工顺延过（snooze）：其 due_at 不再等于 event_at + 偏移分钟。
+ * 用「与期望值不一致」而不是新增数据库列来识别 —— 不改 schema，且 update 重排后
+ * pending 行会被重建（due_at 回到期望值），不会把旧改期误判成 snooze。
+ */
+function isSnoozedRow(schedule: ScheduleRow, occ: DueRow): boolean {
+  if (!isNormalReminderKey(occ.occurrence_key)) return false;
+  const matched = /#(\d+)$/.exec(occ.occurrence_key);
+  if (matched === null) return false;
+  const offset = parseOffsets(schedule.remind_offsets_json)[Number(matched[1])];
+  if (offset === undefined) return false;
+  const expected = DateTime.fromISO(occ.event_at).plus({ minutes: offset }).toUTC().toISO();
+  return expected !== occ.due_at;
 }
 
 /**
@@ -1156,11 +1607,18 @@ export async function fireDue(db: DatabaseSync, services: Services, at: DateTime
           : lateMinutes > CATCHUP_GRACE_MINUTES
             ? `（补发：该提醒已错过约 ${Math.round(lateMinutes)} 分钟）`
             : null;
+      // 手工顺延（snooze）过的正常提醒行：通知里的「时间」取新的 due_at（而不是物化时的
+      // 旧 event_at 快照）；dedupeKey 也带上 due_at，否则同一 occurrence_key 的二次提醒
+      // 会被 outbox 的 (profile_id, dedupe_key) 唯一约束当成重复静默吞掉。
+      const snoozed = !isResend && !isEscalation && isSnoozedRow(schedule, occ);
+      const dedupeKey = snoozed
+        ? `sched:${schedule.id}:${occ.occurrence_key}@${occ.due_at}`
+        : `sched:${schedule.id}:${occ.occurrence_key}`;
       await services.publishProfile(schedule.profile_id, {
         kind: "schedule.reminder",
         title: schedule.title,
-        blocks: reminderBlocks(schedule, occ.event_at, note),
-        dedupeKey: `sched:${schedule.id}:${occ.occurrence_key}`,
+        blocks: reminderBlocks(schedule, occ.event_at, note, snoozed ? occ.due_at : undefined),
+        dedupeKey,
       });
       published += 1;
       db.prepare(

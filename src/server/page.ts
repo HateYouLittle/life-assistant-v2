@@ -100,7 +100,8 @@ const STYLE = `
   .mini .d { color: var(--teal); flex: none; font-size: 12px; }
   .mini li.more { color: var(--mute); font-size: 12px; }
 
-  .card.trend { margin-bottom: 14px; }
+  .card.trend, .card.jobs { margin-bottom: 14px; }
+  .card.jobs .tiny { margin-top: 10px; }
   .trend-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; flex-wrap: wrap; }
   .stats { display: flex; gap: 26px; margin-top: 12px; }
   .stat .n { font-size: 22px; font-weight: 600; letter-spacing: -.02em; line-height: 1.2; }
@@ -357,6 +358,23 @@ const SCRIPT = `
     el('spark-from').textContent = daily.length ? daily[0].label : '';
     el('spark-to').textContent = daily.length ? daily[daily.length - 1].label + ' 今天' : '';
 
+    // 定时任务：概览只回答「有没有任务在失败、最近一次跑在什么时候」，
+    // 逐个任务的最近运行放进抽屉（点开才拉 /api/jobs）。
+    var jobInfo = s.jobs || { total: 0, failed_24h: 0, runs: [] };
+    var jobRuns = jobInfo.runs || [];
+    el('job-stats').innerHTML =
+      '<div class="stat"><div class="n">' + jobInfo.total + '</div><div class="l">定时任务</div></div>' +
+      '<div class="stat"><div class="n ' + (jobInfo.failed_24h > 0 ? 'bad' : 'ok') + '">' + jobInfo.failed_24h +
+      '</div><div class="l">24 小时失败</div></div>';
+    var latestJob = null;
+    jobRuns.forEach(function (j) {
+      if (j.last_run && (latestJob === null || j.last_run.started_at > latestJob.started_at)) latestJob = j.last_run;
+    });
+    el('job-last').innerHTML = latestJob
+      ? '最近运行 ' + jobChip(latestJob.status) + ' · ' + esc(stampShort(latestJob.started_at)) +
+        (latestJob.error ? ' · <span class="bad">' + esc(String(latestJob.error).slice(0, 80)) + '</span>' : '')
+      : '<span class="muted">还没有运行记录</span>';
+
     el('ops').innerHTML =
       row('Profile', esc(s.profiles.join(' · ') || '暂无')) +
       row('账本', s.ledgers.total + ' 个活跃' + (s.ledgers.archived ? ' · ' + s.ledgers.archived + ' 个归档' : ' · 无归档')) +
@@ -376,6 +394,26 @@ const SCRIPT = `
   }
   function row(label, value) {
     return '<div class="ops-row"><span class="l">' + label + '</span><span class="v">' + value + '</span></div>';
+  }
+  /* job_runs 的时间戳是 UTC 瞬间（不是业务日历日）：按浏览器本地时区显示成 MM-dd HH:mm，
+     与 /api/* 里服务端本地化好的业务日期区分开；解析失败就原样截断，不猜。 */
+  function stampShort(iso) {
+    if (!iso) return '—';
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return String(iso).slice(0, 16).replace('T', ' ');
+    return ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2) + ' ' +
+      ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2);
+  }
+  function jobStatusLabel(status) {
+    return status === 'ok' ? '成功'
+      : status === 'failed' ? '失败'
+      : status === 'skipped' ? '跳过'
+      : status === 'running' ? '执行中'
+      : String(status);
+  }
+  function jobChip(status) {
+    var cls = status === 'ok' ? ' green' : status === 'failed' ? ' red' : status === 'skipped' ? ' amber' : '';
+    return '<span class="chip' + cls + '">' + esc(jobStatusLabel(status)) + '</span>';
   }
   /* cron 只渲染「分 时」都写死的常见形式（0 7 * * * → 07:00）；其余原样显示，不猜 */
   function cronTime(expr) {
@@ -630,6 +668,32 @@ const SCRIPT = `
     });
   }
 
+  function openJobs() {
+    openDrawer('jobs', '定时任务', function () {
+      api('/api/jobs').then(function (d) {
+        var items = d.items || [];
+        drawerSub.textContent = items.length + ' 个任务';
+        if (!items.length) { drawerBody.innerHTML = '<div class="empty">没有注册定时任务</div>'; return; }
+        drawerBody.innerHTML = '<div class="sect"><h3>任务与最近运行</h3><ul class="rowlist">' +
+          items.map(function (j) {
+            var r = j.last_run;
+            // 每个 job 展开最近 3 次运行：只看「最近一次」分不清「偶发失败」还是「一直失败」
+            var recent = (j.recent_runs || []).slice(0, 3).map(function (x) {
+              return jobChip(x.status) + ' ' + esc(stampShort(x.started_at));
+            });
+            return '<li><div class="top"><span class="t">' + esc(j.module + '.' + j.name) + '</span>' +
+              (r ? jobChip(r.status) : '<span class="chip">未运行</span>') + '</div>' +
+              '<div class="meta"><span>' + esc(j.cron) + '</span>' +
+              (j.next_run_hint ? '<span>' + esc(j.next_run_hint) + '</span>' : '') +
+              '<span>最近成功 ' + (j.last_ok_at ? esc(stampShort(j.last_ok_at)) : '从未') + '</span>' +
+              (j.failed_24h > 0 ? '<span class="bad">24h 失败 ' + j.failed_24h + ' 次</span>' : '') + '</div>' +
+              (recent.length ? '<div class="meta">' + recent.join(' · ') + '</div>' : '') +
+              (r && r.error ? '<div class="meta bad">' + esc(String(r.error).slice(0, 160)) + '</div>' : '') + '</li>';
+          }).join('') + '</ul></div>';
+      }).catch(fail);
+    });
+  }
+
   function openSystem() {
     openDrawer('system', '系统信息', function () {
       api('/api/status').then(function (s) {
@@ -648,7 +712,8 @@ const SCRIPT = `
           'GET <a href="#" data-api="/api/expenses" style="color:inherit">/api/expenses</a> · ' +
           'GET <a href="#" data-api="/api/schedules" style="color:inherit">/api/schedules</a> · ' +
           'GET <a href="#" data-api="/api/deliveries" style="color:inherit">/api/deliveries</a> · ' +
-          'GET <a href="#" data-api="/api/holidays" style="color:inherit">/api/holidays</a></div></div>';
+          'GET <a href="#" data-api="/api/holidays" style="color:inherit">/api/holidays</a> · ' +
+          'GET <a href="#" data-api="/api/jobs" style="color:inherit">/api/jobs</a></div></div>';
       }).catch(fail);
     });
   }
@@ -658,9 +723,10 @@ const SCRIPT = `
     schedules: openSchedules,
     deliveries: openDeliveries,
     holidays: openHolidays,
+    jobs: openJobs,
     system: openSystem
   };
-  var TITLES = { expenses: '支出明细', schedules: '日程明细', deliveries: '投递明细', holidays: '节假日明细', system: '系统信息' };
+  var TITLES = { expenses: '支出明细', schedules: '日程明细', deliveries: '投递明细', holidays: '节假日明细', jobs: '定时任务', system: '系统信息' };
 
   document.addEventListener('click', function (ev) {
     // 原始状态链接不能直接用 href：普通导航不会带 Authorization 头，配了 token
@@ -766,6 +832,12 @@ export function statusPage(version: string, nonce?: string): string {
         <div class="spark-axis"><span id="spark-from"></span><span id="spark-to"></span></div>
       </div>
     </div>
+  </section>
+
+  <section class="card jobs clickable" data-drawer="jobs" tabindex="0" role="button" aria-label="查看定时任务">
+    <div class="card-k">定时任务 <span class="chev">明细 ›</span></div>
+    <div class="stats" id="job-stats"></div>
+    <div class="tiny" id="job-last"></div>
   </section>
 
   <section class="card ops clickable" data-drawer="system" tabindex="0" role="button" aria-label="查看系统信息">

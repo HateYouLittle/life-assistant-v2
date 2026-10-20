@@ -2,6 +2,8 @@ import { DateTime } from "luxon";
 import type { DatabaseSync } from "node:sqlite";
 import { monthRange } from "../modules/bookkeeping/service.js";
 import { KIND_LABEL, parseEscalation, type ScheduleKind } from "../modules/schedule/service.js";
+import { allJobs, type JobDef } from "../core/registry.js";
+import { lastJobRun, recentJobRuns, type JobRunRow, type JobRunStatus } from "../core/jobs.js";
 import { withReadTransaction } from "../core/database.js";
 import { holidayPeriods } from "../core/holiday.js";
 import { TZ, todayIso } from "../time.js";
@@ -442,4 +444,138 @@ export function holidayDetails(db: DatabaseSync, rawYear: string | undefined): H
     days: days.map((d) => ({ ...d, weekday: weekdayLabel(d.date) })),
     upcoming,
   };
+}
+
+// ── 定时任务 ──────────────────────────────────────────────────────────────
+
+export interface JobRunSummary {
+  status: JobRunStatus;
+  /** UTC ISO；看板/client 自行按本地时区展示（这里是瞬间，不做服务端本地化） */
+  started_at: string;
+  finished_at: string | null;
+  error: string | null;
+}
+
+export interface JobDetailItem {
+  module: string;
+  name: string;
+  /** 与 daemon 注册时同一份求值结果（config 驱动的 cron 也能拿到当前值） */
+  cron: string;
+  last_run: JobRunSummary | null;
+  last_ok_at: string | null;
+  /** 人读的「大约什么时候跑」提示；无法从 cron 概括时省略（看板只显示 cron 原文） */
+  next_run_hint?: string;
+  /** 最近 24 小时内该 job 的失败次数 */
+  failed_24h: number;
+  /** 最近 24 小时内的失败记录（最多 3 条，新的在前） */
+  recent_failures: { started_at: string; error: string | null }[];
+  /** 最近几次运行（最多 3 条，新的在前）：抽屉里展开「每 job 的最近运行」 */
+  recent_runs: JobRunSummary[];
+}
+
+/**
+ * 定时任务明细（/api/jobs 与 /api/status 的 jobs 段共用）。
+ *
+ * 数据源是 `job_runs` 记录而不是 daemon 内存状态：状态页只能看到库，
+ * 而运行记录还包含「上次进程留下的失败」——正是需要曝光的那部分。
+ * 每个 job 取 4 条轻量查询（最近一次 / 最近成功 / 24h 失败数 / 最近几次），
+ * job 数量是个位数，没有必要为它写窗口函数。
+ */
+export function jobDetails(db: DatabaseSync, nowMs: number = Date.now()): JobDetailItem[] {
+  const since24h = new Date(nowMs - 24 * 3600 * 1000).toISOString();
+  const lastOkStmt = db.prepare(
+    "SELECT started_at FROM job_runs WHERE job_name = ? AND status = 'ok' ORDER BY started_at DESC, id DESC LIMIT 1",
+  );
+  const failedCountStmt = db.prepare(
+    "SELECT COUNT(*) AS n FROM job_runs WHERE job_name = ? AND status = 'failed' AND started_at >= ?",
+  );
+  const failuresStmt = db.prepare(
+    "SELECT started_at, error FROM job_runs WHERE job_name = ? AND status = 'failed' AND started_at >= ? ORDER BY started_at DESC, id DESC LIMIT 3",
+  );
+
+  const items: JobDetailItem[] = allJobs().map(({ module, def }) => {
+    const lastRun = lastJobRun(db, def.name);
+    const lastOk = lastOkStmt.get(def.name) as { started_at: string } | undefined;
+    const failed = failedCountStmt.get(def.name, since24h) as { n: number };
+    const recentFailures = failuresStmt.all(def.name, since24h) as {
+      started_at: string;
+      error: string | null;
+    }[];
+    const item: JobDetailItem = {
+      module,
+      name: def.name,
+      cron: jobCronExpr(def),
+      last_run: lastRun === undefined ? null : summarizeRun(lastRun),
+      last_ok_at: lastOk?.started_at ?? null,
+      failed_24h: failed.n,
+      recent_failures: recentFailures,
+      recent_runs: recentJobRuns(db, { jobName: def.name, limit: 3 }).map(summarizeRun),
+    };
+    const hint = nextRunHint(item.cron);
+    if (hint !== undefined) item.next_run_hint = hint;
+    return item;
+  });
+
+  // 按 module + name 排序：注册顺序会随模块 import 顺序变化，展示顺序必须稳定
+  return items.sort((a, b) =>
+    a.module === b.module ? a.name.localeCompare(b.name) : a.module.localeCompare(b.module),
+  );
+}
+
+function summarizeRun(row: JobRunRow): JobRunSummary {
+  return {
+    status: row.status,
+    started_at: row.started_at,
+    finished_at: row.finished_at,
+    error: row.error,
+  };
+}
+
+/** cron 表达式求值方式与 daemon 完全一致（函数形式从 config 惰性读取） */
+function jobCronExpr(def: JobDef): string {
+  try {
+    return typeof def.cron === "function" ? def.cron() : def.cron;
+  } catch {
+    // daemon 启动时已经校验过 cron；这里失败只可能是 runtime 尚未初始化（测试/工具）。
+    // 不能因此让整个状态页 500 —— 退回原样显示一个说明。
+    return "(当前无法求值)";
+  }
+}
+
+/**
+ * 把常见 cron 翻译成一眼能懂的短语（`每天 07:00` / `每 20 分钟`）。
+ * 只做展示提示，不改变任何调度语义；带日/月/星期限制的表达式返回 undefined，
+ * 前端就会原样显示 cron 原文 —— 不猜。
+ */
+function nextRunHint(expr: string): string | undefined {
+  if (expr.startsWith("(")) return undefined;
+  const parts = expr.trim().split(/\s+/);
+  if (parts.length !== 5) return undefined;
+  const [minute = "", hour = "", dom = "", month = "", dow = ""] = parts;
+  if (dom !== "*" || month !== "*" || dow !== "*") return undefined;
+
+  const minuteStep = /^\*\/(\d+)$/.exec(minute);
+  if (minuteStep !== null && hour === "*") {
+    const step = Number(minuteStep[1]);
+    if (Number.isInteger(step) && step >= 1 && step <= 59) {
+      return step === 1 ? "每分钟" : `每 ${step} 分钟`;
+    }
+    return undefined;
+  }
+  if (/^\d+$/.test(minute) && /^\d+$/.test(hour)) {
+    const m = Number(minute);
+    const h = Number(hour);
+    if (m <= 59 && h <= 23)
+      return `每天 ${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+    return undefined;
+  }
+  const hourStep = /^\*\/(\d+)$/.exec(hour);
+  if (hourStep !== null && /^\d+$/.test(minute)) {
+    const step = Number(hourStep[1]);
+    const m = Number(minute);
+    if (Number.isInteger(step) && step >= 1 && step <= 23 && m <= 59) {
+      return `每 ${step} 小时（第 ${m} 分）`;
+    }
+  }
+  return undefined;
 }

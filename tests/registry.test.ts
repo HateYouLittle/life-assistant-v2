@@ -98,10 +98,14 @@ describe("registry 契约", () => {
       "holiday.refresh",
       "holiday.workday_watch",
       "maintenance.daily_backup",
+      // 每日 WAL checkpoint（运维加固），与备份分开登记，便于状态页分辨失败来源
+      "maintenance.wal_checkpoint",
       "notify.retention",
       "schedule.occurrence_cleanup",
       "weather.alert_watch",
       "weather.daily_brief",
+      // 21:00 晚报（EVENING_BRIEF_CRON），与早报成对
+      "weather.evening_brief",
     ]);
     // 本文件前面注册过测试模块（m1/m2/m5…），因此只断言真实模块都在
     const moduleNames = new Set(getModules().map((m) => m.name));

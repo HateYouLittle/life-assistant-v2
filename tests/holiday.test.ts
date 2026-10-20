@@ -58,6 +58,43 @@ function payload2026(): HolidayYearPayload {
   return { year: 2026, days };
 }
 
+/**
+ * 与 payload2026 同构、但年份可任取的合成数据：ensureYears 的用例不能写死年份
+ * （否则测试在「未来年份」与「当前年份」之间随运行日期翻转结论）。
+ */
+function payloadForYear(year: number): HolidayYearPayload {
+  const md = (month: number, day: number): string =>
+    `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  const days: HolidayYearPayload["days"] = [];
+  const off = (name: string, dates: string[]): void => {
+    for (const date of dates) days.push({ name, date, isOffDay: true });
+  };
+  const work = (dates: string[]): void => {
+    for (const date of dates) days.push({ name: "调休", date, isOffDay: false });
+  };
+  off("元旦", [md(1, 1), md(1, 2), md(1, 3)]);
+  off(
+    "春节",
+    [1, 2, 3, 4, 5, 6, 7].map((day) => md(2, 14 + day)),
+  );
+  off("清明节", [md(4, 4), md(4, 5), md(4, 6)]);
+  off("劳动节", [md(5, 1), md(5, 2), md(5, 3), md(5, 4), md(5, 5)]);
+  off("端午节", [md(6, 19), md(6, 20), md(6, 21)]);
+  off("中秋节", [md(9, 25), md(9, 26), md(9, 27)]);
+  off("国庆节", [
+    md(10, 1),
+    md(10, 2),
+    md(10, 3),
+    md(10, 4),
+    md(10, 5),
+    md(10, 6),
+    md(10, 7),
+    md(10, 8),
+  ]);
+  work([md(2, 28), md(4, 26), md(10, 10)]);
+  return { year, days };
+}
+
 describe("节假日数据校验", () => {
   it("合成 2026 年数据通过校验", () => {
     assert.deepEqual(validateYearPayload(payload2026()), []);
@@ -360,25 +397,35 @@ describe("节假日导入与查询", () => {
 });
 
 describe("节假日抓取", () => {
-  it("ensureYears：成功导入、ready 跳过、失败冷却", async () => {
+  it("ensureYears：成功导入、ready 跳过、未来年份 404 记 pending 且 6h 冷却", async () => {
     const env = makeTestEnv();
     try {
+      const currentYear = Number(todayIso().slice(0, 4));
+      const futureYear = currentYear + 1;
+      let futureCalls = 0;
       const fetcher = async (url: string): Promise<unknown> => {
-        if (url.includes("2026")) return payload2026();
+        if (url.includes(String(currentYear))) return payloadForYear(currentYear);
+        futureCalls += 1;
         throw new Error("HTTP 404");
       };
-      const first = await ensureYears(env.db, [2026], fetcher);
-      assert.deepEqual(first.updated, [2026]);
+      const first = await ensureYears(env.db, [currentYear], fetcher);
+      assert.deepEqual(first.updated, [currentYear]);
 
-      const second = await ensureYears(env.db, [2026], fetcher);
+      const second = await ensureYears(env.db, [currentYear], fetcher);
       assert.deepEqual(second.updated, []);
-      assert.deepEqual(second.skipped, [2026]);
+      assert.deepEqual(second.skipped, [currentYear]);
 
-      const missing = await ensureYears(env.db, [2027], fetcher);
-      assert.equal(missing.failed.length, 1);
+      // 下一年数据尚未发布（404）：这是 pending，不是失败（旧实现会在这里报 1 条 failed）
+      const missing = await ensureYears(env.db, [futureYear], fetcher);
+      assert.deepEqual(missing.failed, [], "未来年份尚未发布不算失败");
+      const meta = env.db
+        .prepare("SELECT status FROM cn_holiday_years WHERE year = ?")
+        .get(futureYear) as { status: string };
+      assert.equal(meta.status, "pending");
 
-      const cooldown = await ensureYears(env.db, [2027], fetcher);
-      assert.deepEqual(cooldown.skipped, [2027], "6 小时冷却内不重试");
+      const cooldown = await ensureYears(env.db, [futureYear], fetcher);
+      assert.deepEqual(cooldown.skipped, [futureYear], "6 小时冷却内不重试（含 pending）");
+      assert.equal(futureCalls, 2, "两个候选 URL 各尝试一次后进入冷却");
     } finally {
       cleanupTestEnv(env);
     }

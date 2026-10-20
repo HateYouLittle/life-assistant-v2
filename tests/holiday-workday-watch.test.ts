@@ -273,16 +273,66 @@ describe("holiday workday_watch：多 Profile", () => {
       seed2026(env);
       addProfile(env, "a_bad");
       addProfile(env, "b_good");
-      // 坏掉的 push_route（非法 JSON）会让该 Profile 的 publishProfile 抛错
-      env.db
-        .prepare(
-          "INSERT INTO settings (profile_id, key, value_json, updated_at) VALUES ('a_bad', 'push_route', '{bad', ?)",
-        )
-        .run(new Date().toISOString());
+      // settings 的坏 JSON 已由 core/settings.ts 防御（按缺省值处理、不再抛错），
+      // 因此改用 SQLite 触发器注入「该 Profile 的通知写入必然失败」，继续验证隔离性。
+      env.db.exec(
+        `CREATE TRIGGER fail_notification_a_bad BEFORE INSERT ON notifications
+         WHEN NEW.profile_id = 'a_bad'
+         BEGIN SELECT RAISE(ABORT, 'injected notification failure'); END;`,
+      );
       await runWorkdayWatch();
       assert.equal(notifications(env, "a_bad").length, 0, "坏行 Profile 不应产生通知");
       assert.equal(notifications(env, "b_good").length, 1, "其它 Profile 不受影响");
       assert.equal(notifications(env, "default").length, 1);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
+describe("holiday workday_watch：补班提示的单一来源", () => {
+  /** 直接种一条今天的 weather.brief（真实 runDailyBrief 由 weather 模块的测试覆盖） */
+  function seedBrief(env: TestEnv, profileId = "default"): void {
+    env.db
+      .prepare(
+        `INSERT INTO notifications (id, profile_id, kind, title, body_md, blocks_json, dedupe_key, read, created_at)
+         VALUES (?, ?, 'weather.brief', '北京 每日简报', '', '{}', ?, 0, ?)`,
+      )
+      .run(
+        `brief-${profileId}`,
+        profileId,
+        `brief:${profileId}:北京:seed`,
+        new Date().toISOString(),
+      );
+  }
+
+  it("当天已有 weather.brief 也照常推补班通知（补班不再由早报承载）", async (t) => {
+    // 回归：曾经的修法是「早报已送达就跳过 holiday.workday」，但真实库时序证明
+    // workday_watch 总是先于 daily_brief 跑完，该判断在默认配置下永远为假。
+    // 现在补班文案只在本模块出现，早报是否存在都不应影响这条通知。
+    freeze(t, "2026-09-20");
+    const env = makeTestEnv();
+    try {
+      seed2026(env);
+      seedBrief(env);
+      await runWorkdayWatch();
+      const rows = notifications(env);
+      const workdays = rows.filter((row) => row.kind === "holiday.workday");
+      assert.equal(workdays.length, 1, "补班提醒只由调休模块发且只发一条");
+      assert.equal(workdays[0]?.dedupe_key, "holiday:workday:2026-09-20");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("同一天重复跑仍只落一条（dedupeKey 保持 holiday:workday:<date>）", async (t) => {
+    freeze(t, "2026-09-20");
+    const env = makeTestEnv();
+    try {
+      seed2026(env);
+      await runWorkdayWatch();
+      await runWorkdayWatch();
+      assert.equal(notifications(env).filter((r) => r.kind === "holiday.workday").length, 1);
     } finally {
       cleanupTestEnv(env);
     }

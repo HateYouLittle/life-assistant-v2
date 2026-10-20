@@ -19,6 +19,8 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
       - run: npm ci
+      # 生产依赖的已知漏洞零容忍：有 high/critical 直接失败（devDependencies 不参与）
+      - run: npm audit --omit=dev --audit-level=high
       - run: npm run typecheck
       - run: npm run lint
       - run: npm run format:check

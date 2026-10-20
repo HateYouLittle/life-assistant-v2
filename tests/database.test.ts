@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { readdirSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
+import { describe, it } from "node:test";
 import { bearerToken, isRequestAuthorized } from "../src/core/auth.js";
 import {
   getSchemaVersion,
@@ -8,17 +9,17 @@ import {
   withReadTransaction,
   withTransaction,
 } from "../src/core/database.js";
-import { getCache, pruneCache, setCache } from "../src/core/settings.js";
+import { getCache, getSetting, pruneCache, setCache } from "../src/core/settings.js";
 import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
 
-describe("database schema v3", () => {
+describe("database schema v4", () => {
   it("新库迁移到最新版本并可重复打开", () => {
     const env = makeTestEnv();
     try {
-      assert.equal(getSchemaVersion(env.db), 3);
+      assert.equal(getSchemaVersion(env.db), 4);
       env.db.close();
       const reopened = openDatabase(env.config.dbPath);
-      assert.equal(getSchemaVersion(reopened), 3);
+      assert.equal(getSchemaVersion(reopened), 4);
       reopened.close();
     } finally {
       cleanupTestEnv(env);
@@ -40,7 +41,7 @@ describe("database schema v3", () => {
 
       const upgraded = openDatabase(env.config.dbPath);
       try {
-        assert.equal(getSchemaVersion(upgraded), 3, "老库必须在启动时升级版本号");
+        assert.equal(getSchemaVersion(upgraded), 4, "老库必须在启动时升级版本号");
         const columns = (
           upgraded.prepare("PRAGMA table_info(deliveries)").all() as { name: string }[]
         ).map((c) => c.name);
@@ -49,9 +50,9 @@ describe("database schema v3", () => {
         upgraded.close();
       }
 
-      // 再次打开：已是 v3，迁移必须幂等（否则每次启动都会炸在重复 ALTER 上）
+      // 再次打开：已是 v4，迁移必须幂等（否则每次启动都会炸在重复 ALTER 上）
       const again = openDatabase(env.config.dbPath);
-      assert.equal(getSchemaVersion(again), 3);
+      assert.equal(getSchemaVersion(again), 4);
       again.close();
     } finally {
       cleanupTestEnv(env);
@@ -78,7 +79,7 @@ describe("database schema v3", () => {
 
       const upgraded = openDatabase(env.config.dbPath);
       try {
-        assert.equal(getSchemaVersion(upgraded), 3);
+        assert.equal(getSchemaVersion(upgraded), 4);
         const columns = (
           upgraded.prepare("PRAGMA table_info(ledgers)").all() as { name: string }[]
         ).map((c) => c.name);
@@ -257,9 +258,8 @@ describe("database schema v3", () => {
     }
   });
 
-  it("历史重名活动账本：唯一索引创建失败只告警，不拒绝启动", () => {
+  it("历史重名活动账本：拒绝启动并整笔回滚（索引是账本归属的唯一保障）", () => {
     const env = makeTestEnv();
-    let reopened: DatabaseSync | undefined;
     try {
       // 去掉索引后制造历史重名（模拟旧库脏数据）
       env.db.exec("DROP INDEX idx_ledgers_scoped_name");
@@ -270,11 +270,182 @@ describe("database schema v3", () => {
       insert.run("l2", "日用");
       env.db.close();
 
-      // 打不开就说明 best-effort 失效：历史脏数据不该让进程起不来
-      reopened = openDatabase(env.config.dbPath);
-      assert.equal(getSchemaVersion(reopened), 3);
+      // 缺分范围索引时同名家庭/个人账本可能串范围，宁可拒绝启动让人工核查
+      assert.throws(() => openDatabase(env.config.dbPath), /重名账本/);
+
+      // 失败必须整笔回滚：版本号不前进，也不会留下「旧索引已删、新索引没建」的半升级库
+      const raw = new DatabaseSync(env.config.dbPath);
+      try {
+        assert.equal(getSchemaVersion(raw), 4, "事务回滚后版本号不应变化");
+        const names = (
+          raw
+            .prepare(
+              "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_ledgers%'",
+            )
+            .all() as { name: string }[]
+        ).map((r) => r.name);
+        assert.deepEqual(names, [], "回滚后不应残留半建的索引");
+      } finally {
+        raw.close();
+      }
     } finally {
-      reopened?.close();
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("v3 老库升级到 v4：补 client_token 列并建分范围唯一索引", () => {
+    const env = makeTestEnv();
+    try {
+      env.db
+        .prepare(
+          "INSERT INTO ledgers (id, name, created_at) VALUES ('l1','家用','2026-01-01T00:00:00.000Z')",
+        )
+        .run();
+      env.db
+        .prepare(
+          "INSERT INTO expenses (id, ledger_id, amount_cents, spent_on, created_by_profile, created_at) VALUES ('e1','l1',100,'2026-09-01','default','2026-01-01T00:00:00.000Z')",
+        )
+        .run();
+      env.db.close();
+      // 还原成 v3 形状：摘索引 → 删列 → 版本号写回 3
+      const raw = new DatabaseSync(env.config.dbPath);
+      raw.exec("DROP INDEX IF EXISTS idx_expenses_client_token");
+      raw.exec("DROP INDEX IF EXISTS idx_schedules_client_token");
+      raw.exec("ALTER TABLE expenses DROP COLUMN client_token");
+      raw.exec("ALTER TABLE schedules DROP COLUMN client_token");
+      raw.prepare("UPDATE meta SET value = '3' WHERE key = 'schema_version'").run();
+      raw.close();
+
+      const upgraded = openDatabase(env.config.dbPath);
+      try {
+        assert.equal(getSchemaVersion(upgraded), 4);
+        const columnsOf = (table: string): string[] =>
+          (upgraded.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map(
+            (c) => c.name,
+          );
+        assert.ok(
+          columnsOf("expenses").includes("client_token"),
+          "缺列会让 expense add 的幂等重试直接报 no such column",
+        );
+        assert.ok(columnsOf("schedules").includes("client_token"));
+        const indexes = (
+          upgraded
+            .prepare(
+              "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE '%client_token'",
+            )
+            .all() as { name: string }[]
+        )
+          .map((r) => r.name)
+          .sort();
+        assert.deepEqual(indexes, ["idx_expenses_client_token", "idx_schedules_client_token"]);
+      } finally {
+        upgraded.close();
+      }
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("client_token 分范围唯一：同人重复被拒、跨人可重名、NULL 不参与约束", () => {
+    const env = makeTestEnv();
+    try {
+      env.db
+        .prepare(
+          "INSERT INTO ledgers (id, name, created_at) VALUES ('l1','家用','2026-01-01T00:00:00.000Z')",
+        )
+        .run();
+      const insertExpense = env.db.prepare(
+        "INSERT INTO expenses (id, ledger_id, amount_cents, spent_on, created_by_profile, created_at, client_token) VALUES (?, 'l1', 100, '2026-09-01', ?, '2026-01-01T00:00:00.000Z', ?)",
+      );
+      insertExpense.run("e1", "alice", "req-1");
+      assert.throws(() => insertExpense.run("e2", "alice", "req-1"), /UNIQUE/);
+      insertExpense.run("e3", "bob", "req-1");
+      insertExpense.run("e4", "alice", null);
+      insertExpense.run("e5", "alice", null);
+
+      const insertSchedule = env.db.prepare(
+        "INSERT INTO schedules (id, profile_id, title, created_at, updated_at, client_token) VALUES (?, 'default', '喝水', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', ?)",
+      );
+      insertSchedule.run("s1", "req-9");
+      assert.throws(() => insertSchedule.run("s2", "req-9"), /UNIQUE/);
+      insertSchedule.run("s3", null);
+      insertSchedule.run("s4", null);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("job_runs 记录表：可写入、status/trigger 非法值被 CHECK 拒绝", () => {
+    const env = makeTestEnv();
+    try {
+      const insert = env.db.prepare(
+        "INSERT INTO job_runs (job_name, module, trigger, scheduled_for, started_at, status) VALUES (?, ?, ?, ?, ?, ?)",
+      );
+      insert.run(
+        "daily_brief",
+        "weather",
+        "cron",
+        "2026-10-20T07:30:00.000+08:00",
+        "2026-10-20T07:30:01.000+08:00",
+        "ok",
+      );
+      assert.throws(
+        () =>
+          insert.run(
+            "daily_brief",
+            "weather",
+            "nope",
+            "2026-10-20T07:30:00.000+08:00",
+            "2026-10-20T07:30:01.000+08:00",
+            "ok",
+          ),
+        /CHECK/,
+      );
+      assert.throws(
+        () =>
+          insert.run(
+            "daily_brief",
+            "weather",
+            "cron",
+            "2026-10-20T07:30:00.000+08:00",
+            "2026-10-20T07:30:01.000+08:00",
+            "done",
+          ),
+        /CHECK/,
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("迁移前自动备份：v3 库升级前留一份可打开的 v3 快照，已是最新则不重复备份", () => {
+    const env = makeTestEnv();
+    try {
+      env.db.close();
+      const raw = new DatabaseSync(env.config.dbPath);
+      raw.prepare("UPDATE meta SET value = '3' WHERE key = 'schema_version'").run();
+      raw.close();
+
+      const upgraded = openDatabase(env.config.dbPath, { backupDir: env.config.backupDir });
+      upgraded.close();
+      const names = readdirSync(env.config.backupDir).filter((f) => f.includes("-pre-v3-"));
+      assert.equal(names.length, 1, "升级前必须恰好留一份 pre-v3 快照");
+      const snapshot = new DatabaseSync(`${env.config.backupDir}/${names[0] as string}`);
+      try {
+        assert.equal(getSchemaVersion(snapshot), 3, "快照必须是升级前的版本");
+      } finally {
+        snapshot.close();
+      }
+
+      // 已是最新版本：不再产生新的 pre-v 快照
+      const again = openDatabase(env.config.dbPath, { backupDir: env.config.backupDir });
+      again.close();
+      assert.equal(
+        readdirSync(env.config.backupDir).filter((f) => f.includes("-pre-v")).length,
+        1,
+        "已是最新 version 时不应重复备份",
+      );
+    } finally {
       cleanupTestEnv(env);
     }
   });
@@ -407,6 +578,49 @@ describe("database schema v3", () => {
       raw.prepare("UPDATE meta SET value = '99' WHERE key = 'schema_version'").run();
       raw.close();
       assert.throws(() => openDatabase(env.config.dbPath), /高于/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
+describe("settings / cache 坏 JSON 防御", () => {
+  it("getSetting 遇到坏 JSON 返回 undefined，而不是让整轮 outbox 停摆", () => {
+    const env = makeTestEnv();
+    try {
+      // notify 的静默时段读取走 getSetting：一条坏行曾会让 drainDue 每轮抛异常，
+      // 所有排队的投递永远发不出去（日志里只有重复的 JSON.parse 报错）。
+      env.db
+        .prepare(
+          "INSERT INTO settings (profile_id, key, value_json, updated_at) VALUES ('default','quiet_hours','{\"start\":', '2026-01-01T00:00:00.000Z')",
+        )
+        .run();
+      assert.equal(getSetting(env.db, "default", "quiet_hours"), undefined);
+      assert.equal(getSetting(env.db, "default", "not-exist"), undefined);
+      // 正常行仍然可读
+      env.db
+        .prepare(
+          'UPDATE settings SET value_json = \'{"start":"22:00","end":"08:00"}\' WHERE key = \'quiet_hours\'',
+        )
+        .run();
+      assert.deepEqual(getSetting(env.db, "default", "quiet_hours"), {
+        start: "22:00",
+        end: "08:00",
+      });
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("getCache 遇到坏 JSON 按缓存未命中处理（调用方会重新抓取）", () => {
+    const env = makeTestEnv();
+    try {
+      env.db
+        .prepare(
+          "INSERT INTO cache (key, value_json, expires_at) VALUES ('qweather:now', 'not-json', '2999-01-01T00:00:00.000Z')",
+        )
+        .run();
+      assert.equal(getCache(env.db, "qweather:now"), undefined);
     } finally {
       cleanupTestEnv(env);
     }

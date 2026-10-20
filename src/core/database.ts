@@ -1,9 +1,16 @@
 import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { DateTime } from "luxon";
+import { TZ } from "../time.js";
 import { logger } from "./logger.js";
 
-export const SCHEMA_VERSION = 3;
+/**
+ * v4 新增：job_runs 运行记录表、expenses/schedules.client_token（写路径幂等键）。
+ * 迁移前必须先备份：openDatabase 传了 backupDir 时会 VACUUM INTO 一份
+ * `life-assistant-pre-v<旧版本>-<时间戳>.db`，失败则拒绝启动（宁可停，不带病改库）。
+ */
+export const SCHEMA_VERSION = 4;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -37,6 +44,24 @@ CREATE TABLE IF NOT EXISTS qweather_usage (
   requests INTEGER NOT NULL CHECK (requests >= 0)
 ) STRICT;
 
+-- 定时任务运行记录：每次 job 执行一行（cron / startup / catchup / manual）。
+-- 用途：① 启动补发判定「这个 job 自上次成功后是否又该跑了」；② /api/jobs 与状态页
+-- 「定时任务」卡片；③ doctor --live 判断推送是否真的在跑。只增不改（除 finish 回填），
+-- 由保留策略按天数清理（core/retention.ts）。
+CREATE TABLE IF NOT EXISTS job_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_name TEXT NOT NULL,
+  module TEXT NOT NULL,
+  trigger TEXT NOT NULL CHECK (trigger IN ('cron','startup','catchup','manual')),
+  scheduled_for TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  status TEXT NOT NULL CHECK (status IN ('running','ok','failed','skipped')),
+  error TEXT
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_job_runs_started ON job_runs(started_at);
+CREATE INDEX IF NOT EXISTS idx_job_runs_name ON job_runs(job_name, started_at DESC);
+
 CREATE TABLE IF NOT EXISTS ledgers (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -55,7 +80,10 @@ CREATE TABLE IF NOT EXISTS expenses (
   note TEXT,
   spent_on TEXT NOT NULL,
   created_by_profile TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  -- 写路径幂等键（可选）：客户端重试时带同一个 token，服务端返回原记录而不是再记一笔。
+  -- 唯一性按 (created_by_profile, client_token) 分范围，见 migrate 的 ensureClientTokenIndexes。
+  client_token TEXT
 ) STRICT;
 CREATE INDEX IF NOT EXISTS idx_expenses_ledger_date ON expenses(ledger_id, spent_on);
 CREATE INDEX IF NOT EXISTS idx_expenses_category ON expenses(ledger_id, category);
@@ -95,7 +123,10 @@ CREATE TABLE IF NOT EXISTS schedules (
   next_run_at TEXT,
   version INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  -- 写路径幂等键（可选）：MCP 超时重试时带同一个 token，不会建出两条日程。
+  -- 唯一性按 (profile_id, client_token) 分范围，见 migrate 的 ensureClientTokenIndexes。
+  client_token TEXT
 ) STRICT;
 CREATE INDEX IF NOT EXISTS idx_schedules_profile ON schedules(profile_id, status);
 
@@ -152,6 +183,9 @@ CREATE TABLE IF NOT EXISTS deliveries (
   updated_at TEXT NOT NULL
 ) STRICT;
 CREATE INDEX IF NOT EXISTS idx_deliveries_due ON deliveries(status, next_attempt_at);
+-- 保留策略的通知级联删除、状态页按通知 JOIN 都会按 notification_id 过滤；
+-- 缺这个索引时每次级联都是全表扫。
+CREATE INDEX IF NOT EXISTS idx_deliveries_notification ON deliveries(notification_id);
 
 CREATE TABLE IF NOT EXISTS cn_holiday_days (
   date TEXT PRIMARY KEY,
@@ -173,13 +207,67 @@ CREATE TABLE IF NOT EXISTS cn_holiday_years (
 ) STRICT;
 `;
 
-export function openDatabase(dbPath: string): DatabaseSync {
+export interface OpenDatabaseOptions {
+  /**
+   * 迁移前备份目录（daemon 传 config.backupDir）。不传 = 不备份（测试/一次性工具）。
+   * 升级 schema 属于「改既有数据」的动作：先落一份 VACUUM INTO 快照，失败就拒绝启动。
+   */
+  backupDir?: string;
+}
+
+/**
+ * schema 需要前滚时先备份。用同一个连接做 VACUUM INTO：拿到的是与主库一致的快照，
+ * 且不受并发 writer 影响（VACUUM 会等待写锁，busy_timeout 已设 5s）。
+ * 已是最新版本 / 全新库（meta 还没建）直接返回。
+ */
+function backupBeforeMigration(
+  db: DatabaseSync,
+  backupDir: string | undefined,
+  dbPath: string,
+): void {
+  let stored: number | undefined;
+  try {
+    const row = db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as
+      | { value: string }
+      | undefined;
+    if (row !== undefined) {
+      const parsed = Number(row.value);
+      stored = Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+    }
+  } catch {
+    // 全新库：meta 表还不存在，没有可备份的数据
+    return;
+  }
+  if (stored === undefined || stored >= SCHEMA_VERSION) return;
+  if (backupDir === undefined) {
+    logger.warn(
+      `数据库 schema v${stored} 需要升级到 v${SCHEMA_VERSION}，但未提供备份目录，已跳过迁移前备份`,
+    );
+    return;
+  }
+  mkdirSync(backupDir, { recursive: true });
+  const stamp = DateTime.fromMillis(Date.now(), { zone: TZ }).toFormat("yyyyMMdd-HHmmss");
+  const target = join(backupDir, `life-assistant-pre-v${stored}-${stamp}.db`);
+  try {
+    db.prepare("VACUUM INTO ?").run(target);
+  } catch (e) {
+    throw new Error(
+      `迁移前备份失败，拒绝升级 schema（数据库未改动）: ${dbPath} -> ${target}: ${
+        e instanceof Error ? e.message : String(e)
+      }`,
+    );
+  }
+  logger.info(`迁移前已备份 schema v${stored} 数据库: ${target}`);
+}
+
+export function openDatabase(dbPath: string, opts: OpenDatabaseOptions = {}): DatabaseSync {
   mkdirSync(dirname(dbPath), { recursive: true });
   const db = new DatabaseSync(dbPath);
   try {
     db.exec("PRAGMA journal_mode = WAL");
     db.exec("PRAGMA foreign_keys = ON");
     db.exec("PRAGMA busy_timeout = 5000");
+    backupBeforeMigration(db, opts.backupDir, dbPath);
     migrate(db);
   } catch (e) {
     db.close();
@@ -202,7 +290,10 @@ function addColumnIfMissing(db: DatabaseSync, table: string, column: string, typ
  *
  * 必须在 owner_profile_id 补列之后调用（v1/v2 老库此时才有该列）；旧的全局唯一索引
  * `idx_ledgers_active_name` 必须显式 DROP —— 否则它仍在暗中强制全局唯一，与本语义冲突。
- * best-effort：历史库若已存在同范围重名，建索引会失败；只告警、不拒绝启动。
+ *
+ * 失败不再只是告警：本索引是「不同人可建同名个人账本」语义的唯一保障，缺了它
+ * 应用层仍会按名字查找账本，可能出现跨范围重名导致的串账。历史库若真有同范围重名，
+ * 拒绝启动并让用户人工核查（由 migrate 的调用方关库抛错）。
  */
 function ensureLedgerNameIndex(db: DatabaseSync): void {
   try {
@@ -211,10 +302,26 @@ function ensureLedgerNameIndex(db: DatabaseSync): void {
       "CREATE UNIQUE INDEX IF NOT EXISTS idx_ledgers_scoped_name ON ledgers(name, COALESCE(owner_profile_id, '')) WHERE archived_at IS NULL",
     );
   } catch (e) {
-    logger.warn(
-      `未能创建活动账本名唯一索引（可能存在历史同范围重名账本，请人工核查后重试）: ${String(e)}`,
+    throw new Error(
+      `活动账本名唯一索引创建失败（可能存在同范围重名账本，请核查 ledgers 表后重试）: ${
+        e instanceof Error ? e.message : String(e)
+      }`,
     );
   }
+}
+
+/**
+ * 写路径幂等键的分范围唯一索引：同一 Profile（日程）/同一创建人（支出）内 token 唯一，
+ * 不同人可重复（各自的请求 id 撞车不该互相抑制）。NULL 不参与约束 —— 历史行没有 token。
+ * 依赖 client_token 补列，必须在 v3→v4 之后调用；与 ensureLedgerNameIndex 同理不提升版本号。
+ */
+function ensureClientTokenIndexes(db: DatabaseSync): void {
+  db.exec(
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_expenses_client_token ON expenses(created_by_profile, client_token) WHERE client_token IS NOT NULL",
+  );
+  db.exec(
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_schedules_client_token ON schedules(profile_id, client_token) WHERE client_token IS NOT NULL",
+  );
 }
 
 /**
@@ -241,51 +348,66 @@ function migrateLegacyQweatherUsage(db: DatabaseSync): void {
 }
 
 export function migrate(db: DatabaseSync): void {
-  db.exec(DDL);
-  const row = db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as
-    | { value: string }
-    | undefined;
-  let stored: number;
-  if (row === undefined) {
-    db.prepare("INSERT INTO meta (key, value) VALUES ('schema_version', ?)").run(
-      String(SCHEMA_VERSION),
-    );
-    stored = SCHEMA_VERSION;
-  } else {
-    const parsed = Number(row.value);
-    if (!Number.isInteger(parsed) || parsed < 1) {
-      throw new Error(`数据库 schema 版本不合法: ${row.value}，拒绝启动`);
+  let from = 0;
+  // DDL + 逐级升级 + 幂等补列/索引在同一个事务里：要么整库升到目标版本，要么完全不动。
+  // 旧实现分步执行，中途失败（磁盘满/并发写/CHECK 冲突）会留下「版本号已前滚、列还没补」
+  // 的半升级状态，只能人工修库。SQLite 的 DDL 本身是事务性的，没有理由不包起来。
+  withTransaction(db, () => {
+    db.exec(DDL);
+    const row = db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as
+      | { value: string }
+      | undefined;
+    let stored: number;
+    if (row === undefined) {
+      db.prepare("INSERT INTO meta (key, value) VALUES ('schema_version', ?)").run(
+        String(SCHEMA_VERSION),
+      );
+      stored = SCHEMA_VERSION;
+    } else {
+      const parsed = Number(row.value);
+      if (!Number.isInteger(parsed) || parsed < 1) {
+        throw new Error(`数据库 schema 版本不合法: ${row.value}，拒绝启动`);
+      }
+      if (parsed > SCHEMA_VERSION) {
+        throw new Error(`数据库 schema 版本 ${parsed} 高于程序支持的 ${SCHEMA_VERSION}，拒绝启动`);
+      }
+      stored = parsed;
     }
-    if (parsed > SCHEMA_VERSION) {
-      throw new Error(`数据库 schema 版本 ${parsed} 高于程序支持的 ${SCHEMA_VERSION}，拒绝启动`);
+    from = stored;
+    // 逐级升级（附加式）：只加列/加表，不动既有数据；中途失败回滚整笔事务并拒绝启动
+    let version = stored;
+    if (version === 1) {
+      addColumnIfMissing(db, "deliveries", "expire_at", "TEXT");
+      version = 2;
     }
-    stored = parsed;
-  }
-  // 逐级升级（附加式）：只加列/加表，不动既有数据；中途失败会抛出，由调用方关库拒绝启动
-  let version = stored;
-  if (version === 1) {
-    addColumnIfMissing(db, "deliveries", "expire_at", "TEXT");
-    version = 2;
-  }
-  if (version === 2) {
-    // 账本归属：老库所有既有账本补 owner_profile_id = NULL，视为家庭账本，行为不变。
-    addColumnIfMissing(db, "ledgers", "owner_profile_id", "TEXT");
-    version = 3;
-  }
-  if (version !== stored) {
-    db.prepare("UPDATE meta SET value = ? WHERE key = 'schema_version'").run(String(version));
-    logger.info(`数据库 schema 已从 v${stored} 升级到 v${version}`);
-  }
-  // 幂等补列：老库（含 v2）补 schedules.escalation_json；新库由 DDL 直接建出。
-  // 不提升 SCHEMA_VERSION、不重建 schedules（kind 有 CHECK，重建会牵动 occurrences 外键）。
-  addColumnIfMissing(db, "schedules", "escalation_json", "TEXT");
-  // 同理补 deliveries.deterministic_reject（纯附加列，默认 0 = 非确定性拒绝，
-  // 与升级前「所有 fallback 行都可重投」的既有行为一致，老数据不会被静默改语义）。
-  addColumnIfMissing(db, "deliveries", "deterministic_reject", "INTEGER NOT NULL DEFAULT 0");
-  // 索引依赖 owner_profile_id：必须放在上面的补列之后
-  ensureLedgerNameIndex(db);
-  // 用量从 cache 迁到独立表（一次性；幂等）
-  migrateLegacyQweatherUsage(db);
+    if (version === 2) {
+      // 账本归属：老库所有既有账本补 owner_profile_id = NULL，视为家庭账本，行为不变。
+      addColumnIfMissing(db, "ledgers", "owner_profile_id", "TEXT");
+      version = 3;
+    }
+    if (version === 3) {
+      // 写路径幂等键（P1-12c）：同一 Profile / 同一创建人内唯一，NULL 不参与约束
+      addColumnIfMissing(db, "expenses", "client_token", "TEXT");
+      addColumnIfMissing(db, "schedules", "client_token", "TEXT");
+      version = 4;
+    }
+    if (version !== stored) {
+      db.prepare("UPDATE meta SET value = ? WHERE key = 'schema_version'").run(String(version));
+    }
+    // 幂等补列：老库（含 v2）补 schedules.escalation_json；新库由 DDL 直接建出。
+    // 不提升 SCHEMA_VERSION、不重建 schedules（kind 有 CHECK，重建会牵动 occurrences 外键）。
+    addColumnIfMissing(db, "schedules", "escalation_json", "TEXT");
+    // 同理补 deliveries.deterministic_reject（纯附加列，默认 0 = 非确定性拒绝，
+    // 与升级前「所有 fallback 行都可重投」的既有行为一致，老数据不会被静默改语义）。
+    addColumnIfMissing(db, "deliveries", "deterministic_reject", "INTEGER NOT NULL DEFAULT 0");
+    // 索引依赖上面补的列：必须放在补列之后
+    ensureLedgerNameIndex(db);
+    ensureClientTokenIndexes(db);
+    // 用量从 cache 迁到独立表（一次性；幂等）
+    migrateLegacyQweatherUsage(db);
+  });
+  const to = getSchemaVersion(db);
+  if (to !== from) logger.info(`数据库 schema 已从 v${from} 升级到 v${to}`);
 }
 
 export function getSchemaVersion(db: DatabaseSync): number {

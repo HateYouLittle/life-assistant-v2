@@ -1,10 +1,20 @@
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { MIN_TOKEN_LENGTH, isLoopbackHost, loadConfig, type ResolvedConfig } from "./config.js";
-import { SCHEMA_VERSION, getSchemaVersion, openDatabase } from "./core/database.js";
+import type { DateTime } from "luxon";
+import {
+  isLoopbackHost,
+  loadConfig,
+  MIN_TOKEN_LENGTH,
+  type ResolvedConfig,
+  urlHost,
+} from "./config.js";
+import { BACKUP_STALE_HOURS, backupStatus } from "./core/backup.js";
+import { getSchemaVersion, openDatabase, SCHEMA_VERSION } from "./core/database.js";
 import { holidaySourceUrls, requiredYears } from "./core/holiday.js";
 import { fetchJson } from "./core/http.js";
+import { CATCHUP_POLICY, previousFireTime } from "./core/jobs.js";
 import { loadEd25519PrivateKey } from "./core/qweather-jwt.js";
+import { now } from "./time.js";
 
 /**
  * `npm run doctor`：把「启动能过、第一次用到才炸」的配置问题提前暴露出来。
@@ -61,7 +71,9 @@ function checkDatabase(config: ResolvedConfig): CheckResult[] {
     return [warn(name, `${config.dbPath} 还不存在（首次启动会创建）`)];
   }
   try {
-    const db = openDatabase(config.dbPath);
+    // 与 daemon 共用同一入口：需要 schema 升级时先备份（doctor 是「第一次启动前」最常跑的动作，
+    // 不传 backupDir 会让这次升级失去迁移前快照）。
+    const db = openDatabase(config.dbPath, { backupDir: config.backupDir });
     try {
       const integrity = db.prepare("PRAGMA quick_check").get() as
         | { quick_check?: string }
@@ -166,6 +178,240 @@ function checkBackups(config: ResolvedConfig): CheckResult {
     : ok(name, `${files.length} 份，最近一份在 ${days.toFixed(2)} 天前`);
 }
 
+// ── --live：检查运行中的 daemon ────────────────────────────────────────────
+
+/** live 请求超时：daemon 就在本机，3 秒连不上就该快速报「不可达」，不能拖住自检 */
+const LIVE_TIMEOUT_MS = 3000;
+
+/**
+ * 需要看「新鲜度」的任务（键与 `CATCHUP_POLICY` 同源）。
+ * 只挑用户能感知到的推送/备份任务：清理类任务晚跑一天不会有人发现，
+ * 把它们也列进来只会让自检变长。
+ */
+const LIVE_FRESHNESS_KEYS = [
+  "weather.daily_brief",
+  "weather.evening_brief",
+  "weather.alert_watch",
+  "holiday.workday_watch",
+  "maintenance.daily_backup",
+] as const;
+
+interface LiveJobItem {
+  module: string;
+  name: string;
+  cron: string;
+  last_ok_at: string | null;
+  last_run: { status: string; started_at: string } | null;
+  failed_24h: number;
+}
+
+/** 请求运行中 daemon 的 JSON 端点；非 2xx 一律当失败（401 给出可操作提示） */
+async function fetchLiveJson<T>(url: string, token: string | undefined): Promise<T> {
+  const headers: Record<string, string> = {};
+  if (token !== undefined) headers.Authorization = `Bearer ${token}`;
+  const response = await fetch(url, {
+    headers,
+    signal: AbortSignal.timeout(LIVE_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    throw new Error(
+      response.status === 401
+        ? "HTTP 401（WEB_API_TOKEN 与 daemon 不一致？）"
+        : `HTTP ${response.status}`,
+    );
+  }
+  return (await response.json()) as T;
+}
+
+function liveBaseUrl(config: ResolvedConfig): string {
+  return `http://${urlHost(config.host)}:${config.port}`;
+}
+
+function hoursText(hours: number): string {
+  if (hours < 1) return `${Math.max(1, Math.round(hours * 60))} 分钟`;
+  if (hours < 48) return `${hours.toFixed(1)} 小时`;
+  return `${(hours / 24).toFixed(1)} 天`;
+}
+
+function bytesText(bytes: number): string {
+  if (bytes <= 0) return "0 B";
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * 任务新鲜度：每个关键 job 的 `last_ok_at` 是否落在补发窗口的 2 倍内。
+ * 用 `/api/jobs` 而不是直接查库 —— 自检要和状态页看到的是同一份事实，
+ * 也能顺带验证鉴权与 HTTP 通路。
+ *
+ * 「缺 job」「cron 无法反向求值」「尚无成功记录」只 warn：前两者可能是版本不一致或用户
+ * 自定义了带星期限制的 cron；后者在升级/首次部署后的第一天必然出现（job_runs 是 v4 才有的
+ * 新表），把它判成故障等于每次升级都报一次假警。真正能断定「任务停摆」的是「有成功记录
+ * 但已超出窗口 2 倍」——那条才 fail。
+ */
+function checkJobFreshness(items: LiveJobItem[], at: DateTime): CheckResult[] {
+  const byKey = new Map(items.map((item) => [`${item.module}.${item.name}`, item]));
+  const results: CheckResult[] = [];
+  for (const key of LIVE_FRESHNESS_KEYS) {
+    const name = `任务新鲜度：${key}`;
+    const withinHours = CATCHUP_POLICY[key];
+    if (withinHours === undefined) {
+      results.push(warn(name, "没有补发窗口配置，无法判断新鲜度"));
+      continue;
+    }
+    const item = byKey.get(key);
+    if (item === undefined) {
+      results.push(warn(name, "daemon 未注册该任务（程序版本不一致？）"));
+      continue;
+    }
+    if (previousFireTime(item.cron, at) === null) {
+      results.push(
+        warn(name, `cron "${item.cron}" 无法反向求值（仅支持日/月/星期为 *），不能判断是否新鲜`),
+      );
+      continue;
+    }
+    const limitHours = withinHours * 2;
+    if (item.last_ok_at === null) {
+      results.push(
+        warn(
+          name,
+          `尚无成功运行记录（cron "${item.cron}"）：升级/首次启动后属正常，等下一次触发即可；` +
+            "若持续如此再看日志或手动触发一次",
+        ),
+      );
+      continue;
+    }
+    const ageHours = (at.toMillis() - Date.parse(item.last_ok_at)) / 3_600_000;
+    if (!Number.isFinite(ageHours)) {
+      results.push(warn(name, `last_ok_at 不是合法时间：${item.last_ok_at}`));
+      continue;
+    }
+    const age = Math.max(0, ageHours);
+    const detail = `${hoursText(age)}前成功（cron "${item.cron}"，阈值 ${limitHours} 小时）`;
+    results.push(
+      age <= limitHours
+        ? ok(name, detail)
+        : fail(name, `${detail}：检查 daemon 是否长期未运行、或该任务是否一直失败`),
+    );
+  }
+  return results;
+}
+
+/**
+ * 备份新鲜度：`backupStatus` 是 daemon 备份 job 与 `db:restore` 共用的只读口径。
+ * 超过 BACKUP_STALE_HOURS（36h）warn；超过一周 fail（每日 job 不可能连续 7 天都没跑成）。
+ */
+function checkLiveBackup(config: ResolvedConfig): CheckResult[] {
+  const name = "备份新鲜度";
+  const status = backupStatus(config);
+  const results: CheckResult[] = [];
+  const canonical = status.files.filter((file) => file.canonical);
+  if (status.latest === null) {
+    results.push(
+      warn(
+        name,
+        `还没有规范备份（${status.dir}）：daemon 的每日备份 job（BACKUP_CRON=${config.backupCron}）首次成功后才会生成；立即备份用 npm run db:backup`,
+      ),
+    );
+  } else {
+    const age = status.ageHours ?? 0;
+    const detail = `${canonical.length} 份规范备份，最新 ${status.latest.name}（${hoursText(age)}前，${bytesText(status.latest.sizeBytes)}）`;
+    if (age > BACKUP_STALE_HOURS * 7) {
+      results.push(fail(name, `${detail}：超过一周没有新备份，daemon 很可能没在运行`));
+    } else if (age > BACKUP_STALE_HOURS) {
+      results.push(
+        warn(
+          name,
+          `${detail}：超过 ${BACKUP_STALE_HOURS} 小时（BACKUP_CRON=${config.backupCron}），检查 daemon 是否在运行、日志搜「每日备份」`,
+        ),
+      );
+    } else {
+      results.push(ok(name, detail));
+    }
+  }
+  if (status.nonCanonical.length > 0) {
+    results.push(
+      warn(
+        "备份文件命名",
+        `${status.nonCanonical.length} 个文件不符合规范命名（迁移前快照/恢复留底/手工拷贝？）：${status.nonCanonical
+          .slice(0, 5)
+          .join(
+            "、",
+          )}${status.nonCanonical.length > 5 ? " 等" : ""}；它们不会被保留策略清理，也不会被「恢复最新备份」选中`,
+      ),
+    );
+  }
+  return results;
+}
+
+/**
+ * `doctor --live`：检查运行中的 daemon。默认关闭，避免未启动/内网环境下自检卡住
+ * （与 `--network` 同一取舍）。三项检查各自独立：daemon 不可达时仍会检查备份目录。
+ */
+async function checkLive(config: ResolvedConfig): Promise<CheckResult[]> {
+  const results: CheckResult[] = [];
+  const base = liveBaseUrl(config);
+  const token = config.webApiToken;
+
+  let alive = false;
+  try {
+    const health = await fetchLiveJson<{ ok?: boolean; version?: string; uptime_s?: number }>(
+      `${base}/healthz`,
+      undefined,
+    );
+    alive = health.ok === true;
+    results.push(
+      alive
+        ? ok(
+            "daemon 存活",
+            `${base}/healthz 正常（v${health.version ?? "?"}，已运行 ${hoursText((health.uptime_s ?? 0) / 3600)}）`,
+          )
+        : fail("daemon 存活", `${base}/healthz 返回 ok=false：进程在，但数据库不可用`),
+    );
+  } catch (e) {
+    results.push(
+      fail("daemon 存活", `${base} 不可达：${e instanceof Error ? e.message : String(e)}`),
+    );
+  }
+
+  if (alive) {
+    // /api/status 主要用来确认鉴权通路：配了 WEB_API_TOKEN 时最容易在这里与 daemon 对不上
+    try {
+      await fetchLiveJson<{ ok?: boolean }>(`${base}/api/status`, token);
+      results.push(
+        ok(
+          "只读 API",
+          `/api/status 可读（${token === undefined ? "未启用 token" : "Bearer 鉴权通过"}）`,
+        ),
+      );
+    } catch (e) {
+      results.push(
+        warn(
+          "只读 API",
+          `/api/status 读取失败：${
+            e instanceof Error ? e.message : String(e)
+          }（检查本机 .env 的 WEB_API_TOKEN 是否与 daemon 一致）`,
+        ),
+      );
+    }
+    try {
+      const jobs = await fetchLiveJson<{ items?: LiveJobItem[] }>(`${base}/api/jobs`, token);
+      results.push(...checkJobFreshness(jobs.items ?? [], now()));
+    } catch (e) {
+      results.push(
+        fail("任务新鲜度", `读取 /api/jobs 失败：${e instanceof Error ? e.message : String(e)}`),
+      );
+    }
+  } else {
+    // 后续检查都依赖 /api/*：daemon 没起来时重复报同一件事只会淹没第一因
+    results.push(warn("任务新鲜度", "daemon 未存活，无法检查任务新鲜度"));
+  }
+
+  // 备份检查直接读备份目录，不依赖 daemon：daemon 挂了更要知道备份还新不新
+  results.push(...checkLiveBackup(config));
+  return results;
+}
+
 async function checkNetwork(config: ResolvedConfig): Promise<CheckResult[]> {
   const results: CheckResult[] = [];
 
@@ -212,7 +458,7 @@ async function checkNetwork(config: ResolvedConfig): Promise<CheckResult[]> {
 
 export async function runDoctor(
   env: NodeJS.ProcessEnv = process.env,
-  opts: { network?: boolean } = {},
+  opts: { network?: boolean; live?: boolean } = {},
 ): Promise<DoctorReport> {
   const checks: CheckResult[] = [];
   let config: ResolvedConfig;
@@ -229,6 +475,10 @@ export async function runDoctor(
   checks.push(checkAuth(config));
   checks.push(checkQweather(config, env));
   checks.push(checkBackups(config));
+  // 默认不碰网络：`--live` 才会连本机 daemon（未启动/内网环境下自检不能卡住）
+  if (opts.live === true) {
+    checks.push(...(await checkLive(config)));
+  }
   if (opts.network === true) {
     checks.push(...(await checkNetwork(config)));
   }
@@ -242,8 +492,10 @@ export async function runDoctor(
 const ICON: Record<CheckLevel, string> = { ok: "✅", warn: "⚠️ ", fail: "❌" };
 
 function main(): void {
-  const network = process.argv.slice(2).includes("--network");
-  runDoctor(process.env, { network })
+  const args = process.argv.slice(2);
+  const network = args.includes("--network");
+  const live = args.includes("--live");
+  runDoctor(process.env, { network, live })
     .then((report) => {
       console.log("Life Assistant 自检\n");
       for (const check of report.checks) {
@@ -255,6 +507,9 @@ function main(): void {
       if (report.failed > 0) {
         console.log("有失败项：按上面的提示修正后重跑 `npm run doctor`。");
         process.exitCode = 1;
+      }
+      if (!live) {
+        console.log("（加 --live 可检查运行中的 daemon：任务新鲜度、备份新鲜度）");
       }
       if (!network) console.log("（加 --network 可一并检查 QWeather 与节假日数据源的连通性）");
     })

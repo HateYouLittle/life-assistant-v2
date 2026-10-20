@@ -4,8 +4,11 @@ import * as vm from "node:vm";
 import { DateTime } from "luxon";
 import { resolveToken, statusPage } from "../src/server/page.js";
 import { createStatusApp, statusPayload } from "../src/server/status.js";
+import { allJobs } from "../src/core/registry.js";
 import { TZ, todayIso } from "../src/time.js";
 import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
+// 副作用 import：注册全部模块，/api/jobs 才有 job 清单（与 daemon 同一份注册表）
+import "../src/modules/index.js";
 
 function app(env: TestEnv) {
   return createStatusApp(env.config, env.db);
@@ -773,6 +776,143 @@ describe("看板明细接口", () => {
       assert.ok(Array.isArray(body.notifications.daily));
       assert.ok(Array.isArray(body.schedules.next));
       assert.ok(Array.isArray(body.holidays.failed));
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
+describe("定时任务接口", () => {
+  interface JobRunSeed {
+    jobName: string;
+    module?: string;
+    status: "ok" | "failed" | "skipped" | "running";
+    startedAt: string;
+    finishedAt?: string | null;
+    scheduledFor?: string;
+    error?: string | null;
+  }
+
+  function seedJobRun(env: TestEnv, over: JobRunSeed): void {
+    env.db
+      .prepare(
+        `INSERT INTO job_runs (job_name, module, trigger, scheduled_for, started_at, finished_at, status, error)
+         VALUES (?, ?, 'cron', ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        over.jobName,
+        over.module ?? "weather",
+        over.scheduledFor ?? over.startedAt,
+        over.startedAt,
+        over.finishedAt === undefined ? over.startedAt : over.finishedAt,
+        over.status,
+        over.error ?? null,
+      );
+  }
+
+  it("/api/jobs：每 job 的最近运行/最近成功/24h 失败，按 module+name 排序", async () => {
+    const env = makeTestEnv();
+    try {
+      const now = Date.now();
+      const twoHoursAgo = new Date(now - 2 * 3600 * 1000).toISOString();
+      const oneHourAgo = new Date(now - 3600 * 1000).toISOString();
+      seedJobRun(env, {
+        jobName: "daily_brief",
+        status: "ok",
+        startedAt: twoHoursAgo,
+        scheduledFor: new Date(now - 3 * 3600 * 1000).toISOString(),
+      });
+      seedJobRun(env, {
+        jobName: "daily_brief",
+        status: "failed",
+        startedAt: oneHourAgo,
+        error: "上游 503",
+      });
+
+      const body = (await (await app(env).request("/api/jobs")).json()) as {
+        items: {
+          module: string;
+          name: string;
+          cron: string;
+          last_run: { status: string; started_at: string; error: string | null } | null;
+          last_ok_at: string | null;
+          next_run_hint?: string;
+          failed_24h: number;
+          recent_failures: { error: string | null }[];
+          recent_runs: { status: string }[];
+        }[];
+      };
+      const items = body.items;
+      assert.ok(items.length >= 9, `应列出全部已注册 job，实际 ${items.length}`);
+
+      const brief = items.find((item) => item.name === "daily_brief");
+      assert.ok(brief !== undefined, "缺少 weather.daily_brief");
+      assert.equal(brief.module, "weather");
+      assert.equal(brief.cron, "0 7 * * *", "cron 应与 config 一致（函数形式也要能求值）");
+      assert.equal(brief.last_run?.status, "failed", "最近一次是失败");
+      assert.equal(brief.last_run?.error, "上游 503");
+      assert.equal(brief.last_ok_at, twoHoursAgo, "最近成功要单独给出（不被失败行掩盖）");
+      assert.equal(brief.failed_24h, 1);
+      assert.equal(brief.recent_failures[0]?.error, "上游 503");
+      assert.deepEqual(
+        brief.recent_runs.map((run) => run.status),
+        ["failed", "ok"],
+        "抽屉要能看到最近几次运行，新的在前",
+      );
+      assert.equal(brief.next_run_hint, "每天 07:00");
+
+      // 从未运行过的 job 也要出现（last_run=null 才是「从未运行」的真实表达）
+      const cleanupJob = items.find((item) => item.name === "occurrence_cleanup");
+      assert.ok(cleanupJob !== undefined);
+      assert.equal(cleanupJob.last_run, null);
+      assert.equal(cleanupJob.last_ok_at, null);
+
+      const keys = items.map((item) => `${item.module}.${item.name}`);
+      assert.deepEqual(keys, [...keys].sort(), "按 module+name 排序（看板顺序必须稳定）");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("/api/jobs 受 token 保护", async () => {
+    const token = "t".repeat(32);
+    const env = makeTestEnv({ WEB_API_TOKEN: token, HOST: "0.0.0.0" });
+    try {
+      const a = app(env);
+      assert.equal((await a.request("/api/jobs")).status, 401, "/api/jobs 漏了鉴权");
+      assert.equal((await a.request(`/api/jobs?token=${token}`)).status, 200);
+      const withBearer = await a.request("/api/jobs", {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      assert.equal(withBearer.status, 200);
+      assert.equal(withBearer.headers.get("cache-control"), "no-store", "任务明细不得进缓存");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("/api/status 的 jobs 概览：total / failed_24h / runs", async () => {
+    const env = makeTestEnv();
+    try {
+      const now = Date.now();
+      seedJobRun(env, {
+        jobName: "daily_brief",
+        status: "failed",
+        startedAt: new Date(now - 3600 * 1000).toISOString(),
+        error: "超时",
+      });
+      const body = (await (await app(env).request("/api/status")).json()) as {
+        jobs: {
+          total: number;
+          failed_24h: number;
+          runs: { module: string; name: string; last_run: { status: string } | null }[];
+        };
+      };
+      assert.equal(body.jobs.total, allJobs().length, "total 应是注册的 job 数");
+      assert.equal(body.jobs.failed_24h, 1);
+      assert.ok(body.jobs.runs.length <= 20, "概览只带 20 个 job，全量走 /api/jobs");
+      const brief = body.jobs.runs.find((run) => run.name === "daily_brief");
+      assert.equal(brief?.last_run?.status, "failed");
     } finally {
       cleanupTestEnv(env);
     }

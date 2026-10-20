@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, type Stats, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { DateTime } from "luxon";
@@ -9,7 +9,11 @@ import { logger } from "./logger.js";
 /** BACKUP_KEEP 的缺省保留份数（与 README/旧 CLI 行为一致） */
 export const DEFAULT_BACKUP_KEEP = 14;
 
+/** 规范化备份文件名：`life-assistant-<yyyyMMdd-HHmmss>.db`（Asia/Shanghai 本地时间） */
 const FILE_RE = /^life-assistant-\d{8}-\d{6}\.db$/;
+
+/** 超过这个时长没有新备份即视为过期（内置 job 每日一次，36h 能容忍一次错过/延迟） */
+export const BACKUP_STALE_HOURS = 36;
 
 /**
  * 数据库文件缺失时抛出的专用错误：daemon 的每日备份 job 据此把「DATA_DIR 指错/还没建库」
@@ -27,10 +31,82 @@ export interface BackupOptions {
   keep?: number;
 }
 
+/** 一份备份文件的体检结果（供备份状态展示 / 恢复 CLI 选目标） */
+export interface BackupFileInfo {
+  name: string;
+  path: string;
+  mtimeMs: number;
+  sizeBytes: number;
+  /** 是否符合规范命名（`life-assistant-<时间戳>.db`） */
+  canonical: boolean;
+}
+
+export interface BackupStatus {
+  dir: string;
+  /** 目录下所有 `*.db`（规范与非规范都在，canonical 标记区分） */
+  files: BackupFileInfo[];
+  /** 最新一份规范备份（按 mtime）；没有则为 null */
+  latest: BackupFileInfo | null;
+  /** latest 距今小时数；没有备份为 null */
+  ageHours: number | null;
+  /** 无备份或最新备份超过 BACKUP_STALE_HOURS */
+  stale: boolean;
+  /** 不符合规范命名的 `*.db`（迁移前快照、恢复留底、手工拷贝等） */
+  nonCanonical: string[];
+}
+
+/**
+ * 校验一个 SQLite 文件是不是可用的 Life Assistant 库：`quick_check` 必须 ok，
+ * 且能读到 `meta.schema_version`。返回 schema 版本号，失败抛中文错误。
+ *
+ * 备份生成后、恢复前都走这里 —— 一份「打不开/缺 meta 表」的文件绝不能冒充可用数据。
+ * 只读打开：校验动作不修改文件，也不会在旁边留下 -wal/-shm。
+ */
+export function verifyDatabaseFile(path: string): number {
+  let db: DatabaseSync | undefined;
+  try {
+    db = new DatabaseSync(path, { readOnly: true });
+    const integrity = db.prepare("PRAGMA quick_check").get() as
+      | { quick_check?: string }
+      | undefined;
+    const result = integrity?.quick_check;
+    if (result !== "ok") {
+      throw new Error(`完整性检查未通过（quick_check: ${result ?? "无结果"}）`);
+    }
+    const row = readSchemaVersionRow(db);
+    const version = row === undefined ? Number.NaN : Number(row.value);
+    if (!Number.isInteger(version) || version < 1) {
+      throw new Error(`读不到合法的 meta.schema_version（当前值: ${row?.value ?? "缺失"}）`);
+    }
+    return version;
+  } finally {
+    if (db?.isOpen) db.close();
+  }
+}
+
+/** 读 meta.schema_version；缺表/损坏统一转成中文错误，恢复 CLI 的输出才解释得清 */
+function readSchemaVersionRow(db: DatabaseSync): { value: string } | undefined {
+  try {
+    return db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as
+      | { value: string }
+      | undefined;
+  } catch (e) {
+    throw new Error(
+      `读不到 meta.schema_version（可能不是 Life Assistant 数据库）: ${
+        e instanceof Error ? e.message : String(e)
+      }`,
+    );
+  }
+}
+
 /**
  * 生成一份 SQLite 备份（VACUUM INTO）并清理超出保留份数的旧备份，返回备份文件路径。
  * 数据库文件不存在时抛 MissingDatabaseError —— sqlite 打开不存在的路径会顺手建一个
  * 空库，从而「成功」产出一份空备份。
+ *
+ * 生成后立即自校验：VACUUM INTO 也可能因磁盘满/权限/IO 错误产出半截文件，
+ * 而「坏备份冒充可用」比「没有备份」更危险（用户以为有后路，恢复时才发现没有）。
+ * 校验失败即删除产物并抛错，绝不留在 backups 目录里。
  */
 export function runBackup(
   config: ResolvedConfig,
@@ -64,6 +140,18 @@ export function runBackup(
   } finally {
     db.close();
   }
+  try {
+    verifyDatabaseFile(target);
+  } catch (e) {
+    try {
+      unlinkSync(target);
+    } catch {
+      // 删不掉坏备份也要让「备份失败」这个原始结论暴露出来，而不是被清理错误掩盖
+    }
+    throw new Error(
+      `备份自校验失败，已删除坏备份: ${target}（${e instanceof Error ? e.message : String(e)}）`,
+    );
+  }
   prune(config.backupDir, keep);
   return target;
 }
@@ -81,4 +169,68 @@ function prune(dir: string, keep: number): void {
       logger.warn(`清理旧备份失败: ${stale} ${e instanceof Error ? e.message : e}`);
     }
   }
+}
+
+/**
+ * 备份目录状态（只读）：最新规范备份、年龄、是否过期、以及不符合规范命名的文件。
+ *
+ * 为什么需要「非规范文件」清单：迁移前快照（`life-assistant-pre-v3-*`）、恢复留底
+ * （`*-pre-restore-*`）、手工拷贝（`zombie-*.db`）都可能长期堆在 backups 里。
+ * 它们占据磁盘、让人误以为备份更多，而恢复 CLI 的 `--latest` 只认规范命名。
+ * 这里把口径亮出来，由 doctor/状态页展示（Lead 接线）。
+ */
+export function backupStatus(config: ResolvedConfig, nowMs: number = Date.now()): BackupStatus {
+  let names: string[];
+  try {
+    names = readdirSync(config.backupDir).filter((name) => name.endsWith(".db"));
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
+      logger.warn(
+        `读取备份目录失败: ${config.backupDir} ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+    return {
+      dir: config.backupDir,
+      files: [],
+      latest: null,
+      ageHours: null,
+      stale: true,
+      nonCanonical: [],
+    };
+  }
+
+  // 规范文件名里就是时间戳，字典序即新旧；file 列表保持这个顺序便于人读
+  const files: BackupFileInfo[] = names.sort().map((name) => {
+    const path = join(config.backupDir, name);
+    let stat: Stats | undefined;
+    try {
+      stat = statSync(path);
+    } catch {
+      // 列目录与 stat 之间被删（或断链）不该让整个状态查询失败
+      stat = undefined;
+    }
+    return {
+      name,
+      path,
+      mtimeMs: stat?.mtimeMs ?? 0,
+      sizeBytes: stat?.size ?? 0,
+      canonical: FILE_RE.test(name),
+    };
+  });
+
+  const canonical = files.filter((file) => file.canonical);
+  // 用 mtime 而不是文件名挑最新：迁移前快照/恢复留底可能被复制过，mtime 更贴近「实际生成时间」
+  let latest: BackupFileInfo | null = null;
+  for (const file of canonical) {
+    if (latest === null || file.mtimeMs > latest.mtimeMs) latest = file;
+  }
+  const ageHours = latest === null ? null : Math.max(0, (nowMs - latest.mtimeMs) / 3_600_000);
+  return {
+    dir: config.backupDir,
+    files,
+    latest,
+    ageHours,
+    stale: ageHours === null || ageHours > BACKUP_STALE_HOURS,
+    nonCanonical: files.filter((file) => !file.canonical).map((file) => file.name),
+  };
 }

@@ -1,0 +1,148 @@
+import assert from "node:assert/strict";
+import { existsSync, mkdirSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { describe, it } from "node:test";
+import { runBackup } from "../src/backup.js";
+import { BACKUP_STALE_HOURS, backupStatus, verifyDatabaseFile } from "../src/core/backup.js";
+import { SCHEMA_VERSION } from "../src/core/database.js";
+import { cleanupTestEnv, makeTestEnv } from "./helpers.js";
+
+/**
+ * 备份自校验与备份状态：
+ * - runBackup 产物必须能被独立打开（quick_check + meta.schema_version）；
+ * - 坏文件/缺 meta 表的文件必须被 verifyDatabaseFile 拒绝（恢复 CLI 依赖同一判定）；
+ * - backupStatus 要能区分规范命名与非规范文件，并按 36h 阈值判定过期。
+ */
+
+describe("备份自校验", () => {
+  it("verifyDatabaseFile 接受真实备份并返回 schema 版本", () => {
+    const env = makeTestEnv();
+    try {
+      const target = runBackup(env.config);
+      assert.equal(verifyDatabaseFile(target), SCHEMA_VERSION);
+      // 硬性要求：备份产物就是「用户以为有的后路」，必须能独立打开
+      assert.equal(existsSync(target), true);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("verifyDatabaseFile 拒绝非数据库文件（坏备份绝不能冒充可用）", () => {
+    const env = makeTestEnv();
+    try {
+      mkdirSync(env.config.backupDir, { recursive: true });
+      const garbage = join(env.config.backupDir, "life-assistant-20200101-000000.db");
+      writeFileSync(garbage, "this is not a sqlite database");
+      assert.throws(() => verifyDatabaseFile(garbage), /database|file is not/i);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("verifyDatabaseFile 拒绝缺 meta.schema_version 的 SQLite 库", () => {
+    const env = makeTestEnv();
+    try {
+      mkdirSync(env.config.backupDir, { recursive: true });
+      const notLifeAssistant = join(env.config.backupDir, "other.db");
+      const db = new DatabaseSync(notLifeAssistant);
+      try {
+        db.exec("CREATE TABLE unrelated (x INTEGER)");
+      } finally {
+        db.close();
+      }
+      assert.throws(() => verifyDatabaseFile(notLifeAssistant), /schema_version/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("verifyDatabaseFile 文件不存在时抛错（不会被当成空库放行）", () => {
+    const env = makeTestEnv();
+    try {
+      assert.throws(() => verifyDatabaseFile(join(env.dir, "nope.db")));
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
+describe("备份状态 backupStatus", () => {
+  it("备份目录不存在：无文件、无最新、视为过期", () => {
+    const env = makeTestEnv();
+    try {
+      const status = backupStatus(env.config);
+      assert.equal(status.dir, env.config.backupDir);
+      assert.deepEqual(status.files, []);
+      assert.equal(status.latest, null);
+      assert.equal(status.ageHours, null);
+      assert.equal(status.stale, true);
+      assert.deepEqual(status.nonCanonical, []);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("生成备份后：latest 指向规范文件，新鲜（不 stale）", () => {
+    const env = makeTestEnv();
+    try {
+      const target = runBackup(env.config);
+      const status = backupStatus(env.config);
+      assert.equal(status.files.length, 1);
+      assert.equal(status.latest?.path, target);
+      assert.equal(status.latest?.canonical, true);
+      assert.ok((status.ageHours ?? Number.POSITIVE_INFINITY) < 1);
+      assert.equal(status.stale, false);
+      assert.deepEqual(status.nonCanonical, []);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("超过 36 小时没有新备份判为 stale", () => {
+    const env = makeTestEnv();
+    try {
+      mkdirSync(env.config.backupDir, { recursive: true });
+      const old = join(env.config.backupDir, "life-assistant-20200101-000000.db");
+      writeFileSync(old, "old");
+      // 48 小时前：用 mtime 表达真实年龄（文件名不参与 stale 判定）
+      const oldSeconds = Date.now() / 1000 - 48 * 3600;
+      utimesSync(old, oldSeconds, oldSeconds);
+
+      const status = backupStatus(env.config);
+      assert.equal(status.stale, true);
+      assert.ok(
+        (status.ageHours ?? 0) >= BACKUP_STALE_HOURS,
+        `ageHours=${status.ageHours} 应超过 ${BACKUP_STALE_HOURS}`,
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("非规范命名的 *.db 被单列，且不会被 --latest 选中", () => {
+    const env = makeTestEnv();
+    try {
+      const canonical = runBackup(env.config);
+      mkdirSync(env.config.backupDir, { recursive: true });
+      const strays = [
+        "life-assistant-pre-v3-20260101-000000.db",
+        "life-assistant-pre-restore-20260101-000000.db",
+        "zombie-copy.db",
+      ];
+      for (const name of strays) writeFileSync(join(env.config.backupDir, name), "x");
+      // 让非规范文件的 mtime 比规范备份更新：latest 仍必须只认规范命名
+      const newer = Date.now() / 1000 + 60;
+      for (const name of strays) utimesSync(join(env.config.backupDir, name), newer, newer);
+
+      const status = backupStatus(env.config);
+      assert.deepEqual(status.nonCanonical.sort(), [...strays].sort());
+      assert.equal(status.latest?.path, canonical, "latest 只看 life-assistant-<时间戳>.db");
+      assert.equal(status.files.length, 4);
+      assert.equal(status.files.filter((file) => file.canonical).length, 1);
+      assert.equal(readdirSync(env.config.backupDir).length, 4);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});

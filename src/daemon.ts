@@ -18,9 +18,19 @@ import {
   fail,
   getModules,
   initRuntime,
+  type JobDef,
   type ToolContext,
 } from "./core/registry.js";
 import { cancelPendingDrain, createServices, drainDue, waitForDrain } from "./core/notify.js";
+import {
+  finishJobRun,
+  markInterruptedJobRuns,
+  runStartupCatchups,
+  startJobRun,
+  type JobTrigger,
+} from "./core/jobs.js";
+import { acquireDaemonLock } from "./core/lock.js";
+import { applySecureUmask, createRequestGuard, hardenDataDir } from "./core/security.js";
 import {
   bumpQweatherUsage,
   readQweatherUsage,
@@ -213,7 +223,17 @@ export function createHttpHandler(
   db: DatabaseSync,
 ): (req: IncomingMessage, res: ServerResponse) => void {
   const honoListener = getRequestListener(createStatusApp(config, db).fetch);
+  // Host/Origin 守卫：状态页与 /mcp 都没有 CSRF token，浏览器跨站请求（含 DNS rebinding：
+  // 攻击者把域名解析到 127.0.0.1）会带着伪造 Host 直接读写个人数据。没有 Origin 的
+  // 非浏览器客户端（Hermes/CLI/curl）照常放行。
+  const guard = createRequestGuard(config);
   return (req, res) => {
+    const verdict = guard(req);
+    if (!verdict.ok) {
+      res.writeHead(verdict.status, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ ok: false, error: verdict.body }));
+      return;
+    }
     if (req.url !== undefined && isMcpPath(req.url)) {
       handleMcp(req, res, db, config).catch((e) => {
         logger.error(`MCP 请求处理失败: ${errorMessage(e)}`);
@@ -241,7 +261,24 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
   const config = loadConfig(env);
   setLogLevel(config.logLevel);
   mkdirSync(config.dataDir, { recursive: true });
-  const db = openDatabase(config.dbPath);
+  // 单实例锁必须在任何写库动作之前：两个 daemon 同时跑会让 outbox 重复投递、定时任务
+  // 重复触发。历史上只靠「端口被占」兜底，但占端口之前的窗口已经能写库。
+  const lock = acquireDaemonLock(config.dataDir);
+  // 数据目录与库文件在写之前收紧权限：默认 umask 022 会留下 0644 的库/备份，
+  // 同机其它用户可读个人账目与通知正文。
+  applySecureUmask();
+  let db: DatabaseSync;
+  try {
+    hardenDataDir(config.dataDir, config.dbPath, config.backupDir);
+    // 老库升级 schema 前先 VACUUM 一份 pre-v 快照；备份失败宁可不启动（见 core/database）
+    db = openDatabase(config.dbPath, { backupDir: config.backupDir });
+  } catch (e) {
+    lock.release();
+    throw e;
+  }
+  // 上次进程退出时仍处于 running 的记录一律标 failed，否则状态页会永远显示「运行中」
+  const interruptedRuns = markInterruptedJobRuns(db);
+  if (interruptedRuns > 0) logger.warn(`已把 ${interruptedRuns} 条中断的 job 运行记录标记为失败`);
   // QWeather 用量计量：先把今天的计数读回内存（重启不清零），之后每次出网自增并落库
   seedQweatherUsage(readQweatherUsage(db));
   setQweatherUsageSink((day) => bumpQweatherUsage(db, day));
@@ -251,22 +288,53 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
   const httpServer = createServer(createHttpHandler(config, db));
 
   const busy = new Set<string>();
+  /** job 运行记录的元信息；tick/未登记任务不传（不记 job_runs，避免每分钟刷一行） */
+  interface JobRunMeta {
+    module: string;
+    jobName: string;
+    trigger: JobTrigger;
+    scheduledFor: string;
+  }
   /**
    * 在途 job/tick 的 Promise。停机时必须等它们收敛：job 可能在 await 之后才写库/
    * 发布通知，直接 db.close() 会留下 "database is not open" 并丢掉当次提醒。
    * 按 name 存（name 在 busy 保护下唯一），避免在 Promise 初始化器里自引用。
    */
   const inFlightJobs = new Map<string, Promise<void>>();
-  function runExclusive(name: string, fn: () => Promise<void> | void): Promise<void> {
+  function runExclusive(
+    name: string,
+    fn: () => Promise<void> | void,
+    meta?: JobRunMeta,
+  ): Promise<void> {
     if (busy.has(name)) {
       logger.debug(`跳过重叠触发: ${name}`);
+      // 记一条 skipped：状态页/doctor 能看出「这次是被上一轮挡掉的」，而不是静默消失
+      if (meta !== undefined) {
+        try {
+          finishJobRun(db, startJobRun(db, meta), "skipped");
+        } catch (e) {
+          logger.warn(`写入 job 跳过记录失败: ${errorMessage(e)}`);
+        }
+      }
       return Promise.resolve();
     }
     busy.add(name);
+    const runId = meta === undefined ? undefined : startJobRun(db, meta);
     const task = Promise.resolve()
       .then(fn)
+      .then(() => {
+        if (runId !== undefined) finishJobRun(db, runId, "ok");
+      })
       .catch((e) => {
         logger.error(`${name} 执行失败: ${errorMessage(e)}`);
+        // 记录失败不能反过来让 job 崩溃：db 可能恰好处于关闭过程中
+        if (runId !== undefined) {
+          try {
+            finishJobRun(db, runId, "failed", errorMessage(e));
+          } catch (recordError) {
+            logger.warn(`写入 job 失败记录失败: ${errorMessage(recordError)}`);
+          }
+        }
       })
       .finally(() => {
         busy.delete(name);
@@ -288,11 +356,19 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
   }
 
   // 先把所有 cron 表达式校验完（纯计算，不注册定时器）：配置错误必须在监听之前暴露。
-  const jobSpecs = allJobs().map(({ module, def }) => {
-    const expr = typeof def.cron === "function" ? def.cron() : def.cron;
-    if (!cron.validate(expr)) throw new Error(`Job ${def.name} 的 cron 不合法: ${expr}`);
-    return { module, def, expr };
-  });
+  let jobSpecs: { module: string; def: JobDef; expr: string }[];
+  try {
+    jobSpecs = allJobs().map(({ module, def }) => {
+      const expr = typeof def.cron === "function" ? def.cron() : def.cron;
+      if (!cron.validate(expr)) throw new Error(`Job ${def.name} 的 cron 不合法: ${expr}`);
+      return { module, def, expr };
+    });
+  } catch (e) {
+    // 配置错误不该留下孤儿锁：调用方会 exit，但锁文件里的 pid 仍指向本进程
+    db.close();
+    lock.release();
+    throw e;
+  }
 
   // 监听成功之前不得装配任何定时器（信号处理同理）：端口被占 —— systemd Restart=always
   // 重启时的常见情形 —— 会让旧实现留下一个「启动失败但不退出」的僵尸实例，它的 20s drain
@@ -303,15 +379,28 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
     httpServer.listen(config.port, bindHost(config.host), () => resolve());
   }).catch((e: unknown) => {
     db.close();
+    lock.release();
     throw e;
   });
 
   const tasks: cron.ScheduledTask[] = [];
   for (const { module, def, expr } of jobSpecs) {
     tasks.push(
-      cron.schedule(expr, () => void runExclusive(`job:${def.name}`, () => def.handler(now())), {
-        timezone: TZ,
-      }),
+      cron.schedule(
+        expr,
+        () => {
+          const at = now();
+          void runExclusive(`job:${def.name}`, () => def.handler(at), {
+            module,
+            jobName: def.name,
+            trigger: "cron",
+            // job_runs 的时间口径是 UTC ISO（字符串比较即时间比较）：本地 +08:00 偏移串
+            // 与 Z 串做字典序会得出错误结论，必须显式转 UTC。
+            scheduledFor: at.toUTC().toISO() ?? "",
+          });
+        },
+        { timezone: TZ },
+      ),
     );
     logger.info(`注册定时任务 ${module}.${def.name}: "${expr}" (${TZ})`);
   }
@@ -345,6 +434,28 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
   // onStart 是非阻塞引导（不挡启动），但必须在关库前收敛：否则 stop() 关掉数据库后
   // 它仍在写，日志会出现 "database is not open"，也可能留下半途而废的写入。
   const onStartTasks: Promise<void>[] = [];
+  // 启动补发：停机期间错过的「每天必须发生一次」的 job（早报/晚报/补班/备份…）在这里
+  // 补跑一次。是否该补由 core/jobs 的策略表 + 上一次成功运行记录决定；job 自身的
+  // dedupeKey 保证同一天不会推两遍。非阻塞，与 onStart 一起在停机时收敛。
+  onStartTasks.push(
+    runStartupCatchups({
+      db,
+      jobs: allJobs(),
+      runJob: (module, def, trigger, scheduledFor) =>
+        runExclusive(`job:${def.name}`, () => def.handler(now()), {
+          module,
+          jobName: def.name,
+          trigger,
+          scheduledFor,
+        }),
+    })
+      .then((result) => {
+        if (result.scheduled > 0) logger.info(`启动补发完成：补跑 ${result.scheduled} 个任务`);
+      })
+      .catch((e) => {
+        logger.error(`启动补发失败: ${errorMessage(e)}`);
+      }),
+  );
   for (const module of getModules()) {
     if (module.onStart === undefined) continue;
     onStartTasks.push(
@@ -365,7 +476,16 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
       // 先停止接受新连接（已建立的在途请求继续处理），避免更长的 job/drain 等待期间
       // 又冒出新请求写库。最后用 closeAllConnections 强制收敛。
       const serverClosed = new Promise<void>((resolve) => httpServer.close(() => resolve()));
-      // 先等 cron job / tick 收敛：它们可能在 await 网络后发布通知并触发新一轮 drain。
+      // 先等 onStart / 启动补发收敛：它们可能在等待期间才把 job 放进 inFlightJobs。
+      // 若先等 inFlightJobs 再等 onStart，补发刚启动的 job（如 daily_backup 的 VACUUM）
+      // 会落在两次等待之间的缝隙里，db.close() 之后仍在写库。
+      if (onStartTasks.length > 0) {
+        await Promise.race([
+          Promise.allSettled(onStartTasks),
+          new Promise<void>((resolve) => setTimeout(resolve, 3000).unref()),
+        ]);
+      }
+      // 再等 cron job / tick 收敛：它们可能在 await 网络后发布通知并触发新一轮 drain。
       // 停止定时器后不会再有新 job 启动；循环是为了兜住「等待期间刚好进入 finally」的窗口。
       const jobDeadline = Date.now() + JOB_SHUTDOWN_WAIT_MS;
       while (inFlightJobs.size > 0 && Date.now() < jobDeadline) {
@@ -385,13 +505,6 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
         waitForDrain(),
         new Promise<void>((resolve) => setTimeout(resolve, 10_000).unref()),
       ]);
-      // 给 onStart 一点时间收尾（多为网络抓取），避免关库后仍在写
-      if (onStartTasks.length > 0) {
-        await Promise.race([
-          Promise.allSettled(onStartTasks),
-          new Promise<void>((resolve) => setTimeout(resolve, 3000).unref()),
-        ]);
-      }
       // onStart 理论上也可能发布；关库前再清一次可能新排的 drain（未投出的行留待下次启动）。
       cancelPendingDrain();
       for (const [id, session] of [...sessions]) dropSession(id, session);
@@ -401,6 +514,7 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
     } finally {
       // 无论收尾是否失败都要摘掉信号监听：否则同进程内多次 startDaemon/stop
       // 会不断累积监听器（测试里尤其明显）。
+      lock.release();
       process.off("SIGINT", onSigint);
       process.off("SIGTERM", onSigterm);
     }

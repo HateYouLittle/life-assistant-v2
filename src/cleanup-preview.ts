@@ -22,7 +22,8 @@ function main(): void {
   if (!existsSync(config.dbPath)) {
     throw new Error(`数据库不存在: ${config.dbPath}（检查 DATA_DIR 是否指向真实数据目录）`);
   }
-  const db = openDatabase(config.dbPath);
+  // 与 daemon 同参数：老库升级前先落一份 pre-v 快照，预演也不该在无备份的情况下改库
+  const db = openDatabase(config.dbPath, { backupDir: config.backupDir });
   try {
     const preview = previewOccurrenceCleanup(db);
     console.log(

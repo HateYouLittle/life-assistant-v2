@@ -3,7 +3,7 @@ import { DateTime } from "luxon";
 import { nowIso, todayIso, TZ } from "../../time.js";
 import { withReadTransaction } from "../../core/database.js";
 import type { NotifyBlock } from "../../core/registry.js";
-import { newId } from "../../core/settings.js";
+import { getSetting, newId, setSetting } from "../../core/settings.js";
 
 /** 账本归属：owner_profile_id = NULL 为家庭账本（所有 Profile 共享）；非空为个人账本（仅归属人可见可写） */
 export interface LedgerRow {
@@ -99,6 +99,69 @@ export function getVisibleLedger(
   return ledger;
 }
 
+/** 默认账本设置键（按 Profile 存储，值是账本 id） */
+export const DEFAULT_LEDGER_SETTING = "bookkeeping.default_ledger_id";
+
+/**
+ * 当前 Profile 可写的活动账本：家庭账本 + 自己的个人账本，且未归档。
+ * 与 `ledger list` 的可见范围一致（listLedgers 默认已排除归档账本）。
+ */
+export function writableLedgers(db: DatabaseSync, profileId: string): LedgerRow[] {
+  return listLedgers(db).filter((row) => isLedgerVisible(row, profileId));
+}
+
+/** 已设置的默认账本 id；未设置、类型异常（手工改库）或空串一律视为未设置 */
+export function getDefaultLedgerId(db: DatabaseSync, profileId: string): string | undefined {
+  const value = getSetting<unknown>(db, profileId, DEFAULT_LEDGER_SETTING);
+  return typeof value === "string" && value !== "" ? value : undefined;
+}
+
+export function setDefaultLedgerId(db: DatabaseSync, profileId: string, ledgerId: string): void {
+  setSetting(db, profileId, DEFAULT_LEDGER_SETTING, ledgerId);
+}
+
+export interface DefaultLedgerResolution {
+  /** 命中的账本；null = 无法确定，调用方必须报错并列出 candidates */
+  ledger: LedgerRow | null;
+  /** 当前 Profile 可写的活动账本（错误提示与工具回显共用，复用同一份判定） */
+  candidates: LedgerRow[];
+  /** 命中来源：settings 里的默认账本，或「恰好只有一个可写账本」的确定结果 */
+  source: "setting" | "single" | null;
+}
+
+/**
+ * `expense add` 未传 ledger_id 时的默认账本解析。解析顺序固定、绝不猜：
+ * ① settings 的 `bookkeeping.default_ledger_id` 指向**活动且可写**的账本 → 用它；
+ *    已归档/转给他人的旧设置自动失效（回落到 ②/③），不需要用户先清理设置；
+ * ② 当前 Profile 恰好只有一个可写活动账本 → 用它（这是确定结果，不写 setting：
+ *    把「暂时只有一个」固化下来，之后新建账本时旧值反而会变成错误来源）；
+ * ③ 其余情况（0 个或 2+ 个且无有效默认）→ 返回 null，由工具层报错并列出可选账本。
+ */
+export function resolveAddLedger(db: DatabaseSync, profileId: string): DefaultLedgerResolution {
+  const candidates = writableLedgers(db, profileId);
+  const configuredId = getDefaultLedgerId(db, profileId);
+  if (configuredId !== undefined) {
+    const configured = candidates.find((row) => row.id === configuredId);
+    if (configured !== undefined) return { ledger: configured, candidates, source: "setting" };
+  }
+  if (candidates.length === 1) {
+    return { ledger: candidates[0] as LedgerRow, candidates, source: "single" };
+  }
+  return { ledger: null, candidates, source: null };
+}
+
+/** 校验并设置默认账本；不存在/不可见/已归档一律报可操作错误（不落任何设置） */
+export function setDefaultLedger(db: DatabaseSync, profileId: string, ledgerId: string): LedgerRow {
+  const ledger = writableLedgers(db, profileId).find((row) => row.id === ledgerId);
+  if (ledger === undefined) {
+    throw new Error(
+      `账本不存在或不可写: ${ledgerId}（只能选家庭账本或自己的个人账本，已归档账本不可用）`,
+    );
+  }
+  setDefaultLedgerId(db, profileId, ledger.id);
+  return ledger;
+}
+
 /**
  * 转移账本归属：仅个人账本可转移（家庭 → 个人永不允许）。
  * targetOwnerId 为 null 表示转回家庭（不可逆）；非 null 时该 Profile 必须已存在。
@@ -187,17 +250,69 @@ function normalizedSpentOn(spentOn: string | undefined): string {
   return value;
 }
 
-export function addExpense(
+export interface AddExpenseInput {
+  ledgerId: string;
+  amountCents: number;
+  category?: string;
+  note?: string | null;
+  spentOn?: string;
+  /** 写路径幂等键（工具参数 request_id）；按 (created_by_profile, clientToken) 唯一 */
+  clientToken?: string;
+}
+
+export interface AddExpenseResult {
+  entry: ExpenseRow;
+  /** true = 命中幂等键，返回的是首次写入的那一行（本次没有新增行） */
+  reused: boolean;
+}
+
+/** request_id 上限：够放 UUID/短哈希，又不至于把整段 prompt 塞进唯一索引 */
+export const CLIENT_TOKEN_MAX_LENGTH = 128;
+
+function assertValidClientToken(token: string): void {
+  if (token.trim() === "" || token.length > CLIENT_TOKEN_MAX_LENGTH) {
+    throw new Error(`request_id 不合法（需为 1-${CLIENT_TOKEN_MAX_LENGTH} 个非空白字符）`);
+  }
+}
+
+/** 按幂等键查回首次写入的支出（不存在返回 undefined） */
+export function findExpenseByClientToken(
   db: DatabaseSync,
   profileId: string,
-  input: {
-    ledgerId: string;
-    amountCents: number;
-    category?: string;
-    note?: string | null;
-    spentOn?: string;
-  },
-): ExpenseRow {
+  clientToken: string,
+): ExpenseRow | undefined {
+  return db
+    .prepare("SELECT * FROM expenses WHERE created_by_profile = ? AND client_token = ?")
+    .get(profileId, clientToken) as ExpenseRow | undefined;
+}
+
+/**
+ * 是否是 client_token 的分范围唯一索引冲突。node:sqlite 抛出的错误带
+ * `errcode`（SQLITE_CONSTRAINT_UNIQUE = 2067）；同时校验 message 里出现
+ * `client_token`，避免把主键冲突等其它 UNIQUE 错误误当成「重试命中」。
+ */
+function isClientTokenConflict(e: unknown): boolean {
+  if (!(e instanceof Error) || !e.message.includes("client_token")) return false;
+  const errcode = (e as { errcode?: number }).errcode;
+  return errcode === 2067 || e.message.includes("UNIQUE constraint failed");
+}
+
+/**
+ * 记一笔支出（带可选幂等键）。
+ *
+ * 幂等语义：`(created_by_profile, client_token)` 上有部分唯一索引（见
+ * core/database.ts 的 ensureClientTokenIndexes）。MCP 超时/网络抖动后调用方带同一个
+ * `request_id` 重试时，第二次 INSERT 会撞唯一索引；此时按同一组键查回首次写入的那一行
+ * 返回（reused=true），工具层据此**不再发回执、不再推预算提醒**。
+ *
+ * 刻意不做「先查后写」：并发重试下另一事务可能恰好插在两条语句之间，pre-check 会漏；
+ * 冲突兜底才是唯一可靠的口径（幂等键的唯一性最终由数据库索引保证）。
+ */
+export function addExpenseChecked(
+  db: DatabaseSync,
+  profileId: string,
+  input: AddExpenseInput,
+): AddExpenseResult {
   const ledger = getLedger(db, input.ledgerId);
   if (ledger === undefined) throw new Error(`账本不存在: ${input.ledgerId}`);
   if (ledger.archived_at !== null) throw new Error(`账本已归档: ${ledger.name}`);
@@ -205,12 +320,43 @@ export function addExpense(
   const category = normalizedCategory(input.category);
   const note = normalizedNote(input.note);
   const spentOn = normalizedSpentOn(input.spentOn);
+  if (input.clientToken !== undefined) assertValidClientToken(input.clientToken);
   const id = newId();
-  db.prepare(
-    `INSERT INTO expenses (id, ledger_id, amount_cents, category, note, spent_on, created_by_profile, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(id, input.ledgerId, input.amountCents, category, note, spentOn, profileId, nowIso());
-  return db.prepare("SELECT * FROM expenses WHERE id = ?").get(id) as unknown as ExpenseRow;
+  try {
+    db.prepare(
+      `INSERT INTO expenses (id, ledger_id, amount_cents, category, note, spent_on, created_by_profile, created_at, client_token)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      id,
+      input.ledgerId,
+      input.amountCents,
+      category,
+      note,
+      spentOn,
+      profileId,
+      nowIso(),
+      input.clientToken ?? null,
+    );
+  } catch (e) {
+    if (input.clientToken !== undefined && isClientTokenConflict(e)) {
+      const existing = findExpenseByClientToken(db, profileId, input.clientToken);
+      if (existing !== undefined) return { entry: existing, reused: true };
+    }
+    throw e;
+  }
+  return {
+    entry: db.prepare("SELECT * FROM expenses WHERE id = ?").get(id) as unknown as ExpenseRow,
+    reused: false,
+  };
+}
+
+/** 兼容旧调用（不带幂等键）：只返回新建的行，幂等命中场景走 addExpenseChecked */
+export function addExpense(
+  db: DatabaseSync,
+  profileId: string,
+  input: AddExpenseInput,
+): ExpenseRow {
+  return addExpenseChecked(db, profileId, input).entry;
 }
 
 export function getExpense(db: DatabaseSync, id: string): ExpenseRow | undefined {
@@ -299,6 +445,43 @@ export function listExpenses(
     )
     .all(...params, limit) as unknown as ExpenseRow[];
   return { rows, total: totalRow.n, hasMore: totalRow.n > rows.length };
+}
+
+/** 「常用分类」统计窗口（天，含今天）：只回显最近记过什么，与预算/报表无关 */
+export const RECENT_CATEGORY_DAYS = 90;
+/** 「常用分类」回显条数上限（按出现次数取 top N） */
+export const RECENT_CATEGORY_LIMIT = 5;
+
+/**
+ * 该账本最近 N 天出现次数最多的分类（按笔数降序；同频按分类名升序，结果稳定可测）。
+ *
+ * 只用于 `expense add` 未显式传 category 时的回执提示：给出「平时都记什么」，
+ * 不做任何自动归类/改写。窗口内没有支出时返回空数组（而不是伪造一个分类）。
+ * `excludeId` 用来剔除刚刚插入的这笔 —— 否则它自己（默认分类「其他」）会挤进建议里，
+ * 形成「记什么就推荐什么」的噪声。
+ */
+export function recentCategories(
+  db: DatabaseSync,
+  ledgerId: string,
+  opts: { today?: string; excludeId?: string; limit?: number } = {},
+): string[] {
+  const today = opts.today ?? todayIso();
+  const from = DateTime.fromISO(today, { zone: TZ })
+    .minus({ days: RECENT_CATEGORY_DAYS - 1 })
+    .toISODate();
+  if (from === null) return [];
+  // 下限也 clamp：LIMIT 传 0 会得到空集，传负数在 SQLite 里等于「不限量」
+  const limit = Math.max(1, Math.min(opts.limit ?? RECENT_CATEGORY_LIMIT, 20));
+  const params: (string | number)[] = [ledgerId, from, today];
+  let sql = `SELECT category, COUNT(*) AS n FROM expenses
+    WHERE ledger_id = ? AND spent_on >= ? AND spent_on <= ?`;
+  if (opts.excludeId !== undefined) {
+    sql += " AND id != ?";
+    params.push(opts.excludeId);
+  }
+  sql += " GROUP BY category ORDER BY n DESC, category ASC LIMIT ?";
+  const rows = db.prepare(sql).all(...params, limit) as { category: string; n: number }[];
+  return rows.map((row) => row.category);
 }
 
 export interface ExpenseSummary {
@@ -618,6 +801,12 @@ export function budgetAlertBlocks(status: BudgetStatus): NotifyBlock {
 
 /**
  * 判定该笔支出「跨越」了哪个预算阈值（只推跨过的那一刻，达到即推会每笔都发）。
+ *
+ * **口径是「这笔支出所属月份」而不是「当前月」**：预算按账本每月滚动，补记两个月前的
+ * 支出时必须对照**那个月**的预算消耗来判断（ym 取自 entry.spent_on），否则拿今天的累计
+ * 去比历史月份，会得出「本月超支」的假结论；标题与 dedupeKey 都带 ym，连续两个月各超支
+ * 时是两个独立事件、不会被去重吞掉。
+ *
  * 本笔金额已知：before = after - entry.amount_cents，不重复查库。整数比较避免浮点误差。
  * 同一个预算（总额或某个分类）在一笔支出里只推「跨过的最高阈值」那一条：
  * 一笔从 0% 到 150% 只推 100%，从 70% 到 90% 只推 80%。
@@ -662,11 +851,20 @@ export function budgetAlertsForEntry(
     // dedupeKey 的范围编码：总额用空串、分类用原分类名（setBudget 把空分类归一成总额，
     // 因此二者不歧义）。刻意不改分类的编码：既有分类提醒的键保持连续、升级后不会重推；
     // 总额键从旧编码的 `-` 变为空串，升级当月同一总额阈值最多多推一次。
+    // 键里必须同时带 ym 与范围：只按账本去重会让「8 月已超支」把 9 月的超支静默吞掉。
     const scopeKey = budget.category === "" ? "" : budget.category;
+    // 标题必须带月份：补记历史月份的支出时，用户否则看不出这条「超支」说的是哪个月
+    // （旧标题只有账本名，8 月与 10 月的提醒长得一模一样）。
+    const thresholdLabel = crossed === 80 ? "预算提醒" : "预算超支";
+    const title =
+      budget.category === ""
+        ? `⚠️ ${ledger.name} ${ym} ${thresholdLabel}`
+        : `⚠️ 分类「${budget.category}」${ym} ${thresholdLabel}`;
     alerts.push({
       kind: "bookkeeping.budget",
-      title: `${crossed === 80 ? "预算提醒" : "预算超支"} · ${ledger.name}`,
-      blocks: budgetAlertBlocks(status),
+      title,
+      // 分类标题里没有账本名，正文补一行「账本 · 月份」，两条提醒并排时也能区分
+      blocks: { ...budgetAlertBlocks(status), notes: [`${ledger.name} · ${ym}`] },
       dedupeKey: `budget:${ledger.id}:${scopeKey}:${ym}:${crossed}`,
     });
   }

@@ -20,6 +20,7 @@ describe("config", () => {
     assert.equal(config.host, "127.0.0.1");
     assert.equal(config.port, 3080);
     assert.equal(config.dailyBriefCron, "0 7 * * *");
+    assert.equal(config.eveningBriefCron, "0 21 * * *");
     assert.equal(config.alertWatchCron, "*/20 * * * *");
     assert.equal(config.alertMinLevel, "blue");
     assert.equal(config.workdayWatchCron, "0 7 * * *");
@@ -28,6 +29,44 @@ describe("config", () => {
     assert.equal(config.backupKeep, 14);
     assert.equal(config.defaultCity, "北京");
     assert.equal(config.webApiToken, undefined);
+    assert.equal(config.requireAuth, false);
+    assert.deepEqual(config.allowedHosts, []);
+  });
+
+  it("REQUIRE_AUTH：开启但无 token 拒绝启动；有 token 允许；非法取值拒绝", () => {
+    for (const flag of ["1", "true", "TRUE", "yes", "on"]) {
+      assert.throws(
+        () => loadConfig({ ...BASE, REQUIRE_AUTH: flag }),
+        /REQUIRE_AUTH=1 但未设置 WEB_API_TOKEN/,
+        flag,
+      );
+      const config = loadConfig({ ...BASE, REQUIRE_AUTH: flag, WEB_API_TOKEN: SECRET });
+      assert.equal(config.requireAuth, true, flag);
+    }
+    for (const flag of ["0", "false", "no", "off"]) {
+      assert.equal(loadConfig({ ...BASE, REQUIRE_AUTH: flag }).requireAuth, false, flag);
+    }
+    assert.equal(loadConfig(BASE).requireAuth, false, "未设置时默认关闭（回环零配置）");
+    // 拼错开关名等同于把安全开关关掉，必须拒绝而不是静默按 false
+    assert.throws(() => loadConfig({ ...BASE, REQUIRE_AUTH: "treu" }), /REQUIRE_AUTH 不合法/);
+  });
+
+  it("WEB_ALLOWED_HOSTS：逗号分隔、去空白空项、可带端口", () => {
+    const config = loadConfig({
+      ...BASE,
+      WEB_ALLOWED_HOSTS: "example.com, 192.168.1.10:3080 ,,http://nas.lan/",
+    });
+    assert.deepEqual(config.allowedHosts, ["example.com", "192.168.1.10:3080", "nas.lan"]);
+    assert.deepEqual(loadConfig({ ...BASE, WEB_ALLOWED_HOSTS: "  " }).allowedHosts, []);
+  });
+
+  it("EVENING_BRIEF_CRON 非法拒绝启动，合法则生效", () => {
+    assert.throws(
+      () => loadConfig({ ...BASE, EVENING_BRIEF_CRON: "not-cron" }),
+      /EVENING_BRIEF_CRON/,
+    );
+    const config = loadConfig({ ...BASE, EVENING_BRIEF_CRON: "30 20 * * *" });
+    assert.equal(config.eveningBriefCron, "30 20 * * *");
   });
 
   it("非回环 HOST 无 token 拒绝启动，有 token 允许", () => {

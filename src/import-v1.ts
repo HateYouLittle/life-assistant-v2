@@ -844,7 +844,8 @@ function main(): void {
     if (resolve(oldPath) === resolve(config.dbPath)) {
       throw new Error(`源库与目标库是同一个文件：${oldPath}；--from 应指向 v1 的旧库`);
     }
-    target = openDatabase(config.dbPath);
+    // 与 daemon 同参数：老库升级 schema 前先自动备份（导入本身就是写操作，更需要留底）
+    target = openDatabase(config.dbPath, { backupDir: config.backupDir });
     const report = runImport(target, oldPath, force);
     logger.info(`导入完成：${JSON.stringify(report, null, 2)}`);
     console.log(

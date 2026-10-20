@@ -576,12 +576,15 @@ describe("weather 每日简报：补班/放假提示行", () => {
     return row.body_md;
   }
 
-  it("今天要补班 → 提示行", async (t) => {
+  it("今天要补班 → 早报不写补班行（单一来源是 holiday.workday 独立通知），简报仍正常发布", async (t) => {
     const env = makeTestEnv(ENV);
     try {
       seedHoliday(env);
       const body = await briefBodyAt(t, "2026-09-20", env);
-      assert.match(body, /⚠️ 今天要补班（国庆节调休）/);
+      // 当天补班交给 holiday 模块的 workday_watch：早报再写一行会与它双推
+      assert.doesNotMatch(body, /今天要补班/);
+      // 简报本身照常发布（briefBodyAt 已断言通知落库），且既有天气结论仍在
+      assert.match(body, /适宜出行/);
     } finally {
       cleanupTestEnv(env);
     }

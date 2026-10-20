@@ -767,16 +767,22 @@ function alertLevelOf(color: unknown, severity: unknown): string {
   return sev === "unknown" ? "" : sev;
 }
 
+/**
+ * 气象预警。`ttlMs` 让调用方按巡检节奏覆盖缓存 TTL（默认 10 分钟不变，保持工具查询口径）：
+ * 预警巡检是「每 N 分钟一轮」的周期性查询，固定 10 分钟 TTL 会让每轮都有一半请求
+ * 穿透缓存，把上游请求量放大约 3 倍（见 weather 模块的 alertCacheTtlMs）。
+ */
 export async function alerts(
   db: DatabaseSync,
   host: string,
   key: string,
   loc: LocationInfo,
+  ttlMs: number = CACHE_TTL_MS.alerts,
 ): Promise<WeatherAlert[]> {
   const lat = loc.lat.toFixed(2);
   const lon = loc.lon.toFixed(2);
   const auth = resolveAuth(key);
-  return cached(db, `qweather:alerts:${lat},${lon}`, CACHE_TTL_MS.alerts, async () => {
+  return cached(db, `qweather:alerts:${lat},${lon}`, ttlMs, async () => {
     const body = (await requestQw(
       buildRequest(host, `/weatheralert/v1/current/${lat}/${lon}`, {}, auth),
       auth,

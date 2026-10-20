@@ -12,6 +12,8 @@ import {
   type ToolContext,
 } from "../../core/registry.js";
 import { runRetention } from "../../core/retention.js";
+import { pruneJobRuns } from "../../core/jobs.js";
+import { logger } from "../../core/logger.js";
 import {
   cancelPendingDeliveries,
   getPushRoute,
@@ -206,7 +208,12 @@ registerModule({
       // 与永不回收的已取消日程，避免长期运行后库无限增长
       cron: "50 4 * * *",
       handler: () => {
-        runRetention(runtime().db);
+        const { db } = runtime();
+        runRetention(db);
+        // job_runs 与 notifications/deliveries 一样只增不减：随保留策略一起收敛。
+        // 单独再挂一个 cron 只会多一个可能错过的触发点，还要再维护一份保留期配置。
+        const prunedRuns = pruneJobRuns(db);
+        logger.debug(`任务运行记录清理：删除 ${prunedRuns} 行`);
       },
     },
   ],

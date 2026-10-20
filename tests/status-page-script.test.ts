@@ -5,6 +5,9 @@ import { statusPage } from "../src/server/page.js";
 import { createStatusApp } from "../src/server/status.js";
 import { todayIso } from "../src/time.js";
 import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
+// 副作用 import：注册全部模块。「定时任务」卡片的任务清单来自注册表（allJobs()），
+// 不注册的话卡片永远显示 0 个任务，端到端断言就失去意义。
+import "../src/modules/index.js";
 
 /**
  * 看板页面脚本的整链路冒烟：把状态页里那段内联 JS 放进 vm 用最小 DOM 桩跑起来，
@@ -485,6 +488,104 @@ describe("看板抽屉（点击委托 + 明细渲染）", () => {
       const html = run.elements.get("drawer-body")?.innerHTML ?? "";
       assert.doesNotMatch(html, /<div class="spin">/, "自动刷新不应把抽屉打回「加载中…」");
       assert.match(html, new RegExp(`${year} 年安排`), "刷新后仍显示所选年份");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
+describe("看板「定时任务」卡片", () => {
+  function seedJobRun(
+    env: TestEnv,
+    over: {
+      jobName: string;
+      module?: string;
+      status: "ok" | "failed" | "skipped" | "running";
+      startedAt: string;
+      error?: string | null;
+    },
+  ): void {
+    env.db
+      .prepare(
+        `INSERT INTO job_runs (job_name, module, trigger, scheduled_for, started_at, finished_at, status, error)
+         VALUES (?, ?, 'cron', ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        over.jobName,
+        over.module ?? "weather",
+        over.startedAt,
+        over.startedAt,
+        over.status === "running" ? null : over.startedAt,
+        over.status,
+        over.error ?? null,
+      );
+  }
+
+  it("首屏渲染任务数与失败数，点开抽屉列出每 job 的最近运行", async () => {
+    const env = makeTestEnv();
+    try {
+      const now = Date.now();
+      seedJobRun(env, {
+        jobName: "daily_brief",
+        status: "ok",
+        startedAt: new Date(now - 2 * 3600 * 1000).toISOString(),
+      });
+      seedJobRun(env, {
+        jobName: "alert_watch",
+        status: "failed",
+        startedAt: new Date(now - 3600 * 1000).toISOString(),
+        error: "上游 503",
+      });
+
+      const run = runPageScript(env, "");
+      const rendered = await waitFor(() =>
+        (run.elements.get("job-stats")?.innerHTML ?? "").includes("定时任务"),
+      );
+      assert.ok(rendered, `卡片没有渲染：${run.elements.get("job-stats")?.innerHTML}`);
+
+      const stats = run.elements.get("job-stats")?.innerHTML ?? "";
+      assert.match(stats, /24 小时失败/, "卡片要显示 24 小时失败数");
+      assert.match(stats, /class="n bad">1</, "有失败时数字必须标红（bad）");
+      const last = run.elements.get("job-last")?.innerHTML ?? "";
+      assert.match(last, /最近运行/, "卡片要显示最近一次运行");
+      assert.match(last, /失败/, "最近一次运行来自失败那条（时间更近）");
+      assert.match(last, /上游 503/, "错误原因要露出，不能只显示一个红点");
+
+      run.clickDrawer("jobs");
+      const drawer = await waitFor(() =>
+        (run.elements.get("drawer-body")?.innerHTML ?? "").includes("任务与最近运行"),
+      );
+      assert.ok(drawer, `任务抽屉没有渲染：${run.elements.get("drawer-body")?.innerHTML}`);
+      const html = run.elements.get("drawer-body")?.innerHTML ?? "";
+      assert.match(html, /weather\.daily_brief/, "抽屉按 module.name 列出任务");
+      assert.match(html, /weather\.alert_watch/);
+      assert.match(html, /最近成功/, "每 job 要有最近成功时间");
+      assert.match(html, /24h 失败 1 次/);
+      assert.match(html, /0 7 \* \* \*/, "cron 表达式要展示（config 驱动的 job 也要能求值）");
+      assert.equal(run.elements.get("drawer")?.attrs["aria-hidden"], "false", "抽屉应被打开");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("没有运行记录时给出「还没有运行记录」而不是空白", async () => {
+    const env = makeTestEnv();
+    try {
+      const run = runPageScript(env, "");
+      const rendered = await waitFor(() =>
+        (run.elements.get("job-stats")?.innerHTML ?? "").includes("定时任务"),
+      );
+      assert.ok(rendered);
+      assert.match(run.elements.get("job-last")?.innerHTML ?? "", /还没有运行记录/);
+      assert.match(run.elements.get("job-stats")?.innerHTML ?? "", /24 小时失败/);
+
+      run.clickDrawer("jobs");
+      const drawer = await waitFor(() =>
+        (run.elements.get("drawer-body")?.innerHTML ?? "").includes("任务与最近运行"),
+      );
+      assert.ok(drawer, "即使从未运行，抽屉也要列出全部 job（显示「未运行」）");
+      assert.match(run.elements.get("drawer-body")?.innerHTML ?? "", /未运行/);
+      assert.equal(run.elements.get("drawer")?.attrs["aria-hidden"], "false");
     } finally {
       cleanupTestEnv(env);
     }

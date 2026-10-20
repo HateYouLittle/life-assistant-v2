@@ -26,6 +26,18 @@ import { logger } from "../../core/logger.js";
 
 const ONE_DAY_MS = 86_400_000;
 
+/*
+ * 补班提醒的**唯一来源**是本模块的 workday_watch（它本就负责「今天补班 / 假期临近 /
+ * 假期最后一天」三类调休提醒）；每日简报只做天气与日程，不再重复「今天要补班」。
+ *
+ * 历史缺陷：早报 notes 里也曾写「⚠️ 今天要补班」，两个 job 默认又同在 07:00 触发，
+ * 用户同日收到两条同义推送（2026-09-19、2026-10-09 两个 Profile 均复现）。
+ * 早期方案是「workday_watch 里先查当天是否已有 weather.brief 再跳过」，但真实库的
+ * created_at（毫秒）证明 workday_watch 每次都在 daily_brief 之前跑完 —— 该判断在默认
+ * 配置下永远为假，线上仍会双推。因此改为把补班内容从早报里移除（单一事实来源），
+ * 两条 job 的相对顺序、以及某天简报成功与否都不再影响正确性。
+ */
+
 /**
  * 调休/补班提醒（job workday_watch）。三个互不干扰的触发条件，各自独立去重：
  * ① 今天补班；② 假期临近（首日距今 ≤ WORKDAY_REMIND_DAYS_BEFORE）；③ 假期最后一天。
@@ -45,6 +57,8 @@ export async function runWorkdayWatch(): Promise<void> {
   for (const profileId of listProfiles(db)) {
     try {
       if (todayType === "workday") {
+        // 补班提示只由本模块推送（早报已移除同义文案，见文件上方注释）；
+        // dedupeKey 保持 `holiday:workday:<date>`：同一天重复跑仍只落一条。
         const name = holidayDayName(db, today) ?? "调休";
         await publishProfile(db, rt.config, profileId, {
           kind: "holiday.workday",
