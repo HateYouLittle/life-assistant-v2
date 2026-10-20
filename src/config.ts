@@ -1,3 +1,4 @@
+import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import cron from "node-cron";
 import { z } from "zod";
@@ -79,6 +80,15 @@ export interface ResolvedConfig {
   ledgerDigestCron: string;
   /** 周报 cron（WEEKLY_REPORT_CRON，默认 "0 20 * * 0" 即周日 20:00，Asia/Shanghai） */
   weeklyReportCron: string;
+  /**
+   * 日志目录（LOG_DIR）：daemon 的 stdout/stderr 由 launchd 重定向到这里，
+   * 维护任务按月/按大小轮转。缺省 macOS 的 ~/Library/Logs/life-assistant。
+   */
+  logDir: string;
+  /** 单个日志文件超过该大小才轮转（LOG_MAX_MB，默认 20） */
+  logMaxBytes: number;
+  /** 轮转后保留的份数（LOG_KEEP，默认 7） */
+  logKeep: number;
   logLevel: LogLevel;
 }
 
@@ -400,6 +410,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
     throw new Error(`EVENING_BRIEF_CRON 不是合法 cron 表达式: ${eveningBriefCron}`);
   }
 
+  const logDirRaw = env.LOG_DIR?.trim() || join(homedir(), "Library/Logs/life-assistant");
+  const logMaxMbRaw = env.LOG_MAX_MB?.trim() || "20";
+  const logMaxMb = Number(logMaxMbRaw);
+  if (!Number.isInteger(logMaxMb) || logMaxMb < 1 || logMaxMb > 1024) {
+    throw new Error(`LOG_MAX_MB 必须是 1..1024 的整数: ${logMaxMbRaw}`);
+  }
+  const logKeepRaw = env.LOG_KEEP?.trim() || "7";
+  const logKeep = Number(logKeepRaw);
+  if (!Number.isInteger(logKeep) || logKeep < 1 || logKeep > 100) {
+    throw new Error(`LOG_KEEP 必须是 1..100 的整数: ${logKeepRaw}`);
+  }
+
   const weeklyReportCron = env.WEEKLY_REPORT_CRON?.trim() || "0 20 * * 0";
   if (!cron.validate(weeklyReportCron)) {
     throw new Error(`WEEKLY_REPORT_CRON 不是合法 cron 表达式: ${weeklyReportCron}`);
@@ -484,6 +506,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
     eveningBriefCron,
     ledgerDigestCron,
     weeklyReportCron,
+    logDir: logDirRaw,
+    logMaxBytes: logMaxMb * 1024 * 1024,
+    logKeep,
     logLevel: logLevel.data,
   };
 }

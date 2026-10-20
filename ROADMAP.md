@@ -57,7 +57,7 @@ CI 在 Node 22.16.0 / 22 / 24 三档矩阵全绿（`.github/workflows/ci.yml`）
 4. **per-profile token + 看板可见性**：身份部分 ✅（2026-10-20，`PROFILE_TOKENS_JSON` + `/mcp` 强绑定 + `/api/quick/*`）；看板可见性仍待办（`/api/*` 只认 master，日程/通知按 Profile 过滤未做）。
 5. **预算看板/趋势/引导 + 可执行月报 + 周日周报** ✅（2026-10-20）：状态页预算卡片（`/api/budget`，进度条 + 未设/超支/花速过快/正常四类可执行建议）、周报 job `bookkeeping.weekly_report`（周日 20:00，分类 top5/最大单笔/环比/预算剩余）；月报已有预算对照行。趋势图未做（需要历史曲线再引入）。
 6. **分类字典/别名、CSV 公式注入修复、明细分页** ✅（2026-10-20）：`expense categories|category_alias`、`expense add/update` 别名归一（大小写/空白折叠，不改历史）、`expenseCsv` 文本列防公式注入、`expense list` 与 `/api/expenses|deliveries` 支持 `offset` + 看板「加载更多」（OFFSET 游标，翻页期间数据变化可能重复/漏行，数据量大再换 keyset）。
-7. **可观测性**：`/metrics` + `/readyz` ✅（2026-10-20：鉴权/限流计数器、投递状态、outbox 排队、job 最近成功、备份年龄、DB/WAL、QWeather 用量）；仍待办：`notify test/history/retry`、日志轮转与本地时区。
+7. **可观测性** ✅（2026-10-20）：`/metrics` + `/readyz`（鉴权/限流计数器、投递状态、outbox 排队、job 最近成功、备份年龄、DB/WAL、QWeather 用量）；`notify test/history/retry`（历史分页、失败投递手动重试）；日志本地时间戳 + `maintenance.log_rotate`（每日 04:50 copytruncate，`LOG_DIR`/`LOG_MAX_MB`/`LOG_KEEP`）。
 8. **迁移结构指纹 + 审计日志**（补 `schema_version` 不是完整结构指纹的缺口）
 
 ## 阶段三：新领域 —— 🔲 未开始（6–12 周）

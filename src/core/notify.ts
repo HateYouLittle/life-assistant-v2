@@ -345,6 +345,114 @@ function requeueRoute(db: DatabaseSync, profileId: string): void {
   ).run(nowIso(), nowIso(), profileId);
 }
 
+/** 一次手动重试最多叫醒多少行：45s 的 drain 预算塞不下更多，超出部分计入 skipped */
+export const RETRY_BATCH_LIMIT = 200;
+
+/** 手动可重试的状态：failed（退避等待中）与 fallback（已终结，但用户可能刚修好路由） */
+const RETRYABLE_STATUSES = new Set(["failed", "fallback"]);
+
+export interface RetryDeliveriesInput {
+  profileId: string;
+  /** 只重试这条通知下的所有投递 */
+  notificationId?: string;
+  /** 只重试这一条投递（精确到某条路由） */
+  deliveryId?: string;
+  /** 批量：该 Profile 所有 failed/fallback（上限 RETRY_BATCH_LIMIT） */
+  all?: boolean;
+}
+
+export interface RetryDeliveriesResult {
+  /** 真正重新入队的条数 */
+  retried: number;
+  /** 命中但不可重试（queued/sending/sent/cancelled）或超出批量上限的条数 */
+  skipped: number;
+  deliveryIds: string[];
+}
+
+/**
+ * 手动把失败投递重新入队（用户说「这条没发出去，再发一次」）。
+ *
+ * 与自动重试的分工：drain 的退避阶梯只处理 failed；fallback 是**终态**，只有
+ * ① 路由变更（requeueRoute，且排除确定性拒绝）② 本函数（用户显式要求）能叫醒它。
+ * 因此这里**不看** deterministic_reject —— 用户按下重试就是对「先别重发」判断的覆盖。
+ *
+ * 重置口径：attempts / confirmed_failures / transport_failures 归零（新一轮的失败计数），
+ * next_attempt_at = now（立即可投），expire_at = NULL（用户手动重试的内容通常仍想收到，
+ * 不再因原来的截止时刻被 drain 直接作废），last_error = NULL、request_started_at = NULL
+ * （回到「从未发出过」），generation+1（drain 的请求 id 里带世代，便于对端区分）。
+ *
+ * `request_id` **刻意保留**：已发出但结果不确定的投递（transport_failure）必须复用同一个
+ * X-Request-ID，否则重试可能让对端重复投递一条它其实已经收到的通知；被确定性拒绝的行
+ * 没在对端落库，复用旧 id 也无害。`route_name` 同理保留 —— drain 的 route drift 分支会用
+ * 当前路由名改写它。
+ *
+ * `deterministic_reject` 归零：这一列只用来让 requeueRoute 区分「确定性拒绝」与「从未发出过」。
+ * 手动重试后该行已不再处于终态，若保留旧值，一旦它之后又因路由缺失落回 fallback，
+ * requeueRoute 会把它当成确定性拒绝而**永远不再自动入队** —— 正是要避免的卡死。
+ *
+ * 归属范围由 notifications.profile_id 强制：调用方（工具层）先校验 id 属于谁，
+ * 这里再兜一层，避免把别人的通知重投出去。
+ */
+export function retryDeliveries(
+  db: DatabaseSync,
+  input: RetryDeliveriesInput,
+): RetryDeliveriesResult {
+  const { profileId, notificationId, deliveryId } = input;
+  // 防御：没有任何选择器时必须显式 all=true，否则一次误调用会把该 Profile 的失败行全部刷一遍
+  if (notificationId === undefined && deliveryId === undefined && input.all !== true) {
+    return { retried: 0, skipped: 0, deliveryIds: [] };
+  }
+
+  return withTransaction(db, () => {
+    const where: string[] = ["n.profile_id = ?"];
+    const params: string[] = [profileId];
+    if (deliveryId !== undefined) {
+      where.push("d.id = ?");
+      params.push(deliveryId);
+    }
+    if (notificationId !== undefined) {
+      where.push("d.notification_id = ?");
+      params.push(notificationId);
+    }
+    // 批量模式只捞可重试状态：否则成千上万条 sent 行会占满 LIMIT 窗口、把真正的
+    // 失败行挤出去。指定具体 id 时则连不可重试的一起捞，好把它们计入 skipped。
+    const batch = deliveryId === undefined && notificationId === undefined;
+    const statusFilter = batch ? " AND d.status IN ('failed','fallback')" : "";
+    const clause = `FROM deliveries d JOIN notifications n ON n.id = d.notification_id
+       WHERE ${where.join(" AND ")}${statusFilter}`;
+
+    const total = (db.prepare(`SELECT COUNT(*) AS n ${clause}`).get(...params) as { n: number }).n;
+    const rows = db
+      .prepare(`SELECT d.id, d.status ${clause} ORDER BY d.created_at, d.id LIMIT ?`)
+      .all(...params, RETRY_BATCH_LIMIT) as { id: string; status: string }[];
+
+    const retryable = rows.filter((row) => RETRYABLE_STATUSES.has(row.status));
+    const ids = retryable.map((row) => row.id);
+    // skipped = 命中但没被重投的行：不可重试状态 + 超出批量上限的那部分
+    const skipped = total - ids.length;
+    if (ids.length === 0) return { retried: 0, skipped, deliveryIds: [] };
+
+    const now = nowIso();
+    const placeholders = ids.map(() => "?").join(",");
+    db.prepare(
+      `UPDATE deliveries SET
+         status = 'queued',
+         attempts = 0,
+         confirmed_failures = 0,
+         transport_failures = 0,
+         next_attempt_at = ?,
+         expire_at = NULL,
+         last_error = NULL,
+         request_started_at = NULL,
+         deterministic_reject = 0,
+         generation = generation + 1,
+         updated_at = ?
+       WHERE id IN (${placeholders})`,
+    ).run(now, now, ...ids);
+    return { retried: ids.length, skipped, deliveryIds: ids };
+  });
+}
+
 let drainTimer: ReturnType<typeof setTimeout> | null = null;
 let draining = false;
 /** 当前在途的一轮投递，供停机时等待收敛（见 waitForDrain） */

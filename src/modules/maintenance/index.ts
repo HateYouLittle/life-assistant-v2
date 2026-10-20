@@ -1,5 +1,6 @@
 import { MissingDatabaseError, runBackup } from "../../core/backup.js";
 import { logger } from "../../core/logger.js";
+import { rotateLogs } from "../../core/logrotate.js";
 import { registerModule, runtime } from "../../core/registry.js";
 
 /**
@@ -55,6 +56,38 @@ function runWalCheckpoint(): void {
   }
 }
 
+/**
+ * 日志轮转（job log_rotate，固定 04:50）。
+ *
+ * launchd 把 daemon 的 stdout/stderr 重定向到 ${LOG_DIR}/{daemon.log,daemon.err.log}，
+ * 这两个文件不会自己收敛；这里按 LOG_MAX_MB 用 copytruncate 轮转、按 LOG_KEEP 保留份数
+ * （实现与「为什么先 copy 再 truncate」见 core/logrotate.ts）。
+ *
+ * 为什么与每天的保留策略同分钟（04:50）：都是低峰期的「磁盘收敛」动作，放在同一波维护里
+ * 便于对照状态页的 job 卡片；固定时刻而不是配置项 —— 用户没有调轮转时机的需求。
+ *
+ * 为什么异常要 **rethrow**（与每日备份的「失败只记日志」不同）：备份/checkpoint 失败
+ * 有各自的兜底（下一轮重试、外部 timer），而日志无限增长是**静默**劣化，必须让
+ * job_runs 记 failed、状态页与 doctor 能看见连续失败；否则只能在磁盘写满时才发现。
+ */
+function runLogRotate(): void {
+  const { logDir, logMaxBytes, logKeep } = runtime().config;
+  try {
+    const result = rotateLogs({ dir: logDir, maxBytes: logMaxBytes, keep: logKeep });
+    logger.info(
+      `日志轮转完成：轮转 ${result.rotated.length} 个文件（活动日志归零 ${result.freedBytes} 字节），` +
+        `保留最近 ${logKeep} 份；跳过 ${result.skipped.length} 个` +
+        (result.skipped.length === 0
+          ? ""
+          : `（${result.skipped.map((s) => `${s.file}：${s.reason}`).join("；")}）`),
+    );
+  } catch (e) {
+    // 记一条 error 再抛：job 包装层（daemon 的 runExclusive）会把 failed 写进 job_runs
+    logger.error(`日志轮转失败：${e instanceof Error ? e.message : String(e)}`);
+    throw e;
+  }
+}
+
 registerModule({
   name: "maintenance",
   jobs: [
@@ -68,6 +101,13 @@ registerModule({
       // 与备份错开 15 分钟：固定时刻而不是配置项 —— 它是纯维护动作，用户没有调参需求
       cron: "15 3 * * *",
       handler: runWalCheckpoint,
+    },
+    {
+      name: "log_rotate",
+      // 04:50：与保留策略同一波低峰维护（02:00 抓节假日、03:00 备份、03:15 checkpoint 之后）；
+      // 错过的触发由 CATCHUP_POLICY["maintenance.log_rotate"] 在启动时补一次（幂等）
+      cron: "50 4 * * *",
+      handler: runLogRotate,
     },
   ],
 });

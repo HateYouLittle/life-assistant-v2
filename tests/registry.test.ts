@@ -102,6 +102,8 @@ describe("registry 契约", () => {
       "holiday.refresh",
       "holiday.workday_watch",
       "maintenance.daily_backup",
+      // 每日 04:50 的 launchd 日志轮转（copytruncate + LOG_KEEP 份保留）
+      "maintenance.log_rotate",
       // 每日 WAL checkpoint（运维加固），与备份分开登记，便于状态页分辨失败来源
       "maintenance.wal_checkpoint",
       "notify.retention",

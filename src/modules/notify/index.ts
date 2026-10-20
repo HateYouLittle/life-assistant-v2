@@ -11,8 +11,10 @@ import { pruneJobRuns } from "../../core/jobs.js";
 import { logger } from "../../core/logger.js";
 import {
   cancelPendingDeliveries,
+  drainSoon,
   getPushRoute,
   publishProfile,
+  retryDeliveries,
   routeSecret,
   setPushRoute,
   setPushRouteEnabled,
@@ -61,6 +63,32 @@ function prefsView(
     out[kind] = { push: merged.push !== false, channels: merged.channels ?? null };
   }
   return out;
+}
+
+/**
+ * 分页参数的宽松归一：limit/offset 是「翻页」参数，传错（字符串、负数、越界）时
+ * 回退到最近的合法值比直接报错更有用 —— 用户想看的是通知列表，不该被一个参数挡住。
+ * kind/unread 这类**过滤语义**参数则相反：静默忽略会让结果看起来是对的、其实是错的，
+ * 所以它们由调用方严格校验并 fail。
+ */
+function clampInt(value: unknown, fallback: number, min: number, max: number): number {
+  const n = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(n)));
+}
+
+/** retry 的人话说明：区分「没命中」「都不可重试」「已入队」三种情况 */
+function retryNote(retried: number, skipped: number): string {
+  if (retried === 0) {
+    return skipped > 0
+      ? "没有可重试的投递：命中的行都在排队/发送中/已发出/已取消，不能重复入队"
+      : "没有命中的投递：该通知可能没有投递记录（未配置路由，或该类型已关闭主动推送），可用 history 查看";
+  }
+  return (
+    `已重新入队 ${retried} 条，并触发了一轮投递（去抖 100ms，最迟 20 秒内）` +
+    (skipped > 0 ? `；另有 ${skipped} 条不可重试或超出批量上限` : "") +
+    "。fallback 行若是对端确定性拒绝（4xx/3xx），重试前建议先修好路由或通道配置，否则会被原样再拒一次"
+  );
 }
 
 export function notifyTool(args: Record<string, unknown>, ctx: ToolContext) {
@@ -298,6 +326,161 @@ function notifyToolInner(args: Record<string, unknown>, ctx: ToolContext) {
     });
   }
 
+  if (action === "history") {
+    // 与 pull 的区别：pull 会**标记已读并取消待投递**，history 只是查看历史，
+    // 绝不改 read/status —— 否则「翻一下历史」就会把没推出去的通知变成已读。
+    const limit = clampInt(args.limit, 20, 1, 100);
+    const offset = clampInt(args.offset, 0, 0, Number.MAX_SAFE_INTEGER);
+    const kindRaw = args.kind;
+    if (kindRaw !== undefined && (typeof kindRaw !== "string" || kindRaw.trim() === "")) {
+      return fail("kind 需要非空字符串（如 bookkeeping.entry）");
+    }
+    const unreadRaw = args.unread;
+    if (unreadRaw !== undefined && typeof unreadRaw !== "boolean") {
+      return fail("unread 需要布尔值 true/false");
+    }
+    const conditions = ["profile_id = ?"];
+    const params: (string | number)[] = [profileId];
+    if (kindRaw !== undefined) {
+      conditions.push("kind = ?");
+      params.push((kindRaw as string).trim());
+    }
+    if (unreadRaw === true) conditions.push("read = 0");
+    const where = conditions.join(" AND ");
+
+    const total = (
+      db.prepare(`SELECT COUNT(*) AS n FROM notifications WHERE ${where}`).get(...params) as {
+        n: number;
+      }
+    ).n;
+    const rows = db
+      .prepare(
+        `SELECT id, kind, title, created_at, read FROM notifications WHERE ${where}
+         ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
+      )
+      .all(...params, limit, offset) as {
+      id: string;
+      kind: string;
+      title: string;
+      created_at: string;
+      read: number;
+    }[];
+
+    // 每条通知最近一条投递；同一通知有多条（换过路由/多通道路由历史）时取最新并标注，
+    // 免得用户以为「只有这一条」而漏看另一条通道的失败。
+    interface DeliveryInfo {
+      status: string;
+      attempts: number;
+      last_error: string | null;
+      routes: number;
+    }
+    const deliveryOf = new Map<string, DeliveryInfo>();
+    if (rows.length > 0) {
+      const placeholders = rows.map(() => "?").join(",");
+      const deliveries = db
+        .prepare(
+          `SELECT notification_id, status, attempts, last_error FROM deliveries
+           WHERE notification_id IN (${placeholders})
+           ORDER BY notification_id, created_at DESC, id DESC`,
+        )
+        .all(...rows.map((r) => r.id)) as {
+        notification_id: string;
+        status: string;
+        attempts: number;
+        last_error: string | null;
+      }[];
+      for (const delivery of deliveries) {
+        const existing = deliveryOf.get(delivery.notification_id);
+        if (existing === undefined) {
+          deliveryOf.set(delivery.notification_id, {
+            status: delivery.status,
+            attempts: delivery.attempts,
+            last_error: delivery.last_error,
+            routes: 1,
+          });
+        } else {
+          existing.routes += 1;
+        }
+      }
+    }
+
+    return okJson({
+      总数: total,
+      偏移: offset,
+      还有更多: offset + rows.length < total,
+      记录: rows.map((row) => {
+        const delivery = deliveryOf.get(row.id);
+        return {
+          id: row.id,
+          种类: row.kind,
+          标题: row.title,
+          "时间(本地)": localTimeText(row.created_at),
+          已读: row.read === 1,
+          投递:
+            delivery === undefined
+              ? null
+              : {
+                  状态: delivery.status,
+                  尝试次数: delivery.attempts,
+                  最后错误: delivery.last_error,
+                  ...(delivery.routes > 1 ? { 多路由: true } : {}),
+                },
+        };
+      }),
+    });
+  }
+
+  if (action === "retry") {
+    const notificationIdRaw = args.notification_id;
+    const deliveryIdRaw = args.delivery_id;
+    if (
+      notificationIdRaw !== undefined &&
+      (typeof notificationIdRaw !== "string" || notificationIdRaw.trim() === "")
+    ) {
+      return fail("notification_id 需要非空字符串");
+    }
+    if (
+      deliveryIdRaw !== undefined &&
+      (typeof deliveryIdRaw !== "string" || deliveryIdRaw.trim() === "")
+    ) {
+      return fail("delivery_id 需要非空字符串");
+    }
+    const notificationId = notificationIdRaw as string | undefined;
+    const deliveryId = deliveryIdRaw as string | undefined;
+    const all = args.all === true;
+    if (notificationId === undefined && deliveryId === undefined && !all) {
+      return fail(
+        "retry 需要 notification_id / delivery_id 指定单条，或 all=true 批量重试失败投递",
+      );
+    }
+
+    // 归属预检：id 不存在或不属于当前 Profile 时明确报错（而不是回一句「重试 0 条」让人猜）
+    if (deliveryId !== undefined) {
+      const found = db
+        .prepare(
+          `SELECT 1 AS ok FROM deliveries d JOIN notifications n ON n.id = d.notification_id
+           WHERE d.id = ? AND n.profile_id = ?`,
+        )
+        .get(deliveryId, profileId);
+      if (found === undefined) return fail(`投递不存在或不属于当前 Profile: ${deliveryId}`);
+    }
+    if (notificationId !== undefined) {
+      const found = db
+        .prepare("SELECT 1 AS ok FROM notifications WHERE id = ? AND profile_id = ?")
+        .get(notificationId, profileId);
+      if (found === undefined) return fail(`通知不存在或不属于当前 Profile: ${notificationId}`);
+    }
+
+    const result = retryDeliveries(db, { profileId, notificationId, deliveryId, all });
+    // 用户刚点了「重试」，不该等调度器 20s 那一轮；drainSoon 自带去抖与在途保护
+    if (result.retried > 0) drainSoon(db, ctx.config);
+    return okJson({
+      重试数: result.retried,
+      跳过数: result.skipped,
+      说明: retryNote(result.retried, result.skipped),
+    });
+  }
+
   if (action === "cancel") {
     const id = args.id as string | undefined;
     if (id === undefined) return fail("cancel 需要 id（可从 pull 结果获取）");
@@ -322,10 +505,36 @@ registerModule({
     {
       name: "notify",
       description:
-        "通知管理：action=pull 拉取未读通知（会话开始时调用一次，作为主动推送失败的兜底）；quiet_hours 设置/查看/清除静默时段（HH:MM，支持跨午夜）；route 配置/查看主动推送通道（channel=webhook 默认，HMAC V2 回环 webhook、secret 在 env；channel=log 本地日志通道，不需要 URL/secret）；prefs 查看/设置按类型的推送偏好（不带 kind 返回已保存+内置默认+最终生效值；带 kind+push 或 kind+channels 写入，push=false 表示不主动推送但通知仍入库、可用 pull 取回；bookkeeping.entry 默认不推，由每日摘要取代）；test 发一条测试通知验证通道（返回是否建立投递与所用通道，无路由时仅入库）；cancel 取消某条通知的待投递。",
+        "通知管理：action=pull 拉取未读通知（会话开始时调用一次，作为主动推送失败的兜底，会标记已读并取消待投递）；history 查看通知历史（limit/offset 分页，可按 kind 精确过滤、unread=true 只看未读；**不改变已读状态**，每条带最近一条投递的状态/尝试次数/最后错误，用于回答「哪条没发出去、为什么」）；retry 手动重试投递（notification_id 一条通知的全部投递 / delivery_id 单条投递 / all=true 批量重试该 Profile 所有 failed+fallback；重新入队后立即触发一轮投递）；quiet_hours 设置/查看/清除静默时段（HH:MM，支持跨午夜）；route 配置/查看主动推送通道（channel=webhook 默认，HMAC V2 回环 webhook、secret 在 env；channel=log 本地日志通道，不需要 URL/secret）；prefs 查看/设置按类型的推送偏好（不带 kind 返回已保存+内置默认+最终生效值；带 kind+push 或 kind+channels 写入，push=false 表示不主动推送但通知仍入库、可用 pull 取回；bookkeeping.entry 默认不推，由每日摘要取代）；test 发一条测试通知验证通道（返回是否建立投递与所用通道，无路由时仅入库）；cancel 取消某条通知的待投递。",
       inputSchema: {
-        action: z.enum(["pull", "quiet_hours", "route", "prefs", "test", "cancel"]),
-        limit: z.number().int().min(1).max(100).optional().describe("pull 条数，默认 20"),
+        action: z.enum([
+          "pull",
+          "history",
+          "retry",
+          "quiet_hours",
+          "route",
+          "prefs",
+          "test",
+          "cancel",
+        ]),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(100)
+          .optional()
+          .describe("pull/history 每页条数，默认 20（1-100）"),
+        offset: z.number().int().min(0).optional().describe("history 偏移（从 0 开始），默认 0"),
+        unread: z.boolean().optional().describe("history 只看未读（true）"),
+        notification_id: z
+          .string()
+          .optional()
+          .describe("retry 的通知 id（该通知下的投递全部重试）"),
+        delivery_id: z.string().optional().describe("retry 的单条投递 id（精确到一条路由）"),
+        all: z
+          .boolean()
+          .optional()
+          .describe("retry 批量重试该 Profile 所有 failed/fallback 投递（上限 200 条）"),
         start: z.string().regex(TIME_RE).optional(),
         end: z.string().regex(TIME_RE).optional(),
         clear: z.boolean().optional().describe("清除静默时段"),
@@ -342,7 +551,9 @@ registerModule({
           .string()
           .max(64)
           .optional()
-          .describe("prefs 的通知类型（如 bookkeeping.entry / schedule.reminder）"),
+          .describe(
+            "prefs 的通知类型（如 bookkeeping.entry / schedule.reminder）；history 时作为精确过滤条件",
+          ),
         push: z
           .boolean()
           .optional()

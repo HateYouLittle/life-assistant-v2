@@ -158,6 +158,8 @@ export const CATCHUP_POLICY: Record<string, number> = {
   "bookkeeping.ledger_digest": 12,
   // 周报（bookkeeping.weekly_report，默认周日 20:00）：停机错过一天内仍可补
   "bookkeeping.weekly_report": 24,
+  // 日志轮转（maintenance.log_rotate，默认 04:50）：错过一天仍可补，幂等
+  "maintenance.log_rotate": 24,
   // 预警巡检每 20 分钟一次：只补最近 1 小时内的那次，更早的预警已过时
   "weather.alert_watch": 1,
   // 调休/补班提醒：与日报同一窗口

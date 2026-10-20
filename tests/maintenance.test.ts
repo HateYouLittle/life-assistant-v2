@@ -2,8 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { createStatusApp } from "../src/server/status.js";
-import { runRetention, retentionPreview } from "../src/core/retention.js";
+import { openDatabase } from "../src/core/database.js";
 import {
   bumpQweatherUsage,
   currentWeather,
@@ -12,10 +11,11 @@ import {
   seedQweatherUsage,
 } from "../src/core/qweather.js";
 import { allJobs } from "../src/core/registry.js";
-import { registerAllModules } from "../src/modules/index.js";
-import { now, todayIso } from "../src/time.js";
+import { retentionPreview, runRetention } from "../src/core/retention.js";
 import { runDoctor } from "../src/doctor.js";
-import { openDatabase } from "../src/core/database.js";
+import { registerAllModules } from "../src/modules/index.js";
+import { createStatusApp } from "../src/server/status.js";
+import { now, todayIso } from "../src/time.js";
 import { cleanupTestEnv, makeTestEnv, type TestEnv, v1Current } from "./helpers.js";
 
 /** 保留策略：只删该删的（未读通知、仍有待投递的通知、count 日程都不许动） */
@@ -380,6 +380,69 @@ describe("每日自动备份 job", () => {
       env.config.dbPath = join(env.dir, "missing", "life-assistant.db");
       await assert.doesNotReject(async () => job.def.handler(now()));
       assert.equal(existsSync(env.config.backupDir), false, "缺库时不应留下空备份目录");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
+describe("日志轮转 job", () => {
+  /** 幂等：modules/index.ts 的副作用 import 已完成注册，这里只是拿真实模块清单 */
+  function logRotateJob() {
+    registerAllModules();
+    const job = allJobs().find((j) => j.module === "maintenance" && j.def.name === "log_rotate");
+    assert.ok(job !== undefined, "应注册 maintenance.log_rotate job");
+    return job;
+  }
+
+  it("已注册，cron 固定 04:50（错过的触发由 CATCHUP_POLICY 补）", () => {
+    const env = makeTestEnv();
+    try {
+      const job = logRotateJob();
+      const cron = typeof job.def.cron === "function" ? job.def.cron() : job.def.cron;
+      assert.equal(cron, "50 4 * * *");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("执行 handler：超过阈值的日志被轮转、原文件归零、小文件不动", async () => {
+    const env = makeTestEnv();
+    try {
+      // LOG_DIR 缺省是 macOS 的 ~/Library/Logs（真实用户目录）：测试必须改到临时目录，
+      // 阈值/保留数也调小，避免为了造「超过 20MB」写几十 MB 临时文件
+      const logDir = join(env.dir, "logs");
+      mkdirSync(logDir, { recursive: true });
+      env.config.logDir = logDir;
+      env.config.logMaxBytes = 512;
+      env.config.logKeep = 2;
+      writeFileSync(join(logDir, "daemon.err.log"), "err".repeat(1024));
+      writeFileSync(join(logDir, "daemon.log"), "small");
+
+      const job = logRotateJob();
+      await job.def.handler(now());
+
+      assert.equal(statSync(join(logDir, "daemon.err.log")).size, 0, "原日志应被截断为 0");
+      assert.equal(readFileSync(join(logDir, "daemon.log"), "utf8"), "small");
+      const rotated = readdirSync(logDir).filter((name) => name.startsWith("daemon.err.log."));
+      assert.equal(rotated.length, 1, "超过阈值的那一个文件应产生一份轮转产物");
+      assert.match(rotated[0] ?? "", /^daemon\.err\.log\.\d{8}-\d{6}\.log$/);
+      assert.equal(
+        readFileSync(join(logDir, rotated[0] ?? ""), "utf8"),
+        "err".repeat(1024),
+        "轮转副本必须是完整内容（先 copy 再 truncate）",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("日志目录不存在：handler 正常返回（skipped 只进日志，不抛错）", async () => {
+    const env = makeTestEnv();
+    try {
+      env.config.logDir = join(env.dir, "no-such-log-dir");
+      const job = logRotateJob();
+      await assert.doesNotReject(async () => job.def.handler(now()));
     } finally {
       cleanupTestEnv(env);
     }

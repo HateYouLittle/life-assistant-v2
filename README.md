@@ -65,6 +65,9 @@ npm run build
 | `EVENING_BRIEF_CRON` | | 晚报时间，默认 `'0 21 * * *'`；内容为明日天气/明日日程/今日未完成/明天补班或放假 |
 | `LEDGER_DIGEST_CRON` | | 每日记账摘要时间，默认 `'30 21 * * *'`；汇总当天笔数/合计/分类 top5 只发给记账的人（逐笔回执默认不推） |
 | `WEEKLY_REPORT_CRON` | | 周报时间，默认 `'0 20 * * 0'`（周日 20:00）；按账本汇总本周支出/分类 top5/环比上周/预算执行 |
+| `LOG_DIR` | | daemon 日志目录（launchd 重定向目标），默认 `~/Library/Logs/life-assistant`；维护 job 每日 04:50 copytruncate 轮转 |
+| `LOG_MAX_MB` | | 单个日志超过该大小才轮转，默认 `20`（1..1024） |
+| `LOG_KEEP` | | 轮转产物保留份数，默认 `7`（1..100） |
 | `ALERT_WATCH_CRON` | | 气象预警巡检时间，默认 `'*/20 * * * *'` |
 | `ALERT_MIN_LEVEL` | | 低于此级别的预警不主动推送，`blue|yellow|orange|red`，默认 `blue`（=全部级别都推） |
 | `WORKDAY_WATCH_CRON` | | 调休/补班提醒巡检时间，默认 `'0 7 * * *'` |
@@ -248,7 +251,8 @@ systemctl start life-assistant
 | 状态页 `date-line` 变红报错 | 与上面同源：浏览器里存的凭据失效（换过 token），重新用 `?token=` 引导一次 |
 | stdio 壳报 `daemon 不可达` | daemon 没起或 `MCP_DAEMON_URL` 指错；壳只连 daemon、不自己开库 |
 | MCP 直连报 `Session not found` | daemon 重启过：重新 `initialize`（stdio 壳会自动做） |
-| 收不到主动推送 | 依次查：`notify {action:"quiet_hours"}`（静默时段）→ `notify {action:"route"}`（路由与 `secretConfigured`）→ 状态页「投递」卡片的 queued/failed/fallback 计数 |
+| 收不到主动推送 | 依次查：`notify {action:"quiet_hours"}`（静默时段）→ `notify {action:"route"}`（路由与 `secretConfigured`）→ `notify {action:"history", unread:true}`（哪条没发、投递错误是什么）→ `notify {action:"retry", notification_id}` 重试 |
+| 日志太大 / 时间对不上 | 日志目录由 `LOG_DIR` 指定（默认 `~/Library/Logs/life-assistant`），job `maintenance.log_rotate` 每日 04:50 按 `LOG_MAX_MB`/`LOG_KEEP` 轮转；时间戳是本地 `+08:00`（不是 UTC `Z`） |
 | 天气工具报 `UNAUTHORIZED` / `NO CREDIT` | JWT 私钥或 API KEY 问题：换 JWT 前请确认私钥是 Ed25519 PKCS8、路径为绝对路径（首次请求才校验） |
 | `holidays.failed` 列出年份 | 抓取失败（无外网/CDN 不可达/数据校验不通过），原因就在该行；期间 `workday/holiday` 过滤的日程会暂停而不是猜 |
 | 通知没收到 | 先 `notify.pull`（只返回未读：静默时段/投递失败/无路由的通知可拉到；已成功投递的通知会被标记已读，pull 不再返回） |
@@ -330,6 +334,8 @@ npm run db:cleanup:preview   # 零业务删除预演：occurrence 与保留策�
 - **周报**：每周日 20:00（`WEEKLY_REPORT_CRON`，job `bookkeeping.weekly_report`）按账本汇总本周支出（笔数/分类 top5/最大单笔/环比上周/本月预算剩余与本周日均），家庭账本推给所有配置路由的人、个人账本只给归属人；`dedupeKey=weekly:<ledger>:<周一>` 保证同周不重复；无支出的账本不发。
 - **记账预算**：账本可设**总额**或**分类**月度预算（`ledger {action:"budget"}`，单位元），按账本每月滚动（对照当月支出）。`expense add` 成功后判定该笔是否**跨越** 80%/100% —— 只推跨越那一刻（而非达到即推）；同一个预算一笔只推**跨过的最高阈值**（一笔从 0% 到 150% 只推 100%，70%→90% 只推 80%），总额与分类各自独立判定；`dedupeKey = budget:<ledger>:<分类|空>:<YYYY-MM>:<80|100>`（总额的分类位是空串、分类用原样名字，分类名恰好叫 `-` 也不会与总额撞键），跨月自动重新判定，同月同阈值不重推；告警标题与对照都按**该笔支出所属月份**（补记两个月前的支出报的是那个月的超支，不会按「本月」口径误报）。设了预算的账本，月报追加预算对照行（附在 notes）；未设预算的账本行为完全不变。个人账本的支出**不触发任何预算提醒**（不推送、也不入通知）。
 - **记账摩擦**：`expense add` 不传 `ledger_id` 时按「该 Profile 的默认账本（`expense {action:"set_default_ledger"}` 设置）→ 唯一可写活动账本」解析，仍不唯一才报错并列出候选；未显式传 `category` 时回执附该账本近 90 天 top5「常用分类」。`expense add` 与 `schedule add` 都可带 `request_id`（落 `client_token`，按 Profile/创建人分范围唯一）：MCP 超时重试命中同一 token 时返回首次记录并标 `已存在`，不会重复记账/重复建日程，也不重复推送。
+- **通知历史与手动重试**：`notify {action:"history"}` 按 Profile 分页查通知（种类/已读/最新投递状态/尝试次数/最后错误，不改已读状态）；`notify {action:"retry"}` 把 `failed`/`fallback` 的投递重新入队（重置 attempts、清空 expire/last_error、generation+1、保留 request_id 以免重复投递），可按通知/投递 id 或 `all:true`（上限 200），重试后立即触发一轮 drain。对端确定性拒绝（4xx）需先修路由或参数，否则重试仍会原样被拒。
+- **日志轮转与本地时区**：日志时间戳改为本地带偏移（`2026-10-20T21:20:00.123+08:00`，仍可被 `Date.parse` 解析）；维护 job `maintenance.log_rotate`（每日 04:50）对 `LOG_DIR` 下的 `daemon.err.log`/`daemon.log` 做 copytruncate（先复制再清空，launchd fd 保持有效），单文件超过 `LOG_MAX_MB` 才轮转、按 `LOG_KEEP` 保留最近份数；文件缺失/复制失败只记 skipped，不拖垮其它文件。
 - **通知治理（按 kind 偏好 + 降噪 + 摘要）**：发布入口只有 `publishProfile`，它先查该 Profile 的 `notify_prefs`（`src/core/notify-prefs.ts`），再决定建不建 delivery —— 关闭推送只是「不打扰」，通知照常入库、`notify.pull` 仍取得到。内置默认里 `bookkeeping.entry`（逐笔回执）**不推送**：家庭账本下一笔支出会给每个配置了路由的人各发一条（真实数据 172 条 = 86 笔 × 2 人），现在改为只发记账人，并由每晚 **21:30 的每日记账摘要**（`LEDGER_DIGEST_CRON`，job `bookkeeping.ledger_digest`，kind `bookkeeping.digest`，`dedupeKey=digest:<profile>:<date>`）汇总当天笔数/合计/分类 top5。用户可用 `notify {action:"prefs", kind, push}` 恢复逐笔推送或限定通道，用 `notify {action:"test"}` 验证通道是否真的通。
 - **账本归属**：`ledgers.owner_profile_id` 为 NULL 表示**家庭账本**（所有 Profile 可见可写；`expense add` 的**逐笔回执只发给记账人**、预算提醒仍全局推送、月报物化到所有配置了路由的 Profile）；非空为**个人账本**（仅归属人可见可写，他人一律得到「账本不存在」不泄露存在性；不回执、不推预算提醒，月报只发给归属人）。`ledger create` 缺省建家庭账本、`personal: true` 建个人账本；`ledger transfer` 仅当前归属人可把个人账本转给其他 Profile（目标 Profile 须已存在）或省略 `profile` 转回家庭（不可逆）；家庭账本不能转为个人。账本名**分范围唯一**——家庭账本之间唯一、每人自己的个人账本内唯一，跨范围可同名（因此不同人可各用「日常」），也避免「创建失败」泄露他人账本名；转移归属时若目标范围已有同名活跃账本会被拒绝。状态页与 `/api/status`、`/api/expenses` 只统计/展示家庭账本。升级前的既有账本与 v1 导入账本一律为家庭账本（`schema_version` 2→3 时补 `owner_profile_id = NULL`，行为不变）。
 - **「本月」的口径**：状态页看板、预算对照、月报的「本月」= **自然月全月**（月初→月末，**含月内尚未到来的日期**）—— `spent_on` 是已录入的记账事实，指定了未来日期就不该因为日历没到那天就从本月数字里消失（否则同一个「本月」会随日期推移忽增忽减，对不上账）。工具侧 `expense summary` 不传区间时的默认区间是「月初 → 今天」，那是「本月至今」的查询默认。`expense` 的 `month` 与 `from`/`to` 互斥（同时传直接报错，`from > to` 也报错）：两者都表达区间，混着传会让 `list` 与 `summary` 得出相反结论。
@@ -390,3 +396,5 @@ npm run db:cleanup:preview   # 零业务删除预演：occurrence 与保留策�
 29. **周报标题不含账本名**：家庭有多个活跃账本且都有支出时，同一天会收到多条标题相同的「📅 本周账单 · M/D–M/D」（内容与 dedupeKey 不同）；单账本家庭无感。趋势图未做（预算看板只给当月数字与建议），需要历史曲线再引入。
 
 30. **明细分页用 OFFSET 游标**：`/api/expenses`、`/api/deliveries`、`expense {action:"list"}` 都支持 `offset`（夹紧到 0..100000），排序补了 `id` 兜底保证「页间不重复不跳行」；但 offset 分页对「翻页期间数据变化」敏感——expenses 的计数/取数在同一读事务里，deliveries 的 `items_total` 与 items 是两条语句（期间新增投递可能让下一页重复/漏行，个人规模+30s 刷新下概率很低）。深分页要扫行，数据量大时应改 keyset 游标。状态页「加载更多」追加的是当前月份/当前抽屉，切月或 30s 自动刷新会回到第一页（既有抽屉语义）。
+
+31. **日志轮转是 copytruncate，不是 reopen**：daemon 无法控制 launchd 持有的 stdout/stderr fd，所以只能「先复制副本再清空原文件」；copy 与 truncate 之间新写入的日志可能只落在一处（凌晨低峰执行，概率很低）。要做零丢失需 daemon 自己管理日志文件（重定向改由进程内 reopen），属后续工作。`freedBytes` 指活动日志归零量，不是净磁盘释放（副本仍占盘，按 `LOG_KEEP` 删旧才真正释放）。
