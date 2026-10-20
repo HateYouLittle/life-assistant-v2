@@ -72,6 +72,10 @@ CREATE TABLE IF NOT EXISTS ledgers (
   owner_profile_id TEXT
 ) STRICT;
 
+-- 列定义里不要写含 ASCII 括号的行注释：Node 22 自带的 SQLite 在 ALTER TABLE
+-- DROP COLUMN 时会按 token 重建建表语句，注释里的括号会让重建结果变成非法 SQL
+-- （tests/database.test.ts 的 v3 回滚用例在 CI Node 22 上复现过 "incomplete input"）。
+-- 列级说明统一放在 CREATE TABLE 之前。
 CREATE TABLE IF NOT EXISTS expenses (
   id TEXT PRIMARY KEY,
   ledger_id TEXT NOT NULL REFERENCES ledgers(id) ON DELETE CASCADE,
@@ -81,8 +85,6 @@ CREATE TABLE IF NOT EXISTS expenses (
   spent_on TEXT NOT NULL,
   created_by_profile TEXT NOT NULL,
   created_at TEXT NOT NULL,
-  -- 写路径幂等键（可选）：客户端重试时带同一个 token，服务端返回原记录而不是再记一笔。
-  -- 唯一性按 (created_by_profile, client_token) 分范围，见 migrate 的 ensureClientTokenIndexes。
   client_token TEXT
 ) STRICT;
 CREATE INDEX IF NOT EXISTS idx_expenses_ledger_date ON expenses(ledger_id, spent_on);
@@ -99,6 +101,8 @@ CREATE TABLE IF NOT EXISTS budgets (
   UNIQUE (ledger_id, category)
 ) STRICT;
 
+-- schedules.client_token：写路径幂等键（可选、可空）。唯一性按 (profile_id, client_token)
+-- 分范围，见 migrate 的 ensureClientTokenIndexes；同样不要在列定义内写含括号的注释。
 CREATE TABLE IF NOT EXISTS schedules (
   id TEXT PRIMARY KEY,
   profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
@@ -124,8 +128,6 @@ CREATE TABLE IF NOT EXISTS schedules (
   version INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  -- 写路径幂等键（可选）：MCP 超时重试时带同一个 token，不会建出两条日程。
-  -- 唯一性按 (profile_id, client_token) 分范围，见 migrate 的 ensureClientTokenIndexes。
   client_token TEXT
 ) STRICT;
 CREATE INDEX IF NOT EXISTS idx_schedules_profile ON schedules(profile_id, status);
