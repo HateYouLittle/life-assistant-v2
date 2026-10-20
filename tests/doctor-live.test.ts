@@ -171,6 +171,33 @@ describe("doctor --live", () => {
     }
   });
 
+  it("HOST 是通配绑定（0.0.0.0）时 live 自检走回环，而不是拿 0.0.0.0 当 URL", async () => {
+    // 回归：为局域网/反代把 HOST 改成 0.0.0.0 后，doctor --live 用 http://0.0.0.0:3080
+    // 连不上，还容易被误判成「daemon 挂了」。自检一律探回环。
+    const stub = await startStub({
+      "/healthz": { body: { ok: true, version: "2.0.0", uptime_s: 60 } },
+      "/api/status": { body: { ok: true } },
+      "/api/jobs": { body: { items: FRESH_JOBS } },
+    });
+    const doctorEnv = makeDoctorEnv(stub.port, {
+      HOST: "0.0.0.0",
+      WEB_API_TOKEN: "a".repeat(64),
+    });
+    try {
+      seedBackup(doctorEnv.dir, { ageHours: 1 });
+      const report = await runDoctor(doctorEnv.env, { live: true });
+      assert.equal(levelOf(report.checks, "daemon 存活"), "ok");
+      assert.equal(levelOf(report.checks, "只读 API"), "ok");
+      assert.ok(
+        stub.requests.some((request) => request.path === "/healthz"),
+        `live 自检必须真的打到桩服务：${JSON.stringify(stub.requests)}`,
+      );
+    } finally {
+      await stub.close();
+      doctorEnv.cleanup();
+    }
+  });
+
   it("任务停更 → fail；缺 job / 无法反向求值 → warn；备份过期与非规范文件 → warn", async () => {
     const stub = await startStub({
       "/healthz": { body: { ok: true, version: "2.0.0", uptime_s: 60 } },

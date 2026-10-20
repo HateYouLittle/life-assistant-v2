@@ -223,8 +223,19 @@ async function fetchLiveJson<T>(url: string, token: string | undefined): Promise
   return (await response.json()) as T;
 }
 
+/**
+ * 通配绑定（0.0.0.0 / ::）不是可连接的地址：自检连本机回环即可。
+ * 直接用 0.0.0.0 拼 URL 会连不上（Host 守卫也不放行 0.0.0.0），
+ * 于是在「为局域网/反代绑定 0.0.0.0」的部署下 doctor --live 会假报 daemon 不可达。
+ */
+function isWildcardBindHost(host: string): boolean {
+  const h = host.replace(/^\[/, "").replace(/\]$/, "");
+  return h === "0.0.0.0" || h === "::" || h === "::0" || /^0(:0){7}$/.test(h);
+}
+
 function liveBaseUrl(config: ResolvedConfig): string {
-  return `http://${urlHost(config.host)}:${config.port}`;
+  const probeHost = isWildcardBindHost(config.host) ? "127.0.0.1" : config.host;
+  return `http://${urlHost(probeHost)}:${config.port}`;
 }
 
 function hoursText(hours: number): string {
