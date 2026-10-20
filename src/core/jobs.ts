@@ -156,6 +156,8 @@ export const CATCHUP_POLICY: Record<string, number> = {
   "weather.evening_brief": 6,
   // 每日记账摘要（bookkeeping.ledger_digest，默认 21:30）：当天错过仍可补
   "bookkeeping.ledger_digest": 12,
+  // 周报（bookkeeping.weekly_report，默认周日 20:00）：停机错过一天内仍可补
+  "bookkeeping.weekly_report": 24,
   // 预警巡检每 20 分钟一次：只补最近 1 小时内的那次，更早的预警已过时
   "weather.alert_watch": 1,
   // 调休/补班提醒：与日报同一窗口

@@ -566,6 +566,30 @@ export function monthRange(ym: string): { from: string; to: string } {
   return { from, to: `${ym}-${String(lastDay).padStart(2, "0")}` };
 }
 
+/**
+ * 本地日历周（周一 → 周日）区间。`dateISO` 缺省今天。
+ *
+ * 周一为一周起点用 weekday 显式减出来，**不用** `startOf("week")`：后者按 locale 的
+ * 每周首日取值（部分环境是周日），周报的「本周」会在不同机器上错一天。
+ * 跨月/跨年由 Luxon 的日历运算处理（如 2026-01-01 属于 2025-12-29~2026-01-04）。
+ */
+export function weekRange(dateISO: string = todayIso()): { start: string; end: string } {
+  const dt = DateTime.fromISO(dateISO, { zone: TZ });
+  if (!dt.isValid) throw new Error(`日期不合法（YYYY-MM-DD）: ${dateISO}`);
+  const start = dt.minus({ days: dt.weekday - 1 }); // weekday: 1=周一 … 7=周日
+  return {
+    start: start.toISODate() as string,
+    end: start.plus({ days: 6 }).toISODate() as string,
+  };
+}
+
+/** 标题/备注里的 M/D（不补零）；入参来自 weekRange，一定是本地日历日 */
+export function monthDay(dateISO: string): string {
+  const dt = DateTime.fromISO(dateISO, { zone: TZ });
+  if (!dt.isValid) throw new Error(`日期不合法（YYYY-MM-DD）: ${dateISO}`);
+  return `${dt.month}/${dt.day}`;
+}
+
 /** CSV 表头（固定顺序，工具与 HTTP 导出共用） */
 export const EXPENSE_CSV_HEADER = ["日期", "账本", "分类", "金额(元)", "备注", "记账人"] as const;
 /** MCP 单次导出上限：超过时截断并置 已截断=true，提示调用方缩小范围 */
@@ -879,16 +903,43 @@ export function previousMonth(now: Date = new Date()): string {
     : `${local.year}-${String(local.month - 1).padStart(2, "0")}`;
 }
 
-export function monthlyReportBlocks(
+/** 报表表格里最多列几个分类（其余合并成一行 note，避免表格无限长）；每日摘要与周报共用 */
+export const DIGEST_TOP_CATEGORIES = 5;
+
+/**
+ * 分类占比表的行（含合计行）。`limit` 缺省不限；截断时把其余分类合并成一条备注，
+ * 避免大账本的表格无限长（每日摘要、周报共用同一口径）。
+ *
+ * 排序在 SQL 之外再按「金额降序 + 分类名升序」稳定一次：summarizeExpenses 只按金额
+ * 排序，同额分类的顺序取决于 SQLite 的执行计划，直接拿来做可 diff 的报表不稳定。
+ */
+function categoryShareRows(
   summary: ExpenseSummary,
-  budget: BudgetStatus | null = null,
-): NotifyBlock {
-  const rows = summary.categories.map((c) => [
+  limit = Number.POSITIVE_INFINITY,
+): { rows: string[][]; restNote: string | null } {
+  const ordered = [...summary.categories].sort(
+    (a, b) => b.cents - a.cents || (a.category < b.category ? -1 : a.category > b.category ? 1 : 0),
+  );
+  const top = ordered.slice(0, limit);
+  const rest = ordered.slice(limit);
+  const rows = top.map((c) => [
     c.category,
     `¥${centsToYuan(c.cents)}`,
     `${(c.share * 100).toFixed(1)}%`,
   ]);
   rows.push(["合计", `¥${centsToYuan(summary.total_cents)}`, "100%"]);
+  const restNote =
+    rest.length === 0
+      ? null
+      : `其余 ${rest.length} 类：¥${centsToYuan(rest.reduce((sum, c) => sum + c.cents, 0))}`;
+  return { rows, restNote };
+}
+
+export function monthlyReportBlocks(
+  summary: ExpenseSummary,
+  budget: BudgetStatus | null = null,
+): NotifyBlock {
+  const { rows } = categoryShareRows(summary);
   const notes = [`共 ${summary.count} 笔`];
   if (summary.profiles.length > 1) {
     notes.push(
@@ -912,6 +963,78 @@ function budgetComparisonLine(label: string, budgetCents: number, spentCents: nu
   return `预算对照 · ${label}：预算 ${c.预算} / 已用 ${c.已用} / 剩余 ${c.剩余} / 占比 ${c.占比}`;
 }
 
+/**
+ * 环比上周的句子。上周合计为 0 时**不做除法**（分母为 0 会得到 Infinity/NaN），
+ * 直接说明「上周无支出」——否则用户看到的是「环比 +Infinity%」这种坏数据。
+ */
+function weekOverWeekLine(totalCents: number, previousTotalCents: number): string {
+  if (previousTotalCents <= 0) return "环比上周：上周无支出";
+  const pct = ((totalCents - previousTotalCents) / previousTotalCents) * 100;
+  const sign = pct > 0 ? "+" : "";
+  return `环比上周 ${sign}${pct.toFixed(1)}%`;
+}
+
+/** 周报备注里的预算行：本月已用 / 剩余 / 本周日均（整周 7 天口径） */
+function weeklyBudgetLine(
+  label: string,
+  budgetCents: number,
+  spentCents: number,
+  weekTotalCents: number,
+): string {
+  const c = budgetComparison(budgetCents, spentCents);
+  return `预算 · ${label}：已用 ${c.已用} / 剩余 ${c.剩余} / 本周日均 ¥${centsToYuan(Math.round(weekTotalCents / 7))}`;
+}
+
+export interface WeeklyReportFacts {
+  /** 上周同账本合计（分）；0 = 上周无支出（不除零） */
+  previousTotalCents: number;
+  /** 本周最大单笔；null = 本周无支出（调用方会跳过该账本，保留 null 便于单测） */
+  maxEntry: { amount_cents: number; category: string; spent_on: string } | null;
+  /** 周报发送月（周日所在自然月）的预算对照；未设预算为 null */
+  budget: BudgetStatus | null;
+}
+
+/**
+ * 周报的正文：分类占比表（按金额降序，最多 top5，其余合并成备注）+ 备注
+ * （笔数、最大单笔、环比、本月预算的剩余与本周日均）。
+ * 与月报共用 categoryShareRows，避免两张报表的表格口径分叉。
+ */
+export function weeklyReportBlocks(summary: ExpenseSummary, facts: WeeklyReportFacts): NotifyBlock {
+  const { rows, restNote } = categoryShareRows(summary, DIGEST_TOP_CATEGORIES);
+  const notes = [`共 ${summary.count} 笔`];
+  if (restNote !== null) notes.push(restNote);
+  if (facts.maxEntry !== null) {
+    const max = facts.maxEntry;
+    notes.push(
+      `最大单笔 ¥${centsToYuan(max.amount_cents)}（${max.category}，${monthDay(max.spent_on)}）`,
+    );
+  }
+  notes.push(weekOverWeekLine(summary.total_cents, facts.previousTotalCents));
+  if (facts.budget !== null) {
+    if (facts.budget.total !== null) {
+      notes.push(
+        weeklyBudgetLine(
+          "总额",
+          facts.budget.total.budget_cents,
+          facts.budget.total.spent_cents,
+          summary.total_cents,
+        ),
+      );
+    }
+    for (const cat of facts.budget.categories) {
+      notes.push(
+        weeklyBudgetLine(
+          `分类「${cat.category}」`,
+          cat.budget_cents,
+          cat.spent_cents,
+          summary.total_cents,
+        ),
+      );
+    }
+  }
+  return { table: { columns: ["分类", "金额", "占比"], rows }, notes };
+}
+
 export function entryReceiptBlocks(ledger: LedgerRow, entry: ExpenseRow): NotifyBlock {
   const rows: string[][] = [
     ["账本", ledger.name],
@@ -922,6 +1045,46 @@ export function entryReceiptBlocks(ledger: LedgerRow, entry: ExpenseRow): Notify
   ];
   if (entry.note !== null) rows.push(["备注", entry.note]);
   return { table: { columns: ["项目", "内容"], rows } };
+}
+
+/**
+ * 报表推送所需的最小 services 形状：家庭账本 publishGlobal（多 Profile 物化），
+ * 个人账本 publishProfile（只给归属人）。与 registry.Services 结构兼容，便于测试注入桩。
+ */
+export interface ReportServices {
+  publishGlobal(input: {
+    kind: string;
+    title: string;
+    blocks: NotifyBlock;
+    dedupeKey?: string;
+  }): Promise<{ materialized: number }>;
+  publishProfile(
+    profileId: string,
+    input: {
+      kind: string;
+      title: string;
+      blocks: NotifyBlock;
+      dedupeKey?: string;
+    },
+  ): Promise<{ deduped: boolean }>;
+}
+
+/**
+ * 按账本归属发布一份报表，返回「实际物化」条数：家庭账本走 publishGlobal（每个有路由的
+ * Profile 各一条，返回 materialized），个人账本只给归属人（被去重吞掉时计 0）。
+ * 月报与周报共用：受众判定只写这一处，避免某张报表写反了把个人账本推到全局。
+ */
+async function publishLedgerReport(
+  ledger: LedgerRow,
+  input: { kind: string; title: string; blocks: NotifyBlock; dedupeKey?: string },
+  services: ReportServices,
+): Promise<number> {
+  if (ledger.owner_profile_id === null) {
+    const result = await services.publishGlobal(input);
+    return result.materialized;
+  }
+  const result = await services.publishProfile(ledger.owner_profile_id, input);
+  return result.deduped ? 0 : 1;
 }
 
 /**
@@ -939,23 +1102,7 @@ export function entryReceiptBlocks(ledger: LedgerRow, entry: ExpenseRow): Notify
  */
 export async function pushMonthlyReports(
   db: DatabaseSync,
-  services: {
-    publishGlobal(input: {
-      kind: string;
-      title: string;
-      blocks: NotifyBlock;
-      dedupeKey?: string;
-    }): Promise<{ materialized: number }>;
-    publishProfile(
-      profileId: string,
-      input: {
-        kind: string;
-        title: string;
-        blocks: NotifyBlock;
-        dedupeKey?: string;
-      },
-    ): Promise<{ deduped: boolean }>;
-  },
+  services: ReportServices,
   ym: string,
 ): Promise<number> {
   const { from, to } = monthRange(ym);
@@ -970,13 +1117,63 @@ export async function pushMonthlyReports(
       blocks: monthlyReportBlocks(summary, budget),
       dedupeKey: `report:${ledger.id}:${ym}`,
     };
-    if (ledger.owner_profile_id === null) {
-      const result = await services.publishGlobal(input);
-      pushed += result.materialized;
-    } else {
-      const result = await services.publishProfile(ledger.owner_profile_id, input);
-      if (!result.deduped) pushed += 1;
-    }
+    pushed += await publishLedgerReport(ledger, input, services);
+  }
+  return pushed;
+}
+
+/**
+ * 周报推送：对**每个活跃账本**汇总本周（周一~周日）的支出，家庭账本 publishGlobal、
+ * 个人账本 publishProfile(owner)，无支出的账本跳过（不推「本周 0 笔」的噪音）。
+ *
+ * 幂等：dedupeKey 为 `weekly:<ledgerId>:<weekStart>`，同一周重复触发（cron 与启动补发
+ * 撞车、手动补跑）只会物化一条；跨周的键不同，因此每周都会再发。
+ *
+ * 预算对照用**周日所在自然月**：预算按自然月滚动，跨月的那一周（如 9/29–10/5）若用
+ * 周一所在月，会拿 9 月的预算去对照 10 月才发出的周报，结论会误导。
+ */
+export async function pushWeeklyReports(
+  db: DatabaseSync,
+  services: ReportServices,
+  weekStart: string = weekRange(todayIso()).start,
+): Promise<number> {
+  // 允许传周内任意一天：先归一到该周周一，避免调用方传周日时把「下周」当成这周的键
+  const { start, end } = weekRange(weekStart);
+  const previous = weekRange(
+    DateTime.fromISO(start, { zone: TZ }).minus({ days: 7 }).toISODate() as string,
+  );
+  const budgetMonth = end.slice(0, 7);
+  let pushed = 0;
+  for (const ledger of listLedgers(db)) {
+    const summary = summarizeExpenses(db, ledger.id, { from: start, to: end });
+    if (summary.count === 0) continue;
+    const previousSummary = summarizeExpenses(db, ledger.id, {
+      from: previous.start,
+      to: previous.end,
+    });
+    // 最大单笔：金额相同再按日期/id 升序，保证同一周重复生成的正文完全一致
+    const maxEntry = db
+      .prepare(
+        `SELECT amount_cents, category, spent_on FROM expenses
+         WHERE ledger_id = ? AND spent_on >= ? AND spent_on <= ?
+         ORDER BY amount_cents DESC, spent_on ASC, id ASC LIMIT 1`,
+      )
+      .get(ledger.id, start, end) as
+      | { amount_cents: number; category: string; spent_on: string }
+      | undefined;
+    const budget =
+      getBudgets(db, ledger.id).length > 0 ? budgetStatus(db, ledger.id, budgetMonth) : null;
+    const input = {
+      kind: "bookkeeping.weekly",
+      title: `📅 本周账单 · ${monthDay(start)}–${monthDay(end)}`,
+      blocks: weeklyReportBlocks(summary, {
+        previousTotalCents: previousSummary.total_cents,
+        maxEntry: maxEntry ?? null,
+        budget,
+      }),
+      dedupeKey: `weekly:${ledger.id}:${start}`,
+    };
+    pushed += await publishLedgerReport(ledger, input, services);
   }
   return pushed;
 }
@@ -988,9 +1185,6 @@ export function monthlyReportPublished(db: DatabaseSync, ledgerId: string, ym: s
     .get(`report:${ledgerId}:${ym}`);
   return row !== undefined;
 }
-
-/** 摘要表格里最多列几个分类（其余合并成一行 note，避免表格无限长） */
-export const DIGEST_TOP_CATEGORIES = 5;
 
 /** pushDailyDigests 需要的最小 services 形状（与 pushMonthlyReports 同口径，便于测试注入桩） */
 export interface DigestServices {

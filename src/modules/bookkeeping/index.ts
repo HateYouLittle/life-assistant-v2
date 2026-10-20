@@ -40,6 +40,7 @@ import {
   previousMonth,
   pushDailyDigests,
   pushMonthlyReports,
+  pushWeeklyReports,
   recentCategories,
   renameLedger,
   resolveAddLedger,
@@ -655,6 +656,24 @@ registerModule({
           // 摘要失败不影响记账本身（账已落库），但必须让运维看得见：rethrow 交给 job_runs
           // 记 failed（状态页/doctor --live 可见），否则「摘要静默不推」会被当成一切正常。
           logger.error(`每日记账摘要发布失败: ${errorMessage(e)}`);
+          throw e;
+        }
+      },
+    },
+    {
+      name: "weekly_report",
+      // cron 从 config 惰性读取（WEEKLY_REPORT_CRON，默认 "0 20 * * 0" 即周日 20:00）。
+      // 与其他报表 job 一样，失败必须 rethrow 让 job_runs 记 failed：静默不推的报表
+      // 比推错更糟（用户会以为这周没有记账）。
+      cron: () => runtime().config.weeklyReportCron,
+      handler: async () => {
+        const rt = runtime();
+        try {
+          // 不传 weekStart：默认取「今天所在周的周一」，cron 在周日触发时就是刚结束的这一周
+          const pushed = await pushWeeklyReports(rt.db, rt.services);
+          logger.info(`周报：发布 ${pushed} 条`);
+        } catch (e) {
+          logger.error(`周报发布失败: ${errorMessage(e)}`);
           throw e;
         }
       },

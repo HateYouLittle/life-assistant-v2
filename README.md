@@ -11,7 +11,7 @@
 | 每日简报 | 每日 07:00（可配）确定性组装，无 LLM；含今日日程/逾期未完成与下个假期倒计时；21:00 晚报（可配）给明日天气、明日日程与今日未完成 |
 | 日程 | 待办/生日/纪念日，公历+农历（闰月策略、腊月三十顺延）、按法定工作日/节假日重复；`snooze`/`skip` 处置单次，`complete` 对循环默认只完成当前一次（`all: true` 才结束系列） |
 | 节假日 | 大陆法定节假日/调休日历，每日 02:00 自动抓取校验（数据源 `NateScarlet/holiday-cn` 的 jsDelivr / GitHub raw；无外网时 `workday/holiday` 过滤的日程会暂停并在状态页 `holidays.failed` 显示原因；次年数据未发布记 `pending` 而不是失败） |
-| 记账 | 家庭/个人多账本、只记支出（可编辑已记支出，编辑不触发回执/预算提醒）、CSV 导出，账本/分类月度预算与 80%/100% 跨阈值提醒（按支出所属月份判定）、月度账单推送；默认账本/常用分类降低摩擦 |
+| 记账 | 家庭/个人多账本、只记支出（可编辑已记支出，编辑不触发回执/预算提醒）、CSV 导出，账本/分类月度预算与 80%/100% 跨阈值提醒（按支出所属月份判定）、月度账单与周报推送、状态页预算看板（进度条 + 可执行建议）；默认账本/常用分类降低摩擦 |
 | 通知 | SQLite outbox + 可扩展投递通道（HMAC V2 回环 webhook / 本地 log）、静默时段、`notify.pull` 兜底 |
 | 备份 | daemon 内置每日 03:00 `VACUUM INTO` 备份（保留 14 份，时间与份数可配），产物自校验；schema 升级前自动留快照；`npm run db:restore` 校验并留底后一键恢复 |
 | 任务可靠性 | 每个定时任务写 `job_runs`（running→ok/failed/skipped）；停机期间错过的每日任务在启动时按白名单补发；状态页「定时任务」卡片与 `doctor --live` 可见 |
@@ -64,6 +64,7 @@ npm run build
 | `DAILY_BRIEF_CRON` | | 每日简报时间，默认 `'0 7 * * *'`（含空格需单引号，Asia/Shanghai） |
 | `EVENING_BRIEF_CRON` | | 晚报时间，默认 `'0 21 * * *'`；内容为明日天气/明日日程/今日未完成/明天补班或放假 |
 | `LEDGER_DIGEST_CRON` | | 每日记账摘要时间，默认 `'30 21 * * *'`；汇总当天笔数/合计/分类 top5 只发给记账的人（逐笔回执默认不推） |
+| `WEEKLY_REPORT_CRON` | | 周报时间，默认 `'0 20 * * 0'`（周日 20:00）；按账本汇总本周支出/分类 top5/环比上周/预算执行 |
 | `ALERT_WATCH_CRON` | | 气象预警巡检时间，默认 `'*/20 * * * *'` |
 | `ALERT_MIN_LEVEL` | | 低于此级别的预警不主动推送，`blue|yellow|orange|red`，默认 `blue`（=全部级别都推） |
 | `WORKDAY_WATCH_CRON` | | 调休/补班提醒巡检时间，默认 `'0 7 * * *'` |
@@ -97,6 +98,7 @@ daemon 就绪后：
   | `/api/schedules` | `limit` | 跨 Profile 的活跃日程与下次触发 |
   | `/api/deliveries` | `limit` | 投递计数、近 7 天分布与记录 |
   | `/api/holidays` | `year` | 假期/调休安排与接下来的假期 |
+  | `/api/budget` | `month`（YYYY-MM） | 家庭账本预算对照与可执行建议（未设预算的账本只给提示） |
 
 - `X-Hermes-Profile` 头决定 Profile；缺省为 `default`
 - MCP 会话：空闲 2 小时回收、最多 200 个；daemon 重启后旧 `mcp-session-id` 一律返回 404，
@@ -322,6 +324,8 @@ npm run db:cleanup:preview   # 零业务删除预演：occurrence 与保留策�
 - **主动推送**：定时任务组装**确定性**通知（无 LLM），走 outbox 投递：每日天气简报与调休/补班提醒 07:00、晚报 21:00（可配）、气象预警巡检每 20 分钟（缓存 TTL 跟随巡检间隔）、月报每月 1 号 09:00；节假日数据刷新 02:00、内置备份 03:00、WAL checkpoint 03:15、历史 occurrence 回收 04:30、保留策略清理 04:50。早报在天气结论之后附「今日日程/逾期未完成」（最多 6 条，日程模块异常只跳过该块、不影响早报发布），晚报给「明日天气/明日日程/今日未完成/明天补班或放假」；**当天补班只由调休模块的独立通知承载**，早报不再重复同一句——两个 job 同在 07:00，谁先跑都不影响结果。预警与补班都靠 `dedupe_key` 去重（预警按「id + 级别」，级别升级会再推一次、降级不重推；补班按「事件 + 日期」），静默时段在投递层统一拦截、不为任何类型开例外。每日简报同时给出**下个假期倒计时**（节假日数据未就绪时显示「未知」而不是猜）；出行模式生效期间，简报与预警巡检自动改用目的地城市，并在简报里显式标注。
 - **备份与恢复**：`src/core/backup.ts` 的 `runBackup` 同时服务手动 CLI（`npm run db:backup`）与 `maintenance.daily_backup` job（`BACKUP_CRON`，默认 03:00）：`VACUUM INTO` 生成快照、按 `BACKUP_KEEP`（默认 14）清理最旧文件；产物必须通过 `quick_check` 与 `meta.schema_version` 自校验，否则删除并抛错（坏备份绝不冒充可用）。停机期间错过的备份由启动补发补跑一次。schema 前滚前（daemon 与各 CLI 打开老库）会先落一份 `life-assistant-pre-v<旧版本>-<时间戳>.db`。`npm run db:restore` 复用同一份校验：`--latest`（缺省）只在规范命名的备份里选，`--file` 指定，`--dry-run` 只预演；锁里的 daemon 仍存活时直接拒绝，覆盖前把当前库留底为 `life-assistant-pre-restore-<时间戳>.db`，恢复后清 `-wal`/`-shm` 并重新校验。备份新鲜度（>36h warn、>7 天 fail）与命名异常由 `doctor --live` 检查。
 - **用量与保留**：QWeather 上游请求按本地日计数（含重试、缓存命中不计），状态页「今日天气请求」与 `/api/status` 的 `qweather_usage` 可见，daemon 重启从库里的计数继续累加 —— 官方 2027-02-01 起限制 API KEY 日请求量，没有计量就无从判断余量。保留策略（每日 04:50）只删**已读且投递已终结**的通知（含级联的投递记录）与**已取消超 180 天**的日程；未读通知、仍有待投递的通知、使用 `recurrence.count` 的日程一律保留。**月报通知也不清理**：它的 `dedupe_key` 是月报补发判定的唯一持久证据，删掉会让 7~12 个月前的月报被误判成「从未推送过」。
+- **预算看板**：状态页「预算」卡片（`GET /api/budget`、`/api/status.budget` 同源）展示每个家庭账本的总额进度条（超支红、花速过快黄）、分类预算前 6 项与**可执行建议**：未设预算给设置方法；已超支给差额；按时间进度算出的 pace > 1.1 给「按当前速度会超支约 ¥Y，剩余 Z 天建议日均 ≤ ¥W」；否则给剩余与天数。建议文案全部由服务端生成（`src/server/budget.ts` 纯函数），页面不重复实现口径。
+- **周报**：每周日 20:00（`WEEKLY_REPORT_CRON`，job `bookkeeping.weekly_report`）按账本汇总本周支出（笔数/分类 top5/最大单笔/环比上周/本月预算剩余与本周日均），家庭账本推给所有配置路由的人、个人账本只给归属人；`dedupeKey=weekly:<ledger>:<周一>` 保证同周不重复；无支出的账本不发。
 - **记账预算**：账本可设**总额**或**分类**月度预算（`ledger {action:"budget"}`，单位元），按账本每月滚动（对照当月支出）。`expense add` 成功后判定该笔是否**跨越** 80%/100% —— 只推跨越那一刻（而非达到即推）；同一个预算一笔只推**跨过的最高阈值**（一笔从 0% 到 150% 只推 100%，70%→90% 只推 80%），总额与分类各自独立判定；`dedupeKey = budget:<ledger>:<分类|空>:<YYYY-MM>:<80|100>`（总额的分类位是空串、分类用原样名字，分类名恰好叫 `-` 也不会与总额撞键），跨月自动重新判定，同月同阈值不重推；告警标题与对照都按**该笔支出所属月份**（补记两个月前的支出报的是那个月的超支，不会按「本月」口径误报）。设了预算的账本，月报追加预算对照行（附在 notes）；未设预算的账本行为完全不变。个人账本的支出**不触发任何预算提醒**（不推送、也不入通知）。
 - **记账摩擦**：`expense add` 不传 `ledger_id` 时按「该 Profile 的默认账本（`expense {action:"set_default_ledger"}` 设置）→ 唯一可写活动账本」解析，仍不唯一才报错并列出候选；未显式传 `category` 时回执附该账本近 90 天 top5「常用分类」。`expense add` 与 `schedule add` 都可带 `request_id`（落 `client_token`，按 Profile/创建人分范围唯一）：MCP 超时重试命中同一 token 时返回首次记录并标 `已存在`，不会重复记账/重复建日程，也不重复推送。
 - **通知治理（按 kind 偏好 + 降噪 + 摘要）**：发布入口只有 `publishProfile`，它先查该 Profile 的 `notify_prefs`（`src/core/notify-prefs.ts`），再决定建不建 delivery —— 关闭推送只是「不打扰」，通知照常入库、`notify.pull` 仍取得到。内置默认里 `bookkeeping.entry`（逐笔回执）**不推送**：家庭账本下一笔支出会给每个配置了路由的人各发一条（真实数据 172 条 = 86 笔 × 2 人），现在改为只发记账人，并由每晚 **21:30 的每日记账摘要**（`LEDGER_DIGEST_CRON`，job `bookkeeping.ledger_digest`，kind `bookkeeping.digest`，`dedupeKey=digest:<profile>:<date>`）汇总当天笔数/合计/分类 top5。用户可用 `notify {action:"prefs", kind, push}` 恢复逐笔推送或限定通道，用 `notify {action:"test"}` 验证通道是否真的通。
@@ -379,3 +383,6 @@ npm run db:cleanup:preview   # 零业务删除预演：occurrence 与保留策�
 25. **`/metrics` 是进程内计数器**：daemon 重启归零，没有直方图/耗时分布，也不持久化（持久事实看 `job_runs` 与 `deliveries`）。`/readyz` 的阈值（WAL 512MB、outbox 30 分钟）是代码常量，调整口径需要改代码。
 26. **ICS 未做 RFC 5545 的 75 octet 行折叠**：超长 `DESCRIPTION` 仍输出为一行，主流客户端可接受；严格合规可后续补。订阅链接一旦泄露等于该 Profile 的日程只读泄露，请用 `--days` 控制有效期并定期轮换。
 27. **`/quick` 没有离线缓存 / service worker**：「添加到主屏幕」只是快捷方式，断网时是空白页；弱网下靠 `request_id` 幂等，重复提交不会重复记账。
+
+28. **预算看板只覆盖家庭账本**：个人账本属于「归属人私密」，不进看板/`/api/budget`（个人预算仍可通过 MCP `expense budget` 查看）；没设预算的账本只显示「未设预算」，**不显示本月已花多少**（避免为展示而多做一次聚合，个人规模取舍）。`/api/status` 多带了 `budget` 段，基线 payload 略增。
+29. **周报标题不含账本名**：家庭有多个活跃账本且都有支出时，同一天会收到多条标题相同的「📅 本周账单 · M/D–M/D」（内容与 dedupeKey 不同）；单账本家庭无感。趋势图未做（预算看板只给当月数字与建议），需要历史曲线再引入。

@@ -55,7 +55,7 @@ CI 在 Node 22.16.0 / 22 / 24 三档矩阵全绿（`.github/workflows/ci.yml`）
    目标：从打开对话降到点一下 / 两下。
 3. **ICS 日历订阅** ✅（2026-10-20）：`GET /calendar.ics` 签名 URL（HMAC + 有效期，只读单个 Profile）、`npm run calendar:url` 生成；未做 RFC 5545 的 75 octet 行折叠。
 4. **per-profile token + 看板可见性**：身份部分 ✅（2026-10-20，`PROFILE_TOKENS_JSON` + `/mcp` 强绑定 + `/api/quick/*`）；看板可见性仍待办（`/api/*` 只认 master，日程/通知按 Profile 过滤未做）。
-5. **预算看板/趋势/引导** + 可执行月报 + 周日周报
+5. **预算看板/趋势/引导 + 可执行月报 + 周日周报** ✅（2026-10-20）：状态页预算卡片（`/api/budget`，进度条 + 未设/超支/花速过快/正常四类可执行建议）、周报 job `bookkeeping.weekly_report`（周日 20:00，分类 top5/最大单笔/环比/预算剩余）；月报已有预算对照行。趋势图未做（需要历史曲线再引入）。
 6. **分类字典/别名**、CSV 公式注入修复、明细分页（`expense list` 200 条上限无游标）
 7. **可观测性**：`/metrics` + `/readyz` ✅（2026-10-20：鉴权/限流计数器、投递状态、outbox 排队、job 最近成功、备份年龄、DB/WAL、QWeather 用量）；仍待办：`notify test/history/retry`、日志轮转与本地时区。
 8. **迁移结构指纹 + 审计日志**（补 `schema_version` 不是完整结构指纹的缺口）

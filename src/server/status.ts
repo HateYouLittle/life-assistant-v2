@@ -11,6 +11,7 @@ import { qweatherUsage } from "../core/qweather.js";
 import { allJobs } from "../core/registry.js";
 import { expenseCsv, expenseCsvFilename } from "../modules/bookkeeping/service.js";
 import { TZ, todayIso } from "../time.js";
+import { budgetPayload } from "./budget.js";
 import {
   deliveryDetails,
   expenseDetails,
@@ -41,6 +42,8 @@ export function statusPayload(config: ResolvedConfig, db: DatabaseSync): Record<
   const schedules = scheduleDetails(db, "50");
   const holidays = holidayDetails(db, undefined);
   const jobs = jobDetails(db);
+  // 预算卡片首屏数据源：与支出卡片同一个月（自然月全月），卡片内容因此不必额外拉接口
+  const budget = budgetPayload(db, month);
 
   return {
     ok: true,
@@ -92,6 +95,9 @@ export function statusPayload(config: ResolvedConfig, db: DatabaseSync): Record<
       categories: expenses.categories,
       daily: expenses.daily,
     },
+    // 预算卡片首屏数据：每个活跃家庭账本的总额/分类对照 + 建议。
+    // 全量明细（分类建议等）同时可从 /api/budget?month= 取；这里只给当月。
+    budget,
     holidays: {
       years: holidays.years,
       // 长期抓取失败的年份此前只显示「未导入」，看不出原因
@@ -177,6 +183,10 @@ export function createStatusApp(config: ResolvedConfig, db: DatabaseSync): Hono<
   app.get("/api/expenses", (c) =>
     c.json(expenseDetails(db, c.req.query("month"), c.req.query("limit"))),
   );
+  // 预算看板：每个活跃家庭账本的总额/分类预算对照 + 可执行建议。
+  // 月份缺省/非法回退当月（与 /api/expenses 同一 normalizeMonth 口径）；
+  // 鉴权与 no-store 由上面的 /api/* master 中间件统一兜住。
+  app.get("/api/budget", (c) => c.json(budgetPayload(db, c.req.query("month"))));
   // 家庭账本支出 CSV：与 /api/expenses 同口径（只家庭账本、同一「自然月全月」区间），
   // 鉴权与 no-store 由上面的 /api/* 中间件统一兜住；月份非法/缺省回退当月。
   app.get("/api/expenses.csv", (c) => {

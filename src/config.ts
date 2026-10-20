@@ -77,6 +77,8 @@ export interface ResolvedConfig {
   eveningBriefCron: string;
   /** 每日记账摘要 cron（LEDGER_DIGEST_CRON，默认 "30 21 * * *"，Asia/Shanghai） */
   ledgerDigestCron: string;
+  /** 周报 cron（WEEKLY_REPORT_CRON，默认 "0 20 * * 0" 即周日 20:00，Asia/Shanghai） */
+  weeklyReportCron: string;
   logLevel: LogLevel;
 }
 
@@ -398,6 +400,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
     throw new Error(`EVENING_BRIEF_CRON 不是合法 cron 表达式: ${eveningBriefCron}`);
   }
 
+  const weeklyReportCron = env.WEEKLY_REPORT_CRON?.trim() || "0 20 * * 0";
+  if (!cron.validate(weeklyReportCron)) {
+    throw new Error(`WEEKLY_REPORT_CRON 不是合法 cron 表达式: ${weeklyReportCron}`);
+  }
+
   const ledgerDigestCron = env.LEDGER_DIGEST_CRON?.trim() || "30 21 * * *";
   if (!cron.validate(ledgerDigestCron)) {
     throw new Error(`LEDGER_DIGEST_CRON 不是合法 cron 表达式: ${ledgerDigestCron}`);
@@ -476,6 +483,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
     workdayRemindDaysBefore,
     eveningBriefCron,
     ledgerDigestCron,
+    weeklyReportCron,
     logLevel: logLevel.data,
   };
 }

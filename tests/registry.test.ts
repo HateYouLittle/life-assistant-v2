@@ -97,6 +97,8 @@ describe("registry 契约", () => {
       // 每晚 21:30 的每日记账摘要（LEDGER_DIGEST_CRON），取代家庭账本的逐笔回执
       "bookkeeping.ledger_digest",
       "bookkeeping.monthly_report",
+      // 周日晚 20:00 的周报（WEEKLY_REPORT_CRON），本周账单 + 环比 + 预算提示
+      "bookkeeping.weekly_report",
       "holiday.refresh",
       "holiday.workday_watch",
       "maintenance.daily_backup",

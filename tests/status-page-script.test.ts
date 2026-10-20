@@ -591,3 +591,51 @@ describe("看板「定时任务」卡片", () => {
     }
   });
 });
+
+describe("看板「预算」卡片", () => {
+  it("渲染账本总额进度与超支建议；点开抽屉列出分类预算明细", async () => {
+    const env = makeTestEnv();
+    try {
+      env.db
+        .prepare(
+          "INSERT INTO ledgers (id, name, created_at) VALUES ('lf', '家庭账本', '2026-01-01T00:00:00.000Z')",
+        )
+        .run();
+      const insertBudget = env.db.prepare(
+        "INSERT INTO budgets (id, ledger_id, category, amount_cents, created_at, updated_at) VALUES (?, 'lf', ?, ?, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')",
+      );
+      insertBudget.run("b-total", "", 10000);
+      insertBudget.run("b-food", "餐饮", 5000);
+      env.db
+        .prepare(
+          `INSERT INTO expenses (id, ledger_id, amount_cents, category, spent_on, created_by_profile, created_at)
+           VALUES ('e1', 'lf', 12000, '餐饮', ?, 'default', '2026-01-01T00:00:00.000Z')`,
+        )
+        .run(todayIso());
+
+      const run = runPageScript(env, "");
+      const rendered = await waitFor(() =>
+        (run.elements.get("budget-body")?.innerHTML ?? "").includes("家庭账本"),
+      );
+      assert.ok(rendered, `预算卡片没有渲染：${run.elements.get("budget-body")?.innerHTML}`);
+      const html = run.elements.get("budget-body")?.innerHTML ?? "";
+      assert.match(html, /¥120\.00 \/ ¥100\.00/, "卡片要显示已用/预算");
+      assert.match(html, /prog over/, "超支时进度条必须是红色（over）");
+      assert.match(html, /已超支 ¥20\.00/, "总额建议要直接说明超支金额");
+      assert.match(html, /餐饮/, "分类预算要列出来");
+      assert.match(html, /已超支 ¥70\.00/, "分类超支同样给建议");
+
+      run.clickDrawer("budget");
+      const drawer = await waitFor(() =>
+        (run.elements.get("drawer-body")?.innerHTML ?? "").includes("已用 / 预算"),
+      );
+      assert.ok(drawer, `预算抽屉没有渲染：${run.elements.get("drawer-body")?.innerHTML}`);
+      const drawerHtml = run.elements.get("drawer-body")?.innerHTML ?? "";
+      assert.match(drawerHtml, /餐饮/);
+      assert.match(drawerHtml, /已超支 ¥70\.00/);
+      assert.equal(run.elements.get("drawer")?.attrs["aria-hidden"], "false", "抽屉应被打开");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});

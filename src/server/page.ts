@@ -1,3 +1,5 @@
+import { UNSET_BUDGET_SUGGESTION } from "./budget.js";
+
 /**
  * 状态看板页面：单文件、零依赖（无 CDN、无构建步骤），CSS/JS 全部内联。
  * 首屏只依赖 /api/status；每张卡片可点击，点开按需拉 /api/expenses 等明细端点。
@@ -122,6 +124,33 @@ const STYLE = `
   .ops-row .v { font-size: 13px; }
   .muted { color: var(--mute); }
 
+  /* ── 预算 ── */
+  .card.budget { margin-bottom: 14px; }
+  .bud-item { padding: 12px 0; border-top: 1px solid var(--line-soft); }
+  .bud-item:first-child { border-top: 0; padding-top: 4px; }
+  .bud-item:last-child { padding-bottom: 2px; }
+  .bud-head { display: flex; align-items: baseline; gap: 10px; }
+  .bud-head .t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+  .bud-head .amt { flex: none; color: var(--dim); font-size: 12.5px; }
+  .prog { height: 6px; border-radius: 99px; background: rgba(255,255,255,.06); overflow: hidden; margin: 8px 0 6px; }
+  .prog span { display: block; height: 100%; border-radius: 99px; background: linear-gradient(90deg, rgba(94,234,212,.9), rgba(56,189,248,.7)); }
+  .prog.warn span { background: linear-gradient(90deg, rgba(251,191,36,.9), rgba(251,191,36,.5)); }
+  .prog.over span { background: linear-gradient(90deg, rgba(248,113,113,.95), rgba(248,113,113,.55)); }
+  .bud-tip { font-size: 12px; color: var(--dim); margin-top: 5px; }
+  .bud-tip.warn { color: var(--amber); }
+  .bud-tip.bad { color: var(--red); }
+  .bud-cats { list-style: none; margin: 9px 0 0; padding: 0; font-size: 12px; }
+  .bud-cats li { display: flex; align-items: center; gap: 8px; padding: 4px 0; color: var(--dim); }
+  .bud-cats .c { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bud-cats .c em { font-style: normal; font-size: 11px; margin-left: 6px; }
+  .bud-cats .p { flex: none; width: 84px; }
+  .bud-cats .p span { display: block; height: 4px; border-radius: 99px; background: rgba(255,255,255,.07); overflow: hidden; }
+  .bud-cats .p i { display: block; height: 100%; border-radius: 99px; background: var(--teal); }
+  .bud-cats .p i.warn { background: var(--amber); }
+  .bud-cats .p i.over { background: var(--red); }
+  .bud-cats .a { flex: none; color: var(--mute); font-size: 11.5px; }
+  .bud-cats li.more { color: var(--mute); font-size: 11.5px; }
+
   /* ── drawer ── */
   .scrim {
     position: fixed; inset: 0; background: rgba(4,6,10,.62); opacity: 0; pointer-events: none;
@@ -245,6 +274,8 @@ const SCRIPT = `
   var drawerOpen = false;
   var drawerRender = null;
   var current = null;
+  /* 未设预算的提示文案与 src/server/budget.ts 同源（服务端拼进脚本，避免两处漂移） */
+  var BUDGET_UNSET_TIP = ${JSON.stringify(UNSET_BUDGET_SUGGESTION)};
 
   function api(path) {
     return fetch(path, token ? { headers: { Authorization: 'Bearer ' + token } } : {}).then(function (r) {
@@ -325,6 +356,9 @@ const SCRIPT = `
       '<div class="stat"><div class="n">' + yuan(Math.round(spentToDate / Math.max(1, day))) + '</div><div class="l">日均（至今）</div></div>' +
       '<div class="stat"><div class="n">' + (exp.daily || []).length + '</div><div class="l">记账天数</div></div>' +
       '<div class="stat"><div class="n">' + Math.max(0, dim - day) + '</div><div class="l">本月剩余天</div></div>';
+
+    // 预算：ratio/pace/建议都由服务端算好（budgetPayload），前端只做展示，避免浏览器重算口径
+    renderBudget(s.budget);
 
     var next = s.schedules.next || [];
     el('sch-count').innerHTML = s.schedules.active + ' <small>项</small>';
@@ -414,6 +448,63 @@ const SCRIPT = `
   function jobChip(status) {
     var cls = status === 'ok' ? ' green' : status === 'failed' ? ' red' : status === 'skipped' ? ' amber' : '';
     return '<span class="chip' + cls + '">' + esc(jobStatusLabel(status)) + '</span>';
+  }
+
+  /* ── 预算（服务端已算好 ratio/pace/suggestion；这里只决定颜色与排版） ── */
+  function budLevel(line) {
+    if (!line) return '';
+    if (line.ratio >= 1) return ' over';
+    if (line.pace > 1.1) return ' warn';
+    return '';
+  }
+  function budBar(line) {
+    var pct = Math.max(0, Math.min(100, (line.ratio || 0) * 100));
+    return '<div class="prog' + budLevel(line) + '"><span style="width:' + pct.toFixed(1) + '%"></span></div>';
+  }
+  function budTip(line) {
+    var cls = line.ratio >= 1 ? ' bad' : line.pace > 1.1 ? ' warn' : '';
+    return '<div class="bud-tip' + cls + '">' + esc(line.suggestion) + '</div>';
+  }
+  function budCatLevel(cat) {
+    return cat.ratio >= 1 ? 'over' : cat.pace > 1.1 ? 'warn' : '';
+  }
+  function renderBudget(budget) {
+    var body = el('budget-body');
+    if (!body) return;
+    var ledgers = (budget && budget.ledgers) || [];
+    if (!ledgers.length) {
+      body.innerHTML = '<div class="empty">还没有家庭账本</div>';
+      return;
+    }
+    body.innerHTML = ledgers.map(function (l) {
+      var html = '<div class="bud-item">';
+      if (l.total) {
+        html += '<div class="bud-head"><span class="t">' + esc(l.ledger_name) + '</span>' +
+          '<span class="amt">' + yuan(l.total.spent_cents) + ' / ' + yuan(l.total.budget_cents) + '</span></div>' +
+          budBar(l.total) + budTip(l.total);
+      } else {
+        html += '<div class="bud-head"><span class="t">' + esc(l.ledger_name) + '</span>' +
+          '<span class="chip">' + (l.has_budget ? '仅分类预算' : '未设预算') + '</span></div>' +
+          (l.has_budget ? '' : '<div class="bud-tip">' + esc(BUDGET_UNSET_TIP) + '</div>');
+      }
+      var cats = l.categories || [];
+      if (cats.length) {
+        html += '<ul class="bud-cats">' + cats.slice(0, 6).map(function (c) {
+          var pct = Math.max(0, Math.min(100, (c.ratio || 0) * 100));
+          // 只有「超支 / 花速过快」才把整句建议塞进卡片；正常行保持简洁（完整建议在抽屉里）
+          var advice = c.ratio >= 1 || c.pace > 1.1
+            ? '<em class="' + (c.ratio >= 1 ? 'bad' : 'warn') + '">' + esc(c.suggestion) + '</em>'
+            : '';
+          return '<li><span class="c">' + esc(c.category) + advice + '</span>' +
+            '<span class="p"><span><i class="' + budCatLevel(c) + '" style="width:' + pct.toFixed(1) + '%"></i></span></span>' +
+            '<span class="a">' + yuan(c.spent_cents) + ' / ' + yuan(c.budget_cents) + '</span></li>';
+        }).join('') + (cats.length > 6 ? '<li class="more">+' + (cats.length - 6) + ' 项</li>' : '') + '</ul>';
+      }
+      return html + '</div>';
+    }).join('');
+  }
+  function remainingText(cents) {
+    return cents < 0 ? '超支 ' + yuan(-cents) : yuan(cents);
   }
   /* cron 只渲染「分 时」都写死的常见形式（0 7 * * * → 07:00）；其余原样显示，不猜 */
   function cronTime(expr) {
@@ -694,6 +785,38 @@ const SCRIPT = `
     });
   }
 
+  function openBudget() {
+    openDrawer('budget', '预算明细', function () {
+      api('/api/budget').then(function (d) {
+        var ledgers = d.ledgers || [];
+        drawerSub.textContent = d.month;
+        if (!ledgers.length) { drawerBody.innerHTML = '<div class="empty">还没有家庭账本</div>'; return; }
+        drawerBody.innerHTML = ledgers.map(function (l) {
+          var html = '<div class="sect"><h3>' + esc(l.ledger_name) + '</h3>';
+          if (l.total) {
+            html += '<div class="bud-head"><span class="t">总额</span><span class="amt">' +
+              yuan(l.total.spent_cents) + ' / ' + yuan(l.total.budget_cents) + '</span></div>' +
+              budBar(l.total) + budTip(l.total);
+          } else {
+            html += '<div class="bud-tip">' + (l.has_budget ? '未设总额预算（仅有分类预算）' : esc(BUDGET_UNSET_TIP)) + '</div>';
+          }
+          var cats = l.categories || [];
+          if (cats.length) {
+            html += '<table><thead><tr><th>分类</th><th class="num">已用 / 预算</th><th class="num">剩余</th></tr></thead><tbody>' +
+              cats.map(function (c) {
+                var cls = c.ratio >= 1 ? 'bad' : c.pace > 1.1 ? 'warn' : 'muted';
+                return '<tr><td>' + esc(c.category) + '</td>' +
+                  '<td class="num">' + yuan(c.spent_cents) + ' / ' + yuan(c.budget_cents) + '</td>' +
+                  '<td class="num ' + (c.remaining_cents < 0 ? 'bad' : '') + '">' + remainingText(c.remaining_cents) + '</td></tr>' +
+                  '<tr><td colspan="3" class="' + cls + '" style="padding-top:0">' + esc(c.suggestion) + '</td></tr>';
+              }).join('') + '</tbody></table>';
+          }
+          return html + '</div>';
+        }).join('');
+      }).catch(fail);
+    });
+  }
+
   function openSystem() {
     openDrawer('system', '系统信息', function () {
       api('/api/status').then(function (s) {
@@ -710,6 +833,7 @@ const SCRIPT = `
           '<div class="sect"><h3>原始状态</h3><div class="muted" style="font-size:11.5px">' +
           'GET <a href="#" data-api="/api/status" style="color:inherit">/api/status</a> · ' +
           'GET <a href="#" data-api="/api/expenses" style="color:inherit">/api/expenses</a> · ' +
+          'GET <a href="#" data-api="/api/budget" style="color:inherit">/api/budget</a> · ' +
           'GET <a href="#" data-api="/api/schedules" style="color:inherit">/api/schedules</a> · ' +
           'GET <a href="#" data-api="/api/deliveries" style="color:inherit">/api/deliveries</a> · ' +
           'GET <a href="#" data-api="/api/holidays" style="color:inherit">/api/holidays</a> · ' +
@@ -724,9 +848,10 @@ const SCRIPT = `
     deliveries: openDeliveries,
     holidays: openHolidays,
     jobs: openJobs,
+    budget: openBudget,
     system: openSystem
   };
-  var TITLES = { expenses: '支出明细', schedules: '日程明细', deliveries: '投递明细', holidays: '节假日明细', jobs: '定时任务', system: '系统信息' };
+  var TITLES = { expenses: '支出明细', schedules: '日程明细', deliveries: '投递明细', holidays: '节假日明细', jobs: '定时任务', budget: '预算明细', system: '系统信息' };
 
   document.addEventListener('click', function (ev) {
     // 原始状态链接不能直接用 href：普通导航不会带 Authorization 头，配了 token
@@ -819,6 +944,11 @@ export function statusPage(version: string, nonce?: string): string {
       </section>
     </div>
   </div>
+
+  <section class="card budget clickable" data-drawer="budget" tabindex="0" role="button" aria-label="查看预算明细">
+    <div class="card-k">预算 <span class="chev">明细 ›</span></div>
+    <div id="budget-body"><div class="empty">加载中…</div></div>
+  </section>
 
   <section class="card trend clickable" data-drawer="deliveries" tabindex="0" role="button" aria-label="查看投递明细">
     <div class="trend-top">
