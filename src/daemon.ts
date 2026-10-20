@@ -1,16 +1,34 @@
-import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { mkdirSync } from "node:fs";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createRequire } from "node:module";
+import type { DatabaseSync } from "node:sqlite";
+import { getRequestListener } from "@hono/node-server";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { getRequestListener } from "@hono/node-server";
-import cron from "node-cron";
-import type { DatabaseSync } from "node:sqlite";
 import type { DateTime } from "luxon";
+import cron from "node-cron";
 import { bindHost, loadConfig, parseProfileId, type ResolvedConfig, urlHost } from "./config.js";
-import { isRequestAuthorized } from "./core/auth.js";
+import { resolveIdentity } from "./core/auth.js";
 import { openDatabase } from "./core/database.js";
+import {
+  finishJobRun,
+  type JobTrigger,
+  markInterruptedJobRuns,
+  runStartupCatchups,
+  startJobRun,
+} from "./core/jobs.js";
+import { acquireDaemonLock } from "./core/lock.js";
+import { logger, setLogLevel } from "./core/logger.js";
+import { incCounter } from "./core/metrics.js";
+import { cancelPendingDrain, createServices, drainDue, waitForDrain } from "./core/notify.js";
+import {
+  bumpQweatherUsage,
+  readQweatherUsage,
+  seedQweatherUsage,
+  setQweatherUsageSink,
+} from "./core/qweather.js";
+import { clientAddress, FixedWindowLimiter, rateLimitKey } from "./core/ratelimit.js";
 import {
   allJobs,
   allTools,
@@ -21,27 +39,11 @@ import {
   type JobDef,
   type ToolContext,
 } from "./core/registry.js";
-import { cancelPendingDrain, createServices, drainDue, waitForDrain } from "./core/notify.js";
-import {
-  finishJobRun,
-  markInterruptedJobRuns,
-  runStartupCatchups,
-  startJobRun,
-  type JobTrigger,
-} from "./core/jobs.js";
-import { acquireDaemonLock } from "./core/lock.js";
 import { applySecureUmask, createRequestGuard, hardenDataDir } from "./core/security.js";
-import {
-  bumpQweatherUsage,
-  readQweatherUsage,
-  seedQweatherUsage,
-  setQweatherUsageSink,
-} from "./core/qweather.js";
 import { ensureProfile, pruneCache } from "./core/settings.js";
-import { logger, setLogLevel } from "./core/logger.js";
-import { TZ, now } from "./time.js";
 import { registerAllModules } from "./modules/index.js";
 import { createStatusApp } from "./server/status.js";
+import { now, TZ } from "./time.js";
 
 const require = createRequire(import.meta.url);
 const VERSION = (require("../package.json") as { version: string }).version;
@@ -144,14 +146,26 @@ async function handleMcp(
 ): Promise<void> {
   // 只接受 Authorization: Bearer。/mcp 不接受 ?token= —— URL 会进入访问日志、
   // 浏览器历史与 Referer，凭据不应出现在那里（状态页仍支持 ?token= 首次引导）。
-  if (!isRequestAuthorized(config.webApiToken, req.headers.authorization)) {
+  //
+  // 身份解析：配了 PROFILE_TOKENS_JSON 时，Profile token 直接绑定该 Profile
+  // （不再信任 X-Hermes-Profile 自报）；master token 仍可按头切换（看板/运维/兼容旧部署）。
+  const identity = resolveIdentity({
+    masterToken: config.webApiToken,
+    profileTokens: config.profileTokens,
+    authorization: req.headers.authorization,
+  });
+  if (identity === null) {
+    incCounter("auth_failed_total");
+    logger.warn(
+      `鉴权失败: /mcp from ${clientAddress(req, config.trustProxy)}（master/Profile token 均不匹配）`,
+    );
     res.writeHead(401, { "Content-Type": "application/json" });
     res.end(
       JSON.stringify({
         jsonrpc: "2.0",
         error: {
           code: -32001,
-          message: "unauthorized：/mcp 需要 Authorization: Bearer <WEB_API_TOKEN>",
+          message: "unauthorized：/mcp 需要 Authorization: Bearer <Profile token 或 WEB_API_TOKEN>",
         },
         id: null,
       }),
@@ -176,6 +190,26 @@ async function handleMcp(
       );
       return;
     }
+    // 会话 id 是随机 UUID，但仍要校验身份与创建会话时的 Profile 一致：
+    // 否则拿到别人会话 id 的 Profile token 可以借道读写他人数据。
+    if (identity.kind === "profile" && identity.profileId !== session.profileId) {
+      incCounter("auth_failed_total");
+      logger.warn(
+        `鉴权失败: /mcp 会话 ${headerSession} 属于 ${session.profileId}，但当前 token 绑定 ${identity.profileId}`,
+      );
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          error: {
+            code: -32001,
+            message: "forbidden：会话与 token 所属 Profile 不一致，请重新 initialize",
+          },
+          id: null,
+        }),
+      );
+      return;
+    }
     session.lastSeen = Date.now();
     await session.transport.handleRequest(req, res);
     return;
@@ -183,7 +217,13 @@ async function handleMcp(
 
   const rawProfile = req.headers["x-hermes-profile"];
   let profileId = "default";
-  if (typeof rawProfile === "string" && rawProfile !== "") {
+  if (identity.kind === "profile") {
+    // Profile token 是强绑定：忽略（并记 debug）调用方自报的头，避免越权。
+    profileId = identity.profileId;
+    if (typeof rawProfile === "string" && rawProfile !== "" && rawProfile !== profileId) {
+      logger.debug(`Profile token 绑定 ${identity.profileId}，忽略 X-Hermes-Profile=${rawProfile}`);
+    }
+  } else if (typeof rawProfile === "string" && rawProfile !== "") {
     try {
       profileId = parseProfileId(rawProfile, "X-Hermes-Profile");
     } catch (e) {
@@ -227,12 +267,31 @@ export function createHttpHandler(
   // 攻击者把域名解析到 127.0.0.1）会带着伪造 Host 直接读写个人数据。没有 Origin 的
   // 非浏览器客户端（Hermes/CLI/curl）照常放行。
   const guard = createRequestGuard(config);
+  // 每身份固定窗口限流：公网（经 Lucky 反代）暴露后的兜底，避免一个来源把服务打满。
+  // key 优先用 token 指纹（不同人互不牵连），无凭据时按来源 IP；/healthz 不参与限流。
+  const limiter = new FixedWindowLimiter(config.rateLimitPerMinute, 60_000);
   return (req, res) => {
     const verdict = guard(req);
     if (!verdict.ok) {
       res.writeHead(verdict.status, { "Content-Type": "application/json; charset=utf-8" });
       res.end(JSON.stringify({ ok: false, error: verdict.body }));
       return;
+    }
+    const url = req.url ?? "/";
+    if (!url.startsWith("/healthz")) {
+      const decision = limiter.take(rateLimitKey(req, config.trustProxy));
+      if (!decision.allowed) {
+        incCounter("rate_limited_total");
+        logger.warn(
+          `请求过于频繁，已限流: ${req.method ?? ""} ${url} from ${clientAddress(req, config.trustProxy)}`,
+        );
+        res.writeHead(429, {
+          "Content-Type": "application/json; charset=utf-8",
+          "Retry-After": String(Math.max(1, Math.ceil(decision.retryAfterMs / 1000))),
+        });
+        res.end(JSON.stringify({ ok: false, error: "too many requests" }));
+        return;
+      }
     }
     if (req.url !== undefined && isMcpPath(req.url)) {
       handleMcp(req, res, db, config).catch((e) => {

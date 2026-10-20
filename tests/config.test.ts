@@ -200,6 +200,52 @@ describe("config", () => {
     assert.equal(config.profileRouteSecrets.default, SECRET);
   });
 
+  it("PROFILE_TOKENS_JSON：合法映射生效；非 JSON / 短 token / 非法名 / 重复 token / 与 master 相同都拒绝", () => {
+    const bestie = "b".repeat(64);
+    const config = loadConfig({
+      ...BASE,
+      WEB_API_TOKEN: SECRET,
+      PROFILE_TOKENS_JSON: JSON.stringify({ bestie }),
+    });
+    assert.deepEqual(config.profileTokens, { bestie });
+
+    for (const [name, raw] of [
+      ["非法 JSON", "{not-json"],
+      ["不是对象", JSON.stringify(["a"])],
+      ["token 过短", JSON.stringify({ bestie: "short" })],
+      ["非字符串", JSON.stringify({ bestie: 123 })],
+      ["非法 Profile 名", JSON.stringify({ "Bad Name": bestie })],
+      ["重复 token", JSON.stringify({ bestie, default: bestie })],
+      ["与 master 相同", JSON.stringify({ bestie: SECRET })],
+    ] as const) {
+      assert.throws(
+        () => loadConfig({ ...BASE, WEB_API_TOKEN: SECRET, PROFILE_TOKENS_JSON: raw }),
+        /PROFILE_TOKENS_JSON/,
+        name,
+      );
+    }
+    // 未配置时为空对象（退化为单 token 模式）
+    assert.deepEqual(loadConfig({ ...BASE, WEB_API_TOKEN: SECRET }).profileTokens, {});
+  });
+
+  it("RATE_LIMIT_PER_MINUTE / TRUST_PROXY：默认值与非法值", () => {
+    const base = loadConfig(BASE);
+    assert.equal(base.rateLimitPerMinute, 120);
+    assert.equal(base.trustProxy, false);
+    assert.equal(loadConfig({ ...BASE, RATE_LIMIT_PER_MINUTE: "30" }).rateLimitPerMinute, 30);
+    assert.equal(loadConfig({ ...BASE, RATE_LIMIT_PER_MINUTE: "0" }).rateLimitPerMinute, 0);
+    assert.throws(
+      () => loadConfig({ ...BASE, RATE_LIMIT_PER_MINUTE: "-1" }),
+      /RATE_LIMIT_PER_MINUTE/,
+    );
+    assert.throws(
+      () => loadConfig({ ...BASE, RATE_LIMIT_PER_MINUTE: "abc" }),
+      /RATE_LIMIT_PER_MINUTE/,
+    );
+    assert.equal(loadConfig({ ...BASE, TRUST_PROXY: "1" }).trustProxy, true);
+    assert.throws(() => loadConfig({ ...BASE, TRUST_PROXY: "treu" }), /TRUST_PROXY/);
+  });
+
   it("Profile 名校验", () => {
     assert.equal(parseProfileId("default"), "default");
     assert.throws(() => parseProfileId(undefined), /HERMES_PROFILE/);

@@ -48,6 +48,16 @@ export interface ResolvedConfig {
    * DNS rebinding 防护的显式白名单。
    */
   allowedHosts: string[];
+  /**
+   * 每人一个 token（PROFILE_TOKENS_JSON：{"profileId":"<token>"}）。
+   * 非空时 MCP/写接口按 token 反查 Profile，不再信任 X-Hermes-Profile 自报身份；
+   * master WEB_API_TOKEN 仍可访问看板/运维接口。
+   */
+  profileTokens: Record<string, string>;
+  /** 每身份每分钟请求上限（RATE_LIMIT_PER_MINUTE，默认 120；0 = 关闭） */
+  rateLimitPerMinute: number;
+  /** 反向代理后信任 X-Forwarded-For 第一个地址（TRUST_PROXY，默认 false） */
+  trustProxy: boolean;
   qweatherHost?: string;
   qweatherKey?: string;
   /** 实际使用的认证方式：JWT 优先，其次 API KEY；未配置 QWeather 时为 undefined。 */
@@ -130,6 +140,53 @@ function parseAllowedHosts(raw: string | undefined): string[] {
     .split(",")
     .map((entry) => normalizeHost(entry))
     .filter((entry) => entry !== "");
+}
+
+/**
+ * 每人一个 token。校验从严：Profile 名合法、token ≥ MIN_TOKEN_LENGTH、
+ * 同一 token 不能绑定两个 Profile、也不能与 master token 相同（否则身份二义）。
+ */
+function parseProfileTokens(
+  raw: string | undefined,
+  masterToken: string | undefined,
+): Record<string, string> {
+  if (raw === undefined || raw.trim() === "") return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    throw new Error(
+      `PROFILE_TOKENS_JSON 不是合法 JSON: ${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error('PROFILE_TOKENS_JSON 必须是 {"profileId":"token"} 形式的对象');
+  }
+  const entries = Object.entries(parsed as Record<string, unknown>);
+  if (entries.length > 32) throw new Error("PROFILE_TOKENS_JSON 最多 32 个 Profile");
+  const out: Record<string, string> = {};
+  const seen = new Set<string>();
+  for (const [profileId, value] of entries) {
+    if (!PROFILE_ID_RE.test(profileId)) {
+      throw new Error(`PROFILE_TOKENS_JSON 的 Profile 名不合法: ${profileId}`);
+    }
+    if (typeof value !== "string" || value.trim() === "") {
+      throw new Error(`PROFILE_TOKENS_JSON.${profileId} 必须是非空字符串`);
+    }
+    const token = value.trim();
+    if (token.length < MIN_TOKEN_LENGTH) {
+      throw new Error(`PROFILE_TOKENS_JSON.${profileId} 至少 ${MIN_TOKEN_LENGTH} 字符`);
+    }
+    if (token === masterToken) {
+      throw new Error(`PROFILE_TOKENS_JSON.${profileId} 不能与 WEB_API_TOKEN 相同`);
+    }
+    if (seen.has(token)) {
+      throw new Error(`PROFILE_TOKENS_JSON 里有两个 Profile 用了同一个 token: ${profileId}`);
+    }
+    seen.add(token);
+    out[profileId] = token;
+  }
+  return out;
 }
 
 /**
@@ -297,6 +354,25 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
     throw new Error("REQUIRE_AUTH=1 但未设置 WEB_API_TOKEN（严格模式拒绝无鉴权启动）");
   }
   const allowedHosts = parseAllowedHosts(env.WEB_ALLOWED_HOSTS);
+  const profileTokens = parseProfileTokens(env.PROFILE_TOKENS_JSON, webApiToken);
+  if (Object.keys(profileTokens).length > 0 && webApiToken === undefined) {
+    logger.warn(
+      "PROFILE_TOKENS_JSON 已配置但没有 WEB_API_TOKEN：仅回环部署可用，看板/运维接口将无 master 凭据",
+    );
+  }
+
+  // 每身份每分钟请求上限：默认 120 次；0 表示关闭（本地调试用）。
+  const rateLimitRaw = env.RATE_LIMIT_PER_MINUTE?.trim() || "120";
+  const rateLimitPerMinute = Number(rateLimitRaw);
+  if (
+    !Number.isInteger(rateLimitPerMinute) ||
+    rateLimitPerMinute < 0 ||
+    rateLimitPerMinute > 100_000
+  ) {
+    throw new Error(`RATE_LIMIT_PER_MINUTE 必须是 0..100000 的整数: ${rateLimitRaw}`);
+  }
+  // 反代（Lucky/nginx）后面关闭信任：只有显式开启才采信 X-Forwarded-For 做限流/日志。
+  const trustProxy = parseBooleanFlag(env.TRUST_PROXY, "TRUST_PROXY", false);
 
   const { host: qweatherHost, key: qweatherKey, auth: qweatherAuth } = resolveQweather(env);
   // 注入给 qweather 客户端（模块级）：天气工具按旧签名只传 host+key，JWT 签名器走这里
@@ -378,6 +454,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
     webApiToken,
     requireAuth,
     allowedHosts,
+    profileTokens,
+    rateLimitPerMinute,
+    trustProxy,
     qweatherHost,
     qweatherKey,
     qweatherAuth,

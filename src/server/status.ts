@@ -1,12 +1,15 @@
-import { createRequire } from "node:module";
 import { randomBytes } from "node:crypto";
+import { createRequire } from "node:module";
+import type { DatabaseSync } from "node:sqlite";
 import { Hono } from "hono";
 import { DateTime } from "luxon";
-import type { DatabaseSync } from "node:sqlite";
 import type { ResolvedConfig } from "../config.js";
-import { isRequestAuthorized } from "../core/auth.js";
-import { allJobs } from "../core/registry.js";
+import { type Identity, resolveIdentity } from "../core/auth.js";
+import { logger } from "../core/logger.js";
+import { incCounter } from "../core/metrics.js";
 import { qweatherUsage } from "../core/qweather.js";
+import { allJobs } from "../core/registry.js";
+import { expenseCsv, expenseCsvFilename } from "../modules/bookkeeping/service.js";
 import { TZ, todayIso } from "../time.js";
 import {
   deliveryDetails,
@@ -17,7 +20,6 @@ import {
   scheduleDetails,
 } from "./details.js";
 import { statusPage } from "./page.js";
-import { expenseCsv, expenseCsvFilename } from "../modules/bookkeeping/service.js";
 
 const require = createRequire(import.meta.url);
 const VERSION = (require("../../package.json") as { version: string }).version;
@@ -119,8 +121,13 @@ export function statusPayload(config: ResolvedConfig, db: DatabaseSync): Record<
   };
 }
 
-export function createStatusApp(config: ResolvedConfig, db: DatabaseSync): Hono {
-  const app = new Hono();
+/** Hono 上下文变量：请求身份（master / 某个 Profile），由 /api/* 中间件写入 */
+export interface StatusEnv {
+  Variables: { identity: Identity };
+}
+
+export function createStatusApp(config: ResolvedConfig, db: DatabaseSync): Hono<StatusEnv> {
+  const app = new Hono<StatusEnv>();
   // 安全响应头：状态页渲染的是个人数据（行程、账目、通知正文）。
   // - nosniff：避免把 JSON 当脚本执行
   // - no-referrer：凭据可能出现在 /api/*?token= 的 URL 里，Referer 不能外泄
@@ -134,11 +141,35 @@ export function createStatusApp(config: ResolvedConfig, db: DatabaseSync): Hono 
     if (c.req.path.startsWith("/api/")) c.header("Cache-Control", "no-store");
   });
   app.use("/api/*", async (c, next) => {
-    if (
-      !isRequestAuthorized(config.webApiToken, c.req.header("Authorization"), c.req.query("token"))
-    ) {
+    // `/api/quick/*` 是手机快捷入口（记账/提醒），由 Profile token 授权、按身份过滤，
+    // 自己在路由里解析 identity；其余只读看板接口仍然只允许 master token ——
+    // 单 Profile 的 token 不该看到全家账本/所有日程。
+    if (c.req.path.startsWith("/api/quick/")) {
+      await next();
+      return;
+    }
+    const identity = resolveIdentity({
+      masterToken: config.webApiToken,
+      profileTokens: config.profileTokens,
+      authorization: c.req.header("Authorization"),
+      queryToken: c.req.query("token"),
+    });
+    if (identity === null) {
+      incCounter("auth_failed_total");
+      logger.warn(`鉴权失败: ${c.req.path} from ${c.req.header("x-forwarded-for") ?? "unknown"}`);
       return c.json({ error: "unauthorized" }, 401);
     }
+    if (identity.kind === "profile") {
+      incCounter("auth_forbidden_total");
+      return c.json(
+        {
+          error: "forbidden",
+          message: "看板/只读接口仅 master token 可访问；手机请用 /api/quick/*",
+        },
+        403,
+      );
+    }
+    c.set("identity", identity);
     await next();
   });
 

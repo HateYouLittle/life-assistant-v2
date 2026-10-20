@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import { describe, it, type TestContext } from "node:test";
 import * as vm from "node:vm";
 import { DateTime } from "luxon";
+import { allJobs } from "../src/core/registry.js";
 import { resolveToken, statusPage } from "../src/server/page.js";
 import { createStatusApp, statusPayload } from "../src/server/status.js";
-import { allJobs } from "../src/core/registry.js";
 import { TZ, todayIso } from "../src/time.js";
 import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
 // 副作用 import：注册全部模块，/api/jobs 才有 job 清单（与 daemon 同一份注册表）
@@ -178,6 +178,30 @@ describe("状态接口", () => {
       });
       assert.equal(withBearer.status, 200);
       assert.equal((await a.request("/")).status, 200);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("Profile token 只能走 /api/quick/*：看板接口返回 403（不泄露全家数据）", async () => {
+    const master = "m".repeat(64);
+    const bestie = "b".repeat(64);
+    const env = makeTestEnv({
+      WEB_API_TOKEN: master,
+      HOST: "0.0.0.0",
+      PROFILE_TOKENS_JSON: JSON.stringify({ bestie }),
+    });
+    try {
+      const a = app(env);
+      assert.equal(
+        (await a.request("/api/status", { headers: { Authorization: `Bearer ${bestie}` } })).status,
+        403,
+        "Profile token 看板必须 403",
+      );
+      assert.equal(
+        (await a.request("/api/status", { headers: { Authorization: `Bearer ${master}` } })).status,
+        200,
+      );
     } finally {
       cleanupTestEnv(env);
     }

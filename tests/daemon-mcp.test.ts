@@ -20,8 +20,8 @@ interface Harness {
   close(): Promise<void>;
 }
 
-async function startHarness(): Promise<Harness> {
-  const env = makeTestEnv({ WEB_API_TOKEN: TOKEN, HOST: "0.0.0.0" });
+async function startHarness(extraEnv: Record<string, string> = {}): Promise<Harness> {
+  const env = makeTestEnv({ WEB_API_TOKEN: TOKEN, HOST: "0.0.0.0", ...extraEnv });
   const server = createServer(createHttpHandler(env.config, env.db));
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
   const port = (server.address() as AddressInfo).port;
@@ -234,6 +234,93 @@ describe("/mcp 鉴权", () => {
       await sessionOf(response);
       const row = harness.env.db.prepare("SELECT id FROM profiles WHERE id = 'reader'").get();
       assert.ok(row !== undefined, "初始化会话后必须确保 profiles 行存在");
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("Profile token 绑定自己的 Profile：忽略 X-Hermes-Profile，会话与 token 不一致时 403", async () => {
+    const bestieToken = "b".repeat(64);
+    const defaultToken = "d".repeat(64);
+    const harness = await startHarness({
+      PROFILE_TOKENS_JSON: JSON.stringify({ bestie: bestieToken, default: defaultToken }),
+    });
+    try {
+      const stamp = "2026-01-01T00:00:00.000Z";
+      harness.env.db
+        .prepare("INSERT OR IGNORE INTO profiles (id, created_at) VALUES (?, ?)")
+        .run("bestie", stamp);
+      const insert = harness.env.db.prepare(
+        "INSERT INTO schedules (id, profile_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+      );
+      insert.run("s-default", "default", "仅默认 Profile", stamp, stamp);
+      insert.run("s-bestie", "bestie", "仅好友 Profile", stamp, stamp);
+
+      // bestie 的 token + 伪造头 X-Hermes-Profile: default → 必须仍按 bestie 身份执行
+      const init = await fetch(`http://127.0.0.1:${harness.port}/mcp`, {
+        method: "POST",
+        headers: {
+          ...headers(undefined, false),
+          Authorization: `Bearer ${bestieToken}`,
+          "X-Hermes-Profile": "default",
+        },
+        body: JSON.stringify(INIT),
+      });
+      const sessionId = await sessionOf(init);
+      const initialized = await rpc(
+        harness.port,
+        { jsonrpc: "2.0", method: "notifications/initialized" },
+        sessionId,
+      );
+      await initialized.text();
+
+      const call = await fetch(`http://127.0.0.1:${harness.port}/mcp`, {
+        method: "POST",
+        headers: {
+          ...headers(sessionId, false),
+          Authorization: `Bearer ${bestieToken}`,
+          "X-Hermes-Profile": "default",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 20,
+          method: "tools/call",
+          params: { name: "schedule", arguments: { action: "list" } },
+        }),
+      });
+      const text = await readJson(call);
+      assert.match(text, /仅好友 Profile/, `profile token 应读到 bestie 的日程：${text}`);
+      assert.doesNotMatch(text, /仅默认 Profile/, "不得越权读到 default 的日程");
+
+      // 换另一个 Profile 的 token 复用同一会话 → 403（会话与身份强绑定）
+      const cross = await fetch(`http://127.0.0.1:${harness.port}/mcp`, {
+        method: "POST",
+        headers: {
+          ...headers(sessionId, false),
+          Authorization: `Bearer ${defaultToken}`,
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 21, method: "tools/list" }),
+      });
+      assert.equal(cross.status, 403, "会话与 token 所属 Profile 不一致必须拒绝");
+      await cross.text();
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("RATE_LIMIT_PER_MINUTE 生效：同一身份超限返回 429 与 Retry-After", async () => {
+    const harness = await startHarness({ RATE_LIMIT_PER_MINUTE: "2" });
+    try {
+      const first = await rpc(harness.port, INIT);
+      await first.text();
+      assert.equal(first.status, 200);
+      const second = await rpc(harness.port, INIT);
+      await second.text();
+      assert.equal(second.status, 200);
+      const third = await rpc(harness.port, INIT);
+      await third.text();
+      assert.equal(third.status, 429);
+      assert.ok(third.headers.get("retry-after"), "429 必须带 Retry-After");
     } finally {
       await harness.close();
     }
