@@ -16,13 +16,13 @@
 | 备份 | daemon 内置每日 03:00 `VACUUM INTO` 备份（保留 14 份，时间与份数可配），产物自校验；schema 升级前自动留快照；`npm run db:restore` 校验并留底后一键恢复 |
 | 任务可靠性 | 每个定时任务写 `job_runs`（running→ok/failed/skipped）；停机期间错过的每日任务在启动时按白名单补发；状态页「定时任务」卡片与 `doctor --live` 可见 |
 | 部署安全 | 单实例锁、umask 077（库/备份 0600）、Host/Origin 守卫（DNS rebinding 防护）、`REQUIRE_AUTH` 强制鉴权、`WEB_ALLOWED_HOSTS` 放行名单 |
-| 手机入口 | `/quick` PWA（记一笔 / 设提醒，Profile token 鉴权）+ `POST /api/quick/expenses\|schedules`；HTTP Shortcuts、小布指令、NFC 用法见 [docs/quick-entry.md](docs/quick-entry.md) |
+| 手机入口 | `/quick` PWA（记一笔 / 设提醒，Profile token 鉴权）+ `POST /api/quick/expenses\|schedules`；HTTP Shortcuts 可直接导入 [docs/http-shortcuts.json](docs/http-shortcuts.json)（说明见 [docs/http-shortcuts.md](docs/http-shortcuts.md)）；小布指令/NFC 见 [docs/quick-entry.md](docs/quick-entry.md) |
 | 日历订阅 | `GET /calendar.ics` 签名 URL（HMAC + 有效期），iOS/Android 日历可订阅；`npm run calendar:url` 生成 |
 | 运维端点 | `GET /metrics`（Prometheus 文本，master token）与 `GET /readyz`（外部监控，无需凭据） |
 
 相对 v1 的主要变化：**单守护进程**（去掉 stdio 查询进程与 scheduler 的双进程并发防护）；**46 个工具收敛为 7 个**（域内 action 参数化）；**舍弃**油价、共享账本角色、生活指数、自动化 DSL、Open-Meteo 多源回退、React 仪表盘；通知改为 **Markdown 表格**渲染（微信/企业微信）。
 
-阶段进度与后续路线图见 [ROADMAP.md](ROADMAP.md)（当前：v2.0.0 / schema v4，阶段一「可靠性 + 安全基线 + 每日闭环」已完成）。
+阶段进度与后续路线图见 [ROADMAP.md](ROADMAP.md)（当前：v2.0.0 / schema v5，阶段一「可靠性 + 安全基线 + 每日闭环」与阶段二「个人化入口 + 通知治理 + 可观测性」已完成）。
 手机/公网访问（局域网 + NAS Lucky 反代）的目标架构与施工清单见 [docs/remote-access.md](docs/remote-access.md)（阶段二，待实施）。
 
 ## 安装
@@ -37,7 +37,7 @@ npm run build
 ```
 
 `npm start` / `npm run dev` / `npm run db:backup` / `npm run db:cleanup:preview` /
-`npm run db:restore` / `npm run calendar:url` / `npm run doctor` / `npm run import:v1` 会用 Node 的 `--env-file-if-exists=.env` 自动读取同目录 `.env`
+`npm run db:restore` / `npm run db:fingerprint` / `npm run calendar:url` / `npm run doctor` / `npm run import:v1` 会用 Node 的 `--env-file-if-exists=.env` 自动读取同目录 `.env`
 （已存在的环境变量优先，systemd 的 `EnvironmentFile` 不受影响）。手工执行其他命令时可
 `set -a; source .env; set +a`。
 
@@ -102,6 +102,7 @@ daemon 就绪后：
   | `/api/deliveries` | `limit`、`offset` | 投递计数、近 7 天分布与记录（分页同上） |
   | `/api/holidays` | `year` | 假期/调休安排与接下来的假期 |
   | `/api/budget` | `month`（YYYY-MM） | 家庭账本预算对照与可执行建议（未设预算的账本只给提示） |
+  | `/api/audit` | `limit`、`offset` | 写接口审计（master 全量、Profile 仅自己；detail 不含备注全文） |
 
 - `X-Hermes-Profile` 头决定 Profile；缺省为 `default`
 - MCP 会话：空闲 2 小时回收、最多 200 个；daemon 重启后旧 `mcp-session-id` 一律返回 404，
@@ -313,12 +314,12 @@ npm run db:cleanup:preview   # 零业务删除预演：occurrence 与保留策�
 
 ## 设计要点
 
-- **单写者**：所有 SQLite 写入收敛到 daemon，WAL + 严格 schema（STRICT 表、CHECK、外键）。schema 版本记在 `meta.schema_version`，启动时逐级自动升级（只做附加式加列/加表，升级失败即拒绝启动）；库版本高于程序时同样拒绝启动。注意 `schedules.escalation_json` 是有意只走幂等补列、不提升版本的（重建 `schedules` 会牵动 `occurrences` 外键与 `kind` 的 CHECK），因此 `schema_version` 表示「升级阶梯走到了哪一级」，而非表结构的完整指纹。迁移整体包在单个事务里（失败整笔回滚，不会留下「版本号前滚了、列还没补」的半升级库）；前滚前若传了备份目录，会先 `VACUUM INTO` 一份 `life-assistant-pre-v<旧版本>-<时间戳>.db` 快照，备份失败则拒绝启动；活动账本名唯一索引建不出来同样拒绝启动（宁可停，也不让同名账本串范围）。schema v4 新增 `job_runs` 与 `expenses/schedules.client_token`（写路径幂等键）。
+- **单写者**：所有 SQLite 写入收敛到 daemon，WAL + 严格 schema（STRICT 表、CHECK、外键）。schema 版本记在 `meta.schema_version`，启动时逐级自动升级（只做附加式加列/加表，升级失败即拒绝启动）；库版本高于程序时同样拒绝启动。注意 `schedules.escalation_json` 是有意只走幂等补列、不提升版本的（重建 `schedules` 会牵动 `occurrences` 外键与 `kind` 的 CHECK），因此 `schema_version` 表示「升级阶梯走到了哪一级」，而非表结构的完整指纹。迁移整体包在单个事务里（失败整笔回滚，不会留下「版本号前滚了、列还没补」的半升级库）；前滚前若传了备份目录，会先 `VACUUM INTO` 一份 `life-assistant-pre-v<旧版本>-<时间戳>.db` 快照，备份失败则拒绝启动；活动账本名唯一索引建不出来同样拒绝启动（宁可停，也不让同名账本串范围）。schema v4 新增 `job_runs` 与 `expenses/schedules.client_token`（写路径幂等键）；v5 新增 `audit_log`（写接口审计）与 `meta.schema_fingerprint`（结构指纹对账，漂移会 warn，`npm run db:fingerprint` 可查）。
 - **模块契约**：模块注册 `tools / jobs / tick / onStart` 四个扩展点；调度保证 tick 不重叠；核心不 import 模块内部。
 - **recurrence 引擎**：自研纯函数替代 rrule，只覆盖 daily/weekly/monthly/yearly × 农历 + 工作日过滤；漏触发只补最近一次。
 - **outbox**：通知 + 投递记录同事务写入；发布即触发投递；静默时段只拦主动推送；带 `expiresAt` 的通知（气象预警）到点仍未投出即作废，不会在静默时段结束后补投一条已经失效的告警（通知本身保留，`notify.pull` 仍可取到）。投递通道由 `src/core/channels.ts` 抽象：`webhook` 逐字保留原 HMAC V2 协议与重试语义，`log` 只写进程日志（本地联调用）；路由的 `channel` 字段缺省为 `webhook`，旧 `push_route` 数据不需要迁移。
 - **身份与可见性**：`WEB_API_TOKEN` 是 master（家庭看板、运维、doctor、Hermes stdio 壳）；`PROFILE_TOKENS_JSON` 给每人一个 token，MCP、`/api/quick/*` 与看板 `/api/*` 都按 token 反查 Profile（不再信任 `X-Hermes-Profile`），会话与 token 所属 Profile 不一致直接 403。看板可见性矩阵：支出（master=家庭账本；profile=家庭+本人个人）、日程/通知/投递/Profile 列表（master=全部；profile=仅自己）、预算与 CSV（始终家庭账本）、jobs/holidays（共享）；`/api/status` 返回 `identity` 字段供页面渲染「家庭看板 / 个人视图」。除 `/healthz`、`/readyz` 外的请求按身份做固定窗口限流（429 + `Retry-After`），鉴权失败写 warn 日志并计入 `/metrics`。
-- **手机快捷入口**：`/quick` 是零构建 PWA（记一笔 / 设提醒，token 引导、常用分类 chips、`?type=&amount=&category=&title=` 预填），写接口 `POST /api/quick/expenses|schedules` 复用 MCP 同一份 service —— 幂等键、家庭账本回执、预算提醒、occurrence 物化语义完全一致；`GET /api/quick/bootstrap` 只返回该 Profile 可见账本与常用分类。OPPO/ColorOS 的 PWA、HTTP Shortcuts（可粘贴 cURL 导入）、小布指令/NFC 三种用法见 [docs/quick-entry.md](docs/quick-entry.md)。
+- **手机快捷入口**：`/quick` 是零构建 PWA（记一笔 / 设提醒，token 引导、常用分类 chips、`?type=&amount=&category=&title=` 预填），写接口 `POST /api/quick/expenses|schedules` 复用 MCP 同一份 service —— 幂等键、家庭账本回执、预算提醒、occurrence 物化语义完全一致；`GET /api/quick/bootstrap` 只返回该 Profile 可见账本与常用分类。OPPO/ColorOS 的 PWA、HTTP Shortcuts（可直接导入 `docs/http-shortcuts.json`，或按 [docs/quick-entry.md](docs/quick-entry.md) 用 cURL 导入）、小布指令/NFC 三种用法见 [docs/quick-entry.md](docs/quick-entry.md)。
 - **日历订阅**：`GET /calendar.ics?p=&exp=&sig=` 用 HMAC-SHA256(master, `"<profile>.<exp>"`) 签发**只读单个 Profile、带有效期**的链接（日历客户端无法附加请求头，所以不能直接用 token）；`npm run calendar:url -- --profile bestie --days 30 --base https://<域名>` 生成。只导出该 Profile **活跃**日程在未来 62 天内、状态为 `pending/notified` 的 occurrence；空数据也返回合法空日历。
 - **运维端点**：`GET /metrics`（Prometheus 文本：鉴权/限流计数器、投递六状态、outbox 最老排队秒数、每个 job 最近成功时间、备份年龄、DB/WAL 大小、今日 QWeather 用量）仅 master token；`GET /readyz` 无需凭据，做 DB 可写探针、WAL 阈值与 outbox 卡住判定，异常 503 + `reasons`。两者与 `/healthz` 一样对外可用，但只有 `/readyz`/`/healthz` 豁免限流。
 - **时区**：全部调度固定 Asia/Shanghai，无 DST。
@@ -326,6 +327,7 @@ npm run db:cleanup:preview   # 零业务删除预演：occurrence 与保留策�
 - **部署安全基线**：启动先取 `daemon.lock`（`open(..., "wx")` + PID 存活探测，死进程/损坏锁自动接管）再开库 —— 两个 daemon 同时跑会让 outbox 重复投递；`umask(0o077)` 并把数据目录/库/备份收紧到 0700/0600；HTTP 入口统一校验 Host（缺失或不在允许名单即 403）与 Origin（存在时必须同源，CLI/agent 这类无 Origin 的请求放行），挡 DNS rebinding 与跨站请求；`REQUIRE_AUTH=1` 让回环部署也强制 token。
 - **QWeather 请求治理**：按数据类型短 TTL 缓存（`CACHE_TTL_MS`：实时 20min / 逐天 2h 且取 `min(2h, 距本地次日 00:00)` / 空气质量 45min，只有成功响应才写缓存；预警的缓存 TTL 跟随 `ALERT_WATCH_CRON` 间隔 +30s（复杂 cron 回退 15min）——工具查询仍用 10min，巡检不再每轮穿透缓存、日请求量约减半）；同进程并发上限 3；仅对 429/5xx 与网络故障做指数退避（`2^c` 秒 + 抖动，c 上限 10），**4xx 一律立即抛出** —— 官方明确反复重试错误请求会被判定为攻击并冻结账号。认证优先 JWT（EdDSA），API KEY 保留回退。**GeoAPI 结果不得落盘缓存/批量存储/建索引**（官方版权限制），只允许进程内 memo —— 唯一例外是用户经 `weather locate` **显式选定的位置会作为该 Profile 的配置长期保存**（`settings.location`），属用户主动设置而非缓存/批量索引，供后续查询与每日简报复用；`weather travel` 设置的出行计划同理，只保存城市/经纬度与起止日期（`settings.travel_plan`），生效期间直接复用、**不再请求 GeoAPI**。
 - **主动推送**：定时任务组装**确定性**通知（无 LLM），走 outbox 投递：每日天气简报与调休/补班提醒 07:00、晚报 21:00（可配）、气象预警巡检每 20 分钟（缓存 TTL 跟随巡检间隔）、月报每月 1 号 09:00；节假日数据刷新 02:00、内置备份 03:00、WAL checkpoint 03:15、历史 occurrence 回收 04:30、保留策略清理 04:50。早报在天气结论之后附「今日日程/逾期未完成」（最多 6 条，日程模块异常只跳过该块、不影响早报发布），晚报给「明日天气/明日日程/今日未完成/明天补班或放假」；**当天补班只由调休模块的独立通知承载**，早报不再重复同一句——两个 job 同在 07:00，谁先跑都不影响结果。预警与补班都靠 `dedupe_key` 去重（预警按「id + 级别」，级别升级会再推一次、降级不重推；补班按「事件 + 日期」），静默时段在投递层统一拦截、不为任何类型开例外。每日简报同时给出**下个假期倒计时**（节假日数据未就绪时显示「未知」而不是猜）；出行模式生效期间，简报与预警巡检自动改用目的地城市，并在简报里显式标注。
+- **结构指纹与审计**：启动时对 `sqlite_master` 做一次规范快照并记入 `meta.schema_fingerprint`，与上次启动对比——不一致会 warn（手工 ALTER/升级异常的早期信号），`npm run db:fingerprint` 打印 computed/stored/match，`doctor` 也会检查；它是「结构漂移」检测，不是完整性校验（完整性靠 `quick_check`）。写接口（`/api/quick/*`）成功后写 `audit_log`（身份/动作/对象/摘要，不含备注全文与 token），`GET /api/audit` master 看全部、Profile 只看自己。
 - **备份与恢复**：`src/core/backup.ts` 的 `runBackup` 同时服务手动 CLI（`npm run db:backup`）与 `maintenance.daily_backup` job（`BACKUP_CRON`，默认 03:00）：`VACUUM INTO` 生成快照、按 `BACKUP_KEEP`（默认 14）清理最旧文件；产物必须通过 `quick_check` 与 `meta.schema_version` 自校验，否则删除并抛错（坏备份绝不冒充可用）。停机期间错过的备份由启动补发补跑一次。schema 前滚前（daemon 与各 CLI 打开老库）会先落一份 `life-assistant-pre-v<旧版本>-<时间戳>.db`。`npm run db:restore` 复用同一份校验：`--latest`（缺省）只在规范命名的备份里选，`--file` 指定，`--dry-run` 只预演；锁里的 daemon 仍存活时直接拒绝，覆盖前把当前库留底为 `life-assistant-pre-restore-<时间戳>.db`，恢复后清 `-wal`/`-shm` 并重新校验。备份新鲜度（>36h warn、>7 天 fail）与命名异常由 `doctor --live` 检查。
 - **用量与保留**：QWeather 上游请求按本地日计数（含重试、缓存命中不计），状态页「今日天气请求」与 `/api/status` 的 `qweather_usage` 可见，daemon 重启从库里的计数继续累加 —— 官方 2027-02-01 起限制 API KEY 日请求量，没有计量就无从判断余量。保留策略（每日 04:50）只删**已读且投递已终结**的通知（含级联的投递记录）与**已取消超 180 天**的日程；未读通知、仍有待投递的通知、使用 `recurrence.count` 的日程一律保留。**月报通知也不清理**：它的 `dedupe_key` 是月报补发判定的唯一持久证据，删掉会让 7~12 个月前的月报被误判成「从未推送过」。
 - **分类字典**：`expense {action:"categories"}` 查看字典与近 90 天用量，`expense {action:"category_alias", category:"餐饮", alias:"吃饭"}` 建别名；`expense add/update` 写入前会把别名（大小写/空白折叠）归一成标准名，未知分类保持自由文本，**不改历史数据**。字典按 Profile 存储（`settings.expense_categories`），不同人的别名互不影响。
@@ -378,7 +380,7 @@ npm run db:cleanup:preview   # 零业务删除预演：occurrence 与保留策�
 14. **记账编辑只做「更正」，不触发推送、不保留历史**：`expense {action:"update"}` 改金额/分类/备注/日期后不会补发回执、也不会重新判定 80%/100% 预算阈值（避免修正金额时凭空多推一条），且不记录修改前值；如需按新金额触发提醒，只能等下一笔支出或人工核对预算。编辑也不能把账目挪到另一个账本。
 15. **出行模式一个 Profile 同时只保留一份计划**：`weather {view:"travel"}` 覆盖式保存，不支持多段行程/多城市串联，也没有历史行程查询；显式传 `city` 的查询始终优先于出行计划。计划只按本地日历日判断生效，跨时区行程仍以 Asia/Shanghai 为准；窗口结束后计划不会自动删除（`show` 显示未生效、可 `clear`）。简报的 `dedupeKey` 含城市名：同一天内把目的地改到另一个城市会再发一条新城市简报（旧城市那条已发出，无法撤回）。
 16. **看板 CSV 只导出家庭账本**：`/api/expenses.csv` 与看板同口径（共享 `WEB_API_TOKEN` 下不暴露个人账本），个人账本导出走 MCP `expense {action:"export"}`（仅当前 Profile 可见的账本）；CSV 只支持按月导出，不做任意区间。
-17. **投递通道有 `webhook`、`log`、`bark`、`ntfy`**：`log` 只写进程日志（本地联调，不代表用户真收到）；`bark`（iOS）用 `https://api.day.app/<device_key>` 形式的 URL，`ntfy`（Android/自建）用 `https://ntfy.sh/<topic>` 形式的 topic URL —— 两者 URL 本身就是凭据，别用可猜的 topic。尚未接 SMTP/邮件与 Telegram；通道按 Markdown 原文投递，没有按通道渲染格式（`bark`/`ntfy` 收到的是 `body_md`）。
+17. **投递通道有 `webhook`、`log`、`bark`、`ntfy`、`telegram`、`smtp`**：`log` 只写进程日志（本地联调，不代表用户真收到）；`bark`（iOS）用 `https://api.day.app/<device_key>`；`ntfy`（Android/自建）用 `https://ntfy.sh/<topic>`；`telegram` 用 `https://api.telegram.org/bot<token>/sendMessage?chat_id=<id>`（超 4096 字符会截断并注明）；`smtp` 用 `smtp://user:pass@host:587?from=&to=`（`to` 可重复，≤10 个；465/`smtps` 隐式 TLS、587 STARTTLS、25 明文，`?tls=plain|starttls|implicit` 可覆盖；支持 AUTH LOGIN/PLAIN）。所有 URL 形态的凭据都会落库并可能被 `notify route` 回显，别用可猜的 topic、别把密码放进共享聊天。通道仍按 Markdown 原文投递（`bark`/`ntfy`/`telegram`/`smtp` 收到的是 `body_md`），没有按通道渲染格式；SMTP 的 TLS 成功路径无自动化测试（需受信证书），真机建议先用 `?tls=plain` 验证账号再切 587/465。
 18. ~~**内置备份 job 依赖 daemon 运行 / 无完整性校验 / 无恢复入口**~~ —— **已实施（2026-10-20）**：备份产物生成后即自校验（`quick_check` + `meta.schema_version`，坏产物删除并报错）；停机错过的备份由启动补发补跑；新增 `npm run db:restore`（校验 + 留底 + 拒绝在 daemon 运行时操作）；schema 前滚前自动落 `pre-v<旧版本>` 快照；`doctor --live` 检查备份新鲜度与命名异常。仍保留：`VACUUM INTO` 在主进程事件循环上同步执行，库很大时会短暂阻塞 HTTP/MCP（每日一次、个人规模可接受；彻底隔离需要 worker thread）；状态页暂不展示备份卡片。
 
 19. **启动补发只是「最近一次」**：每个白名单 job 只补最近一次错过的触发，且只支持「日/月/星期为 `*`」的 cron；连续停机多天不会逐天补齐（补 3 天前的日报只会打扰用户）。`CATCHUP_POLICY` 的键必须与真实 `module.job` 一致，`tests/jobs.test.ts` 会在键名拼错时立刻变红。
@@ -398,3 +400,5 @@ npm run db:cleanup:preview   # 零业务删除预演：occurrence 与保留策�
 30. **明细分页用 OFFSET 游标**：`/api/expenses`、`/api/deliveries`、`expense {action:"list"}` 都支持 `offset`（夹紧到 0..100000），排序补了 `id` 兜底保证「页间不重复不跳行」；但 offset 分页对「翻页期间数据变化」敏感——expenses 的计数/取数在同一读事务里，deliveries 的 `items_total` 与 items 是两条语句（期间新增投递可能让下一页重复/漏行，个人规模+30s 刷新下概率很低）。深分页要扫行，数据量大时应改 keyset 游标。状态页「加载更多」追加的是当前月份/当前抽屉，切月或 30s 自动刷新会回到第一页（既有抽屉语义）。
 
 31. **日志轮转是 copytruncate，不是 reopen**：daemon 无法控制 launchd 持有的 stdout/stderr fd，所以只能「先复制副本再清空原文件」；copy 与 truncate 之间新写入的日志可能只落在一处（凌晨低峰执行，概率很低）。要做零丢失需 daemon 自己管理日志文件（重定向改由进程内 reopen），属后续工作。`freedBytes` 指活动日志归零量，不是净磁盘释放（副本仍占盘，按 `LOG_KEEP` 删旧才真正释放）。
+
+32. **`audit_log` 目前只增不清**：每次 `/api/quick/*` 写入一行，个人规模量级可忽略；保留策略尚未接管（后续按天数清理或归档）。`/api/audit` 的 master 能看到所有 Profile 的审计 detail（含账本名/标题，但不含备注全文与 token）；Profile 只能看自己的。结构指纹是「上次启动结构 vs 当前结构」的对账，无法发现从未经过本程序的结构（首次启动/恢复旧快照后基线即当前结构）；回滚到 `pre-v4` 快照会丢掉升级后的 `audit_log` 行与指纹状态，属预期。

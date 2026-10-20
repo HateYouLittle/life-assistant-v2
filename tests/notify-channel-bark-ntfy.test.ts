@@ -127,10 +127,10 @@ function okResponse(res: ServerResponse): void {
 describe("Bark / ntfy 通道注册", () => {
   it("通道清单包含 bark 与 ntfy，默认通道不变", () => {
     assert.equal(DEFAULT_CHANNEL, "webhook");
-    assert.deepEqual(supportedChannels(), ["webhook", "log", "bark", "ntfy"]);
+    assert.deepEqual(supportedChannels(), ["webhook", "log", "bark", "ntfy", "telegram", "smtp"]);
     assert.equal(getChannel("bark").name, "bark");
     assert.equal(getChannel("ntfy").name, "ntfy");
-    assert.throws(() => getChannel("telegram"), /不支持的推送通道/);
+    assert.throws(() => getChannel("pager"), /不支持的推送通道/);
   });
 
   it("两个通道都需要 URL、都不需要 secret", () => {

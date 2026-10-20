@@ -27,7 +27,8 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   （需先 `npm run build`）。`db:backup` / `db:cleanup:preview` / `db:restore` / `doctor` /
   `import:v1` / `calendar:url` 同理：无前缀脚本依赖 `dist/`，`dev:*` 变体直接跑 TS 源码。
 - `.env` 只会被 `start` / `dev` / `db:backup` / `db:cleanup:preview` / `db:restore` /
-  `calendar:url` / `doctor` / `import:v1` 及其 `dev:*` 变体通过 `--env-file-if-exists` 自动读取。
+  `calendar:url` / `db:fingerprint` / `doctor` / `import:v1` 及其 `dev:*` 变体通过
+  `--env-file-if-exists` 自动读取。
   其他命令需手动 `set -a; source .env; set +a`。
 - 首次运行会创建 `$DATA_DIR/life-assistant.db`；测试使用一次性临时目录。
 
@@ -70,6 +71,8 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   也是打开时幂等重建并 DROP 掉旧的全局索引 `idx_ledgers_active_name`，不提升版本号。
   v4 新增 `job_runs` 表与 `expenses.client_token` / `schedules.client_token`（写路径幂等键，
   分范围部分唯一索引 `idx_expenses_client_token` / `idx_schedules_client_token`，NULL 不参与约束）。
+  v5 新增 `audit_log` 表（写接口审计，`/api/audit` 按身份过滤）与 `meta.schema_fingerprint`
+  （结构指纹：`db:fingerprint` CLI/doctor 可查；启动时对比并更新，漂移会 warn）。
   迁移整体包在单个事务里（失败整笔回滚）；升级前若 `openDatabase` 传了 `backupDir` 会先
   `VACUUM INTO` 一份 `life-assistant-pre-v<旧版本>-<时间戳>.db`，备份失败拒绝启动。
   活动账本名唯一索引建不出来现在**拒绝启动**（旧实现只告警；缺索引会让同名账本串范围）。
@@ -122,11 +125,12 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
 - 启动补发只覆盖 `CATCHUP_POLICY` 白名单内的 job，且只补最近一次、只支持日/月/星期为 `*`
   的 cron。新增「每天必须发生一次」的任务时记得加进策略表；`tests/jobs.test.ts` 会校验
   键名必须对应真实注册的 `module.job`。
-- **鉴权矩阵**：`/api/*`（看板/只读）只认 master `WEB_API_TOKEN`（Profile token → 403）；
-  `/api/quick/*` 认 master 或 Profile token，身份由 `resolveIdentity` 反查（**绝不读
-  `X-Hermes-Profile`**）；`/mcp` 两者都认，但 Profile token 强绑定自己的 Profile，会话与
-  token 不一致 → 403；`/metrics` 只认 master；`/readyz`、`/healthz` 无需凭据；`/calendar.ics`
-  用签名 URL（`src/core/ics.ts`），不使用 header。新增接口时先想清楚属于哪一档。
+- **鉴权矩阵**：`/api/*`（看板/只读）认 master 与 Profile token —— master=家庭看板（家庭账本
+  支出 + 所有 Profile 日程/通知），Profile token=个人视图（家庭+本人个人账本、仅自己的日程/
+  通知/投递）；`/api/quick/*` 同上；身份由 `resolveIdentity` 反查（**绝不读 `X-Hermes-Profile`**）；
+  `/mcp` 两者都认，但 Profile token 强绑定自己的 Profile，会话与 token 不一致 → 403；
+  `/metrics` 只认 master；`/readyz`、`/healthz` 无需凭据；`/calendar.ics` 用签名 URL
+  （`src/core/ics.ts`），不使用 header。新增接口时先想清楚属于哪一档、按什么身份过滤。
 - **限流豁免**：`/healthz` 与 `/readyz` 不参与限流（外部监控高频轮询会被 429 误判）；
   `/metrics` 与业务接口一样受限流。改 `createHttpHandler` 的豁免名单要同步 `docs/remote-access.md`。
 - `daemon.lock` 存在表示同机已有实例；stale 锁（pid 已死/内容损坏）会自动接管。`db:restore`

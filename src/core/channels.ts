@@ -1,5 +1,6 @@
 import { createHmac } from "node:crypto";
 import { logger } from "./logger.js";
+import { parseSmtpRouteUrl, type SmtpRoute, sendSmtpMail } from "./smtp.js";
 
 /**
  * 投递通道抽象：outbox 只负责「何时投、投几次、失败怎么退避」，通道负责「怎么真正发出去」。
@@ -9,8 +10,10 @@ import { logger } from "./logger.js";
  * 路由的 channel 字段缺省（旧数据）等同 webhook，旧 push_route 不需要迁移。
  *
  * 内置通道：webhook（回环 Hermes 网关，HMAC V2）、log（本地日志）、
- * bark（iOS 推送，URL 即凭据）、ntfy（自建/公共 topic）。后两者投递到公网，
- * 因此**不**做 webhook 那样的回环限制 —— 它们不带 secret，URL 本身就是凭据。
+ * bark（iOS 推送，URL 即凭据）、ntfy（自建/公共 topic）、
+ * telegram（Bot API，token+chat_id 在 URL 里）、smtp（邮件，协议实现在 core/smtp.ts）。
+ * 除 webhook 与 log 外都投递到外部服务，因此**不**做 webhook 那样的回环限制 ——
+ * 它们不带 secret，URL 本身就是凭据。
  */
 
 export const EVENT_TYPE = "life_assistant.reminder";
@@ -21,7 +24,7 @@ export interface ChannelRoute {
   url: string;
 }
 
-/** 通道专属的路由校验输入：webhook/bark/ntfy 从 url 取地址，log 不需要 URL */
+/** 通道专属的路由校验输入：webhook/bark/ntfy/telegram/smtp 从 url 取地址，log 不需要 URL */
 export interface ChannelRouteInput {
   url?: string;
 }
@@ -361,11 +364,131 @@ export const ntfyChannel: NotificationChannel = {
   },
 };
 
+/**
+ * Telegram 通道：route.url 形如
+ * `https://api.telegram.org/bot<token>/sendMessage?chat_id=<id>`（自建 Bot API 服务器也允许，
+ * 只要是 http(s)）。token 与 chat_id 都在 URL 里 —— 与 bark/ntfy 同理，URL 即凭据。
+ *
+ * 为什么 chat_id 必须在 validateRoute 就校验：投递时才发现的坏路由只剩 fallback，
+ * 用户在状态页只看到「投递失败」，看不出是配置漏了。chat_id 允许数字（含负数群组 id）
+ * 或 `@频道名`。
+ */
+const TELEGRAM_CHAT_ID_RE = /^@?[A-Za-z0-9_-]{1,64}$/;
+/** Telegram 单条消息上限 4096 个 UTF-16 码元；超限会被 400 拒收（整条通知丢失） */
+const TELEGRAM_MAX_TEXT = 4096;
+
+/** 解析并规范化 Telegram 路由 URL（校验失败抛中文错误，由 setPushRoute 在使用前拦住） */
+function telegramUrl(raw: string | undefined): URL {
+  if (raw === undefined || raw === "") {
+    throw new Error(
+      "telegram 通道需要 url（如 https://api.telegram.org/bot<token>/sendMessage?chat_id=<id>）",
+    );
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`telegram URL 不合法: ${raw}`);
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(`telegram URL 仅支持 http/https: ${raw}`);
+  }
+  if (parsed.hostname === "") throw new Error(`telegram URL 缺少 host: ${raw}`);
+  const chatId = (parsed.searchParams.get("chat_id") ?? "").trim();
+  if (!TELEGRAM_CHAT_ID_RE.test(chatId)) {
+    throw new Error("telegram URL 缺少合法的 chat_id（?chat_id=<数字或 @频道名>）");
+  }
+  // 去路径尾斜杠、保留 query：用户照抄文档常多打一个 `/`，部分反代/自建 Bot API 对
+  // `/sendMessage/` 会回 301，而我们不跟随重定向 → 会被判成确定性失败。
+  const path = parsed.pathname.replace(/\/+$/, "");
+  if (path !== "") parsed.pathname = path;
+  return parsed;
+}
+
+/** 超过 Telegram 上限就截断：整条被拒等于什么都收不到，截断后至少前半段能送达 */
+function truncateTelegramText(text: string): string {
+  if (text.length <= TELEGRAM_MAX_TEXT) return text;
+  const suffix = "\n\n…（已截断）";
+  const cut = text.slice(0, TELEGRAM_MAX_TEXT - suffix.length);
+  // 不要切在代理对中间（尾部留半个 emoji 会变成非法 UTF-16 / 显示成问号）
+  return `${cut.replace(/[\uD800-\uDBFF]$/, "")}${suffix}`;
+}
+
+export const telegramChannel: NotificationChannel = {
+  name: "telegram",
+  requiresSecret: false,
+  requiresUrl: true,
+
+  validateRoute(input: ChannelRouteInput): string {
+    return telegramUrl(input.url).toString();
+  },
+
+  deliver(input: ChannelDeliveryInput): Promise<ChannelOutcome> {
+    let parsed: URL;
+    try {
+      parsed = telegramUrl(input.route.url);
+    } catch (e) {
+      // 入库后路由被手工改坏：按确定性失败处理，不让 drain 抛错卡住其它 Profile
+      return Promise.resolve({
+        status: "terminal_failure",
+        error: truncateError(`telegram 路由不合法：${e instanceof Error ? e.message : String(e)}`),
+      });
+    }
+    const chatId = (parsed.searchParams.get("chat_id") ?? "").trim();
+    // 纯数字（含负数的群组 id）发整数：Bot API 两种都收，但整数形式在日志/回执里更直观
+    const chatIdValue = /^-?\d+$/.test(chatId) ? Number(chatId) : chatId;
+    return postDelivery(
+      "Telegram",
+      parsed.toString(),
+      { "Content-Type": "application/json" },
+      JSON.stringify({
+        chat_id: chatIdValue,
+        text: truncateTelegramText(`${input.title}\n\n${input.bodyMd}`),
+      }),
+    );
+  },
+};
+
+/**
+ * SMTP 邮件通道：route.url 形如
+ * `smtp://user:pass@host:587?from=me@example.com&to=you@example.com`（`to` 可重复）。
+ * 协议实现（EHLO/STARTTLS/AUTH/MAIL FROM/RCPT TO/DATA）在 core/smtp.ts，本通道只做映射：
+ * 通知标题 → Subject（RFC 2047 编码中文），通知正文 → text/plain 正文。
+ *
+ * 注意：密码在 URL 里，会随 push_route 一起落库并出现在 `notify route` 的回显里 ——
+ * 与 bark/ntfy 的「URL 即凭据」同一取舍；文档里提醒用户不要把带密码的 URL 贴给别人。
+ */
+export const smtpChannel: NotificationChannel = {
+  name: "smtp",
+  requiresSecret: false,
+  requiresUrl: true,
+
+  validateRoute(input: ChannelRouteInput): string {
+    return parseSmtpRouteUrl(input.url).url;
+  },
+
+  async deliver(input: ChannelDeliveryInput): Promise<ChannelOutcome> {
+    let route: SmtpRoute;
+    try {
+      route = parseSmtpRouteUrl(input.route.url);
+    } catch (e) {
+      return {
+        status: "terminal_failure",
+        error: truncateError(`smtp 路由不合法：${e instanceof Error ? e.message : String(e)}`),
+      };
+    }
+    const result = await sendSmtpMail(route, { subject: input.title, body: input.bodyMd });
+    return result.ok ? { status: "sent" } : { status: result.status, error: result.error };
+  },
+};
+
 const CHANNELS: readonly NotificationChannel[] = [
   webhookChannel,
   logChannel,
   barkChannel,
   ntfyChannel,
+  telegramChannel,
+  smtpChannel,
 ];
 const BY_NAME = new Map(CHANNELS.map((channel) => [channel.name, channel]));
 

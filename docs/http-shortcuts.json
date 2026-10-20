@@ -1,0 +1,82 @@
+{
+  "version": 92,
+  "compatibilityVersion": 90,
+  "categories": [
+    {
+      "id": "8f1a2b3c-4d5e-4f60-8a71-9b2c3d4e5f60",
+      "name": "生活助理",
+      "layoutType": "linear_list",
+      "shortcuts": [
+        {
+          "id": "1b2c3d4e-5f60-4a71-8b82-9c3d4e5f6071",
+          "name": "记一笔",
+          "description": "记一笔支出：只需输入金额，分类与备注留空即可",
+          "method": "POST",
+          "url": "https://life.example.com/api/quick/expenses",
+          "headers": [
+            {
+              "key": "Authorization",
+              "value": "Bearer PASTE_YOUR_PROFILE_TOKEN_HERE"
+            }
+          ],
+          "bodyContent": "{\"amount\":\"{{amount}}\",\"request_id\":\"{{request_id}}\"}",
+          "requestBodyType": "custom_text",
+          "contentType": "application/json",
+          "executionType": "app",
+          "timeout": 10000,
+          "launcherShortcut": true,
+          "responseHandling": {
+            "uiType": "toast",
+            "successOutput": "response",
+            "failureOutput": "detailed"
+          }
+        },
+        {
+          "id": "2c3d4e5f-6071-4b82-9c93-ad4e5f607182",
+          "name": "设提醒",
+          "description": "新建一条待办提醒：只需输入事项，默认今天 09:00",
+          "method": "POST",
+          "url": "https://life.example.com/api/quick/schedules",
+          "headers": [
+            {
+              "key": "Authorization",
+              "value": "Bearer PASTE_YOUR_PROFILE_TOKEN_HERE"
+            }
+          ],
+          "bodyContent": "{\"title\":\"{{title}}\",\"request_id\":\"{{request_id}}\"}",
+          "requestBodyType": "custom_text",
+          "contentType": "application/json",
+          "executionType": "app",
+          "timeout": 10000,
+          "launcherShortcut": true,
+          "responseHandling": {
+            "uiType": "toast",
+            "successOutput": "response",
+            "failureOutput": "detailed"
+          }
+        }
+      ]
+    }
+  ],
+  "variables": [
+    {
+      "id": "3d4e5f60-7182-4c93-8da4-be5f60718293",
+      "key": "amount",
+      "type": "number",
+      "title": "金额（元）",
+      "message": "例如 20.5"
+    },
+    {
+      "id": "4e5f6071-8293-4da4-8eb5-cf6071829304",
+      "key": "title",
+      "type": "text",
+      "title": "提醒事项",
+      "message": "例如 交房租"
+    },
+    {
+      "id": "5f607182-9304-4eb5-9fc6-d07182930415",
+      "key": "request_id",
+      "type": "uuid"
+    }
+  ]
+}

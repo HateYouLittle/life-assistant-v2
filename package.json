@@ -23,6 +23,8 @@
     "dev:db:restore": "tsx --env-file-if-exists=.env src/restore.ts",
     "calendar:url": "node --env-file-if-exists=.env dist/calendar-url.js",
     "dev:calendar:url": "tsx --env-file-if-exists=.env src/calendar-url.ts",
+    "db:fingerprint": "node --env-file-if-exists=.env dist/fingerprint.js",
+    "dev:db:fingerprint": "tsx --env-file-if-exists=.env src/fingerprint.ts",
     "db:cleanup:preview": "node --env-file-if-exists=.env dist/cleanup-preview.js",
     "dev:db:cleanup:preview": "tsx --env-file-if-exists=.env src/cleanup-preview.ts",
     "doctor": "node --env-file-if-exists=.env dist/doctor.js",

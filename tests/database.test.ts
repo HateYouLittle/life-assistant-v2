@@ -6,20 +6,21 @@ import { bearerToken, isRequestAuthorized } from "../src/core/auth.js";
 import {
   getSchemaVersion,
   openDatabase,
+  SCHEMA_VERSION,
   withReadTransaction,
   withTransaction,
 } from "../src/core/database.js";
 import { getCache, getSetting, pruneCache, setCache } from "../src/core/settings.js";
 import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
 
-describe("database schema v4", () => {
+describe("database schema v5", () => {
   it("新库迁移到最新版本并可重复打开", () => {
     const env = makeTestEnv();
     try {
-      assert.equal(getSchemaVersion(env.db), 4);
+      assert.equal(getSchemaVersion(env.db), SCHEMA_VERSION);
       env.db.close();
       const reopened = openDatabase(env.config.dbPath);
-      assert.equal(getSchemaVersion(reopened), 4);
+      assert.equal(getSchemaVersion(reopened), SCHEMA_VERSION);
       reopened.close();
     } finally {
       cleanupTestEnv(env);
@@ -41,7 +42,7 @@ describe("database schema v4", () => {
 
       const upgraded = openDatabase(env.config.dbPath);
       try {
-        assert.equal(getSchemaVersion(upgraded), 4, "老库必须在启动时升级版本号");
+        assert.equal(getSchemaVersion(upgraded), SCHEMA_VERSION, "老库必须在启动时升级版本号");
         const columns = (
           upgraded.prepare("PRAGMA table_info(deliveries)").all() as { name: string }[]
         ).map((c) => c.name);
@@ -50,9 +51,9 @@ describe("database schema v4", () => {
         upgraded.close();
       }
 
-      // 再次打开：已是 v4，迁移必须幂等（否则每次启动都会炸在重复 ALTER 上）
+      // 再次打开：已是最新版本，迁移必须幂等（否则每次启动都会炸在重复 ALTER 上）
       const again = openDatabase(env.config.dbPath);
-      assert.equal(getSchemaVersion(again), 4);
+      assert.equal(getSchemaVersion(again), SCHEMA_VERSION);
       again.close();
     } finally {
       cleanupTestEnv(env);
@@ -79,7 +80,7 @@ describe("database schema v4", () => {
 
       const upgraded = openDatabase(env.config.dbPath);
       try {
-        assert.equal(getSchemaVersion(upgraded), 4);
+        assert.equal(getSchemaVersion(upgraded), SCHEMA_VERSION);
         const columns = (
           upgraded.prepare("PRAGMA table_info(ledgers)").all() as { name: string }[]
         ).map((c) => c.name);
@@ -276,7 +277,7 @@ describe("database schema v4", () => {
       // 失败必须整笔回滚：版本号不前进，也不会留下「旧索引已删、新索引没建」的半升级库
       const raw = new DatabaseSync(env.config.dbPath);
       try {
-        assert.equal(getSchemaVersion(raw), 4, "事务回滚后版本号不应变化");
+        assert.equal(getSchemaVersion(raw), SCHEMA_VERSION, "事务回滚后版本号不应变化");
         const names = (
           raw
             .prepare(
@@ -293,7 +294,7 @@ describe("database schema v4", () => {
     }
   });
 
-  it("v3 老库升级到 v4：补 client_token 列并建分范围唯一索引", () => {
+  it("v3 老库升级到最新：补 client_token 列并建分范围唯一索引", () => {
     const env = makeTestEnv();
     try {
       env.db
@@ -318,7 +319,7 @@ describe("database schema v4", () => {
 
       const upgraded = openDatabase(env.config.dbPath);
       try {
-        assert.equal(getSchemaVersion(upgraded), 4);
+        assert.equal(getSchemaVersion(upgraded), SCHEMA_VERSION);
         const columnsOf = (table: string): string[] =>
           (upgraded.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map(
             (c) => c.name,

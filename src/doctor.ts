@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import type { DateTime } from "luxon";
 import {
   isLoopbackHost,
@@ -10,6 +11,7 @@ import {
 } from "./config.js";
 import { BACKUP_STALE_HOURS, backupStatus } from "./core/backup.js";
 import { getSchemaVersion, openDatabase, SCHEMA_VERSION } from "./core/database.js";
+import { schemaFingerprint, storedSchemaFingerprint } from "./core/fingerprint.js";
 import { holidaySourceUrls, requiredYears } from "./core/holiday.js";
 import { fetchJson } from "./core/http.js";
 import { CATCHUP_POLICY, previousFireTime } from "./core/jobs.js";
@@ -62,6 +64,47 @@ function checkDataDir(config: ResolvedConfig): CheckResult {
     return ok(name, `${config.dataDir}（可写）`);
   } catch (e) {
     return fail(name, `${config.dataDir} 不可写：${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+/**
+ * 结构指纹：回答「这个库的表结构和上次启动时是否一致」。
+ * 必须用独立的只读连接读**打开前**的 stored —— 紧随其后的 checkDatabase 走 openDatabase，
+ * 它会在迁移后把指纹对账到当前结构，用同一条连接比较永远相等。
+ * 等级只到 warn：指纹变化本身可能是合法的（升级程序、附加式迁移），不能因此让自检退出码变红。
+ */
+function checkSchemaFingerprint(config: ResolvedConfig): CheckResult {
+  const name = "结构指纹";
+  if (!existsSync(config.dbPath)) {
+    return warn(name, "数据库还不存在（首次启动会创建并写入结构指纹）");
+  }
+  let db: DatabaseSync | undefined;
+  try {
+    db = new DatabaseSync(config.dbPath, { readOnly: true });
+    // daemon 正在写时只读连接也可能先撞 BUSY：给 2 秒窗口，失败按「无法检查」处理
+    db.exec("PRAGMA busy_timeout = 2000");
+    const computed = schemaFingerprint(db);
+    const stored = storedSchemaFingerprint(db);
+    if (stored === null) {
+      return warn(
+        name,
+        `meta 里还没有结构指纹（老库/首次升级）：启动一次 daemon 或运行 npm run db:fingerprint 写入；当前 ${computed.slice(0, 12)}…`,
+      );
+    }
+    if (stored !== computed) {
+      return warn(
+        name,
+        `与上次启动不一致：可能手工 ALTER 或升级不完整（stored ${stored.slice(0, 12)}… / computed ${computed.slice(0, 12)}…）。确认无误后运行 npm run db:fingerprint 更新`,
+      );
+    }
+    return ok(name, `与上次启动一致（${computed.slice(0, 12)}…）`);
+  } catch (e) {
+    return warn(
+      name,
+      `无法检查（库被占用或不可读）：${e instanceof Error ? e.message : String(e)}`,
+    );
+  } finally {
+    if (db?.isOpen) db.close();
   }
 }
 
@@ -481,6 +524,8 @@ export async function runDoctor(
   }
   checks.push(ok("配置解析", `.env 已读取，DATA_DIR=${config.dataDir}`));
   checks.push(checkDataDir(config));
+  // 必须在 openDatabase 之前：后者会在迁移后把指纹对账到当前结构，届时永远「一致」。
+  checks.push(checkSchemaFingerprint(config));
   checks.push(...checkDatabase(config));
   // 鉴权与私钥检查都必须基于「实际会被 daemon 读取的那份 env」，不能偷看 process.env
   checks.push(checkAuth(config));

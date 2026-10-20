@@ -49,7 +49,7 @@ CI 在 Node 22.16.0 / 22 / 24 三档矩阵全绿（`.github/workflows/ci.yml`）
 
 **功能项**
 
-1. **通知通道/偏好/聚合/受众** ✅（2026-10-20）：Bark + ntfy 通道、按 kind 的 `notify_prefs`（默认逐笔回执不推）、家庭账本回执只发记账人、每晚 21:30 记账摘要、`notify prefs|test`。仍待办：SMTP/邮件与 Telegram 通道、按通道渲染格式、聚合窗口（当前只支持「推/不推」）。原计划：Bark / ntfy / SMTP 邮件 + 按 `kind` 偏好、回执聚合、家庭级去重
+1. **通知通道/偏好/聚合/受众** ✅（2026-10-20）：Bark + ntfy + Telegram + SMTP 通道、按 kind 的 `notify_prefs`（默认逐笔回执不推）、家庭账本回执只发记账人、每晚 21:30 记账摘要、`notify prefs|test`。仍待办：按通道渲染格式、聚合窗口（当前只支持「推/不推」）；SMTP 的 TLS 成功路径未自动化（需受信证书）。原计划：Bark / ntfy / SMTP 邮件 + 按 `kind` 偏好、回执聚合、家庭级去重
    （当前 172 条记账回执按 Profile 各发一遍，是最大噪声源）
 2. **写 API + 手机快捷入口** ✅（2026-10-20）：`POST /api/quick/expenses|schedules`（复用 `request_id` 幂等）+ `GET /api/quick/bootstrap` + `/quick` PWA（记账/提醒、token 引导、预填参数）；HTTP Shortcuts/小布指令/NFC 用法见 [docs/quick-entry.md](docs/quick-entry.md)。仍待办：HTTP Shortcuts 的导出 JSON 文件（文档目前给的是 cURL 导入）。
    目标：从打开对话降到点一下 / 两下。
@@ -58,7 +58,7 @@ CI 在 Node 22.16.0 / 22 / 24 三档矩阵全绿（`.github/workflows/ci.yml`）
 5. **预算看板/趋势/引导 + 可执行月报 + 周日周报** ✅（2026-10-20）：状态页预算卡片（`/api/budget`，进度条 + 未设/超支/花速过快/正常四类可执行建议）、周报 job `bookkeeping.weekly_report`（周日 20:00，分类 top5/最大单笔/环比/预算剩余）；月报已有预算对照行。趋势图未做（需要历史曲线再引入）。
 6. **分类字典/别名、CSV 公式注入修复、明细分页** ✅（2026-10-20）：`expense categories|category_alias`、`expense add/update` 别名归一（大小写/空白折叠，不改历史）、`expenseCsv` 文本列防公式注入、`expense list` 与 `/api/expenses|deliveries` 支持 `offset` + 看板「加载更多」（OFFSET 游标，翻页期间数据变化可能重复/漏行，数据量大再换 keyset）。
 7. **可观测性** ✅（2026-10-20）：`/metrics` + `/readyz`（鉴权/限流计数器、投递状态、outbox 排队、job 最近成功、备份年龄、DB/WAL、QWeather 用量）；`notify test/history/retry`（历史分页、失败投递手动重试）；日志本地时间戳 + `maintenance.log_rotate`（每日 04:50 copytruncate，`LOG_DIR`/`LOG_MAX_MB`/`LOG_KEEP`）。
-8. **迁移结构指纹 + 审计日志**（补 `schema_version` 不是完整结构指纹的缺口）
+8. **迁移结构指纹 + 审计日志** ✅（2026-10-20，schema v5）：`meta.schema_fingerprint` 启动对账（漂移 warn）+ `npm run db:fingerprint` CLI + doctor 检查；新增 `audit_log` 表与 `/api/audit`（master 全量、Profile 仅自己），`/api/quick/*` 写入后记审计；迁移纯附加式、单事务、升级前自动 `pre-v4` 快照。仍待办：audit 保留策略（目前只增不清）。
 
 ## 阶段三：新领域 —— 🔲 未开始（6–12 周）
 

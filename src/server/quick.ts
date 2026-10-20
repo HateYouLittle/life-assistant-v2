@@ -4,8 +4,10 @@ import type { Context } from "hono";
 import { Hono } from "hono";
 import { DateTime } from "luxon";
 import { PROFILE_ID_RE, type ResolvedConfig } from "../config.js";
+import { recordAudit } from "../core/audit.js";
 import { resolveIdentity } from "../core/auth.js";
 import { runtime, type ToolContext, type ToolResult } from "../core/registry.js";
+import { ensureProfile } from "../core/settings.js";
 import { bookkeepingExpenseTool } from "../modules/bookkeeping/index.js";
 import {
   monthRange,
@@ -235,6 +237,9 @@ export function createQuickApp(config: ResolvedConfig, db: DatabaseSync): Hono {
     const requestId = optionalText(body.request_id, "request_id");
     if (!requestId.ok) return fail(c, 400, requestId.error);
 
+    // 手机入口没有 MCP 会话的 ensureProfile：先登记 Profile，个人账本归属与审计外键都依赖它
+    // （审计表 profile_id 有外键，未登记的 Profile 会让审计静默失败）。
+    ensureProfile(db, who.profileId);
     // 走工具层：默认账本解析、可见性判定、client_token 幂等、回执与预算提醒都在那里
     const args: Record<string, unknown> = { action: "add", amount };
     if (ledgerId.value !== undefined) args.ledger_id = ledgerId.value;
@@ -250,6 +255,20 @@ export function createQuickApp(config: ResolvedConfig, db: DatabaseSync): Hono {
       已存在?: boolean;
     };
     const entry = data.已记账 ?? {};
+    // 审计：手机写 API 是唯一不经 MCP 的写路径，留痕用于回溯「谁记的、记到哪个账本」。
+    // 只放非隐私摘要 —— 备注全文可能含身体/医疗等敏感信息，token 更不能落库。
+    recordAudit(db, {
+      profileId: who.profileId,
+      action: "quick.expense.add",
+      targetKind: "expense",
+      targetId: entry.id,
+      detail: {
+        金额: amount,
+        分类: entry.分类 ?? null,
+        账本: entry.账本 ?? null,
+        ...(data.已存在 === true ? { 已存在: true } : {}),
+      },
+    });
     return c.json(
       {
         ok: true,
@@ -291,6 +310,7 @@ export function createQuickApp(config: ResolvedConfig, db: DatabaseSync): Hono {
       return fail(c, 400, "all_day 必须是布尔值");
     }
 
+    ensureProfile(db, who.profileId);
     // 缺省「今天 09:00」：手机页面的快捷 chips 一定会给日期，API 直连（HTTP Shortcuts）
     // 只给标题时也要能落地，而不是回一句「公历日程需要提供 date」。
     const args: Record<string, unknown> = {
@@ -312,6 +332,18 @@ export function createQuickApp(config: ResolvedConfig, db: DatabaseSync): Hono {
     };
     const id = data.已创建?.id ?? "";
     const row = id === "" ? undefined : getSchedule(db, who.profileId, id);
+    // 审计：标题是识别「这条记录是什么」的最小必要信息；备注（可能含隐私）不进审计。
+    recordAudit(db, {
+      profileId: who.profileId,
+      action: "quick.schedule.add",
+      targetKind: "schedule",
+      targetId: id === "" ? null : id,
+      detail: {
+        标题: title,
+        事件时间: row === undefined ? null : eventTimeText(row),
+        ...(data.已存在 === true ? { 已存在: true } : {}),
+      },
+    });
     return c.json(
       {
         ok: true,

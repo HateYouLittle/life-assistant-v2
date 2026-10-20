@@ -4,6 +4,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { Hono } from "hono";
 import { DateTime } from "luxon";
 import type { ResolvedConfig } from "../config.js";
+import { AUDIT_DEFAULT_LIMIT, AUDIT_MAX_LIMIT, type AuditRow, listAudit } from "../core/audit.js";
 import { type Identity, resolveIdentity } from "../core/auth.js";
 import { logger } from "../core/logger.js";
 import { incCounter } from "../core/metrics.js";
@@ -13,6 +14,7 @@ import { expenseCsv, expenseCsvFilename } from "../modules/bookkeeping/service.j
 import { TZ, todayIso } from "../time.js";
 import { budgetPayload } from "./budget.js";
 import {
+  clampOffset,
   deliveryDetails,
   expenseDetails,
   holidayDetails,
@@ -33,6 +35,45 @@ const WEEKDAY_CN = ["一", "二", "三", "四", "五", "六", "日"];
  */
 function visibleProfileId(identity: Identity): string | undefined {
   return identity.kind === "profile" ? identity.profileId : undefined;
+}
+
+/** /api/audit 的 limit：缺省 50、上限 200；空串/非数字按缺省处理（与看板明细同口径） */
+function parseAuditLimit(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return AUDIT_DEFAULT_LIMIT;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return AUDIT_DEFAULT_LIMIT;
+  return Math.max(1, Math.min(Math.trunc(value), AUDIT_MAX_LIMIT));
+}
+
+/** 审计时间：库里是 UTC ISO 瞬间，接口按 Asia/Shanghai 本地文本返回（前端不做时区推算） */
+function auditTimeText(iso: string): string {
+  const at = DateTime.fromISO(iso, { zone: "utc" });
+  return at.isValid ? at.setZone(TZ).toFormat("yyyy-LL-dd HH:mm") : iso;
+}
+
+/** 「对象」的人类可读形态：`expense:<id>`；只有一类信息时就只回那一个 */
+function auditObjectLabel(row: AuditRow): string | null {
+  if (row.target_kind === null && row.target_id === null) return null;
+  if (row.target_kind === null) return row.target_id;
+  if (row.target_id === null) return row.target_kind;
+  return `${row.target_kind}:${row.target_id}`;
+}
+
+/**
+ * detail_json 解析：只回对象形态（数组/标量视为异常数据返回 null）。
+ * detail 只随「请求者可见的那一行」返回 —— master 全量、Profile 只有自己的记录，
+ * 因此不存在跨 Profile 泄漏 detail 的旁路。
+ */
+function auditDetail(json: string | null): Record<string, unknown> | null {
+  if (json === null) return null;
+  try {
+    const parsed: unknown = JSON.parse(json);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 export function statusPayload(
@@ -243,6 +284,29 @@ export function createStatusApp(config: ResolvedConfig, db: DatabaseSync): Hono<
   // 定时任务全量明细：每 job 的最近运行/最近成功/24h 失败。doctor --live 也读它，
   // 鉴权与 no-store 由上面的 /api/* 中间件统一兜住（运维数据不含 Profile 隐私）。
   app.get("/api/jobs", (c) => c.json({ items: jobDetails(db) }));
+  // 审计日志：master 看全部（运维/回溯），Profile token 只看自己的记录。
+  // 身份由 /api/* 中间件解析；把 profileId 下推到 SQL，响应里不会出现别人的行与 detail。
+  app.get("/api/audit", (c) => {
+    const limit = parseAuditLimit(c.req.query("limit"));
+    const offset = clampOffset(c.req.query("offset"));
+    const page = listAudit(db, {
+      limit,
+      offset,
+      profileId: visibleProfileId(c.get("identity")),
+    });
+    return c.json({
+      总数: page.total,
+      偏移: offset,
+      还有更多: offset + page.items.length < page.total,
+      记录: page.items.map((row) => ({
+        时间: auditTimeText(row.created_at),
+        身份: row.profile_id,
+        动作: row.action,
+        对象: auditObjectLabel(row),
+        详情: auditDetail(row.detail_json),
+      })),
+    });
+  });
   app.get("/api/deliveries", (c) =>
     c.json(
       deliveryDetails(

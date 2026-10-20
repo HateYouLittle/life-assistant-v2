@@ -3,14 +3,17 @@ import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { DateTime } from "luxon";
 import { TZ } from "../time.js";
+import { reconcileSchemaFingerprint } from "./fingerprint.js";
 import { logger } from "./logger.js";
 
 /**
  * v4 新增：job_runs 运行记录表、expenses/schedules.client_token（写路径幂等键）。
+ * v5 新增：audit_log 审计日志表（手机写 API 的操作留痕）；同时开始记录
+ * `meta.schema_fingerprint`（结构指纹，见 core/fingerprint.ts）。
  * 迁移前必须先备份：openDatabase 传了 backupDir 时会 VACUUM INTO 一份
  * `life-assistant-pre-v<旧版本>-<时间戳>.db`，失败则拒绝启动（宁可停，不带病改库）。
  */
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -207,6 +210,22 @@ CREATE TABLE IF NOT EXISTS cn_holiday_years (
   last_attempt_at TEXT,
   last_error TEXT
 ) STRICT;
+
+-- 审计日志（v5）：记录谁在何时对什么做了什么。首期只接手机写 API（quick.expense.add /
+-- quick.schedule.add）：那是唯一不经 MCP、直接由 HTTP 凭据驱动的写路径。
+-- 只增不改；detail_json 只放非隐私摘要，不放 token/备注全文。
+-- 注意：本注释区域不要出现半角圆括号，Node 22 的 SQLite 重建表时会按 token 解析建表语句。
+CREATE TABLE IF NOT EXISTS audit_log (
+  id TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL REFERENCES profiles(id),
+  action TEXT NOT NULL,
+  target_kind TEXT,
+  target_id TEXT,
+  detail_json TEXT,
+  created_at TEXT NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_audit_log_created_at ON audit_log(created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_log_profile ON audit_log(profile_id, created_at);
 `;
 
 export interface OpenDatabaseOptions {
@@ -271,6 +290,9 @@ export function openDatabase(dbPath: string, opts: OpenDatabaseOptions = {}): Da
     db.exec("PRAGMA busy_timeout = 5000");
     backupBeforeMigration(db, opts.backupDir, dbPath);
     migrate(db);
+    // 结构指纹必须在迁移之后对账：迁移本身会加表/加列，先算再迁移会把合法变化误报成漂移。
+    // 缺失则写入；不同则 warn 一次后以当前结构为准（见 core/fingerprint.ts）。
+    reconcileSchemaFingerprint(db);
   } catch (e) {
     db.close();
     throw e;
@@ -392,6 +414,11 @@ export function migrate(db: DatabaseSync): void {
       addColumnIfMissing(db, "expenses", "client_token", "TEXT");
       addColumnIfMissing(db, "schedules", "client_token", "TEXT");
       version = 4;
+    }
+    if (version === 4) {
+      // v5：audit_log 已由上面的 DDL 建出（CREATE TABLE IF NOT EXISTS），没有数据变换；
+      // 这一步只前滚版本号。老库数据原样保留，重复打开幂等。
+      version = 5;
     }
     if (version !== stored) {
       db.prepare("UPDATE meta SET value = ? WHERE key = 'schema_version'").run(String(version));

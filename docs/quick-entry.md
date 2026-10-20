@@ -28,7 +28,11 @@
 
 ## 2. HTTP Shortcuts：一键直达（推荐给固定动作）
 
-安装 [HTTP Shortcuts](https://github.com/Waboodoo/HTTP-Shortcuts)（Play / F-Droid 均可）。
+安装 [HTTP Shortcuts](https://github.com/Waboodoo/HTTP-Shortcuts)（Play / F-Droid 均可，**需 ≥ 3.28**）。
+
+**最快路径：直接导入 [http-shortcuts.json](http-shortcuts.json)**（含「记一笔」「设提醒」两个快捷方式，导入后把
+`https://life.example.com` 和 `Bearer PASTE_YOUR_PROFILE_TOKEN_HERE` 替换成你的真实地址与 token；
+详见 [http-shortcuts.md](http-shortcuts.md)）。
 
 **方式 A：粘贴 cURL 导入**（App 内「导入 / Import from cURL」）：
 

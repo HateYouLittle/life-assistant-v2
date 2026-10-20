@@ -116,7 +116,7 @@ describe("notify prefs：写", () => {
       const unknown = tool(env, {
         action: "prefs",
         kind: "schedule.reminder",
-        channels: ["telegram"],
+        channels: ["pager"],
       });
       assert.equal(unknown.isError, true);
       assert.match(errorText(unknown), /不支持的通道/);
