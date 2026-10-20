@@ -80,8 +80,7 @@ curl -s -X POST https://<域名>/api/quick/expenses \
 
 ## 5. 安全与轮换
 
-- Profile token 只能访问 `/api/quick/*` 与该 Profile 的 MCP 工具；看板/运维接口（`/api/*`）
-  仍只认 master token。
+- Profile token 可以访问 `/api/quick/*`、该 Profile 的 MCP 工具，以及**个人视图看板**（自己的日程/通知 + 家庭与本人个人账本）；家庭看板/运维接口（全量数据、`/metrics`、`/api/jobs` 等）仍只认 master token。
 - 泄露或换手机：改 `.env` 里 `PROFILE_TOKENS_JSON` 的对应值 → 重启 daemon
   （`launchctl kickstart -k gui/$(id -u)/ai.life-assistant.daemon`）→ 手机上重新用 `?token=` 引导。
 - 公网只暴露 `/`、`/quick`、`/api/quick/*`、`/calendar.ics`；**不要**暴露 `/mcp`

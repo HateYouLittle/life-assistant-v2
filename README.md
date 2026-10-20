@@ -304,13 +304,14 @@ npm run doctor         # 自检：配置/目录/库完整性/鉴权/JWT 私钥/�
 npm run db:backup      # VACUUM INTO 备份，按 BACKUP_KEEP 保留（默认 14 份），产物自校验
 npm run db:restore     # 从备份恢复（--latest 缺省 / --file 指定 / --dry-run 预演；daemon 运行中拒绝）
 npm run calendar:url   # 生成日历订阅签名 URL：--profile bestie --days 30 [--base https://<域名>]
+npm run db:fingerprint # 打印 schema 结构指纹（computed/stored/match）；漂移时提示已自动修复
 npm run db:cleanup:preview   # 零业务删除预演：occurrence 与保留策略会删掉哪些行（数字与 job 同一份判定；打开旧库时可能做附加式 schema 升级）
 ```
 
-> `db:backup` / `db:restore` / `calendar:url` / `db:cleanup:preview` / `doctor` / `import:v1` 跑的是 `dist/` 里的构建产物，先
+> `db:backup` / `db:restore` / `calendar:url` / `db:fingerprint` / `db:cleanup:preview` / `doctor` / `import:v1` 跑的是 `dist/` 里的构建产物，先
 > `npm run build`（或改用对应的 `dev:*` 变体直接跑源码）。
 
-结构：`src/core`（database/registry/jobs/lock/security/auth/http/logger/settings/notify/channels/render/qweather/qweather-jwt/holiday/recurrence/retention/backup）、`src/modules`（weather/holiday/schedule/bookkeeping/notify/maintenance，经 `modules/index.ts` 注册，核心不反向依赖）、`src/server`（status/page/details，状态页与只读 API）、`src/daemon.ts`、`src/stdio.ts`、`src/config.ts`、`src/time.ts`、`src/import-v1.ts`、`src/backup.ts`、`src/restore.ts`、`src/cleanup-preview.ts`。
+结构：`src/core`（database/fingerprint/audit/registry/jobs/lock/security/auth/http/logger/logrotate/metrics/ratelimit/settings/notify/notify-prefs/channels/render/qweather/qweather-jwt/holiday/recurrence/retention/backup/ics）、`src/modules`（weather/holiday/schedule/bookkeeping/notify/maintenance，经 `modules/index.ts` 注册，核心不反向依赖）、`src/server`（status/page/details/budget/quick/calendar/ops，状态页、只读 API、手机入口、日历订阅与运维端点）、`src/daemon.ts`、`src/stdio.ts`、`src/config.ts`、`src/time.ts`、`src/import-v1.ts`、`src/backup.ts`、`src/restore.ts`、`src/fingerprint.ts`、`src/calendar-url.ts`、`src/cleanup-preview.ts`。
 
 ## 设计要点
 

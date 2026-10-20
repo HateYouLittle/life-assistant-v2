@@ -31,10 +31,10 @@ CI 在 Node 22.16.0 / 22 / 24 三档矩阵全绿（`.github/workflows/ci.yml`）
 
 - 状态页暂无「备份」卡片（`doctor --live` 已覆盖备份新鲜度与命名异常）
 - 启动补发只补**最近一次**，且只支持日/月/星期为 `*` 的 cron（如 `0 7 * * 1-5` 不补）
-- `job_runs` 只保留 30 天、无耗时趋势；`/metrics`、`/readyz`、日志轮转未做
+- `job_runs` 只保留 30 天、无耗时趋势（`/metrics`、`/readyz`、日志轮转已在阶段二补齐）
 - `VACUUM INTO` 仍在主进程事件循环上同步执行（库大时会短暂阻塞 HTTP/MCP）
 
-## 阶段二：触达与家庭 —— 🔲 未开始（3–6 周）
+## 阶段二：触达与家庭 —— ✅ 已完成（2026-10-20）
 
 > 决策（2026-10-20）：服务只跑局域网，公网入口由 **NAS 上的 Lucky 反向代理**（TLS 终止、DDNS、路径控制）；
 > daemon 绑 `0.0.0.0` + `WEB_API_TOKEN` + `REQUIRE_AUTH`，Mac 不做公网直连、不装证书。
@@ -43,22 +43,22 @@ CI 在 Node 22.16.0 / 22 / 24 三档矩阵全绿（`.github/workflows/ci.yml`）
 
 **前置（阻塞手机端与 ICS）**
 
-0. **局域网 + NAS Lucky 反代**：Mac 固定 LAN IP、daemon 改绑 `0.0.0.0`、`WEB_ALLOWED_HOSTS` 覆盖
-   Lucky 前端域名与 LAN 地址；Lucky 侧只放必要路径（公网不暴露 `/mcp`，SSE 缓冲会卡）。
-   **暴露前必须先完成 per-profile token 与写 API 限流**。
+0. **局域网 + NAS Lucky 反代** ✅：daemon 改绑 `0.0.0.0`、`REQUIRE_AUTH` + `WEB_API_TOKEN`、
+   `WEB_ALLOWED_HOSTS` 覆盖 LAN 地址；Lucky 侧只放必要路径（公网不暴露 `/mcp`，SSE 缓冲会卡）——
+   施工清单与安全门槛见 [docs/remote-access.md](docs/remote-access.md)。公网转发由用户在 NAS 侧自行完成。
 
 **功能项**
 
-1. **通知通道/偏好/聚合/受众** ✅（2026-10-20）：Bark + ntfy + Telegram + SMTP 通道、按 kind 的 `notify_prefs`（默认逐笔回执不推）、家庭账本回执只发记账人、每晚 21:30 记账摘要、`notify prefs|test`。仍待办：按通道渲染格式、聚合窗口（当前只支持「推/不推」）；SMTP 的 TLS 成功路径未自动化（需受信证书）。原计划：Bark / ntfy / SMTP 邮件 + 按 `kind` 偏好、回执聚合、家庭级去重
+1. **通知通道/偏好/聚合/受众** ✅（2026-10-20，`2cc2f5b` + `7161c01`）：Bark + ntfy + Telegram + SMTP 通道、按 kind 的 `notify_prefs`（默认逐笔回执不推）、家庭账本回执只发记账人、每晚 21:30 记账摘要、`notify prefs|test`。仍待办：按通道渲染格式、聚合窗口（当前只支持「推/不推」）；SMTP 的 TLS 成功路径未自动化（需受信证书）。原计划：Bark / ntfy / SMTP 邮件 + 按 `kind` 偏好、回执聚合、家庭级去重
    （当前 172 条记账回执按 Profile 各发一遍，是最大噪声源）
-2. **写 API + 手机快捷入口** ✅（2026-10-20）：`POST /api/quick/expenses|schedules`（复用 `request_id` 幂等）+ `GET /api/quick/bootstrap` + `/quick` PWA（记账/提醒、token 引导、预填参数）；HTTP Shortcuts/小布指令/NFC 用法见 [docs/quick-entry.md](docs/quick-entry.md)。仍待办：HTTP Shortcuts 的导出 JSON 文件（文档目前给的是 cURL 导入）。
+2. **写 API + 手机快捷入口** ✅（2026-10-20，`ecd18b3`）：`POST /api/quick/expenses|schedules`（复用 `request_id` 幂等）+ `GET /api/quick/bootstrap` + `/quick` PWA（记账/提醒、token 引导、预填参数）；HTTP Shortcuts 可直接导入 [docs/http-shortcuts.json](docs/http-shortcuts.json)（说明见 [docs/http-shortcuts.md](docs/http-shortcuts.md)），小布指令/NFC 用法见 [docs/quick-entry.md](docs/quick-entry.md)。
    目标：从打开对话降到点一下 / 两下。
-3. **ICS 日历订阅** ✅（2026-10-20）：`GET /calendar.ics` 签名 URL（HMAC + 有效期，只读单个 Profile）、`npm run calendar:url` 生成；未做 RFC 5545 的 75 octet 行折叠。
-4. **per-profile token + 看板可见性** ✅（2026-10-20）：`PROFILE_TOKENS_JSON` + `/mcp` 强绑定 + `/api/quick/*` + 看板 `/api/*` 按 Profile 过滤（profile=自己的日程/通知 + 家庭/本人个人账本；master=家庭看板），`/api/status` 返回 `identity` 供页面显示身份。
-5. **预算看板/趋势/引导 + 可执行月报 + 周日周报** ✅（2026-10-20）：状态页预算卡片（`/api/budget`，进度条 + 未设/超支/花速过快/正常四类可执行建议）、周报 job `bookkeeping.weekly_report`（周日 20:00，分类 top5/最大单笔/环比/预算剩余）；月报已有预算对照行。趋势图未做（需要历史曲线再引入）。
-6. **分类字典/别名、CSV 公式注入修复、明细分页** ✅（2026-10-20）：`expense categories|category_alias`、`expense add/update` 别名归一（大小写/空白折叠，不改历史）、`expenseCsv` 文本列防公式注入、`expense list` 与 `/api/expenses|deliveries` 支持 `offset` + 看板「加载更多」（OFFSET 游标，翻页期间数据变化可能重复/漏行，数据量大再换 keyset）。
-7. **可观测性** ✅（2026-10-20）：`/metrics` + `/readyz`（鉴权/限流计数器、投递状态、outbox 排队、job 最近成功、备份年龄、DB/WAL、QWeather 用量）；`notify test/history/retry`（历史分页、失败投递手动重试）；日志本地时间戳 + `maintenance.log_rotate`（每日 04:50 copytruncate，`LOG_DIR`/`LOG_MAX_MB`/`LOG_KEEP`）。
-8. **迁移结构指纹 + 审计日志** ✅（2026-10-20，schema v5）：`meta.schema_fingerprint` 启动对账（漂移 warn）+ `npm run db:fingerprint` CLI + doctor 检查；新增 `audit_log` 表与 `/api/audit`（master 全量、Profile 仅自己），`/api/quick/*` 写入后记审计；迁移纯附加式、单事务、升级前自动 `pre-v4` 快照。仍待办：audit 保留策略（目前只增不清）。
+3. **ICS 日历订阅** ✅（2026-10-20，`ecd18b3`）：`GET /calendar.ics` 签名 URL（HMAC + 有效期，只读单个 Profile）、`npm run calendar:url` 生成；未做 RFC 5545 的 75 octet 行折叠。
+4. **per-profile token + 看板可见性** ✅（2026-10-20，`4bfce42` + `0cfa390`）：`PROFILE_TOKENS_JSON` + `/mcp` 强绑定 + `/api/quick/*` + 看板 `/api/*` 按 Profile 过滤（profile=自己的日程/通知 + 家庭/本人个人账本；master=家庭看板），`/api/status` 返回 `identity` 供页面显示身份。
+5. **预算看板/趋势/引导 + 可执行月报 + 周日周报** ✅（2026-10-20，`2b8349e`）：状态页预算卡片（`/api/budget`，进度条 + 未设/超支/花速过快/正常四类可执行建议）、周报 job `bookkeeping.weekly_report`（周日 20:00，分类 top5/最大单笔/环比/预算剩余）；月报已有预算对照行。趋势图未做（需要历史曲线再引入）。
+6. **分类字典/别名、CSV 公式注入修复、明细分页** ✅（2026-10-20，`88ed2b7`）：`expense categories|category_alias`、`expense add/update` 别名归一（大小写/空白折叠，不改历史）、`expenseCsv` 文本列防公式注入、`expense list` 与 `/api/expenses|deliveries` 支持 `offset` + 看板「加载更多」（OFFSET 游标，翻页期间数据变化可能重复/漏行，数据量大再换 keyset）。
+7. **可观测性** ✅（2026-10-20，`ecd18b3` + `589a87d`）：`/metrics` + `/readyz`（鉴权/限流计数器、投递状态、outbox 排队、job 最近成功、备份年龄、DB/WAL、QWeather 用量）；`notify test/history/retry`（历史分页、失败投递手动重试）；日志本地时间戳 + `maintenance.log_rotate`（每日 04:50 copytruncate，`LOG_DIR`/`LOG_MAX_MB`/`LOG_KEEP`）。
+8. **迁移结构指纹 + 审计日志** ✅（2026-10-20，`7161c01`，schema v5）：`meta.schema_fingerprint` 启动对账（漂移 warn）+ `npm run db:fingerprint` CLI + doctor 检查；新增 `audit_log` 表与 `/api/audit`（master 全量、Profile 仅自己），`/api/quick/*` 写入后记审计；迁移纯附加式、单事务、升级前自动 `pre-v4` 快照。仍待办：audit 保留策略（目前只增不清）。
 
 ## 阶段三：新领域 —— 🔲 未开始（6–12 周）
 

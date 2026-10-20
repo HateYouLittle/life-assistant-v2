@@ -24,8 +24,8 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
 
 - 只跑单个测试文件：`node --import tsx/esm --test tests/schedule.test.ts`
 - `npm run dev` 用 tsx 跑 `src/daemon.ts`；`npm start` 跑构建产物 `dist/daemon.js`
-  （需先 `npm run build`）。`db:backup` / `db:cleanup:preview` / `db:restore` / `doctor` /
-  `import:v1` / `calendar:url` 同理：无前缀脚本依赖 `dist/`，`dev:*` 变体直接跑 TS 源码。
+  （需先 `npm run build`）。`db:backup` / `db:cleanup:preview` / `db:restore` / `db:fingerprint` /
+  `doctor` / `import:v1` / `calendar:url` 同理：无前缀脚本依赖 `dist/`，`dev:*` 变体直接跑 TS 源码。
 - `.env` 只会被 `start` / `dev` / `db:backup` / `db:cleanup:preview` / `db:restore` /
   `calendar:url` / `db:fingerprint` / `doctor` / `import:v1` 及其 `dev:*` 变体通过
   `--env-file-if-exists` 自动读取。
@@ -34,8 +34,9 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
 
 ## 架构
 
-- `src/core/` 是框架层：database/registry/jobs/lock/security/auth/http/logger/settings/notify/
-  channels/render/qweather/qweather-jwt/holiday/recurrence/retention/backup/ratelimit/metrics/ics。`src/modules/`
+- `src/core/` 是框架层：database/fingerprint/audit/registry/jobs/lock/security/auth/http/logger/
+  logrotate/settings/notify/notify-prefs/channels/render/qweather/qweather-jwt/holiday/recurrence/
+  retention/backup/ratelimit/metrics/ics。`src/modules/`
   （weather/holiday/schedule/bookkeeping/notify/maintenance）通过 `src/modules/index.ts` 的
   副作用 import 接入，遵循 `tools / jobs / tick / onStart` 四个契约扩展点。`maintenance`
   注册每日备份（与 `db:backup` CLI 共用 `src/core/backup.ts`）与每日 WAL checkpoint 两个 job。
@@ -45,7 +46,7 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   `src/core/ics.ts`：日历订阅的签名 URL（HMAC-SHA256(master, `"<profile>.<exp>"`)）与 ICS 文本工具。
   `src/server/quick.ts`（`/quick` + `/api/quick/*`）、`src/server/calendar.ts`（`/calendar.ics`）、
   `src/server/ops.ts`（`/metrics` + `/readyz`）是三个独立子应用，由 `createHttpHandler` 挂到
-  同一个 Hono 上（共享 Host/Origin 守卫与限流）。
+  同一个 Hono 上（共享 Host/Origin 守卫与限流）；`src/server/budget.ts` 是预算看板的纯函数层。
 - `src/core/jobs.ts`：`job_runs` 运行记录（running→ok/failed/skipped）、`CATCHUP_POLICY`
   启动补发白名单、`previousFireTime`（自写 cron 反向求值，只支持日/月/星期为 `*`）、
   `runStartupCatchups`；daemon 在 listen 之后非阻塞调用，停机时与 onStart 一起收敛。
