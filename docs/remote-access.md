@@ -35,7 +35,7 @@ HOST=0.0.0.0                 # 允许 NAS 反代进来；不要写 127.0.0.1
 PORT=3080
 REQUIRE_AUTH=1               # 即使只绑局域网也强制鉴权
 WEB_API_TOKEN=<master token，openssl rand -hex 32>
-# 每人一个 token（阶段二实现后启用；服务端由 token 反查 Profile，不再信 X-Hermes-Profile）
+# 每人一个 token（服务端由 token 反查 Profile，不再信 X-Hermes-Profile）
 PROFILE_TOKENS_JSON='{"default":"<token-default>","bestie":"<token-bestie>"}'
 # Host/Origin 守卫放行名单：Lucky 前端域名 + Mac 的 LAN 地址都要有。
 # 端口按 Lucky 实际使用写：443 可省略端口；非标准端口要写 <域名>:<端口>。
@@ -102,8 +102,9 @@ curl -sS -o /dev/null -w '%{http_code}\n' -H 'Origin: https://evil.example.com' 
 
 - [ ] `HOST=0.0.0.0` + `WEB_API_TOKEN`（≥32 字符）+ `REQUIRE_AUTH=1`，先验证无 token 时 401
 - [ ] per-profile token：token → Profile，拒绝 `X-Hermes-Profile` 自报身份（公网入口下尤其重要）
-- [ ] 写 API 限流：按 token + 来源 IP 的固定窗口，超限 429；Lucky 后面的真实来源 IP 走
-      `X-Forwarded-For`，只在 `TRUST_PROXY=1` 时采信（且只信任 NAS 的 LAN 地址）
+- [ ] 写 API 限流：来源 IP（所有请求都计）+ 鉴权后 token 指纹（带 Bearer 且凭据有效才加一层）的
+      两层固定窗口，超限 429；无效/伪造 token 只落 IP 桶，轮换 token 不能换桶绕过。Lucky 后面的
+      真实来源 IP 走 `X-Forwarded-For`，只在 `TRUST_PROXY=1` 时采信（且只信任 NAS 的 LAN 地址）
 - [ ] `WEB_ALLOWED_HOSTS` 精确覆盖 Lucky 前端域名（含端口）与 LAN 地址
 - [ ] 公网只放必要路径：`/`、`/quick`、`/api/quick/*`、`/calendar.ics`、`/readyz`；`/mcp` 不暴露（或单独子域 + 关缓冲）
 - [ ] 失败鉴权写 warn 日志并计入 `/metrics`（公网暴露后会立刻有扫描）

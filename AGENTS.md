@@ -35,25 +35,36 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
 ## 架构
 
 - `src/core/` 是框架层：database/fingerprint/audit/registry/jobs/lock/security/auth/http/logger/
-  logrotate/settings/notify/notify-prefs/channels/render/qweather/qweather-jwt/holiday/recurrence/
+  logrotate/settings/notify/notify-prefs/channels/smtp/render/qweather/qweather-jwt/holiday/recurrence/
   retention/backup/ratelimit/metrics/ics。`src/modules/`
   （weather/holiday/schedule/bookkeeping/notify/maintenance）通过 `src/modules/index.ts` 的
   副作用 import 接入，遵循 `tools / jobs / tick / onStart` 四个契约扩展点。`maintenance`
-  注册每日备份（与 `db:backup` CLI 共用 `src/core/backup.ts`）与每日 WAL checkpoint 两个 job。
-- `src/core/ratelimit.ts`：`FixedWindowLimiter` + `clientAddress`/`rateLimitKey`（带 Bearer 时按 token
-  指纹归并，否则按来源 IP；只有 `TRUST_PROXY=1` 才采信 `X-Forwarded-For`）。
+  注册每日备份（与 `db:backup` CLI 共用 `src/core/backup.ts`）、每日 WAL checkpoint 与日志轮转三个 job。
+- `src/core/ratelimit.ts`：`FixedWindowLimiter` 双层固定窗口 —— 每个请求按来源 IP 计一层，
+  凭据校验通过且带 Bearer 时再按 token 指纹计一层（无效/缺失凭据只落 IP 桶，轮换伪 token
+  不能换桶绕过）；桶数有硬上限（默认 10_000，满时淘汰最旧）。`clientAddress`/`envClientAddress`
+  统一地址口径（只有 `TRUST_PROXY=1` 才采信 `X-Forwarded-For`）。
   `src/core/metrics.ts`：进程内计数器（`auth_failed_total` / `auth_forbidden_total` / `rate_limited_total`）。
   `src/core/ics.ts`：日历订阅的签名 URL（HMAC-SHA256(master, `"<profile>.<exp>"`)）与 ICS 文本工具。
   `src/server/quick.ts`（`/quick` + `/api/quick/*`）、`src/server/calendar.ts`（`/calendar.ics`）、
   `src/server/ops.ts`（`/metrics` + `/readyz`）是三个独立子应用，由 `createHttpHandler` 挂到
   同一个 Hono 上（共享 Host/Origin 守卫与限流）；`src/server/budget.ts` 是预算看板的纯函数层。
 - `src/core/jobs.ts`：`job_runs` 运行记录（running→ok/failed/skipped）、`CATCHUP_POLICY`
-  启动补发白名单、`previousFireTime`（自写 cron 反向求值，只支持日/月/星期为 `*`）、
-  `runStartupCatchups`；daemon 在 listen 之后非阻塞调用，停机时与 onStart 一起收敛。
-  `src/core/lock.ts`：`daemon.lock` 单实例锁（PID 存活探测、stale 接管）。
-  `src/core/security.ts`：`applySecureUmask`/`hardenDataDir`/`createRequestGuard`
-  （Host/Origin 守卫，daemon 的 `createHttpHandler` 对所有路径统一调用）。`src/restore.ts`
-  是 `npm run db:restore` 的实现（校验/留底/替换，复用 `backupStatus` 的规范文件口径）。
+  启动补发白名单、`previousFireTime`（自写 cron 反向求值：支持 `*`、单值、逗号列表、
+  `a-b` 范围与 `a-b/n` 步长（步长按 node-cron「展开后取模」语义）；星期 `7` 只允许单值/
+  单值列表，含 `7` 的范围/步长与「列表+步长混用」等特殊写法保守放弃；日与月必须为 `*`）、
+  `runStartupCatchups`（补发时把
+  「原定触发时刻」传给 handler，供早报/晚报/摘要/周报/调休提醒按该时刻取业务日期）；daemon 在 listen
+  之后非阻塞调用，停机时与 onStart 一起收敛。
+  `src/core/lock.ts`：`daemon.lock` 单实例锁（写完整临时文件后 `link` 原子创建、
+  失效锁 rename 原子接管并校验 inode/pid、PID 存活探测）。
+  `src/core/security.ts`：`applySecureUmask`/`hardenDataDir`/`applyCliSecurityBaseline`/
+  `createRequestGuard`（umask 077 与目录/库/备份收紧对 daemon 与 `db:backup`/`db:restore`/
+  `db:cleanup:preview`/`db:fingerprint` 同口径：库不存在时只设 umask、不 chmod 可能写错的目录；
+  `import:v1`/doctor 只设 umask；
+  `createRequestGuard` 是 Host/Origin 守卫，daemon 的 `createHttpHandler` 对所有路径统一调用）。
+  `src/restore.ts` 是 `npm run db:restore` 的实现（校验/留底/替换，复用 `backupStatus` 的
+  规范文件口径；锁文件损坏/不可读时拒绝恢复）。
 - **核心层不得 import 模块内部。** 这一点由 `tests/registry.test.ts` 的静态 import 扫描强制，
   而不仅是运行时查重。新模块在 `modules/index.ts` 注册。
 - 例外是 `src/server/details.ts`，它直接 import 了 bookkeeping/schedule 的纯函数；
@@ -123,9 +134,12 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
 - 所有 HTTP 请求都过 Host/Origin 守卫：缺 Host 或不在允许名单 → 403；带 Origin 时必须同源
   （无 Origin 的 CLI/agent 放行）。绑定 `0.0.0.0` 或经反代/域名访问时，把实际 Host 写进
   `WEB_ALLOWED_HOSTS`，否则是预期内的 403。
-- 启动补发只覆盖 `CATCHUP_POLICY` 白名单内的 job，且只补最近一次、只支持日/月/星期为 `*`
-  的 cron。新增「每天必须发生一次」的任务时记得加进策略表；`tests/jobs.test.ts` 会校验
-  键名必须对应真实注册的 `module.job`。
+- 启动补发只覆盖 `CATCHUP_POLICY` 白名单内的 job，且只补最近一次；cron 的日与月字段
+  必须为 `*`；分钟/小时/星期支持 `*`、单值、逗号列表、`a-b` 范围与 `a-b/n` 步长（步长按
+  node-cron 展开后取模语义），星期 `7` 只允许单值/单值列表，含 `7` 的范围/步长与特殊写法
+  保守不反查。补发会把「原定触发时刻」
+  传给 handler。新增「每天必须发生一次」的任务时记得加进策略表；`tests/jobs.test.ts`
+  会校验键名必须对应真实注册的 `module.job`。
 - **鉴权矩阵**：`/api/*`（看板/只读）认 master 与 Profile token —— master=家庭看板（家庭账本
   支出 + 所有 Profile 日程/通知），Profile token=个人视图（家庭+本人个人账本、仅自己的日程/
   通知/投递）；`/api/quick/*` 同上；身份由 `resolveIdentity` 反查（**绝不读 `X-Hermes-Profile`**）；
@@ -133,9 +147,11 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   `/metrics` 只认 master；`/readyz`、`/healthz` 无需凭据；`/calendar.ics` 用签名 URL
   （`src/core/ics.ts`），不使用 header。新增接口时先想清楚属于哪一档、按什么身份过滤。
 - **限流豁免**：`/healthz` 与 `/readyz` 不参与限流（外部监控高频轮询会被 429 误判）；
-  `/metrics` 与业务接口一样受限流。改 `createHttpHandler` 的豁免名单要同步 `docs/remote-access.md`。
-- `daemon.lock` 存在表示同机已有实例；stale 锁（pid 已死/内容损坏）会自动接管。`db:restore`
-  在锁内 pid 仍存活时拒绝执行，别绕过它直接覆盖库文件。
+  `/metrics` 与业务接口一样受限流。`RATE_LIMIT_PER_MINUTE=0` 时整体关闭限流（仅本地调试）。
+  改 `createHttpHandler` 的豁免名单要同步 `docs/remote-access.md`。
+- `daemon.lock` 存在表示同机已有实例；stale 锁（pid 已死/内容损坏）启动时会原子接管。`db:restore`
+  在锁内 pid 仍存活时拒绝执行；锁文件存在但内容损坏/不可读时无法确认 daemon 已停，同样拒绝
+  （dead-pid 残留仍放行），需先确认停服再手工删锁。别绕过它直接覆盖库文件。
 - `notify.pull` 只能取消 `queued`/`failed` 的投递，无法拦住已处于 `sending` 的那一次。
 - `npm run db:cleanup:preview` 是**零业务删除**预演（打开旧库时仍可能执行附加式 schema
   升级，因此不保证零写入）：occurrence 清理 job（每日 04:30）与保留策略
