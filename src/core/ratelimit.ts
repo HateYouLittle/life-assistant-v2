@@ -1,5 +1,4 @@
 import type { IncomingMessage } from "node:http";
-import { tokenFingerprint } from "./auth.js";
 
 /**
  * 单进程内存限流：公网（经反代）暴露后，最基本的「不让一个来源把服务打满」的防线。
@@ -14,19 +13,38 @@ export interface RateLimitDecision {
   retryAfterMs: number;
 }
 
+export interface FixedWindowLimiterOptions {
+  /**
+   * 桶数量硬上限（默认 10_000）。key 来自请求（来源 IP / 鉴权后的 token 指纹），
+   * 不设上限时可用大量不同 key 把 Map 撑大：达到上限先清过期桶，仍满则淘汰最旧的
+   * 一批，保证内存有界。
+   */
+  maxBuckets?: number;
+}
+
 interface Bucket {
   start: number;
   count: number;
 }
 
+export const DEFAULT_MAX_BUCKETS = 10_000;
+
 export class FixedWindowLimiter {
   private readonly buckets = new Map<string, Bucket>();
+  private readonly maxBuckets: number;
 
   constructor(
     private readonly limit: number,
     private readonly windowMs: number,
     private readonly now: () => number = Date.now,
-  ) {}
+    options: FixedWindowLimiterOptions = {},
+  ) {
+    const maxBuckets = options.maxBuckets ?? DEFAULT_MAX_BUCKETS;
+    if (!Number.isInteger(maxBuckets) || maxBuckets < 1) {
+      throw new Error(`maxBuckets 必须是正整数: ${String(maxBuckets)}`);
+    }
+    this.maxBuckets = maxBuckets;
+  }
 
   take(key: string): RateLimitDecision {
     if (this.limit <= 0) return { allowed: true, retryAfterMs: 0 };
@@ -34,13 +52,27 @@ export class FixedWindowLimiter {
     const bucket = this.buckets.get(key);
     if (bucket === undefined || at - bucket.start >= this.windowMs) {
       this.buckets.set(key, { start: at, count: 1 });
-      // 惰性清理：只在 key 数量膨胀时做一次，避免每个请求都全表扫
-      if (this.buckets.size > 10_000) this.prune(at);
+      // 惰性清理 + 硬上限：只在 key 数量膨胀时动一次，避免每个请求都全表扫
+      if (this.buckets.size > this.maxBuckets) {
+        this.prune(at);
+        if (this.buckets.size > this.maxBuckets) {
+          this.evictOldest(this.buckets.size - this.maxBuckets);
+        }
+      }
       return { allowed: true, retryAfterMs: 0 };
     }
     bucket.count += 1;
     if (bucket.count <= this.limit) return { allowed: true, retryAfterMs: 0 };
     return { allowed: false, retryAfterMs: this.windowMs - (at - bucket.start) };
+  }
+
+  /** 按窗口起点升序淘汰最旧的一批（同起点按插入顺序，刚插入的桶不会被误伤） */
+  private evictOldest(count: number): void {
+    if (count <= 0) return;
+    const victims = [...this.buckets.entries()]
+      .sort(([, a], [, b]) => a.start - b.start)
+      .slice(0, count);
+    for (const [key] of victims) this.buckets.delete(key);
   }
 
   prune(at: number = this.now()): void {
@@ -68,12 +100,13 @@ export function clientAddress(req: IncomingMessage, trustProxy: boolean): string
   return req.socket.remoteAddress ?? "unknown";
 }
 
-/** 限流 key：带 Bearer 时按 token 指纹（不同人互不牵连），否则按来源地址 */
-export function rateLimitKey(req: IncomingMessage, trustProxy: boolean): string {
-  const authorization = req.headers.authorization;
-  if (typeof authorization === "string" && authorization.startsWith("Bearer ")) {
-    const token = authorization.slice("Bearer ".length).trim();
-    if (token !== "") return `t:${tokenFingerprint(token)}`;
-  }
-  return `ip:${clientAddress(req, trustProxy)}`;
+/**
+ * Hono 的 `c.env` → 来源地址。`@hono/node-server` 会把 Node 的 `incoming`/`outgoing`
+ * 放进 env（见 getRequestListener），服务端路由据此拿到与 `createHttpHandler` 同一口径的
+ * 客户端地址（同样遵守 TRUST_PROXY）。直接 `app.request()`（单元测试/非 node-server
+ * 适配器）时拿不到 Node 请求，返回 "unknown"。
+ */
+export function envClientAddress(env: unknown, trustProxy: boolean): string {
+  const incoming = (env as { incoming?: IncomingMessage } | null | undefined)?.incoming;
+  return incoming === undefined ? "unknown" : clientAddress(incoming, trustProxy);
 }

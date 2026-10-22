@@ -2,10 +2,14 @@ import { randomBytes } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { Context } from "hono";
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { DateTime } from "luxon";
 import { PROFILE_ID_RE, type ResolvedConfig } from "../config.js";
 import { recordAudit } from "../core/audit.js";
-import { resolveIdentity } from "../core/auth.js";
+import { type Identity, resolveIdentity } from "../core/auth.js";
+import { logger, sanitizeLogText } from "../core/logger.js";
+import { incCounter } from "../core/metrics.js";
+import { envClientAddress } from "../core/ratelimit.js";
 import { runtime, type ToolContext, type ToolResult } from "../core/registry.js";
 import { ensureProfile } from "../core/settings.js";
 import { bookkeepingExpenseTool } from "../modules/bookkeeping/index.js";
@@ -49,9 +53,12 @@ export function stripTokenParam(search: string): string {
 }
 
 /** 统一错误体：`{ok:false, error:"中文说明"}` */
-function fail(c: Context, status: 400 | 401, error: string): Response {
+function fail(c: Context, status: 400 | 401 | 413, error: string): Response {
   return c.json({ ok: false, error }, status);
 }
+
+/** 手机写 API 的请求体上限：正常请求 < 2 KiB，64 KiB 已足够宽松；防止未鉴权大 body 打满内存 */
+const QUICK_BODY_LIMIT = 64 * 1024;
 
 /** 工具结果里的文本（okJson 是单个 JSON 文本块，fail 是「错误：…」文本块） */
 function toolText(result: ToolResult): string {
@@ -74,28 +81,51 @@ interface Who {
   profileId: string;
 }
 
+/** 未授权统一文案（手机页面拿到后引导 ?token=） */
+const UNAUTHORIZED_MESSAGE =
+  "未授权：请携带 Authorization: Bearer <token>（手机页面用 ?token= 引导一次即可）";
+
 /**
- * 解析请求身份并落到目标 Profile。
- * - 无凭据 → 401（未配置任何 token 时 resolveIdentity 返回 master，保持回环零配置可用）；
- * - Profile token → 该 Profile（请求里的 profile 参数一律忽略）；
- * - master → `?profile=` 或 body.profile，缺省 default；名字必须合法，否则 400。
+ * 写接口的 body 上限中间件：在鉴权之前就能挡掉超大/慢速 body（否则未鉴权请求也能让进程
+ * 缓冲任意大的 JSON）。Content-Length 超限时直接 413、不读 body。
  */
-function whoAmI(
-  config: ResolvedConfig,
-  authorization: string | undefined,
-  requestedProfile: unknown,
-): Who | { error: string; status: 400 | 401 } {
-  const identity = resolveIdentity({
+const quickBodyLimit = bodyLimit({
+  maxSize: QUICK_BODY_LIMIT,
+  onError: (c) => c.json({ ok: false, error: "请求体过大（上限 64 KiB）" }, 413),
+});
+
+/** 401 统一处理：中文错误体 + warn 日志 + auth_failed_total（与 /api/*、/mcp 同口径） */
+function unauthorized(c: Context, config: ResolvedConfig): Response {
+  incCounter("auth_failed_total");
+  // path 与来源都先净化：两者都来自请求（path 可能被 percent 解码出控制字符；TRUST_PROXY=1
+  // 时来源取自 X-Forwarded-For），不能原样拼进单行日志。
+  logger.warn(
+    `鉴权失败: ${sanitizeLogText(c.req.path)} from ${sanitizeLogText(envClientAddress(c.env, config.trustProxy), 100)}`,
+  );
+  return fail(c, 401, UNAUTHORIZED_MESSAGE);
+}
+
+/**
+ * 只解析凭据（不看 body/query 里的 profile）：写接口要在**读 body 之前**先做这一步，
+ * 未鉴权请求直接 401 早退，不再为它缓冲请求体。
+ */
+function authenticate(config: ResolvedConfig, authorization: string | undefined): Identity | null {
+  return resolveIdentity({
     masterToken: config.webApiToken,
     profileTokens: config.profileTokens,
     authorization,
   });
-  if (identity === null) {
-    return {
-      error: "未授权：请携带 Authorization: Bearer <token>（手机页面用 ?token= 引导一次即可）",
-      status: 401,
-    };
-  }
+}
+
+/**
+ * 身份落到目标 Profile。
+ * - Profile token 强绑定自己的 Profile（请求里的 profile 参数一律忽略）；
+ * - master 才允许用 `?profile=` / body.profile 指定，缺省 default；名字必须合法，否则 400。
+ */
+function targetProfile(
+  identity: Identity,
+  requestedProfile: unknown,
+): Who | { error: string; status: 400 } {
   if (identity.kind === "profile") return { profileId: identity.profileId };
   const wanted =
     requestedProfile === undefined || requestedProfile === null || requestedProfile === ""
@@ -205,22 +235,24 @@ export function createQuickApp(config: ResolvedConfig, db: DatabaseSync): Hono {
   });
 
   app.get("/api/quick/bootstrap", (c) => {
-    const who = whoAmI(config, c.req.header("Authorization"), c.req.query("profile"));
-    if ("error" in who) return fail(c, who.status, who.error);
+    const identity = authenticate(config, c.req.header("Authorization"));
+    if (identity === null) return unauthorized(c, config);
+    const who = targetProfile(identity, c.req.query("profile"));
+    if ("error" in who) return fail(c, 400, who.error);
     return c.json({ ok: true, ...bootstrapPayload(db, who.profileId) });
   });
 
-  app.post("/api/quick/expenses", async (c) => {
+  app.post("/api/quick/expenses", quickBodyLimit, async (c) => {
+    // 先鉴权再读 body：未鉴权请求直接 401，不为它缓冲请求体（旧的 body 先解析既浪费内存，
+    // 又会让「非法 JSON」先于「未授权」报错）。
+    const identity = authenticate(config, c.req.header("Authorization"));
+    if (identity === null) return unauthorized(c, config);
     const parsed = await readJsonBody(c);
     if (!parsed.ok) return fail(c, 400, parsed.error);
     const body = parsed.value;
     // master 的目标 Profile：body.profile 优先，其次 ?profile=（HTTP Shortcuts 常把参数放 URL）
-    const who = whoAmI(
-      config,
-      c.req.header("Authorization"),
-      body.profile ?? c.req.query("profile"),
-    );
-    if ("error" in who) return fail(c, who.status, who.error);
+    const who = targetProfile(identity, body.profile ?? c.req.query("profile"));
+    if ("error" in who) return fail(c, 400, who.error);
 
     const amount = normalizeAmount(body.amount);
     if (amount === null) {
@@ -281,17 +313,16 @@ export function createQuickApp(config: ResolvedConfig, db: DatabaseSync): Hono {
     );
   });
 
-  app.post("/api/quick/schedules", async (c) => {
+  app.post("/api/quick/schedules", quickBodyLimit, async (c) => {
+    // 同 expenses：鉴权（401 早退）→ 读 body → 再按 body.profile/?profile 选目标 Profile。
+    const identity = authenticate(config, c.req.header("Authorization"));
+    if (identity === null) return unauthorized(c, config);
     const parsed = await readJsonBody(c);
     if (!parsed.ok) return fail(c, 400, parsed.error);
     const body = parsed.value;
     // master 的目标 Profile：body.profile 优先，其次 ?profile=（HTTP Shortcuts 常把参数放 URL）
-    const who = whoAmI(
-      config,
-      c.req.header("Authorization"),
-      body.profile ?? c.req.query("profile"),
-    );
-    if ("error" in who) return fail(c, who.status, who.error);
+    const who = targetProfile(identity, body.profile ?? c.req.query("profile"));
+    if ("error" in who) return fail(c, 400, who.error);
 
     const title = typeof body.title === "string" ? body.title.trim() : "";
     if (title === "") return fail(c, 400, "标题不能为空");

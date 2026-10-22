@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
-import { readdirSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, readdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { bearerToken, isRequestAuthorized } from "../src/core/auth.js";
 import {
   getSchemaVersion,
   openDatabase,
   SCHEMA_VERSION,
+  uniqueFilePath,
   withReadTransaction,
   withTransaction,
 } from "../src/core/database.js";
@@ -446,6 +450,208 @@ describe("database schema v5", () => {
         1,
         "已是最新 version 时不应重复备份",
       );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("uniqueFilePath：已存在则依次加 -1/-2 后缀，不冲突时原样返回且不创建文件", () => {
+    const env = makeTestEnv();
+    try {
+      const base = join(env.dir, "life-assistant-pre-v3-20261022-230000.db");
+      assert.equal(uniqueFilePath(base), base, "文件不存在时不应改名");
+      assert.equal(existsSync(base), false, "helper 不得创建文件（只负责挑名字）");
+      writeFileSync(base, "occupied");
+      assert.equal(
+        uniqueFilePath(base),
+        join(env.dir, "life-assistant-pre-v3-20261022-230000-1.db"),
+      );
+      writeFileSync(join(env.dir, "life-assistant-pre-v3-20261022-230000-1.db"), "occupied");
+      assert.equal(
+        uniqueFilePath(base),
+        join(env.dir, "life-assistant-pre-v3-20261022-230000-2.db"),
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("迁移前快照同一秒内可重复：连续两次迁移都成功且各留一份快照（不再因重名拒绝启动）", (t) => {
+    const env = makeTestEnv();
+    try {
+      env.db.close();
+      // 把库退回 v3 形状（去掉 v4 的 client_token 列/索引）并写回版本号 3，让 openDatabase 每次都前滚
+      const downgradeToV3 = (): void => {
+        const raw = new DatabaseSync(env.config.dbPath);
+        try {
+          raw.exec("DROP INDEX IF EXISTS idx_expenses_client_token");
+          raw.exec("DROP INDEX IF EXISTS idx_schedules_client_token");
+          raw.exec("ALTER TABLE expenses DROP COLUMN client_token");
+          raw.exec("ALTER TABLE schedules DROP COLUMN client_token");
+          raw.prepare("UPDATE meta SET value = '3' WHERE key = 'schema_version'").run();
+        } finally {
+          raw.close();
+        }
+      };
+      downgradeToV3();
+      // 冻结时钟到整秒：两次迁移前快照一定落在同一秒（修复前第二次会因 VACUUM INTO 目标已存在失败）
+      t.mock.timers.enable({ apis: ["Date"], now: Date.UTC(2026, 9, 22, 15, 0, 0) });
+
+      const first = openDatabase(env.config.dbPath, { backupDir: env.config.backupDir });
+      assert.equal(getSchemaVersion(first), SCHEMA_VERSION);
+      first.close();
+
+      downgradeToV3();
+      const second = openDatabase(env.config.dbPath, { backupDir: env.config.backupDir });
+      assert.equal(getSchemaVersion(second), SCHEMA_VERSION);
+      second.close();
+
+      const snapshots = readdirSync(env.config.backupDir)
+        .filter((name) => name.includes("-pre-v3-"))
+        .sort();
+      assert.deepEqual(
+        snapshots,
+        ["life-assistant-pre-v3-20261022-230000-1.db", "life-assistant-pre-v3-20261022-230000.db"],
+        "同一秒两次迁移必须各留一份快照（第二次自动加 -1 后缀）",
+      );
+      for (const name of snapshots) {
+        const snapshot = new DatabaseSync(join(env.config.backupDir, name));
+        try {
+          const version = getSchemaVersion(snapshot);
+          // 并发下另一进程可能在本进程读完 schema_version、做 VACUUM 之前完成迁移，
+          // 于是快照内容是新版本 —— 这仍是一份完整快照；这里只要求「可打开且版本合法」，
+          // 以及下面的「快照名不重复、不覆盖」（本次修复要保证的是撞名不再误报失败）。
+          assert.ok(
+            Number.isInteger(version) && version >= 3 && version <= SCHEMA_VERSION,
+            `快照 ${name} 必须是可打开的合法版本（实际 v${version}）`,
+          );
+        } finally {
+          snapshot.close();
+        }
+      }
+    } finally {
+      t.mock.timers.reset();
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("并发打开同一无版本库：快照撞名不会被误报为备份失败（VACUUM 换名重试）", async () => {
+    const env = makeTestEnv();
+    try {
+      env.db.close();
+      const downgradeToV3 = (): void => {
+        const raw = new DatabaseSync(env.config.dbPath);
+        try {
+          raw.exec("DROP INDEX IF EXISTS idx_expenses_client_token");
+          raw.exec("DROP INDEX IF EXISTS idx_schedules_client_token");
+          raw.exec("ALTER TABLE expenses DROP COLUMN client_token");
+          raw.exec("ALTER TABLE schedules DROP COLUMN client_token");
+          raw.prepare("UPDATE meta SET value = '3' WHERE key = 'schema_version'").run();
+        } finally {
+          raw.close();
+        }
+      };
+      downgradeToV3();
+
+      // 两个进程同时 openDatabase 同一个 v3 库、同一个 backupDir：两个进程可能同时选中
+      // 同一个秒级快照名，后到者的 VACUUM INTO 会因目标已存在失败 —— 修复前会抛
+      // 「迁移前备份失败」（R2-3）。这里只要求：至少一个成功、没有任何进程因快照撞名失败、
+      // 快照不互相覆盖（每个都是可独立打开的 v3 快照）。
+      const goFile = join(env.dir, "go");
+      const dbSourceHref = pathToFileURL(
+        fileURLToPath(new URL("../src/core/database.ts", import.meta.url)),
+      ).href;
+      const runChild = (): { ready: Promise<void>; result: Promise<{ output: string }> } => {
+        const code = `
+(async () => {
+  const { existsSync } = await import("node:fs");
+  const { openDatabase } = await import(${JSON.stringify(dbSourceHref)});
+  console.log("READY");
+  while (!existsSync(${JSON.stringify(goFile)})) {
+    // 自旋等待发令，让两个进程尽量同时进入 openDatabase
+  }
+  try {
+    const db = openDatabase(${JSON.stringify(env.config.dbPath)}, {
+      backupDir: ${JSON.stringify(env.config.backupDir)},
+    });
+    db.close();
+    console.log("OK");
+  } catch (e) {
+    console.log("ERR " + (e instanceof Error ? e.message : String(e)));
+  }
+})();
+`;
+        let signalReady: () => void = () => {};
+        const ready = new Promise<void>((resolve) => {
+          signalReady = resolve;
+        });
+        const result = new Promise<{ output: string }>((resolve) => {
+          const child = spawn(process.execPath, ["--import", "tsx", "-e", code], {
+            stdio: ["ignore", "pipe", "pipe"],
+          });
+          let output = "";
+          child.stdout.on("data", (chunk: Buffer) => {
+            output += chunk.toString();
+            if (output.includes("READY")) signalReady();
+          });
+          child.stderr.on("data", (chunk: Buffer) => {
+            output += chunk.toString();
+          });
+          child.on("exit", () => {
+            signalReady();
+            resolve({ output });
+          });
+        });
+        return { ready, result };
+      };
+
+      const first = runChild();
+      const second = runChild();
+      await Promise.all([first.ready, second.ready]);
+      writeFileSync(goFile, "go");
+      const results = await Promise.all([first.result, second.result]);
+      const outputs = results.map((result) => result.output);
+      assert.ok(
+        outputs.some((output) => output.includes("OK")),
+        `至少一个进程应成功打开并迁移；实际输出：${outputs.join(" | ")}`,
+      );
+      for (const output of outputs) {
+        assert.doesNotMatch(
+          output,
+          /迁移前备份失败/,
+          `快照撞名不应被误报成备份失败（R2-3）：${output}`,
+        );
+      }
+
+      // 快照不互相覆盖：每份都是可独立打开的 v3 快照，且文件名唯一
+      const snapshots = readdirSync(env.config.backupDir)
+        .filter((name) => name.includes("-pre-v3-"))
+        .sort();
+      assert.ok(snapshots.length >= 1, "并发迁移至少应留下一份 v3 快照");
+      assert.equal(new Set(snapshots).size, snapshots.length, "快照名不得重复");
+      for (const name of snapshots) {
+        const snapshot = new DatabaseSync(join(env.config.backupDir, name));
+        try {
+          const version = getSchemaVersion(snapshot);
+          // 并发下另一进程可能在本进程读完 schema_version、做 VACUUM 之前完成迁移，
+          // 于是快照内容是新版本 —— 这仍是一份完整快照；这里只要求「可打开且版本合法」，
+          // 以及下面的「快照名不重复、不覆盖」（本次修复要保证的是撞名不再误报失败）。
+          assert.ok(
+            Number.isInteger(version) && version >= 3 && version <= SCHEMA_VERSION,
+            `快照 ${name} 必须是可打开的合法版本（实际 v${version}）`,
+          );
+        } finally {
+          snapshot.close();
+        }
+      }
+
+      // 事后单独打开必须正常（胜者已完成迁移）
+      const reopened = openDatabase(env.config.dbPath, { backupDir: env.config.backupDir });
+      try {
+        assert.equal(getSchemaVersion(reopened), SCHEMA_VERSION);
+      } finally {
+        reopened.close();
+      }
     } finally {
       cleanupTestEnv(env);
     }

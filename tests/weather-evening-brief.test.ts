@@ -266,6 +266,36 @@ describe("weather evening_brief：去重、过期与降级", () => {
     }
   });
 
+  it("启动补发用原定触发时刻：01:00 补前一天 21:00 的晚报，不会吞掉当晚 21:00 的推送", async () => {
+    const env = makeTestEnv(ENV);
+    try {
+      // 模拟「20 日 21:00 错过、21 日 01:00 启动补发」：daemon 会把原定触发时刻传给 handler。
+      const catchupAt = DateTime.fromISO("2026-10-20T21:00:00", { zone: TZ });
+      await withMockFetch(eveningHandler, () => runEveningBrief(catchupAt));
+      const afterCatchup = eveningRows(env);
+      assert.equal(afterCatchup.length, 1);
+      assert.equal(
+        afterCatchup[0]?.dedupe_key,
+        "evening:default:2026-10-21",
+        "补发按原定触发日推导：明天 = 21 日（不是 22 日）",
+      );
+
+      // 当晚 21:00 正常触发：按当前时刻推导出 22 日 → 新键 → 新增一条，不被前面那次吞掉
+      const normalAt = DateTime.fromISO("2026-10-21T21:00:00", { zone: TZ });
+      await withMockFetch(eveningHandler, () => runEveningBrief(normalAt));
+      const keys = eveningRows(env)
+        .map((row) => row.dedupe_key)
+        .sort();
+      assert.deepEqual(
+        keys,
+        ["evening:default:2026-10-21", "evening:default:2026-10-22"],
+        "跨午夜补发与当晚正常触发必须是两个不同的 dedupe 键",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("expiresAt = 明天 12:00（过期不再补投）", async () => {
     const env = makeTestEnv(ENV);
     try {

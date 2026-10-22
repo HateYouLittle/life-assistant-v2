@@ -6,8 +6,10 @@ import { loadConfig, PROFILE_ID_RE } from "./config.js";
 import { TIME_RE, TZ, isDate } from "./time.js";
 import { openDatabase, withTransaction } from "./core/database.js";
 import { logger } from "./core/logger.js";
+import { applyCliSecurityBaseline } from "./core/security.js";
 import { ensureProfile, getSetting, setSetting } from "./core/settings.js";
 import { collapseLunarInterval, type Recurrence } from "./core/recurrence.js";
+import { MAX_REMIND_OFFSET_MINUTES, MAX_REMIND_OFFSETS } from "./modules/schedule/service.js";
 
 /**
  * v1 → v2 一次性导入：旧库只读打开，映射 profiles/静默时段/日程/账本/支出/节假日。
@@ -275,14 +277,38 @@ function mapReminders(raw: string | null, title: string, warnings: string[]): nu
     const parsed = json.filter(
       (r): r is { minutesBefore?: number; target?: string } => typeof r === "object" && r !== null,
     );
-    const offsets = parsed
-      .filter((r) => r.target === undefined || r.target === "occurrence")
-      .map((r) => -(typeof r.minutesBefore === "number" ? r.minutesBefore : 0));
+    // 导入是旧的裸 SQL 写入路径（不经 createSchedule / validateRemindOffsets），
+    // 而 v1 的 minutesBefore 没有范围与整数约束：`999999` 会把提醒时刻算到两年后，
+    // `1.5` 会写入引擎不认识的分钟数。逐项转成 v2 的「相对事件时刻的分钟偏移」并收口：
+    // 非有限值按 0、取整后 clamp 到 ±MAX_REMIND_OFFSET_MINUTES，被调整过的记 warning。
+    const offsets: number[] = [];
+    for (const reminder of parsed) {
+      if (reminder.target !== undefined && reminder.target !== "occurrence") continue;
+      const minutesBefore = typeof reminder.minutesBefore === "number" ? reminder.minutesBefore : 0;
+      const rawOffset = -minutesBefore;
+      const truncated = Number.isFinite(rawOffset) ? Math.trunc(rawOffset) : 0;
+      const clamped = Math.max(
+        -MAX_REMIND_OFFSET_MINUTES,
+        Math.min(MAX_REMIND_OFFSET_MINUTES, truncated),
+      );
+      if (!Number.isFinite(rawOffset) || clamped !== rawOffset) {
+        warnings.push(
+          `日程「${title}」的提醒偏移 ${String(minutesBefore)} 分钟不合法（v1 minutesBefore 需为 0-${MAX_REMIND_OFFSET_MINUTES} 的整数分钟），已收敛为 ${String(clamped)} 分钟（负数=提前）`,
+        );
+      }
+      offsets.push(clamped);
+    }
     const deadlines = parsed.filter((r) => r.target === "deadline").length;
     if (deadlines > 0)
       warnings.push(`日程「${title}」有 ${deadlines} 个 deadline 提醒，v2 不支持已丢弃`);
     if (offsets.length === 0) return [0];
-    return offsets.slice(0, 5);
+    // v2 每个日程最多 5 条提醒：超出的必须留痕，否则用户从报告里看不出少导入了一条
+    if (offsets.length > MAX_REMIND_OFFSETS) {
+      warnings.push(
+        `日程「${title}」有 ${offsets.length} 个提醒，v2 最多支持 ${MAX_REMIND_OFFSETS} 个，已丢弃其后 ${offsets.length - MAX_REMIND_OFFSETS} 个`,
+      );
+    }
+    return offsets.slice(0, MAX_REMIND_OFFSETS);
   } catch {
     warnings.push(`日程「${title}」reminders_json 无法解析，按到点提醒导入`);
     return [0];
@@ -837,6 +863,10 @@ function main(): void {
   }
   const force = args.includes("--force");
   const config = loadConfig(process.env);
+  // 只收紧 umask（首次建库/迁移前快照必须 0600），**不** harden 已有目录：导入的目标
+  // DATA_DIR 可能还没创建、也可能写错路径，提前 chmod 既无意义、还可能误改无关目录的
+  // 权限。统一走 CLI 基线的 harden:false（与 db:restore --dry-run 等不写盘路径同口径）。
+  applyCliSecurityBaseline(config, { harden: false });
   let target: ReturnType<typeof openDatabase> | undefined;
   try {
     const oldPath = resolveOldDbPath(args[fromIndex + 1] as string);

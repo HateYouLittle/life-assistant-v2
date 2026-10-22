@@ -10,7 +10,7 @@ import {
   setBudget,
   weekRange,
 } from "../src/modules/bookkeeping/service.js";
-import { todayIso } from "../src/time.js";
+import { TZ, todayIso } from "../src/time.js";
 import { cleanupTestEnv, makeTestEnv, type Published, type TestEnv } from "./helpers.js";
 // 副作用 import：注册全部模块，才能从 allJobs() 里取到 weekly_report 这个 job
 import "../src/modules/index.js";
@@ -502,6 +502,37 @@ describe("周报幂等与 job 接线", () => {
       assert.equal(pub.profileId, "*");
       assert.equal(pub.input.title, `📅 本周账单 · ${monthDay(start)}–${monthDay(end)}`);
       assert.equal(pub.input.dedupeKey, `weekly:l1:${start}`);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("周一 09:00 补周日 20:00 的周报：weekStart 是刚结束那一周（不是新一周）", async () => {
+    const env = makeTestEnv();
+    try {
+      seedLedger(env, { id: "l1", name: "补发周报" });
+      // 10/12~10/18 那一周有支出；10/19（周一）没有
+      seedExpense(env, {
+        id: "e1",
+        ledgerId: "l1",
+        cents: 3000,
+        category: "餐饮",
+        date: "2026-10-14",
+      });
+      const job = allJobs().find(
+        (j) => j.module === "bookkeeping" && j.def.name === "weekly_report",
+      );
+      assert.ok(job !== undefined);
+
+      // 补发：daemon 把「错过的那次原定触发时刻」（周日 20:00）作为 at 传入
+      await job.def.handler(DateTime.fromISO("2026-10-18T20:00:00", { zone: TZ }));
+      const pub = weeklyPublished(env);
+      assert.equal(
+        pub.input.dedupeKey,
+        "weekly:l1:2026-10-12",
+        "周起点必须是刚结束那一周的周一，而不是补发当天（周一 10-19）所在的新一周",
+      );
+      assert.equal(pub.input.title, "📅 本周账单 · 10/12–10/18");
     } finally {
       cleanupTestEnv(env);
     }

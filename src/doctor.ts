@@ -16,6 +16,7 @@ import { holidaySourceUrls, requiredYears } from "./core/holiday.js";
 import { fetchJson } from "./core/http.js";
 import { CATCHUP_POLICY, previousFireTime } from "./core/jobs.js";
 import { loadEd25519PrivateKey } from "./core/qweather-jwt.js";
+import { applySecureUmask } from "./core/security.js";
 import { now } from "./time.js";
 
 /**
@@ -320,7 +321,7 @@ function checkJobFreshness(items: LiveJobItem[], at: DateTime): CheckResult[] {
     }
     if (previousFireTime(item.cron, at) === null) {
       results.push(
-        warn(name, `cron "${item.cron}" 无法反向求值（仅支持日/月/星期为 *），不能判断是否新鲜`),
+        warn(name, `cron "${item.cron}" 无法反向求值（仅支持日/月为 *），不能判断是否新鲜`),
       );
       continue;
     }
@@ -548,6 +549,9 @@ export async function runDoctor(
 const ICON: Record<CheckLevel, string> = { ok: "✅", warn: "⚠️ ", fail: "❌" };
 
 function main(): void {
+  // 安全基线：doctor 首次运行时可能创建数据目录/库，必须在任何 mkdir/open 之前收紧 umask。
+  // 只做 umask：自检的职责是诊断，不主动 chmod 用户现有的库/备份（避免「自检改权限」的意外）。
+  applySecureUmask();
   const args = process.argv.slice(2);
   const network = args.includes("--network");
   const live = args.includes("--live");

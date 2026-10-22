@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { DateTime } from "luxon";
 import { logger } from "../../core/logger.js";
 import {
   errorMessage,
@@ -40,6 +41,7 @@ import {
   listExpenses,
   listLedgers,
   monthRange,
+  normalizeCategory,
   previousMonth,
   pushDailyDigests,
   pushMonthlyReports,
@@ -152,11 +154,42 @@ export function bookkeepingLedgerTool(args: Record<string, unknown>, ctx: ToolCo
       }
       const ledger = getVisibleLedger(db, ledgerId, ctx.profileId);
       if (ledger === undefined) return fail(`账本不存在: ${ledgerId}`);
-      const category = ((args.category as string | undefined) ?? "").trim();
+      // 分类预算与 expense add/update 共用同一份字典归一：否则用户用别名（如「吃饭」）
+      // 设的预算会落在别名文本下，而归一后的支出记在标准名（「餐饮」）下 —— 已用恒为 0、
+      // 阈值提醒永不触发，且没有任何提示。总额预算（空分类）不参与归一。
+      //
+      // 存量数据：旧版本只归一写入路径，库里可能已存在 `category='吃饭'` 的旧预算行。
+      // 本次写入/清除时，把该账本里**归一后与目标同义**的所有旧分类行一并清掉（两个方向
+      // 都要覆盖）：既清「别名→标准名」的原文行，也清「用标准名操作」时残留的别名行，
+      // 否则对照表里会同时出现两条同义预算（一条恒 ¥0）。
+      const rawCategory = ((args.category as string | undefined) ?? "").trim();
+      const category = rawCategory === "" ? "" : normalizeCategory(db, ctx.profileId, rawCategory);
+      const normalized = category !== rawCategory;
+      const normalizedHint = normalized ? { 分类归一: category } : {};
+      // 同义旧分类行：非目标分类、但归一后等于目标分类（总额预算不参与）。
+      const sameScopeAliases =
+        category === ""
+          ? []
+          : getBudgets(db, ledgerId)
+              .map((row) => row.category)
+              .filter(
+                (existing) =>
+                  existing !== category &&
+                  normalizeCategory(db, ctx.profileId, existing) === category,
+              );
       if (args.clear === true) {
-        const removed = clearBudget(db, ledgerId, category);
+        let removed = clearBudget(db, ledgerId, category);
+        if (normalized) removed = clearBudget(db, ledgerId, rawCategory) || removed;
+        for (const alias of sameScopeAliases) {
+          removed = clearBudget(db, ledgerId, alias) || removed;
+        }
         return okJson({
-          已清除: { 账本: ledger.name, 范围: budgetScopeLabel(category), 删除: removed },
+          已清除: {
+            账本: ledger.name,
+            范围: budgetScopeLabel(category),
+            删除: removed,
+          },
+          ...normalizedHint,
         });
       }
       const amount = args.amount as number | undefined;
@@ -164,6 +197,8 @@ export function bookkeepingLedgerTool(args: Record<string, unknown>, ctx: ToolCo
         if (!Number.isFinite(amount) || amount <= 0 || amount > 1_000_000) {
           return fail(`金额不合法: ${String(amount)}`);
         }
+        if (normalized) clearBudget(db, ledgerId, rawCategory);
+        for (const alias of sameScopeAliases) clearBudget(db, ledgerId, alias);
         const row = setBudget(db, ledgerId, category, Math.round(amount * 100));
         return okJson({
           已设置: {
@@ -171,6 +206,7 @@ export function bookkeepingLedgerTool(args: Record<string, unknown>, ctx: ToolCo
             范围: budgetScopeLabel(row.category),
             预算: `¥${centsToYuan(row.amount_cents)}`,
           },
+          ...normalizedHint,
           本月对照: budgetStatusView(budgetStatus(db, ledgerId, todayIso().slice(0, 7))),
         });
       }
@@ -709,13 +745,16 @@ registerModule({
   jobs: [
     {
       name: "ledger_digest",
-      // cron 从 config 惰性读取（LEDGER_DIGEST_CRON，默认 21:30）：与月报不同，
-      // 摘要必须每晚都跑，错过一天的「今天记了什么」补发也没有意义。
+      // cron 从 config 惰性读取（LEDGER_DIGEST_CRON，默认 21:30）。
+      // `at` = 这次运行对应的参考时刻：cron/手动调用是当前时刻，启动补发是「错过的那次
+      // 原定触发时刻」。跨午夜补发（21:30 的触发在次日 00:00–09:30 才补跑）若仍按 now()
+      // 取「今天」，会汇总到新的一天：前一天的摘要永久丢失；若新一天已有（提前录入的）
+      // 支出，还会生成错误日期的摘要并占住 dedupe 键，把当晚的真实摘要吞掉。
       cron: () => runtime().config.ledgerDigestCron,
-      handler: async () => {
+      handler: async (at?: DateTime) => {
         const rt = runtime();
         try {
-          const pushed = await pushDailyDigests(rt.db, rt.services);
+          const pushed = await pushDailyDigests(rt.db, rt.services, at?.toISODate() ?? todayIso());
           logger.info(`每日记账摘要：发布 ${pushed} 条`);
         } catch (e) {
           // 摘要失败不影响记账本身（账已落库），但必须让运维看得见：rethrow 交给 job_runs
@@ -731,11 +770,13 @@ registerModule({
       // 与其他报表 job 一样，失败必须 rethrow 让 job_runs 记 failed：静默不推的报表
       // 比推错更糟（用户会以为这周没有记账）。
       cron: () => runtime().config.weeklyReportCron,
-      handler: async () => {
+      handler: async (at?: DateTime) => {
         const rt = runtime();
         try {
-          // 不传 weekStart：默认取「今天所在周的周一」，cron 在周日触发时就是刚结束的这一周
-          const pushed = await pushWeeklyReports(rt.db, rt.services);
+          // weekStart 用参考时刻的日期：cron 正常触发（周日 20:00）时它就是本周周一；
+          // 启动补发在周一早上补跑时传的是周日 20:00，归一后仍是刚结束那一周的周一，
+          // 不会把「刚开始的新一周」当成本周（那样会统计出 0 笔、静默不发）。
+          const pushed = await pushWeeklyReports(rt.db, rt.services, at?.toISODate() ?? todayIso());
           logger.info(`周报：发布 ${pushed} 条`);
         } catch (e) {
           logger.error(`周报发布失败: ${errorMessage(e)}`);

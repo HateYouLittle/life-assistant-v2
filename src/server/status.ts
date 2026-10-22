@@ -6,9 +6,10 @@ import { DateTime } from "luxon";
 import type { ResolvedConfig } from "../config.js";
 import { AUDIT_DEFAULT_LIMIT, AUDIT_MAX_LIMIT, type AuditRow, listAudit } from "../core/audit.js";
 import { type Identity, resolveIdentity } from "../core/auth.js";
-import { logger } from "../core/logger.js";
+import { logger, sanitizeLogText } from "../core/logger.js";
 import { incCounter } from "../core/metrics.js";
 import { qweatherUsage } from "../core/qweather.js";
+import { envClientAddress } from "../core/ratelimit.js";
 import { allJobs } from "../core/registry.js";
 import { expenseCsv, expenseCsvFilename } from "../modules/bookkeeping/service.js";
 import { TZ, todayIso } from "../time.js";
@@ -241,7 +242,11 @@ export function createStatusApp(config: ResolvedConfig, db: DatabaseSync): Hono<
     });
     if (identity === null) {
       incCounter("auth_failed_total");
-      logger.warn(`鉴权失败: ${c.req.path} from ${c.req.header("x-forwarded-for") ?? "unknown"}`);
+      // 来源必须走统一的 clientAddress 口径（TRUST_PROXY=1 才采信 X-Forwarded-For）；
+      // 路径先净化再拼日志，避免解码后的控制字符/任意文本污染审计记录。
+      logger.warn(
+        `鉴权失败: ${sanitizeLogText(c.req.path)} from ${sanitizeLogText(envClientAddress(c.env, config.trustProxy), 100)}`,
+      );
       return c.json({ error: "unauthorized" }, 401);
     }
     // Profile token 也放行看板：数据范围由各路由按 identity 下推到 SQL 过滤

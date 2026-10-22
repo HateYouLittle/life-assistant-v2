@@ -3,6 +3,7 @@ import { DatabaseSync } from "node:sqlite";
 import { loadConfig } from "./config.js";
 import { getSchemaVersion, openDatabase, SCHEMA_VERSION } from "./core/database.js";
 import { schemaFingerprint, storedSchemaFingerprint } from "./core/fingerprint.js";
+import { applyCliSecurityBaseline } from "./core/security.js";
 
 /**
  * `npm run db:fingerprint`：打印数据库结构指纹，并在打开时把 `meta.schema_fingerprint`
@@ -39,6 +40,10 @@ function readStoredBefore(dbPath: string): StoredBefore {
 function main(): void {
   try {
     const config = loadConfig(process.env);
+    // 安全基线必须在任何 mkdir/open 之前：本次打开可能前滚 schema 并落迁移前快照。
+    // 库不存在时本命令会新建空库 —— 这种「DATA_DIR 可能写错」的情况只收紧 umask，
+    // 不 chmod 用户写错指向的无关目录（Round2 R2-2）。
+    applyCliSecurityBaseline(config, { harden: existsSync(config.dbPath) });
     const before = readStoredBefore(config.dbPath);
     // 与 daemon/doctor 同一入口：可能前滚 schema，必须带迁移前备份目录
     const db = openDatabase(config.dbPath, { backupDir: config.backupDir });

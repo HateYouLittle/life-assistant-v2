@@ -5,8 +5,10 @@ import type { ResolvedConfig } from "../config.js";
 import { resolveIdentity } from "../core/auth.js";
 import { backupStatus } from "../core/backup.js";
 import { lastJobRun } from "../core/jobs.js";
+import { logger, sanitizeLogText } from "../core/logger.js";
 import { incCounter, snapshotCounters } from "../core/metrics.js";
 import { qweatherUsage } from "../core/qweather.js";
+import { envClientAddress } from "../core/ratelimit.js";
 import { allJobs } from "../core/registry.js";
 
 /**
@@ -259,8 +261,13 @@ export function createOpsApp(config: ResolvedConfig, db: DatabaseSync): Hono {
       authorization: c.req.header("Authorization"),
     });
     if (identity === null) {
-      // 与状态页同一组进程内计数器：鉴权失败/越权尝试也要能在图上看见
+      // 与状态页/quick/calendar 同一口径：鉴权失败既计数也写 warn 日志。
+      // 公网暴露后 /metrics 是扫描目标之一，只有计数器而没有日志会丢掉「谁在试」的线索。
       incCounter("auth_failed_total");
+      // 来源可能来自 X-Forwarded-For（TRUST_PROXY=1），净化+截断后再落单行日志。
+      logger.warn(
+        `鉴权失败: /metrics from ${sanitizeLogText(envClientAddress(c.env, config.trustProxy), 100)}`,
+      );
       return c.json({ error: "unauthorized" }, 401, NO_STORE);
     }
     if (identity.kind === "profile") {

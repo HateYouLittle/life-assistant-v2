@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { DateTime } from "luxon";
@@ -237,6 +237,29 @@ export interface OpenDatabaseOptions {
 }
 
 /**
+ * 返回一个当前不存在的文件名：原路径已被占用时依次尝试 `<base>-1.<ext>`、`-2`…
+ *
+ * 为什么需要：迁移前快照 / 恢复留底的文件名只精确到秒。同一秒内第二次执行（升级窗口里
+ * daemon 重启与 doctor/cleanup-preview 并发、或 supervisor 在失败后立刻重试）会撞名，
+ * 而 SQLite 的 `VACUUM INTO` 要求目标文件不存在 —— 不换名就会把「一次本可成功的迁移」
+ * 变成「拒绝启动」，错误还是误导性的 `file is not a database`。
+ *
+ * 不做原子占位（先到先得靠调用方紧接着的创建/写入）：并发进程可能同时选中同一个名字。
+ * 因此真正写入的调用方（如迁移前 `VACUUM INTO`）必须容忍「目标文件已被抢先创建」：
+ * 换下一个不冲突名字重试（见 backupBeforeMigration），否则会出现 R2-3 的「查-写」TOCTOU。
+ * 最多尝试 99 个后缀，避免死循环。
+ */
+export function uniqueFilePath(path: string): string {
+  if (!existsSync(path)) return path;
+  const base = path.endsWith(".db") ? path.slice(0, -3) : path;
+  for (let i = 1; i < 100; i += 1) {
+    const candidate = `${base}-${i}.db`;
+    if (!existsSync(candidate)) return candidate;
+  }
+  throw new Error(`无法生成不冲突的文件名（99 个后缀都被占用）: ${path}`);
+}
+
+/**
  * schema 需要前滚时先备份。用同一个连接做 VACUUM INTO：拿到的是与主库一致的快照，
  * 且不受并发 writer 影响（VACUUM 会等待写锁，busy_timeout 已设 5s）。
  * 已是最新版本 / 全新库（meta 还没建）直接返回。
@@ -266,28 +289,63 @@ function backupBeforeMigration(
     );
     return;
   }
+  vacuumPreMigrationSnapshot(db, backupDir, stored, dbPath);
+}
+
+/** 迁移前快照的换名重试上限（并发进程同时选中同一文件名时用） */
+const SNAPSHOT_NAME_RETRIES = 3;
+
+/**
+ * 落一份迁移前快照（`VACUUM INTO`）。
+ *
+ * 文件名 = 秒级时间戳 + `uniqueFilePath` 去重，但 `existsSync` 与 `VACUUM INTO` 之间不是
+ * 原子的：两个进程可能同时选中同一个名字，后到者的 `VACUUM INTO` 会因「目标已存在」失败。
+ * 这不是真实故障，换下一个不冲突名字重试即可（Round2 R2-3）。
+ *
+ * 只有「目标文件现在存在」才认定是撞名重试；其它失败（磁盘满、权限、库损坏、库被锁）
+ * 立刻抛出原始错误 —— 不能被重试掩盖成「换了个名字就好了」。
+ */
+function vacuumPreMigrationSnapshot(
+  db: DatabaseSync,
+  backupDir: string,
+  stored: number,
+  dbPath: string,
+): void {
   mkdirSync(backupDir, { recursive: true });
   const stamp = DateTime.fromMillis(Date.now(), { zone: TZ }).toFormat("yyyyMMdd-HHmmss");
-  const target = join(backupDir, `life-assistant-pre-v${stored}-${stamp}.db`);
-  try {
-    db.prepare("VACUUM INTO ?").run(target);
-  } catch (e) {
-    throw new Error(
-      `迁移前备份失败，拒绝升级 schema（数据库未改动）: ${dbPath} -> ${target}: ${
-        e instanceof Error ? e.message : String(e)
-      }`,
-    );
+  const base = join(backupDir, `life-assistant-pre-v${stored}-${stamp}.db`);
+  let target = uniqueFilePath(base);
+  let firstError: unknown;
+  for (let attempt = 0; attempt < SNAPSHOT_NAME_RETRIES; attempt += 1) {
+    try {
+      db.prepare("VACUUM INTO ?").run(target);
+      logger.info(`迁移前已备份 schema v${stored} 数据库: ${target}`);
+      return;
+    } catch (e) {
+      firstError ??= e;
+      // 目标现在存在 = 并发进程刚把这个名字写出来（或我们留下了半成品）：换名再试
+      if (!existsSync(target)) break;
+      const next = uniqueFilePath(base);
+      if (next === target) break;
+      target = next;
+    }
   }
-  logger.info(`迁移前已备份 schema v${stored} 数据库: ${target}`);
+  throw new Error(
+    `迁移前备份失败，拒绝升级 schema（数据库未改动）: ${dbPath} -> ${target}: ${
+      firstError instanceof Error ? firstError.message : String(firstError)
+    }`,
+  );
 }
 
 export function openDatabase(dbPath: string, opts: OpenDatabaseOptions = {}): DatabaseSync {
   mkdirSync(dirname(dbPath), { recursive: true });
   const db = new DatabaseSync(dbPath);
   try {
+    // busy_timeout 必须最先设置：并发打开旧库时 `journal_mode = WAL` 自己也可能撞 SQLITE_BUSY，
+    // 此时还没有等待窗口（默认 0）会直接失败（Round2 R2-3 观察）。
+    db.exec("PRAGMA busy_timeout = 5000");
     db.exec("PRAGMA journal_mode = WAL");
     db.exec("PRAGMA foreign_keys = ON");
-    db.exec("PRAGMA busy_timeout = 5000");
     backupBeforeMigration(db, opts.backupDir, dbPath);
     migrate(db);
     // 结构指纹必须在迁移之后对账：迁移本身会加表/加列，先算再迁移会把合法变化误报成漂移。

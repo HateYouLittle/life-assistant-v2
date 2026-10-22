@@ -196,52 +196,88 @@ export function pruneJobRuns(
 // ── cron 反向求值 ──────────────────────────────────────────────────────────
 
 /**
- * 解析 cron 的「分钟」或「小时」字段：支持 `*`、`*` 后接 `/n` 的步长写法（每隔 n 个单位）、
- * 精确数字、逗号列表、`a-b` 范围（以及 `a-b/n`、`5/n` 这两种合法扩展；其余写法返回 null）。
+ * 解析一个 cron 字段，**复刻 node-cron 3.x 的转换语义**（而不是标准 cron）：
+ *
+ * 1. `*` 替换成 `min-max`（node-cron 的 convertAsterisksToRanges，星期字段是 0-6）；
+ * 2. `a-b` 展开成区间内的每个整数，**端点 a>b 时交换**（range-conversion 行为）；
+ * 3. 步长 `/n` 不是「从起点每 n 个」，而是**展开后保留 `value % n === 0`**
+ *    （step-values-conversion 行为）：`9-18/2` → 10/12/14/16/18，`1-5/2` → 2/4；
+ *    单值 `a/n` 只在 `a % n === 0` 时得到 `{a}`，否则该字段为空集（表达式永不触发）。
+ *
+ * 只接受能被上述流程精确表达的写法；其余（多个 `/`、多个 `*`、`1-2-3` 之类的病态写法）
+ * 一律返回 null，由调用方按「宁可漏补，不猜」处理。返回值是字段内的整数集合；
+ * 星期字段返回的 0 仍表示周日，由调用方映射到 luxon 的 7。
  */
 function parseCronField(raw: string, min: number, max: number): Set<number> | null {
-  const values = new Set<number>();
-  for (const part of raw.split(",")) {
-    if (part === "") return null;
-    const stepParts = part.split("/");
-    if (stepParts.length > 2) return null;
-    const base = stepParts[0] ?? "";
-    let step = 1;
-    if (stepParts[1] !== undefined) {
-      if (!/^\d+$/.test(stepParts[1])) return null;
-      step = Number(stepParts[1]);
-      if (step < 1) return null;
-    }
-    let start: number;
-    let end: number;
-    if (base === "*") {
-      start = min;
-      end = max;
-    } else if (/^\d+$/.test(base)) {
-      start = Number(base);
-      // `5/n` 的 cron 语义是「从 5 开始，每 n 个单位」→ 一直延伸到字段上界
-      end = stepParts[1] === undefined ? start : max;
-    } else {
-      const range = /^(\d+)-(\d+)$/.exec(base);
-      if (range === null) return null;
-      start = Number(range[1]);
-      end = Number(range[2]);
-    }
-    if (start < min || end > max || start > end) return null;
-    for (let value = start; value <= end; value += step) values.add(value);
+  const text = raw.trim();
+  if (text === "") return null;
+  // node-cron 的步长正则 `^(.+)\/(\w+)$` 作用于**整个字段**，多个 `/` 无法精确表达
+  const slashCount = (text.match(/\//g) ?? []).length;
+  if (slashCount > 1) return null;
+  let base = text;
+  let step = 1;
+  if (slashCount === 1) {
+    const cut = text.lastIndexOf("/");
+    base = text.slice(0, cut);
+    const stepRaw = text.slice(cut + 1);
+    if (!/^\d+$/.test(stepRaw)) return null;
+    step = Number(stepRaw);
+    if (step < 1) return null;
   }
-  return values.size > 0 ? values : null;
+  // `*`：node-cron 只把字段里**第一个** `*` 替换成 min-max；还有剩余 `*` 则无法表达
+  if (base.includes("*")) {
+    base = base.replace("*", `${min}-${max}`);
+    if (base.includes("*")) return null;
+  }
+  const expanded: number[] = [];
+  for (const part of base.split(",")) {
+    if (part === "") return null;
+    const range = /^(\d+)-(\d+)$/.exec(part);
+    let first: number;
+    let last: number;
+    if (range !== null) {
+      first = Number(range[1]);
+      last = Number(range[2]);
+      // node-cron 的 range-conversion 在 a>b 时交换端点
+      if (first > last) [first, last] = [last, first];
+    } else if (/^\d+$/.test(part)) {
+      first = Number(part);
+      last = first;
+    } else {
+      return null;
+    }
+    // 越界值会被 node-cron 的 validate 拒绝（配置根本起不来）；这里同样放弃反向求值
+    if (first < min || last > max) return null;
+    for (let value = first; value <= last; value += 1) expanded.push(value);
+  }
+  // 步长：展开后按 value % n === 0 过滤（不是「从起点每 n 个」）
+  const values = step === 1 ? expanded : expanded.filter((value) => value % step === 0);
+  return values.length > 0 ? new Set(values) : null;
 }
 
 /**
  * 上一次（含当前分钟）触发的时刻。
  *
- * 只支持「日 / 月 / 星期均为 `*`」的表达式（分钟与小时可以任意组合）：
- * 补发要的是「每天这个点」的语义，遇到 `0 7 * * 1-5` 这类带日期限制的表达式，
- * 直接返回 null 并 debug 一行 —— 宁可漏补，也不要把误判成「今天该跑」的通知推给用户。
+ * 支持的表达式：**日与月必须为 `*`**；分钟、小时、星期可任意组合（星期含 `7` 的
+ * 范围/步长除外，见下）——启动补发需要覆盖 `0 20 * * 0` 这类周任务，否则
+ * CATCHUP_POLICY 里的周报窗口只是一条永远算不出触发时刻的死配置。日/月非 `*` 的
+ * 表达式（如 `0 9 1 * *`）仍直接返回 null 并 debug 一行：补发要的是「每天/每周这个点」
+ * 的语义，遇到带月份日限制的表达式，宁可漏补，也不要把误判成「今天该跑」的通知推给用户。
  *
- * 实现是从 `at` 所在分钟向前逐分钟扫描（最多 8 天）：不用 cron 库的正向 next 反推，
- * 也就不依赖任何库的内部语义；典型日级表达式平均只扫几百次，启动时一次性的开销可忽略。
+ * 关键：字段语义按 **node-cron 3.x 的实际转换**复刻（见 `parseCronField`），不是标准
+ * cron——范围+步长是「先展开 a..b、再保留 `value % n === 0`」，如 `9-18/2` = 10/12/14/16/18、
+ * `1-5/2` = 2/4；`a-b` 端点 a>b 会交换；单值 `a/n` 只在 a%n===0 时有效。照标准 cron 的
+ * 「从 a 起每 n 个」实现会让补发判定与真实触发错位（漏补/多补）。
+ *
+ * 星期字段里 `7` 的边界（宁可漏补也不猜）：node-cron 先做**字符串级** `replace('7','0')`
+ * （只替换第一处）再展开范围/步长，因此 `6-7` 实际是「0-6=每天」、`0-7` 是「0-0=仅周日」、
+ * `1-7/2` 是「0,1/2=仅周日」—— 与「按 0..7 数值区间展开」并不等价。这里只在「单个值 /
+ * 单值逗号列表」里接受 7（如 `7`、`5,7`，与 node-cron 语义一致）；一旦 7 出现在范围或
+ * 步长（`6-7`、`0-7`、`1-7/2`…）就直接放弃反向求值。非 7 的范围/步长按上面的取模语义解析。
+ *
+ * 实现是从 `at` 所在分钟向前逐分钟扫描（最多 8 天，足以覆盖「每周一次」的最远间隔）：
+ * 不用 cron 库的正向 next 反推，也就不依赖任何库的内部语义；典型日级表达式平均只扫几百次，
+ * 启动时一次性的开销可忽略。星期判定取候选时刻在 `at` 所在时区的星期（调用方传本地 at）。
  *
  * 返回值是 **UTC** 的 DateTime（`toISO()` 形如 `...Z`），便于直接作为
  * `scheduled_for` 落库并与其它 UTC 时间戳做字符串比较。
@@ -260,8 +296,8 @@ export function previousFireTime(expr: string, at: DateTime): DateTime | null {
     string,
     string,
   ];
-  if (domRaw !== "*" || monthRaw !== "*" || dowRaw !== "*") {
-    logger.debug(`补发：cron 的日/月/星期不是 *，跳过反向求值: "${expr}"`);
+  if (domRaw !== "*" || monthRaw !== "*") {
+    logger.debug(`补发：cron 的日/月不是 *，跳过反向求值: "${expr}"`);
     return null;
   }
   const minutes = parseCronField(minuteRaw, 0, 59);
@@ -270,6 +306,30 @@ export function previousFireTime(expr: string, at: DateTime): DateTime | null {
     logger.debug(`补发：cron 的分钟/小时字段不受支持: "${expr}"`);
     return null;
   }
+  // 星期字段：node-cron 先做字符串级 replace('7','0') 再按 0-6 展开/步长；`6-7`/`0-7`/
+  // `1-7/2` 这类「范围或步长里含 7」的写法与数值区间语义不同（见文档注释），保守放弃。
+  // 单值/单值列表里的 7 与 0 同义（周日），统一替换成 0 后按 0-6 的 node-cron 语义解析。
+  let weekdays: Set<number> | null = null;
+  if (dowRaw !== "*") {
+    for (const part of dowRaw.split(",")) {
+      if (/[-/]/.test(part) && part.includes("7")) {
+        logger.debug(
+          `补发：cron 的星期字段在范围/步长里含 7（node-cron 语义与数值区间不一致），跳过反向求值: "${expr}"`,
+        );
+        return null;
+      }
+    }
+    const dowWithSevenNormalized = dowRaw
+      .split(",")
+      .map((part) => (/^\d+$/.test(part) && Number(part) === 7 ? "0" : part))
+      .join(",");
+    const dow = parseCronField(dowWithSevenNormalized, 0, 6);
+    if (dow === null) {
+      logger.debug(`补发：cron 的星期字段不受支持: "${expr}"`);
+      return null;
+    }
+    weekdays = new Set([...dow].map((value) => (value === 0 ? 7 : value)));
+  }
 
   // 含当前分钟：若 daemon 恰好在触发分钟内启动（node-cron 此时已错过今天的注册时机），
   // 这次触发对本进程而言就是「刚错过」，应当补发。重复执行由覆盖判定兜住。
@@ -277,7 +337,13 @@ export function previousFireTime(expr: string, at: DateTime): DateTime | null {
   const maxMinutes = 8 * 24 * 60;
   for (let i = 0; i <= maxMinutes; i += 1) {
     if (i > 0) candidate = candidate.minus({ minutes: 1 });
-    if (minutes.has(candidate.minute) && hours.has(candidate.hour)) return candidate.toUTC();
+    if (
+      minutes.has(candidate.minute) &&
+      hours.has(candidate.hour) &&
+      (weekdays === null || weekdays.has(candidate.weekday))
+    ) {
+      return candidate.toUTC();
+    }
   }
   logger.debug(`补发：cron "${expr}" 在 8 天内找不到触发点`);
   return null;

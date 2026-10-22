@@ -330,6 +330,44 @@ export function validateScheduleInput(input: ScheduleInput): void {
   }
 }
 
+/** 提醒偏移的项数上限（与 MCP schema 一致） */
+export const MAX_REMIND_OFFSETS = 5;
+/** 单个提醒偏移的绝对值上限（分钟，30 天；与 MCP schema 一致） */
+export const MAX_REMIND_OFFSET_MINUTES = 43200;
+
+/**
+ * 提醒偏移的写入边界校验。
+ *
+ * MCP 入口由 zod schema 校验（1-5 项、整数、±43200），但 `/api/quick/schedules` 直接
+ * 调用工具层、服务层也可能被直接调用，绕不过这一层：不在这里收口，quick 就能写入
+ * `[999999]` 这类超出契约的值（提醒时刻算到 2 年后）或空数组（物化出零提醒的死日程）。
+ *
+ * 只校验**本次写入的值**：update 未显式传 `remindOffsets` 时沿用库里的历史值，
+ * 老数据（如导入的长数组/越界值）不能被「只改标题」这类无关 patch 卡死 —— 与
+ * `normalizeInheritedRecurrence` 对存量脏数据的宽容口径一致。
+ */
+export function validateRemindOffsets(offsets: number[]): void {
+  // 直接调用服务层的入口可能传 null / 非数组（MCP 有 zod；update 的 null 已在调用方
+  // 按「未提供」处理）。先给中文报错，不要让 `.length` 抛内部 TypeError。
+  if (!Array.isArray(offsets)) {
+    throw new Error("remind_offsets 需要是分钟偏移数组（例如 [0] 或 [-30, 0]）");
+  }
+  if (offsets.length < 1 || offsets.length > MAX_REMIND_OFFSETS) {
+    throw new Error(`remind_offsets 需要 1-${MAX_REMIND_OFFSETS} 项`);
+  }
+  for (const minutes of offsets) {
+    if (
+      !Number.isInteger(minutes) ||
+      minutes < -MAX_REMIND_OFFSET_MINUTES ||
+      minutes > MAX_REMIND_OFFSET_MINUTES
+    ) {
+      throw new Error(
+        `remind_offsets 不合法: ${String(minutes)}（需为 -${MAX_REMIND_OFFSET_MINUTES} 到 ${MAX_REMIND_OFFSET_MINUTES} 的整数分钟）`,
+      );
+    }
+  }
+}
+
 function insertSchedule(
   db: DatabaseSync,
   profileId: string,
@@ -582,6 +620,8 @@ export function createSchedule(
   clientToken: string | null = null,
 ): ScheduleRow {
   validateScheduleInput(input);
+  // 服务层再收口一道 remind_offsets 边界（MCP 有 zod，quick 直接走工具层绕过了它）。
+  validateRemindOffsets(input.remindOffsets);
   ensureProfile(db, profileId);
   let lastError: unknown = null;
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -661,8 +701,10 @@ export function createScheduleIdempotent(
   }
 }
 
-export interface SchedulePatch extends Partial<Omit<ScheduleInput, "calendar">> {
+export interface SchedulePatch extends Partial<Omit<ScheduleInput, "calendar" | "remindOffsets">> {
   calendar?: "solar" | "lunar";
+  /** null 与 undefined 同义：未提供，沿用库里的历史值 */
+  remindOffsets?: number[] | null;
   status?: "active" | "done" | "cancelled";
 }
 
@@ -674,6 +716,15 @@ export function updateSchedule(
 ): ScheduleRow {
   const row = getSchedule(db, profileId, id);
   if (row === undefined) throw new Error(`日程不存在: ${id}`);
+  // 只有**本次显式传入**的 remind_offsets 才做完整边界校验（quick 绕过 MCP schema 的
+  // 路径主要走 create；update 的显式值同样要收口）。未传时沿用库里的历史值，
+  // 存量脏数据（越界/多余项）不能被无关 patch 卡死 —— validateScheduleInput 里的
+  // 「最多 5 个」长度检查保持不变，这里只补范围/整数/非空。
+  // `null` 与 `undefined` 一样按「未提供」处理（JSON 里很常见）：旧实现直接取
+  // `.length` 抛内部 TypeError，且下方 `??` 本来就把 null 当未提供 —— 校验必须先对齐。
+  if (patch.remindOffsets !== undefined && patch.remindOffsets !== null) {
+    validateRemindOffsets(patch.remindOffsets);
+  }
   // 归一只服务校验：写回时仍用 inheritedRecurrence 的原值（用户设的 interval 不能被
   // 一次无关的 patch 顺手改掉）。patch 显式传了 recurrence 的按显式值校验。
   const inheritedRecurrence = parseRecurrence(row.recurrence_json);
@@ -825,6 +876,16 @@ export function completeSchedule(
          WHERE schedule_id = ? AND status IN ('pending','notified')
            AND substr(occurrence_key, 1, ?) = ?`,
       ).run(id, eventPrefix.length + 1, `${eventPrefix}#`);
+    }
+    // 一次性待办：它只有这一次发生，完成该次就等于完成整条日程（与裸调 complete 对齐）。
+    // 此前这里只把 occurrence 置 done、日程仍停在 active：回执写着「已完成」，但该待办
+    // 永远留在 list 里、再无提醒，用户没有任何收尾入口（裸调 complete 才会转 done）。
+    // 循环日程不能这么做（只完成当前一次、系列继续），损坏的 recurrence_json 按循环处理。
+    if (row.recurrence_json === null && row.kind === "todo") {
+      db.prepare("UPDATE schedules SET status = 'done', updated_at = ? WHERE id = ?").run(
+        nowIso(),
+        id,
+      );
     }
   } else {
     db.prepare(
@@ -1130,16 +1191,58 @@ export interface UpcomingItem {
   escalation_json: string | null;
 }
 
+/**
+ * 接下来要发生的提醒（最多 limit 条**事件**）。
+ *
+ * 同一事件可能同时有多条 pending 行：多个提醒偏移（`#0..#4`）与 `:resend` / `#esc:N`
+ * 派生行。直接按行返回会让同一件事重复出现、并可能把 `snooze` 不支持的派生 key 交给
+ * 调用方（schema 却告诉 agent 这些 key 可直接用于 complete/snooze/skip）。因此这里按
+ * 事件前缀去重（与 `pendingOccurrences` / `agendaForDate` 同口径）：
+ * - 同一事件只保留一条，且**代表行必须是普通提醒行**（`<日期>T<时刻>#N`）：普通行已
+ *   notified、只剩 `:resend` / `#esc:N` pending 的事件不出现 —— 它的 key 对 snooze/skip
+ *   不可用，返回出去只会让 agent 照着 schema 调用、然后稳定失败；
+ * - 同一事件有多条 pending 普通行时取 due_at 最早的那条；
+ * - 排序仍按 due_at 升序，最后再 slice(limit)。
+ *
+ * 只剩派生行的事件并非「不可处理」：`complete` 接受任意 key，`schedule list` 的
+ * 「待办发生」也仍会给出该事件普通行的 key（pending/notified 均收录），可据此收尾。
+ *
+ * 派生行在 **SQL 层就排除**（不在内存里先取一大批再丢弃）：`LIMIT rowLimit` 是按行
+ * 截断的，若前 5×limit 行全是「只剩 :resend/#esc」的事件，后面的正常提醒会被整批挤出
+ * 结果集（limit=1/3 直接返回空）。排除后每个事件最多 5 条 pending 普通行，5×limit 行
+ * 至少覆盖 limit 个事件。末端 `isNormalReminderKey` 过滤保留作防御。
+ */
 export function upcoming(db: DatabaseSync, profileId: string, limit: number): UpcomingItem[] {
-  return db
+  const rowLimit = Math.max(limit * 5, 50);
+  const rows = db
     .prepare(
       `SELECT o.occurrence_key, o.event_at, o.due_at, s.id AS schedule_id, s.title, s.kind,
               s.note, s.workday_filter, s.resend_minutes, s.escalation_json
        FROM occurrences o JOIN schedules s ON s.id = o.schedule_id
        WHERE s.profile_id = ? AND s.status = 'active' AND o.status = 'pending' AND o.due_at >= ?
+         AND instr(o.occurrence_key, '#esc:') = 0
+         AND substr(o.occurrence_key, -length(':resend')) != ':resend'
        ORDER BY o.due_at LIMIT ?`,
     )
-    .all(profileId, nowIso(), limit) as unknown as UpcomingItem[];
+    .all(profileId, nowIso(), rowLimit) as unknown as UpcomingItem[];
+  const chosen = new Map<string, UpcomingItem>();
+  for (const row of rows) {
+    const prefix = eventPrefixOf(row.occurrence_key) ?? row.occurrence_key;
+    const eventKey = `${row.schedule_id}|${prefix}`;
+    const existing = chosen.get(eventKey);
+    if (existing === undefined) {
+      chosen.set(eventKey, row);
+      continue;
+    }
+    // 同事件多条：优先普通提醒行（派生行只可能来自 :resend / #esc:N）
+    if (!isNormalReminderKey(existing.occurrence_key) && isNormalReminderKey(row.occurrence_key)) {
+      chosen.set(eventKey, row);
+    }
+  }
+  return [...chosen.values()]
+    .filter((row) => isNormalReminderKey(row.occurrence_key))
+    .sort((a, b) => (a.due_at < b.due_at ? -1 : a.due_at > b.due_at ? 1 : 0))
+    .slice(0, limit);
 }
 
 /**

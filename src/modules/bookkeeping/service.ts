@@ -723,7 +723,10 @@ export function listExpenses(
     .get(...params) as { n: number };
   const rows = db
     .prepare(
-      `SELECT * FROM expenses WHERE ${where} ORDER BY spent_on DESC, created_at DESC LIMIT ? OFFSET ?`,
+      // `id` 兜底：spent_on + created_at（毫秒）都可能并列（导入/快速连续记账），
+      // 排序键不唯一时 OFFSET 分页不能保证「页间不重复不跳行」。与 /api/expenses 同口径。
+      `SELECT * FROM expenses WHERE ${where}
+       ORDER BY spent_on DESC, created_at DESC, id DESC LIMIT ? OFFSET ?`,
     )
     .all(...params, limit, offset) as unknown as ExpenseRow[];
   // 还有更多必须按「本次窗口末尾」判断：offset>0 时 total > rows.length 恒成立，

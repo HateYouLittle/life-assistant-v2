@@ -8,6 +8,9 @@ import {
   formatIcsUtc,
   verifyCalendarSignature,
 } from "../core/ics.js";
+import { logger, sanitizeLogText } from "../core/logger.js";
+import { incCounter } from "../core/metrics.js";
+import { envClientAddress } from "../core/ratelimit.js";
 import { TZ } from "../time.js";
 
 /**
@@ -38,6 +41,19 @@ interface CalendarRow {
 function errorStatus(config: ResolvedConfig, reason: string): 401 | 403 | 503 {
   if (config.webApiToken === undefined || config.webApiToken === "") return 503;
   return reason === CALENDAR_SIGNATURE_MISMATCH ? 403 : 401;
+}
+
+/**
+ * 失败原因 → 可安全落日志的文本。
+ *
+ * `verdict.reason` 大多来自 core/ics.ts 的固定文案，但「Profile 名不合法: <p>」会把
+ * query 里**解码后**的任意 p（ESC/换行/超长文本）带进来 —— 直接拼日志等于给未鉴权请求
+ * 一个伪造/拆分审计日志、终端转义的入口。含用户输入的原因只记固定文案，其余仍统一净化
+ * 并截断（防御性兜底）。
+ */
+function safeAuthFailureReason(reason: string): string {
+  if (reason.startsWith("Profile 名不合法")) return "Profile 名不合法";
+  return sanitizeLogText(reason, 200);
 }
 
 /** 组装 VCALENDAR 文本；行结束统一 CRLF，末尾留一个空行 */
@@ -111,8 +127,18 @@ export function createCalendarApp(config: ResolvedConfig, db: DatabaseSync): Hon
       sig: c.req.query("sig"),
     });
     if (!verdict.ok) {
+      const status = errorStatus(config, verdict.reason);
+      // 401/403 是鉴权失败（缺参/过期/篡改）：与 /api/*、/mcp 同口径留痕，公网暴露后
+      // 能看到签名探测；503 是「没配 WEB_API_TOKEN，订阅不可用」的配置问题，不算鉴权失败。
+      if (status !== 503) {
+        incCounter("auth_failed_total");
+        // 不记录原始 p（见 safeAuthFailureReason）：原因与来源都只保留净化后的文本。
+        logger.warn(
+          `鉴权失败: /calendar.ics from ${sanitizeLogText(envClientAddress(c.env, config.trustProxy), 100)}（${safeAuthFailureReason(verdict.reason)}）`,
+        );
+      }
       // 中文说明 + 明确状态码：客户端/用户能区分「链接过期该重取」与「链接被改过」
-      return c.json({ ok: false, error: verdict.reason }, errorStatus(config, verdict.reason));
+      return c.json({ ok: false, error: verdict.reason }, status);
     }
     if (profileId === undefined) {
       // 不可达（verify 已确认 p 存在且合法），仅为类型收窄保留

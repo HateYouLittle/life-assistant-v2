@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { Hono } from "hono";
+import { sanitizeLogText } from "../src/core/logger.js";
+import { counterValue, resetCountersForTests } from "../src/core/metrics.js";
 import { setDefaultLedgerId } from "../src/modules/bookkeeping/service.js";
 import { createQuickApp } from "../src/server/quick.js";
 import { todayIso } from "../src/time.js";
@@ -109,6 +111,148 @@ describe("/api/quick 鉴权", () => {
       });
       assert.equal(res.status, 400);
       assert.match(String((await body(res)).error), /Profile 名不合法/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("鉴权失败计入 auth_failed_total 并写 warn 日志（与 /api/*、/mcp 同口径）", async () => {
+    const env = buildEnv();
+    const logs: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => {
+      logs.push(args.map(String).join(" "));
+    };
+    try {
+      resetCountersForTests();
+      const res = await appFor(env).request("/api/quick/expenses", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ amount: 10 }),
+      });
+      assert.equal(res.status, 401);
+      assert.equal(counterValue("auth_failed_total"), 1, "失败鉴权必须计入 /metrics");
+      assert.ok(
+        logs.some((line) => line.includes("鉴权失败: /api/quick/expenses")),
+        `应写鉴权失败日志：${logs.join("\n")}`,
+      );
+      assert.ok(!logs.join("\n").includes(BESTIE), "日志不得包含 token 原文");
+    } finally {
+      console.error = original;
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("鉴权失败日志：path/来源净化后单行落日志（控制字符不进日志）", async () => {
+    const env = makeTestEnv({
+      WEB_API_TOKEN: MASTER,
+      PROFILE_TOKENS_JSON: JSON.stringify({ bestie: BESTIE, other: OTHER }),
+      TRUST_PROXY: "1",
+    });
+    const logs: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => {
+      logs.push(args.map(String).join(" "));
+    };
+    try {
+      const app = appFor(env);
+      // path 里编码的控制字符：quick 路由是精确匹配，解码后不匹配 → 404，不会进鉴权日志
+      const unmatched = await app.request("/api/quick/expenses%1B%0A", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      assert.equal(unmatched.status, 404);
+      // 真实 401 分支：TRUST_PROXY=1 下来源取自 X-Forwarded-For（可被伪造为任意文本）
+      const bindings: Record<string, unknown> = {
+        incoming: {
+          headers: { "x-forwarded-for": `1.2.3.4\u001b[31m\u000afake\u000d${"8".repeat(200)}` },
+          socket: { remoteAddress: "127.0.0.1" },
+        },
+      };
+      const res = await app.request(
+        "/api/quick/expenses",
+        { method: "POST", headers: { "Content-Type": "application/json" } },
+        bindings,
+      );
+      assert.equal(res.status, 401);
+      // path 形状的输入经公共 helper 净化（quick 命中路由的 path 本身是固定串，这里直接钉契约）
+      assert.equal(
+        sanitizeLogText("/api/quick/expenses\u001b[31m\nfake"),
+        "/api/quick/expenses[31mfake",
+      );
+    } finally {
+      console.error = original;
+      cleanupTestEnv(env);
+    }
+    const lines = logs.filter((line) => line.includes("鉴权失败: /api/quick/expenses"));
+    assert.equal(lines.length, 1, `只应有真实 401 的日志：${logs.join("\n")}`);
+    const line = lines[0] ?? "";
+    assert.ok(
+      !line.includes("\x1b") && !line.includes("\n") && !line.includes("\r"),
+      `控制字符必须被过滤：${JSON.stringify(line)}`,
+    );
+    assert.ok(line.includes("1.2.3.4[31mfake"), `可读部分应保留：${line}`);
+    assert.ok(!line.includes("8".repeat(120)), `超长来源必须被截断：${line.length}`);
+    assert.ok(line.length < 400, `日志长度受限：${line.length}`);
+  });
+
+  it("先鉴权后读 body：未鉴权 + 非法 JSON 返回 401（不是 400）", async () => {
+    const env = buildEnv();
+    try {
+      const app = appFor(env);
+      const noAuth = await app.request("/api/quick/expenses", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: '{"amount":',
+      });
+      assert.equal(noAuth.status, 401, "未鉴权请求不该先解析 body 再报 JSON 错误");
+
+      const authorized = await app.request("/api/quick/expenses", {
+        method: "POST",
+        headers: bearer(BESTIE),
+        body: '{"amount":',
+      });
+      assert.equal(authorized.status, 400, "鉴权通过后才轮到 JSON 解析错误");
+      assert.match(String((await body(authorized)).error), /合法 JSON/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("请求体超过 64 KiB → 413（未鉴权大 body 不会被缓冲/落库）", async () => {
+    const env = buildEnv();
+    try {
+      const app = appFor(env);
+      // 显式 Content-Length：生产路径（@hono/node-server）下 bodyLimit 会在读 body 之前
+      // 直接拒绝；这里也按同一条早退路径验证。
+      const huge = JSON.stringify({ amount: 10, note: "x".repeat(100 * 1024) });
+      const noAuth = await app.request("/api/quick/expenses", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": String(Buffer.byteLength(huge)),
+        },
+        body: huge,
+      });
+      assert.equal(noAuth.status, 413);
+      const payload = await body(noAuth);
+      assert.equal(payload.ok, false);
+      assert.match(String(payload.error), /请求体过大/);
+
+      const bigSchedule = JSON.stringify({ title: "x".repeat(100 * 1024) });
+      const authed = await app.request("/api/quick/schedules", {
+        method: "POST",
+        headers: {
+          ...bearer(BESTIE),
+          "Content-Length": String(Buffer.byteLength(bigSchedule)),
+        },
+        body: bigSchedule,
+      });
+      assert.equal(authed.status, 413, "两个 POST 路由都要有请求体上限");
+
+      const rows = env.db.prepare("SELECT COUNT(*) AS n FROM schedules").get() as { n: number };
+      assert.equal(rows.n, 0, "被 413 拒绝的请求不得落库");
     } finally {
       cleanupTestEnv(env);
     }

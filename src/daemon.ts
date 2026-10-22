@@ -6,10 +6,10 @@ import type { DatabaseSync } from "node:sqlite";
 import { getRequestListener } from "@hono/node-server";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import type { DateTime } from "luxon";
+import { DateTime } from "luxon";
 import cron from "node-cron";
 import { bindHost, loadConfig, parseProfileId, type ResolvedConfig, urlHost } from "./config.js";
-import { resolveIdentity } from "./core/auth.js";
+import { bearerToken, resolveIdentity, tokenFingerprint } from "./core/auth.js";
 import { openDatabase } from "./core/database.js";
 import {
   finishJobRun,
@@ -19,7 +19,7 @@ import {
   startJobRun,
 } from "./core/jobs.js";
 import { acquireDaemonLock } from "./core/lock.js";
-import { logger, setLogLevel } from "./core/logger.js";
+import { logger, maskSensitiveUrl, sanitizeLogText, setLogLevel } from "./core/logger.js";
 import { incCounter } from "./core/metrics.js";
 import { cancelPendingDrain, createServices, drainDue, waitForDrain } from "./core/notify.js";
 import {
@@ -28,7 +28,7 @@ import {
   seedQweatherUsage,
   setQweatherUsageSink,
 } from "./core/qweather.js";
-import { clientAddress, FixedWindowLimiter, rateLimitKey } from "./core/ratelimit.js";
+import { clientAddress, FixedWindowLimiter } from "./core/ratelimit.js";
 import {
   allJobs,
   allTools,
@@ -159,8 +159,9 @@ async function handleMcp(
   });
   if (identity === null) {
     incCounter("auth_failed_total");
+    // 来源在 TRUST_PROXY=1 时取自 X-Forwarded-For：净化+截断后再落单行日志。
     logger.warn(
-      `鉴权失败: /mcp from ${clientAddress(req, config.trustProxy)}（master/Profile token 均不匹配）`,
+      `鉴权失败: /mcp from ${sanitizeLogText(clientAddress(req, config.trustProxy), 100)}（master/Profile token 均不匹配）`,
     );
     res.writeHead(401, { "Content-Type": "application/json" });
     res.end(
@@ -197,8 +198,9 @@ async function handleMcp(
     // 否则拿到别人会话 id 的 Profile token 可以借道读写他人数据。
     if (identity.kind === "profile" && identity.profileId !== session.profileId) {
       incCounter("auth_failed_total");
+      // session id 来自请求头（理论上可控文本）：净化+截断后再拼日志。
       logger.warn(
-        `鉴权失败: /mcp 会话 ${headerSession} 属于 ${session.profileId}，但当前 token 绑定 ${identity.profileId}`,
+        `鉴权失败: /mcp 会话 ${sanitizeLogText(headerSession, 80)} 属于 ${session.profileId}，但当前 token 绑定 ${identity.profileId}`,
       );
       res.writeHead(403, { "Content-Type": "application/json" });
       res.end(
@@ -224,7 +226,10 @@ async function handleMcp(
     // Profile token 是强绑定：忽略（并记 debug）调用方自报的头，避免越权。
     profileId = identity.profileId;
     if (typeof rawProfile === "string" && rawProfile !== "" && rawProfile !== profileId) {
-      logger.debug(`Profile token 绑定 ${identity.profileId}，忽略 X-Hermes-Profile=${rawProfile}`);
+      // 自报头同样是请求可控文本：debug 日志也净化，避免控制字符/超长内容进日志。
+      logger.debug(
+        `Profile token 绑定 ${identity.profileId}，忽略 X-Hermes-Profile=${sanitizeLogText(rawProfile, 80)}`,
+      );
     }
   } else if (typeof rawProfile === "string" && rawProfile !== "") {
     try {
@@ -260,6 +265,20 @@ function isMcpPath(url: string): boolean {
   return url === "/mcp" || url.startsWith("/mcp?") || url.startsWith("/mcp/");
 }
 
+/**
+ * 探针豁免限流的路径判定：只认**精确路径**（允许带 query）。
+ *
+ * 为什么不能用前缀：`req.url` 是原始请求行，`/healthz/../api/status` 或 `%2e%2e`
+ * 形态在 Hono 侧会被归一化到真实业务路由，但前缀匹配仍会把它当成探针而整段跳过
+ * 限流（Round4 终审实测可无限打 `/api/*` 并放大鉴权失败日志）。`/healthzzz`
+ * 这类只多花一次 404 的旧观察也一并收紧。
+ */
+function isProbeExemptPath(url: string): boolean {
+  const queryAt = url.indexOf("?");
+  const pathname = queryAt < 0 ? url : url.slice(0, queryAt);
+  return pathname === "/healthz" || pathname === "/readyz";
+}
+
 /** HTTP 入口（/mcp 走 MCP，其余走状态页）；导出以便不启动调度器即可测试 */
 export function createHttpHandler(
   config: ResolvedConfig,
@@ -276,8 +295,13 @@ export function createHttpHandler(
   // 攻击者把域名解析到 127.0.0.1）会带着伪造 Host 直接读写个人数据。没有 Origin 的
   // 非浏览器客户端（Hermes/CLI/curl）照常放行。
   const guard = createRequestGuard(config);
-  // 每身份固定窗口限流：公网（经 Lucky 反代）暴露后的兜底，避免一个来源把服务打满。
-  // key 优先用 token 指纹（不同人互不牵连），无凭据时按来源 IP；/healthz 不参与限流。
+  // 固定窗口限流：公网（经 Lucky 反代）暴露后的兜底，避免一个来源把服务打满。
+  // 双层计数：
+  // - IP 桶对**每个**请求都计数：未鉴权 / 无效凭据 / 伪造 Bearer 都只能落在这里，
+  //   不能靠轮换 token 换桶（旧实现直接按任意 Bearer 指纹分桶，伪 token 即可绕过）；
+  // - 鉴权通过且带 Bearer 时才额外按 token 指纹计一层：同一人跨 IP 共用一个身份桶，
+  //   不同人互不牵连。
+  // /healthz 与 /readyz 不参与限流；/metrics 与业务接口同口径仍受限。
   const limiter = new FixedWindowLimiter(config.rateLimitPerMinute, 60_000);
   return (req, res) => {
     const verdict = guard(req);
@@ -289,16 +313,39 @@ export function createHttpHandler(
     const url = req.url ?? "/";
     // 探针豁免限流：/healthz 给 systemd/uptime，/readyz 给外部监控（高频轮询），
     // 被 429 会误判成「服务不健康」。/metrics 带凭据且较重，仍参与限流。
-    if (!url.startsWith("/healthz") && !url.startsWith("/readyz")) {
-      const decision = limiter.take(rateLimitKey(req, config.trustProxy));
-      if (!decision.allowed) {
+    // 只按**精确路径**豁免：`/healthz/../api/status` 这类原始 URL 会被 Hono/URL 归一化
+    // 成真实业务路由，用前缀匹配会让它整段跳过限流（公网可无限打 /api/*、刷鉴权失败日志）。
+    if (config.rateLimitPerMinute > 0 && !isProbeExemptPath(url)) {
+      const ipDecision = limiter.take(`ip:${clientAddress(req, config.trustProxy)}`);
+      const presented = bearerToken(req.headers.authorization);
+      // query token 不参与限流：它只用于状态页首次引导，且会进 URL/日志。
+      const identity =
+        presented === undefined
+          ? null
+          : resolveIdentity({
+              masterToken: config.webApiToken,
+              profileTokens: config.profileTokens,
+              authorization: req.headers.authorization,
+            });
+      const tokenDecision =
+        presented === undefined || identity === null
+          ? { allowed: true, retryAfterMs: 0 }
+          : limiter.take(`t:${tokenFingerprint(presented)}`);
+      const denied = !ipDecision.allowed
+        ? ipDecision
+        : !tokenDecision.allowed
+          ? tokenDecision
+          : null;
+      if (denied !== null) {
         incCounter("rate_limited_total");
+        // URL 里可能有 `?token=`（状态页引导）/`?sig=`（日历订阅）：日志前打码，
+        // 别让凭据因为「被限流」而原文落盘；来源同样可能来自 XFF，净化后落单行。
         logger.warn(
-          `请求过于频繁，已限流: ${req.method ?? ""} ${url} from ${clientAddress(req, config.trustProxy)}`,
+          `请求过于频繁，已限流: ${req.method ?? ""} ${maskSensitiveUrl(url)} from ${sanitizeLogText(clientAddress(req, config.trustProxy), 100)}`,
         );
         res.writeHead(429, {
           "Content-Type": "application/json; charset=utf-8",
-          "Retry-After": String(Math.max(1, Math.ceil(decision.retryAfterMs / 1000))),
+          "Retry-After": String(Math.max(1, Math.ceil(denied.retryAfterMs / 1000))),
         });
         res.end(JSON.stringify({ ok: false, error: "too many requests" }));
         return;
@@ -512,12 +559,21 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
       db,
       jobs: allJobs(),
       runJob: (module, def, trigger, scheduledFor) =>
-        runExclusive(`job:${def.name}`, () => def.handler(now()), {
-          module,
-          jobName: def.name,
-          trigger,
-          scheduledFor,
-        }),
+        // 补发时把该次「原本应触发」的时刻传给 handler（而不是 now()）：
+        // 晚报/摘要/周报等按时刻取业务日期的 job 才能补对那一天的班。
+        runExclusive(
+          `job:${def.name}`,
+          () => {
+            const at = DateTime.fromISO(scheduledFor, { zone: "utc" }).setZone(TZ);
+            return def.handler(at.isValid ? at : now());
+          },
+          {
+            module,
+            jobName: def.name,
+            trigger,
+            scheduledFor,
+          },
+        ),
     })
       .then((result) => {
         if (result.scheduled > 0) logger.info(`启动补发完成：补跑 ${result.scheduled} 个任务`);

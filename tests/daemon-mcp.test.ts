@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createServer, type Server } from "node:http";
+import { createServer, request, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { describe, it } from "node:test";
 import { createHttpHandler, sweepSessions } from "../src/daemon.js";
@@ -52,6 +52,21 @@ function rpc(port: number, body: unknown, sessionId?: string, withToken = true):
     method: "POST",
     headers: headers(sessionId, withToken),
     body: JSON.stringify(body),
+  });
+}
+
+/**
+ * 原样把请求行发出去：`fetch`/undici 会先把 `..` 归一化掉，测「探针豁免绕过」必须用
+ * 底层 http.request 才能复现 `/healthz/../api/status` 这种原始 URL。
+ */
+function rawGet(port: number, path: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const req = request({ host: "127.0.0.1", port, path, method: "GET" }, (res) => {
+      res.resume();
+      res.on("end", () => resolve(res.statusCode ?? 0));
+    });
+    req.on("error", reject);
+    req.end();
   });
 }
 
@@ -324,5 +339,219 @@ describe("/mcp 鉴权", () => {
     } finally {
       await harness.close();
     }
+  });
+
+  it("探针豁免只认精确路径：/healthz/../api/status 不能绕过限流", async () => {
+    // 本轮修复的回归：Hono 会把 `/healthz/../api/status` 归一化到真实路由，但旧实现用
+    // `req.url.startsWith("/healthz")` 判断豁免，于是整段跳过限流（公网可无限打业务接口）。
+    const harness = await startHarness({ RATE_LIMIT_PER_MINUTE: "2" });
+    try {
+      const bypass: number[] = [];
+      for (let i = 0; i < 4; i += 1) {
+        bypass.push(await rawGet(harness.port, "/healthz/../api/status"));
+      }
+      assert.deepEqual(
+        bypass,
+        [401, 401, 429, 429],
+        `归一化后命中 /api/status，必须受限流：${bypass.join(",")}`,
+      );
+      // 编码形态（`%2e%2e`）同样不能绕过（此时 IP 桶已耗尽）
+      const encoded = await rawGet(harness.port, "/healthz/%2e%2e/api/status");
+      assert.equal(encoded, 429, "编码后的 .. 也必须受限流");
+      // 精确探针路径仍然豁免（即使桶已耗尽）
+      const probes: number[] = [];
+      for (let i = 0; i < 5; i += 1) probes.push(await rawGet(harness.port, "/healthz"));
+      assert.deepEqual(
+        probes,
+        [200, 200, 200, 200, 200],
+        `系统探针不能被限流：${probes.join(",")}`,
+      );
+    } finally {
+      await harness.close();
+    }
+  });
+});
+
+describe("双层限流与鉴权失败日志", () => {
+  it("轮换任意 Bearer 不能换桶：伪 token 也受同一 IP 桶限流", async () => {
+    const harness = await startHarness({ RATE_LIMIT_PER_MINUTE: "2" });
+    try {
+      const statuses: number[] = [];
+      for (let i = 0; i < 3; i += 1) {
+        const res = await fetch(`http://127.0.0.1:${harness.port}/api/status`, {
+          headers: { Authorization: `Bearer fake-${i}-${"x".repeat(40)}` },
+        });
+        await res.text();
+        statuses.push(res.status);
+      }
+      assert.deepEqual(
+        statuses,
+        [401, 401, 429],
+        `每次换伪 token 也必须落进同一个 IP 桶：${statuses.join(",")}`,
+      );
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("鉴权失败日志：TRUST_PROXY=0 不采信 X-Forwarded-For，且过滤控制字符", async () => {
+    const harness = await startHarness();
+    const logs: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => {
+      logs.push(args.map(String).join(" "));
+    };
+    try {
+      const res = await fetch(`http://127.0.0.1:${harness.port}/api/%1B[2J%1B[31mRED`, {
+        headers: { "X-Forwarded-For": "203.0.113.9" },
+      });
+      assert.equal(res.status, 401);
+      await res.text();
+    } finally {
+      console.error = original;
+      await harness.close();
+    }
+    const line = logs.find((l) => l.includes("鉴权失败: /api/")) ?? "";
+    assert.ok(line !== "", `应记录鉴权失败日志：${logs.join("\n")}`);
+    assert.match(line, /from 127\.0\.0\.1/, `来源应是 socket 地址：${line}`);
+    assert.ok(!line.includes("203.0.113.9"), `TRUST_PROXY=0 时 XFF 不得进入日志：${line}`);
+    assert.ok(!line.includes("\x1b"), `控制字符不得原样进日志：${JSON.stringify(line)}`);
+  });
+
+  it("限流 429 日志对 query 凭据打码：token / sig 原文不得落盘", async () => {
+    const harness = await startHarness({ RATE_LIMIT_PER_MINUTE: "1" });
+    const logs: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => {
+      logs.push(args.map(String).join(" "));
+    };
+    const sig = "a".repeat(64);
+    try {
+      // 状态页支持 ?token= 引导：URL 里带 master token 时，被限流也不能把原文写进日志
+      const url = `http://127.0.0.1:${harness.port}/api/status?token=${TOKEN}&view=2`;
+      const first = await fetch(url);
+      assert.equal(first.status, 200);
+      await first.text();
+      const second = await fetch(url);
+      assert.equal(second.status, 429);
+      await second.text();
+      // 日历签名同理（IP 桶已耗尽，这一条也必然被限流）
+      const calendar = await fetch(
+        `http://127.0.0.1:${harness.port}/calendar.ics?p=default&exp=9999999999&sig=${sig}`,
+      );
+      assert.equal(calendar.status, 429);
+      await calendar.text();
+    } finally {
+      console.error = original;
+      await harness.close();
+    }
+    const line = logs.find((l) => l.includes("已限流") && l.includes("/api/status")) ?? "";
+    assert.ok(line !== "", `应记录限流日志：${logs.join("\n")}`);
+    assert.ok(line.includes("token=***"), `敏感 query 参数应打码：${line}`);
+    assert.ok(!line.includes(TOKEN), `日志不得含 token 原文：${line}`);
+    assert.ok(line.includes("view=2"), `非敏感参数应保留：${line}`);
+    assert.ok(!line.includes("\x1b") && !line.includes("\n"), "日志必须单行且无控制字符");
+
+    const calendarLine =
+      logs.find((l) => l.includes("已限流") && l.includes("/calendar.ics")) ?? "";
+    assert.ok(calendarLine.includes("sig=***"), `签名参数应打码：${calendarLine}`);
+    assert.ok(!calendarLine.includes(sig), `日志不得含 sig 原文：${calendarLine}`);
+  });
+
+  it("请求可控字段净化：X-Forwarded-For 来源被截断，日志单行无控制字符", async () => {
+    const harness = await startHarness({ TRUST_PROXY: "1", RATE_LIMIT_PER_MINUTE: "1" });
+    const logs: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => {
+      logs.push(args.map(String).join(" "));
+    };
+    const spoof = `203.0.113.9${"5".repeat(300)}`;
+    const send = () =>
+      fetch(`http://127.0.0.1:${harness.port}/mcp`, {
+        method: "POST",
+        headers: {
+          ...headers(undefined, false),
+          Authorization: "Bearer wrong",
+          "X-Forwarded-For": spoof,
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      });
+    try {
+      const first = await send();
+      assert.equal(first.status, 401);
+      await first.text();
+      const second = await send();
+      assert.equal(second.status, 429);
+      await second.text();
+    } finally {
+      console.error = original;
+      await harness.close();
+    }
+    const authLine = logs.find((l) => l.includes("鉴权失败: /mcp")) ?? "";
+    const limitLine = logs.find((l) => l.includes("已限流")) ?? "";
+    for (const line of [authLine, limitLine]) {
+      assert.ok(line !== "", `应写日志：${logs.join("\n")}`);
+      assert.ok(
+        !line.includes("\x1b") && !line.includes("\n") && !line.includes("\r"),
+        `日志必须单行且无控制字符：${JSON.stringify(line)}`,
+      );
+      assert.ok(line.includes("203.0.113.9"), `可读前缀应保留：${line}`);
+      assert.ok(!line.includes("5".repeat(120)), `超长来源必须被截断：${line.length}`);
+      assert.ok(line.length < 500, `日志长度受限：${line.length}`);
+    }
+  });
+
+  it("恶意 mcp-session-id 不进日志；会话不一致日志单行且保留真实会话 id", async () => {
+    const bestieToken = "b".repeat(64);
+    const defaultToken = "d".repeat(64);
+    const harness = await startHarness({
+      PROFILE_TOKENS_JSON: JSON.stringify({ bestie: bestieToken, default: defaultToken }),
+    });
+    const logs: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => {
+      logs.push(args.map(String).join(" "));
+    };
+    const evilSession = "E".repeat(1000);
+    let sessionId = "";
+    try {
+      const init = await fetch(`http://127.0.0.1:${harness.port}/mcp`, {
+        method: "POST",
+        headers: { ...headers(undefined, false), Authorization: `Bearer ${bestieToken}` },
+        body: JSON.stringify(INIT),
+      });
+      sessionId = await sessionOf(init);
+      // 超长（请求可控）session id：查不到会话 → 404，且不写鉴权日志
+      const unknown = await fetch(`http://127.0.0.1:${harness.port}/mcp`, {
+        method: "POST",
+        headers: { ...headers(evilSession, false), Authorization: `Bearer ${bestieToken}` },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }),
+      });
+      assert.equal(unknown.status, 404);
+      await unknown.text();
+      // 真实会话 + 另一个 Profile 的 token → 403，日志里的会话 id 被净化后仍可读
+      const cross = await fetch(`http://127.0.0.1:${harness.port}/mcp`, {
+        method: "POST",
+        headers: { ...headers(sessionId, false), Authorization: `Bearer ${defaultToken}` },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list" }),
+      });
+      assert.equal(cross.status, 403);
+      await cross.text();
+    } finally {
+      console.error = original;
+      await harness.close();
+    }
+    assert.ok(
+      !logs.some((line) => line.includes(evilSession)),
+      `未知/超长 session id 不得进日志：${logs.join("\n")}`,
+    );
+    const mismatch = logs.find((l) => l.includes("鉴权失败: /mcp 会话")) ?? "";
+    assert.ok(mismatch !== "", `会话不一致应写日志：${logs.join("\n")}`);
+    assert.ok(
+      !mismatch.includes("\x1b") && !mismatch.includes("\n") && !mismatch.includes("\r"),
+      `日志必须单行且无控制字符：${JSON.stringify(mismatch)}`,
+    );
+    assert.ok(mismatch.includes(sessionId), "真实会话 id 应保留可读");
+    assert.ok(mismatch.length < 400, `日志长度受限：${mismatch.length}`);
   });
 });

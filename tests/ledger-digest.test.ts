@@ -5,7 +5,7 @@ import { createServices } from "../src/core/notify.js";
 import { allJobs, type PublishInput, runtime, type ToolContext } from "../src/core/registry.js";
 import { bookkeepingExpenseTool, bookkeepingLedgerTool } from "../src/modules/bookkeeping/index.js";
 import { DIGEST_TOP_CATEGORIES, pushDailyDigests } from "../src/modules/bookkeeping/service.js";
-import { todayIso } from "../src/time.js";
+import { TZ, todayIso } from "../src/time.js";
 import { cleanupTestEnv, makeTestEnv, type Published, type TestEnv } from "./helpers.js";
 // 副作用 import：注册全部模块，才能从 allJobs() 里取到 ledger_digest 这个 job
 import "../src/modules/index.js";
@@ -327,6 +327,51 @@ describe("每日记账摘要 pushDailyDigests（降噪②）", () => {
       );
       assert.ok(job !== undefined);
       assert.equal((job.def.cron as () => string)(), "45 22 * * *");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("启动补发用原定触发日：01:00 补前一天 21:30 的摘要，且当晚正常触发不被吞", async () => {
+    const env = makeTestEnv();
+    try {
+      seedLedger(env);
+      // 21 日一条、22 日一条（22 日是「提前录入的未来日期」支出）
+      seedExpense(env, {
+        id: "d21",
+        ledgerId: "l1",
+        cents: 500,
+        category: "餐饮",
+        profile: "default",
+        date: "2026-10-21",
+      });
+      seedExpense(env, {
+        id: "d22",
+        ledgerId: "l1",
+        cents: 100,
+        category: "交通",
+        profile: "default",
+        date: "2026-10-22",
+      });
+      const job = allJobs().find(
+        (j) => j.module === "bookkeeping" && j.def.name === "ledger_digest",
+      );
+      assert.ok(job !== undefined);
+
+      // 补发：参考时刻 = 前一天 21:30（daemon 的补发入口会把原定触发时刻作为 at 传入）
+      await job.def.handler(DateTime.fromISO("2026-10-21T21:30:00", { zone: TZ }));
+      const catchup = env.published.filter((p) => p.input.kind === "bookkeeping.digest");
+      assert.equal(catchup.length, 1);
+      assert.equal(catchup[0]?.input.dedupeKey, "digest:default:2026-10-21");
+      assert.match(catchup[0]?.input.title ?? "", /今日记账 1 笔 · ¥5\.00/);
+
+      // 当晚 21:30 正常触发：按当前日期 → 新键 → 新增一条，不被前一天的补发吞掉
+      await job.def.handler(DateTime.fromISO("2026-10-22T21:30:00", { zone: TZ }));
+      const keys = env.published
+        .filter((p) => p.input.kind === "bookkeeping.digest")
+        .map((p) => p.input.dedupeKey)
+        .sort();
+      assert.deepEqual(keys, ["digest:default:2026-10-21", "digest:default:2026-10-22"]);
     } finally {
       cleanupTestEnv(env);
     }

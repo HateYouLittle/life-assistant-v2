@@ -256,3 +256,43 @@ export function hardenDataDir(dataDir: string, dbPath: string, backupDir: string
     chmodBestEffort(join(backupDir, name), 0o600, "备份文件");
   }
 }
+
+/**
+ * CLI 入口的安全基线：与 daemon 启动同口径。
+ *
+ * 为什么 CLI 也要做：`umask(0o077)` 之前只在 `startDaemon` 里设置，`db:backup` /
+ * `db:restore` / `import:v1` / `db:cleanup:preview` / `db:fingerprint` 由用户手工执行
+ * （尤其 `import:v1` 常在任何 daemon 启动之前首次建库），按默认 umask 022 会把库、
+ * 备份、迁移前快照落成 0644、目录 0755 —— 同机其它用户可读个人账目/日程/通知。
+ *
+ * 必须在任何 mkdir/open 之前调用（umask 只影响之后创建的 inode）；`hardenDataDir`
+ * 是 best-effort，不会抛错。daemon 路径仍由 `startDaemon` 自己调用同一组函数
+ * （它还要在取锁之后、开库之前做，顺序敏感）。
+ *
+ * 时机很重要（Round2 R2-2）：`harden` 会 chmod 已存在的目录/库/备份 —— 在校验完成前
+ * 或「不写盘」的路径上调用会产生用户可见的意外副作用。调用方应在确认「这次确实会写
+ * 数据目录」之后再让它 harden：
+ * - dry-run / 只读预览：只 `applySecureUmask()`（进程内 umask，不碰任何现有文件）；
+ * - 库还不存在（首次创建，或 DATA_DIR 写错）：传 `{ harden: false }`，避免 chmod 用户
+ *   写错指向的无关目录；创建出来的新文件仍受 umask 保护。
+ */
+export interface CliSecurityBaselineOptions {
+  /**
+   * 是否把已有数据目录/库/WAL/SHM/备份收紧到 0700/0600。默认 true；
+   * 库不存在或本次不写盘时传 false（umask 仍会生效）。
+   */
+  harden?: boolean;
+}
+
+export function applyCliSecurityBaseline(
+  config: {
+    dataDir: string;
+    dbPath: string;
+    backupDir: string;
+  },
+  opts: CliSecurityBaselineOptions = {},
+): void {
+  applySecureUmask();
+  if (opts.harden === false) return;
+  hardenDataDir(config.dataDir, config.dbPath, config.backupDir);
+}

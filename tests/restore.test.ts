@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
@@ -199,6 +199,86 @@ describe("db:restore", () => {
       assert.equal(result.dryRun, true);
       assert.equal(result.target, backupPath);
       assert.deepEqual(preRestoreFiles(env), [], "dry-run 不写留底");
+      assert.deepEqual(ledgerIds(env.config.dbPath), ["keep-me"]);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("锁文件内容损坏时拒绝恢复（无法确认 daemon 已停，不能当成未运行放行）", () => {
+    const env = makeTestEnv();
+    try {
+      seedLedger(env, "keep-me");
+      env.db.close();
+      runBackup(env.config);
+      // 空文件（创建后写到一半崩溃）与非法 JSON 都属于「存在但读不懂」
+      for (const garbage of ["{not-json", ""]) {
+        writeFileSync(daemonLockPath(env.dir), garbage);
+        assert.throws(
+          () => runRestore(env.config, { latest: true }),
+          /内容损坏|无法确认/,
+          "锁文件损坏时覆盖库可能丢掉在跑 daemon 尚未合并的 WAL 写入，必须拒绝",
+        );
+        assert.deepEqual(ledgerIds(env.config.dbPath), ["keep-me"], "拒绝时当前库不得改动");
+        assert.deepEqual(preRestoreFiles(env), [], "拒绝时不该生成留底");
+      }
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("前置校验失败时不改动权限元数据（库层：--file 不存在 / 锁损坏）", () => {
+    const env = makeTestEnv();
+    try {
+      seedLedger(env, "keep-me");
+      env.db.close();
+      const posix = process.platform !== "win32";
+      const mode = (path: string): number => statSync(path).mode & 0o777;
+      if (posix) {
+        chmodSync(env.dir, 0o755);
+        chmodSync(env.config.dbPath, 0o644);
+      }
+
+      assert.throws(
+        () => runRestore(env.config, { file: join(env.dir, "definitely-not-exist.db") }),
+        /备份文件不存在/,
+      );
+
+      runBackup(env.config);
+      writeFileSync(daemonLockPath(env.dir), "{not-json");
+      assert.throws(() => runRestore(env.config, { latest: true }), /内容损坏|无法确认/);
+
+      if (posix) {
+        assert.equal(mode(env.dir), 0o755, "失败路径不得 chmod 数据目录");
+        assert.equal(mode(env.config.dbPath), 0o644, "失败路径不得 chmod 库");
+      }
+      assert.deepEqual(preRestoreFiles(env), [], "失败路径不得生成留底");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("死 pid 的 stale 锁仍允许恢复（崩溃残留不应逼用户先手工 rm）", () => {
+    const env = makeTestEnv();
+    try {
+      seedLedger(env, "keep-me");
+      env.db.close();
+      const backupPath = runBackup(env.config);
+      // 起一个立刻退出的子进程，拿到一个「确实已经不存活」的 pid
+      const exited = spawnSync(process.execPath, ["-e", "process.exit(0)"], { encoding: "utf8" });
+      assert.equal(exited.status, 0, exited.stderr);
+      writeFileSync(
+        daemonLockPath(env.dir),
+        JSON.stringify({
+          pid: exited.pid,
+          startedAt: "2026-01-01T00:00:00.000Z",
+          hostname: "old-host",
+        }),
+      );
+
+      const result = runRestore(env.config, { latest: true });
+      assert.equal(result.target, backupPath);
+      assert.equal(result.schemaVersion, SCHEMA_VERSION);
       assert.deepEqual(ledgerIds(env.config.dbPath), ["keep-me"]);
     } finally {
       cleanupTestEnv(env);

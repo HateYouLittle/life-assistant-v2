@@ -6,6 +6,7 @@ import {
   NOTIFICATION_RETENTION_DAYS,
   retentionPreview,
 } from "./core/retention.js";
+import { applyCliSecurityBaseline } from "./core/security.js";
 import { OCCURRENCE_CLEANUP_DAYS, previewOccurrenceCleanup } from "./modules/schedule/service.js";
 
 /**
@@ -18,10 +19,13 @@ import { OCCURRENCE_CLEANUP_DAYS, previewOccurrenceCleanup } from "./modules/sch
 
 function main(): void {
   const config = loadConfig(process.env);
-  // 与 backup 同理：sqlite 会顺手建出空库，「预演成功、0 行」会掩盖 DATA_DIR 指错
+  // 与 backup 同理：sqlite 会顺手建出空库，「预演成功、0 行」会掩盖 DATA_DIR 指错。
+  // 校验必须放在安全基线之前：DATA_DIR 写错时不能先 chmod 那个无关目录（Round2 R2-2）。
   if (!existsSync(config.dbPath)) {
     throw new Error(`数据库不存在: ${config.dbPath}（检查 DATA_DIR 是否指向真实数据目录）`);
   }
+  // 安全基线必须在 openDatabase（可能做迁移前快照）和任何 mkdir 之前
+  applyCliSecurityBaseline(config);
   // 与 daemon 同参数：老库升级前先落一份 pre-v 快照，预演也不该在无备份的情况下改库
   const db = openDatabase(config.dbPath, { backupDir: config.backupDir });
   try {

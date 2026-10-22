@@ -220,11 +220,12 @@ describe("doctor --live", () => {
               cron: "*/20 * * * *",
               lastOkAgoHours: null,
             }),
-            // 带星期限制的 cron：无法反推触发时刻 → warn 而不是 fail
+            // 带「日」限制的 cron（每月 1 号）：无法反推触发时刻 → warn 而不是 fail
+            // （星期限制已支持反向求值，只有日/月非 * 的表达式才是不可求值的）
             jobItem({
               module: "holiday",
               name: "workday_watch",
-              cron: "0 7 * * 1-5",
+              cron: "0 9 1 * *",
               lastOkAgoHours: 1,
             }),
             // 阈值 = 24h × 2 = 48h，已 50 小时没成功

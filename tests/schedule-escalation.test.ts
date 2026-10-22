@@ -433,7 +433,10 @@ describe("schedule escalation：complete 单次（occurrence_key）收敛派生�
       assert.notEqual(done.isError, true);
       assert.equal(statusOf(env, id, `${EVENT}#0`), "done");
       assert.equal(statusOf(env, id, `${EVENT}#0#esc:1`), "done", "派生升级行应一并终结");
-      assert.equal(scheduleStatus(env, id), "active", "单次完成不终结整个日程");
+      // B3：截止型待办是一次性的（recurrence 为 null），只有这一次发生 —— 带 key 完成
+      // 就等于完成整条日程；「单次完成不终结系列」只适用于循环日程
+      //（见 schedule-actions「循环日程带 occurrence_key」用例）。
+      assert.equal(scheduleStatus(env, id), "done", "一次性待办完成后应转终态");
 
       await fire(env, `${D}T09:00+08:00`); // +1h 阶梯时刻
       await fire(env, `${D}T14:00+08:00`); // +6h 阶梯时刻

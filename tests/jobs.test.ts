@@ -131,11 +131,163 @@ describe("previousFireTime（cron 反向求值）", () => {
     );
   });
 
-  it("日/月/星期不是 * 时返回 null（宁可漏补，也不猜）", () => {
+  it("日/月不是 * 时返回 null（宁可漏补，也不猜）；星期已支持", () => {
     const at = atLocal("2026-10-20T09:00:00");
-    assert.equal(previousFireTime("0 7 * * 1-5", at), null, "带星期限制的表达式不支持");
     assert.equal(previousFireTime("0 7 1 * *", at), null, "带日限制的表达式不支持");
     assert.equal(previousFireTime("0 7 * 1 *", at), null, "带月限制的表达式不支持");
+  });
+
+  it("星期限制：单值/列表/范围/步长都支持；`7` 仅允许单值/列表（M3）", () => {
+    // 2026-10-20 是周二
+    assert.equal(
+      previousFireTime("0 7 * * 1-5", atLocal("2026-10-20T09:00:00"))
+        ?.setZone(TZ)
+        .toFormat("yyyy-LL-dd HH:mm"),
+      "2026-10-20 07:00",
+      "周二在工作日范围内 → 当天 07:00",
+    );
+    // 周一 09:00 启动：上一周的周日 20:00（周报的默认 cron）必须能算出来
+    const monday = atLocal("2026-10-19T09:00:00");
+    assert.equal(
+      previousFireTime("0 20 * * 0", monday)?.setZone(TZ).toFormat("yyyy-LL-dd HH:mm"),
+      "2026-10-18 20:00",
+      "0 = 周日",
+    );
+    assert.equal(
+      previousFireTime("0 20 * * 7", monday)?.setZone(TZ).toFormat("yyyy-LL-dd HH:mm"),
+      "2026-10-18 20:00",
+      "7 = 周日（node-cron 同义）",
+    );
+    // 单值逗号列表里的 7：node-cron 会把 7 替换成 0，5,7 = 周五+周日，与 0 同义
+    assert.equal(
+      previousFireTime("0 20 * * 5,7", monday)?.setZone(TZ).toFormat("yyyy-LL-dd HH:mm"),
+      "2026-10-18 20:00",
+      "5,7 = 周五 + 周日；周一之前最近的是周日",
+    );
+    // 2026-10-22 是周四；列表里只有周一/周三/周五 → 最近一次是周三
+    assert.equal(
+      previousFireTime("0 7 * * 1,3,5", atLocal("2026-10-22T09:00:00"))
+        ?.setZone(TZ)
+        .toFormat("yyyy-LL-dd HH:mm"),
+      "2026-10-21 07:00",
+    );
+    // 单项（非范围）的星期仍可正常反查
+    assert.equal(
+      previousFireTime("0 7 * * 6", atLocal("2026-10-22T09:00:00"))
+        ?.setZone(TZ)
+        .toFormat("yyyy-LL-dd HH:mm"),
+      "2026-10-17 07:00",
+      "周六",
+    );
+    // 不含 7 的步长：*/2 = 周日/周二/周四/周六；周四 09:00 → 当天 07:00
+    assert.equal(
+      previousFireTime("0 7 * * */2", atLocal("2026-10-22T09:00:00"))
+        ?.setZone(TZ)
+        .toFormat("yyyy-LL-dd HH:mm"),
+      "2026-10-22 07:00",
+      "0/2/4/6 映射为 周日/周二/周四/周六",
+    );
+    // 越界的星期字段仍返回 null（8 / 负数不在 0-7 内）
+    assert.equal(previousFireTime("0 7 * * 8", atLocal("2026-10-20T09:00:00")), null);
+  });
+
+  it("星期范围/步长含 7：node-cron 先做字符串 7→0 再展开，语义与数值区间不一致 → 保守放弃（M3）", () => {
+    const at = atLocal("2026-10-19T09:00:00");
+    // node-cron 的实际展开：6-7 → 0-6（每天）、0-7 → 0-0（仅周日）、1-7/2 → {0}（仅周日）
+    assert.equal(previousFireTime("0 20 * * 6-7", at), null, "6-7 在 node-cron 里是每天");
+    assert.equal(previousFireTime("0 20 * * 5-7", at), null, "5-7 在 node-cron 里是周一~周五+周日");
+    assert.equal(previousFireTime("0 20 * * 0-7", at), null, "0-7 在 node-cron 里只有周日");
+    assert.equal(previousFireTime("0 20 * * 1-7/2", at), null, "1-7/2 在 node-cron 里只有周日");
+    assert.equal(previousFireTime("0 20 * * */7", at), null, "步长含 7 同样保守放弃");
+    // 不含 7 的范围/步长不受影响（范围+步长按 node-cron 的取模语义，见下一个用例）
+    assert.notEqual(previousFireTime("0 20 * * 6", at), null);
+    assert.notEqual(previousFireTime("0 20 * * 0-6", at), null);
+    assert.notEqual(previousFireTime("0 20 * * 0-6/2", at), null);
+  });
+
+  it("范围+步长按 node-cron 的「展开后取模」语义：1-5/2 = 周二/周四（J1）", () => {
+    // 2026-10-21 是周三；node-cron 的 1-5/2 只保留偶数 → {2,4} = 周二/周四
+    assert.equal(
+      previousFireTime("0 20 * * 1-5/2", atLocal("2026-10-21T09:00:00"))
+        ?.setZone(TZ)
+        .toFormat("yyyy-LL-dd HH:mm"),
+      "2026-10-20 20:00",
+      "周三是 1-5/2 的空档，最近一次是周二 20:00",
+    );
+    // 2026-10-22 是周四：当天 20:00 之前 → 上一次是周四（同一候选由「含当前分钟」决定）
+    assert.equal(
+      previousFireTime("0 20 * * 1-5/2", atLocal("2026-10-22T21:00:00"))
+        ?.setZone(TZ)
+        .toFormat("yyyy-LL-dd HH:mm"),
+      "2026-10-22 20:00",
+    );
+    // 1-6/2 = {2,4,6} = 周二/周四/周六；0-6/2 = {0,2,4,6} = 周日/周二/周四/周六
+    assert.equal(
+      previousFireTime("0 20 * * 1-6/2", atLocal("2026-10-18T09:00:00"))
+        ?.setZone(TZ)
+        .toFormat("yyyy-LL-dd HH:mm"),
+      "2026-10-17 20:00",
+      "周六 20:00（-6 的 Sat）",
+    );
+    assert.equal(
+      previousFireTime("0 20 * * 0-6/2", atLocal("2026-10-19T09:00:00"))
+        ?.setZone(TZ)
+        .toFormat("yyyy-LL-dd HH:mm"),
+      "2026-10-18 20:00",
+      "周日 20:00（0 属于 0-6/2）",
+    );
+  });
+
+  it("分钟/小时字段的范围+步长同样取模：9-18/2 = 10/12/14/16/18（J1）", () => {
+    assert.equal(
+      previousFireTime("0 9-18/2 * * *", atLocal("2026-10-20T19:00:00"))
+        ?.setZone(TZ)
+        .toFormat("HH:mm"),
+      "18:00",
+      "9-18/2 含 18；不是「9、11、13…」",
+    );
+    assert.equal(
+      previousFireTime("0 9-18/2 * * *", atLocal("2026-10-20T17:30:00"))
+        ?.setZone(TZ)
+        .toFormat("HH:mm"),
+      "16:00",
+      "17 是奇数不在集合内",
+    );
+    // 范围端点 a>b 会交换（node-cron range-conversion）：18-9/2 与 9-18/2 等价
+    assert.equal(
+      previousFireTime("0 18-9/2 * * *", atLocal("2026-10-20T19:00:00"))
+        ?.setZone(TZ)
+        .toFormat("HH:mm"),
+      "18:00",
+    );
+    // 分钟：*/20 仍是 0/20/40；单值 a/n 只有 a%n===0 时才产生值
+    assert.equal(
+      previousFireTime("*/20 * * * *", atLocal("2026-10-20T08:45:00"))
+        ?.setZone(TZ)
+        .toFormat("HH:mm"),
+      "08:40",
+    );
+    assert.equal(
+      previousFireTime("5/5 * * * *", atLocal("2026-10-20T10:17:00"))
+        ?.setZone(TZ)
+        .toFormat("HH:mm"),
+      "10:05",
+      "5/5 = {5}（5%5===0）",
+    );
+    assert.equal(
+      previousFireTime("5/2 * * * *", atLocal("2026-10-20T10:17:00")),
+      null,
+      "5%2!==0 → 空集",
+    );
+    // 逗号 + 步长：node-cron 是对展开后的值逐个取模（1,5/2 → 空集 → 无触发）
+    assert.equal(previousFireTime("1,5/2 * * * *", atLocal("2026-10-20T10:17:00")), null);
+    // 2,4/2 逐个取模都命中 → {2,4}（步长不再生效于间距）
+    assert.equal(
+      previousFireTime("2,4/2 * * * *", atLocal("2026-10-20T10:17:00"))
+        ?.setZone(TZ)
+        .toFormat("HH:mm"),
+      "10:04",
+    );
   });
 
   it("非法/超出范围的字段返回 null 而不是抛错", () => {
@@ -397,9 +549,29 @@ describe("planCatchups（停机补发判定）", () => {
         "月报不在白名单（它有自己 6 个月回看的补发逻辑）",
       );
       assert.deepEqual(
-        planCatchups(env.db, [{ module: "weather", def: def("daily_brief", "0 7 * * 1-5") }], now),
+        planCatchups(env.db, [{ module: "weather", def: def("daily_brief", "0 9 1 * *") }], now),
         [],
-        "带星期限制的 cron 无法可靠反向求值，宁可漏补",
+        "日/月不是 * 的 cron 仍无法可靠反向求值，宁可漏补",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("周任务（dow≠*）现在可补发：周一启动能求出上周日 20:00", () => {
+    const env = makeTestEnv();
+    try {
+      const now = atLocal("2026-10-19T09:00:00"); // 周一 09:00
+      const plans = planCatchups(
+        env.db,
+        [{ module: "bookkeeping", def: def("weekly_report", "0 20 * * 0") }],
+        now,
+      );
+      assert.equal(plans.length, 1, "周报 cron 的星期字段已支持反向求值");
+      assert.equal(
+        plans[0]?.scheduledFor,
+        "2026-10-18T12:00:00.000Z",
+        "周日 20:00 +08:00 = 12:00Z（不是把「本周一」当原定时刻）",
       );
     } finally {
       cleanupTestEnv(env);

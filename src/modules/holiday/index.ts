@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { DateTime } from "luxon";
-import { DATE_RE, TZ, isDate, todayIso } from "../../time.js";
+import { DATE_RE, TZ, isDate, now, todayIso } from "../../time.js";
 import {
   dayType,
   ensureYears,
@@ -43,11 +43,17 @@ const ONE_DAY_MS = 86_400_000;
  * ① 今天补班；② 假期临近（首日距今 ≤ WORKDAY_REMIND_DAYS_BEFORE）；③ 假期最后一天。
  * 遍历口径与 runDailyBrief 一致（listProfiles）：即使无推送路由也保留通知，供 notify.pull 兜底。
  * 当天年份数据 unknown 时一律跳过、不猜；单个 Profile 失败只记日志，job 不抛。
+ *
+ * `at` = 这次运行对应的**参考时刻**：cron/手动调用传当前时刻（缺省 now()），启动补发
+ * 则传「错过的那次原定触发时刻」。`WORKDAY_WATCH_CRON` 可配到 18:00 之后，6 小时补发
+ * 窗口会跨午夜：若仍按 now() 取业务日，凌晨补发会把「今天/假期最后一天」整体错位一天
+ * （该推的提醒整条丢失，与 B1 是同一缺陷的另一半）。
  */
-export async function runWorkdayWatch(): Promise<void> {
+export async function runWorkdayWatch(at?: DateTime): Promise<void> {
   const rt = runtime();
   const db = rt.db;
-  const today = todayIso();
+  // 业务日锚定参考时刻：下面的「今天补班 / 假期临近 / 假期最后一天」与 dedupeKey 都用它。
+  const today = (at ?? now()).toISODate() ?? todayIso();
   const todayType = dayType(db, today);
   if (todayType === "unknown") return;
 
@@ -96,11 +102,24 @@ export async function runWorkdayWatch(): Promise<void> {
 
       const ending = periods.find((period) => period.end === today);
       if (ending !== undefined) {
-        const tomorrow = DateTime.fromISO(today, { zone: TZ }).plus({ days: 1 }).toISODate();
+        const tomorrowDate = DateTime.fromISO(today, { zone: TZ }).plus({ days: 1 }).toISODate();
+        const tomorrow = tomorrowDate ?? "";
+        // 次日不一定是上班日：公告假期最后一天可能是周五/周六（如 2019 清明/端午/中秋
+        // 都是周五单日假），次日是普通周末且没有调休补班行。硬编码「恢复正常上班」会
+        // 说错事实；按 dayType 分支，unknown 时保持中性、绝不猜。
+        const tomorrowType = tomorrowDate === null ? "unknown" : dayType(db, tomorrowDate);
+        const note =
+          tomorrowType === "workday" || tomorrowType === "weekday"
+            ? `明天（${tomorrow}）恢复正常上班`
+            : tomorrowType === "weekend"
+              ? `明天（${tomorrow}）是周末，正常休息`
+              : tomorrowType === "holiday"
+                ? `明天（${tomorrow}）仍是假期`
+                : `明天（${tomorrow}）假期结束`;
         await publishProfile(db, rt.config, profileId, {
           kind: "holiday.lastday",
           title: `${ending.name}假期最后一天`,
-          blocks: { notes: [`明天（${tomorrow}）恢复正常上班`] },
+          blocks: { notes: [note] },
           dedupeKey: `holiday:lastday:${today}`,
         });
       }
@@ -144,9 +163,31 @@ export async function holidayTool(
   if (view === "month") {
     const month = typeof args.month === "string" ? args.month : "";
     if (!/^\d{4}-\d{2}$/.test(month)) return fail("month 需为 YYYY-MM 格式");
+    // 格式合法不等于月份合法：`2026-13` 会被 LIKE '2026-13-%' 静默查成「无安排」。
+    const monthNumber = Number(month.slice(5, 7));
+    if (monthNumber < 1 || monthNumber > 12) {
+      return fail(`月份不合法: ${month}（需为 01-12）`);
+    }
+    // 先按行查，再看年份元数据 —— 与 dayType 的「行命中优先」口径一致：
+    // 跨年日期（如 2027 年度文件里的 2026-12-31）会让「日期所属年份」未就绪但行已存在，
+    // 此时 is_workday 给出确定答案，month 也必须照常展示，不能反过来报「未知」。
+    // 只有「该月没有任何行」且年份未 ready 时才是真正未知。
+    const year = Number(month.slice(0, 4));
     const rows = db
       .prepare("SELECT date, day_type, name FROM cn_holiday_days WHERE date LIKE ? ORDER BY date")
       .all(`${month}-%`) as { date: string; day_type: string; name: string }[];
+    if (rows.length === 0) {
+      const meta = db.prepare("SELECT status FROM cn_holiday_years WHERE year = ?").get(year) as
+        | { status: string }
+        | undefined;
+      if (meta?.status !== "ready") {
+        return okJson({
+          月份: month,
+          安排: `未知（${year} 年节假日数据未就绪，不猜测）`,
+          数据覆盖年份: holidayYearsReady(db),
+        });
+      }
+    }
     const table = rows.map((r) => [r.date, r.day_type === "holiday" ? "休息" : "上班", r.name]);
     return okJson({
       月份: month,

@@ -12,6 +12,7 @@ import {
   getSchedule,
   materializeSchedule,
   updateSchedule,
+  validateRemindOffsets,
 } from "../src/modules/schedule/service.js";
 import { scheduleTool } from "../src/modules/schedule/index.js";
 import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
@@ -1625,6 +1626,226 @@ describe("schedule 农历缺月日脏行的回显", () => {
       // 该行零 occurrence，upcoming 不该出现它
       const upText = tool(env, { action: "upcoming", limit: 10 }).content[0]?.text ?? "{}";
       assert.doesNotMatch(upText, /农历缺月日无occurrence/, `死行不该进 upcoming：${upText}`);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
+describe("schedule upcoming：只剩派生行的事件不出现（M1）", () => {
+  /** 解析 schedule 工具的 JSON 回执 */
+  function payloadOf<T>(result: { content: { text: string }[] }): T {
+    return JSON.parse(result.content[0]?.text ?? "{}") as T;
+  }
+
+  it("普通行已 notified、只剩 :resend pending：upcoming 不返回该事件，list 的待办发生仍可 complete", async () => {
+    const env = makeTestEnv();
+    try {
+      const created = createSchedule(env.db, "default", {
+        title: "只剩派生行",
+        note: null,
+        kind: "todo",
+        calendar: "solar",
+        startDate: todayIso(),
+        lunarMonth: null,
+        lunarDay: null,
+        leapPolicy: "follow",
+        lunarClamp: true,
+        time: "09:00",
+        allDay: false,
+        recurrence: null,
+        remindOffsets: [0],
+        resendMinutes: 60,
+        escalation: null,
+        workdayFilter: "any",
+      });
+      // 触发 #0（通知已发）→ 派生 :resend（事件 +60 分钟，仍在未来）
+      await fireDue(env.db, envServices(env), DateTime.fromISO(`${todayIso()}T09:00:30+08:00`));
+      const derived = occurrenceRows(env, created.id).filter((row) =>
+        String(row.occurrence_key).endsWith(":resend"),
+      );
+      assert.equal(derived.length, 1, "构造前提：存在一条 pending 的 :resend 派生行");
+      assert.equal(derived[0]?.status, "pending");
+
+      const up = payloadOf<{ 即将到来: { id: string; occurrence_key: string }[] }>(
+        tool(env, { action: "upcoming", limit: 10 }),
+      );
+      assert.ok(
+        !up.即将到来.some((item) => item.id === created.id),
+        "只剩派生行 pending 的事件不应出现在 upcoming（它的 key 对 snooze/skip 不可用）",
+      );
+
+      // list 的「待办发生」仍收录该事件普通行（notified 也算未完成），可直接 complete 收尾
+      const listed = payloadOf<{
+        日程: { id: string; 待办发生?: { occurrence_key: string }[] }[];
+      }>(tool(env, { action: "list" }));
+      const row = listed.日程.find((item) => item.id === created.id);
+      assert.ok(row?.待办发生 !== undefined && row.待办发生.length > 0);
+      const key = row.待办发生[0]?.occurrence_key as string;
+      assert.match(key, /#\d+$/, "list 给出的必须是普通提醒行 key");
+      const done = tool(env, { action: "complete", id: created.id, occurrence_key: key }) as {
+        isError?: boolean;
+      };
+      assert.notEqual(done.isError, true, "list 的待办发生 key 必须能用于 complete");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("正常多偏移事件仍只出一条，且返回的 key 可直接 snooze", () => {
+    const env = makeTestEnv();
+    try {
+      const created = createSchedule(env.db, "default", {
+        title: "多偏移待办",
+        note: null,
+        kind: "todo",
+        calendar: "solar",
+        startDate: day(1),
+        lunarMonth: null,
+        lunarDay: null,
+        leapPolicy: "follow",
+        lunarClamp: true,
+        time: "09:00",
+        allDay: false,
+        recurrence: null,
+        remindOffsets: [-60, 0],
+        resendMinutes: 0,
+        escalation: null,
+        workdayFilter: "any",
+      });
+      const up = payloadOf<{ 即将到来: { id: string; occurrence_key: string }[] }>(
+        tool(env, { action: "upcoming", limit: 10 }),
+      );
+      const mine = up.即将到来.filter((item) => item.id === created.id);
+      assert.equal(mine.length, 1, "同一事件的多条提醒行只能出现一条");
+      assert.equal(mine[0]?.occurrence_key, `${day(1)}T09:00#0`);
+      const snoozed = tool(env, {
+        action: "snooze",
+        id: created.id,
+        occurrence_key: mine[0]?.occurrence_key,
+        minutes: 10,
+      }) as { isError?: boolean; content: { text: string }[] };
+      assert.notEqual(snoozed.isError, true, snoozed.content[0]?.text);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
+describe("schedule update：remind_offsets 为 null 视为未提供（M6）", () => {
+  it("null 不报错且沿用旧值；非数组仍给出中文错误而不是内部 TypeError", () => {
+    const env = makeTestEnv();
+    try {
+      const created = createSchedule(env.db, "default", {
+        title: "null 偏移",
+        note: null,
+        kind: "todo",
+        calendar: "solar",
+        startDate: day(2),
+        lunarMonth: null,
+        lunarDay: null,
+        leapPolicy: "follow",
+        lunarClamp: true,
+        time: "09:00",
+        allDay: false,
+        recurrence: null,
+        remindOffsets: [-30, 0],
+        resendMinutes: 0,
+        escalation: null,
+        workdayFilter: "any",
+      });
+      // 服务层直接传 null：与 undefined 同义（沿用历史值），不得抛 TypeError
+      const updated = updateSchedule(env.db, "default", created.id, { remindOffsets: null });
+      assert.equal(updated.remind_offsets_json, "[-30,0]");
+      // MCP 工具路径（handler 直调，绕过 zod）同样按「未提供」处理
+      const viaTool = scheduleTool(
+        { action: "update", id: created.id, title: "改标题", remind_offsets: null },
+        {
+          profileId: "default",
+          db: env.db,
+          config: env.config,
+          services: {
+            publishProfile: async () => ({ id: "x", deduped: false }),
+            publishGlobal: async () => ({ materialized: 0 }),
+          },
+        },
+      ) as { isError?: boolean };
+      assert.notEqual(viaTool.isError, true);
+      assert.equal(getSchedule(env.db, "default", created.id)?.remind_offsets_json, "[-30,0]");
+
+      // 非数组直接调校验函数：中文报错，不能是 "Cannot read properties of null"
+      assert.throws(() => validateRemindOffsets(null as never), /remind_offsets/);
+      assert.throws(() => validateRemindOffsets("0" as never), /remind_offsets/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
+describe("schedule upcoming：派生行在 SQL 层排除，不再挤掉正常提醒（J2）", () => {
+  function payloadOf<T>(result: { content: { text: string }[] }): T {
+    return JSON.parse(result.content[0]?.text ?? "{}") as T;
+  }
+
+  function addOnceAt(env: TestEnv, title: string, time: string, resendMinutes: number): string {
+    return createSchedule(env.db, "default", {
+      title,
+      note: null,
+      kind: "todo",
+      calendar: "solar",
+      startDate: "2026-10-22",
+      lunarMonth: null,
+      lunarDay: null,
+      leapPolicy: "follow",
+      lunarClamp: true,
+      time,
+      allDay: false,
+      recurrence: null,
+      remindOffsets: [0],
+      resendMinutes,
+      escalation: null,
+      workdayFilter: "any",
+    }).id;
+  }
+
+  it("50 条「只剩 :resend」的待办 + 3 条普通提醒：limit=1/3 仍返回普通提醒", async (t) => {
+    t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-22T09:05:00+08:00") });
+    const env = makeTestEnv();
+    try {
+      // 50 个 09:00 到点、10 分钟后重发的待办：触发后各只剩一条 09:10 的 :resend
+      for (let i = 0; i < 50; i += 1) addOnceAt(env, `派生${i}`, "09:00", 10);
+      // fireDue 单轮上限 50 行，分两轮确保全部触发
+      await fireDue(env.db, envServices(env), DateTime.fromISO("2026-10-22T09:00:30+08:00"));
+      await fireDue(env.db, envServices(env), DateTime.fromISO("2026-10-22T09:00:31+08:00"));
+
+      // 3 条排在派生行之后的普通提醒（09:20/09:30/09:40）
+      const normalTitles = ["目标1", "目标2", "目标3"];
+      addOnceAt(env, normalTitles[0] as string, "09:20", 0);
+      addOnceAt(env, normalTitles[1] as string, "09:30", 0);
+      addOnceAt(env, normalTitles[2] as string, "09:40", 0);
+
+      // 修复前：前 50 行全是 :resend → 去重后又被过滤 → limit=1/3 返回 0 条
+      const one = payloadOf<{ 即将到来: { 标题: string }[] }>(
+        tool(env, { action: "upcoming", limit: 1 }),
+      );
+      assert.deepEqual(
+        one.即将到来.map((item) => item.标题),
+        ["目标1"],
+        "派生-only 事件不得把普通提醒挤出 LIMIT 窗口",
+      );
+
+      const three = payloadOf<{ 即将到来: { 标题: string }[] }>(
+        tool(env, { action: "upcoming", limit: 3 }),
+      );
+      assert.deepEqual(
+        three.即将到来.map((item) => item.标题),
+        normalTitles,
+        "3 条普通提醒按 due_at 升序全部可见",
+      );
+      assert.ok(
+        !three.即将到来.some((item) => item.标题.startsWith("派生")),
+        "只剩派生行的待办仍不出现在 upcoming",
+      );
     } finally {
       cleanupTestEnv(env);
     }

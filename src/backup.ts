@@ -1,5 +1,7 @@
+import { existsSync } from "node:fs";
 import { loadConfig } from "./config.js";
 import { runBackup } from "./core/backup.js";
+import { applyCliSecurityBaseline } from "./core/security.js";
 
 /**
  * CLI 入口，同时保留 `runBackup(config, nowMs?)` 的向后兼容导出。
@@ -20,6 +22,10 @@ function main(): void {
   // 用户才能判断是配置错、库损坏，还是留下了垃圾备份
   try {
     const config = loadConfig(env);
+    // 安全基线必须在建备份目录/写备份文件之前：CLI 没有 daemon 启动时那套 umask 收紧。
+    // 库不存在时 runBackup 会抛 MissingDatabaseError 且不建目录 —— 这种「DATA_DIR 可能写错」
+    // 的情况下只收紧 umask，不对无关目录做 chmod（Round2 R2-2）。
+    applyCliSecurityBaseline(config, { harden: existsSync(config.dbPath) });
     const target = runBackup(config);
     console.log(target);
   } catch (e) {

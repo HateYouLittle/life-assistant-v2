@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, it, type TestContext } from "node:test";
+import { DateTime } from "luxon";
 import { importYear } from "../src/core/holiday.js";
 import { allJobs } from "../src/core/registry.js";
 import { runWorkdayWatch } from "../src/modules/holiday/index.js";
+import { TZ } from "../src/time.js";
 import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
 
 /**
@@ -214,6 +216,64 @@ describe("holiday workday_watch：③ 假期最后一天", () => {
       cleanupTestEnv(env);
     }
   });
+
+  it("次日是普通周末：说「周末正常休息」，不硬编码「恢复正常上班」（B4）", async (t) => {
+    // 2026 元旦 1/1~1/3 放假（1/3 周六），1/4 周日是普通周末、没有调休补班行。
+    // 真实数据里同形态：2019 清明/端午/中秋都是周五单日假，次日为普通周末。
+    freeze(t, "2026-01-03");
+    const env = makeTestEnv();
+    try {
+      importYear(
+        env.db,
+        {
+          year: 2026,
+          days: [
+            { name: "元旦", date: "2026-01-01", isOffDay: true },
+            { name: "元旦", date: "2026-01-02", isOffDay: true },
+            { name: "元旦", date: "2026-01-03", isOffDay: true },
+          ],
+        },
+        "test",
+      );
+      await runWorkdayWatch();
+      const rows = notifications(env);
+      const lastday = rows.find((row) => row.kind === "holiday.lastday");
+      assert.ok(lastday !== undefined, "最后一天仍要提醒，只是文案不能撒谎");
+      assert.match(lastday.body_md, /明天（2026-01-04）是周末，正常休息/);
+      assert.doesNotMatch(lastday.body_md, /恢复上班/, "次日是周末时不能告诉用户「恢复正常上班」");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("次日数据未就绪：中性「假期结束」，不猜上班与否", async (t) => {
+    freeze(t, "2026-01-03");
+    const env = makeTestEnv();
+    try {
+      importYear(
+        env.db,
+        {
+          year: 2026,
+          days: [
+            { name: "元旦", date: "2026-01-01", isOffDay: true },
+            { name: "元旦", date: "2026-01-02", isOffDay: true },
+            { name: "元旦", date: "2026-01-03", isOffDay: true },
+          ],
+        },
+        "test",
+      );
+      // today 的 dayType 优先按行命中（仍是 holiday），但次日 2026-01-04 不在表里、
+      // 年份 metadata 又被降级 → dayType = unknown，文案不得猜「上班/休息」。
+      env.db.prepare("UPDATE cn_holiday_years SET status = 'pending' WHERE year = 2026").run();
+      await runWorkdayWatch();
+      const lastday = notifications(env).find((row) => row.kind === "holiday.lastday");
+      assert.ok(lastday !== undefined);
+      assert.match(lastday.body_md, /明天（2026-01-04）假期结束/);
+      assert.doesNotMatch(lastday.body_md, /上班|休息日/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
 });
 
 describe("holiday workday_watch：不推场景", () => {
@@ -333,6 +393,39 @@ describe("holiday workday_watch：补班提示的单一来源", () => {
       await runWorkdayWatch();
       await runWorkdayWatch();
       assert.equal(notifications(env).filter((r) => r.kind === "holiday.workday").length, 1);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
+describe("holiday workday_watch：启动补发按原定触发日（M2）", () => {
+  it("晚 cron 跨午夜补发：at=前一天 22:00 仍推假期最后一天（按 now 则整条丢失）", async (t) => {
+    t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-01-04T01:00:00+08:00") });
+    const env = makeTestEnv();
+    try {
+      importYear(
+        env.db,
+        {
+          year: 2026,
+          days: [
+            { name: "元旦", date: "2026-01-01", isOffDay: true },
+            { name: "元旦", date: "2026-01-02", isOffDay: true },
+            { name: "元旦", date: "2026-01-03", isOffDay: true },
+          ],
+        },
+        "test",
+      );
+      // 不传 at（当前时钟 01-04 凌晨）：01-04 不是补班、假期也已结束 → 零通知
+      await runWorkdayWatch();
+      assert.equal(notifications(env).length, 0, "按 now() 算会整条丢失");
+
+      // daemon 补发会传原定触发时刻（本地 01-03 22:00）→ 业务日 01-03 = 假期最后一天
+      await runWorkdayWatch(DateTime.fromISO("2026-01-03T22:00:00", { zone: TZ }));
+      const rows = notifications(env);
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0]?.kind, "holiday.lastday");
+      assert.equal(rows[0]?.dedupe_key, "holiday:lastday:2026-01-03");
     } finally {
       cleanupTestEnv(env);
     }

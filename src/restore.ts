@@ -4,9 +4,10 @@ import { DatabaseSync } from "node:sqlite";
 import { DateTime } from "luxon";
 import { loadConfig, type ResolvedConfig } from "./config.js";
 import { backupStatus, verifyDatabaseFile } from "./core/backup.js";
-import { SCHEMA_VERSION } from "./core/database.js";
-import { daemonLockPath, isDaemonLocked } from "./core/lock.js";
+import { SCHEMA_VERSION, uniqueFilePath } from "./core/database.js";
+import { daemonLockPath, inspectDaemonLock } from "./core/lock.js";
 import { logger } from "./core/logger.js";
+import { applySecureUmask, hardenDataDir } from "./core/security.js";
 import { TZ } from "./time.js";
 
 /**
@@ -17,7 +18,8 @@ import { TZ } from "./time.js";
  *    在「备份其实打不开」时把好库覆盖成坏库；
  * 2. schema 版本高于程序支持时拒绝 —— 旧程序打开新库会拒绝启动，恢复过去等于自锁；
  * 3. 检测 daemon 是否在跑（daemon.lock 的 pid 存活）—— 运行中替换数据库文件会丢
- *    WAL 里未合并的写入，也可能让在跑进程继续写旧 inode；
+ *    WAL 里未合并的写入，也可能让在跑进程继续写旧 inode。锁文件存在但内容损坏/不可读时
+ *    无法排除「daemon 正在跑」，必须按「不安全」拒绝（见 inspectDaemonLock）；
  * 4. 覆盖前把当前库留底成 `backups/life-assistant-pre-restore-<时间戳>.db`，
  *    并把 WAL checkpoint 回主文件，保证留底完整。
  */
@@ -78,17 +80,6 @@ function checkpointCurrentDatabase(dbPath: string): void {
   }
 }
 
-/** 留底文件名去重：同一秒内执行两次恢复时不覆盖上一份现场 */
-function uniquePath(path: string): string {
-  if (!existsSync(path)) return path;
-  const base = path.endsWith(".db") ? path.slice(0, -3) : path;
-  for (let i = 1; i < 100; i += 1) {
-    const candidate = `${base}-${i}.db`;
-    if (!existsSync(candidate)) return candidate;
-  }
-  throw new Error(`无法生成不冲突的恢复前备份名: ${path}`);
-}
-
 function restoreFileMode(path: string): void {
   try {
     chmodSync(path, 0o600);
@@ -133,35 +124,57 @@ export function runRestore(config: ResolvedConfig, opts: RestoreOptions = {}): R
     return { target, schemaVersion, preRestoreBackup: null, dryRun: true };
   }
 
-  // 4. 真正恢复时 daemon 必须停服：运行中替换主库会丢 WAL 写入、并让在跑进程写旧 inode
-  const lockState = isDaemonLocked(config.dataDir);
-  if (lockState.locked) {
+  // 4. 真正恢复时 daemon 必须停服：运行中替换主库会丢 WAL 写入、并让在跑进程写旧 inode。
+  //    锁文件存在但内容损坏/不可读时**无法确认** daemon 是否在跑，必须拒绝（不能当成
+  //    「没有实例」放行 —— 那样会在活 daemon 上覆盖库并删 -wal，丢掉未合并写入）。
+  const lockPath = daemonLockPath(config.dataDir);
+  const lockState = inspectDaemonLock(config.dataDir);
+  if (lockState.state === "locked") {
     throw new Error(
-      `检测到 daemon 正在运行（pid=${lockState.pid ?? "未知"}，锁文件 ${daemonLockPath(config.dataDir)}），拒绝恢复。` +
+      `检测到 daemon 正在运行（pid=${lockState.pid}，锁文件 ${lockPath}），拒绝恢复。` +
         "请先停止 daemon（如 systemctl stop life-assistant）再重试",
     );
   }
+  if (lockState.state === "corrupt") {
+    throw new Error(
+      `daemon 锁文件存在但内容损坏/不可读（${lockPath}），无法确认 daemon 是否已停止，拒绝恢复。` +
+        "请先确认 daemon 已停止（如 systemctl stop life-assistant），再手工删除该锁文件后重试",
+    );
+  }
 
-  // 5. 当前库留底：先 checkpoint 再复制主文件（WAL 里的写入才算完整现场）
+  // 5. 前置校验全部通过、确认要写盘：此刻才收紧已有数据目录/库/WAL/SHM/备份的权限。
+  //    失败路径（--file 不存在、备份坏/版本过高、daemon 在跑、锁损坏、dry-run）不碰权限
+  //    元数据 —— 这些是常见的误操作，不该顺带改动目录/文件 mode（R3-2）。
+  //    先确认两个「目录」路径确实是目录（或尚不存在）：`--data-dir` 手滑指向普通文件时，
+  //    hardenDataDir 的 chmod 会先把那个文件 600→700，再在 mkdir 时以 ENOTDIR 失败。
+  for (const dir of [config.dataDir, config.backupDir]) {
+    const stat = statSync(dir, { throwIfNoEntry: false });
+    if (stat !== undefined && !stat.isDirectory()) {
+      throw new Error(`数据目录不是目录: ${dir}（检查 DATA_DIR / --data-dir 是否指错）`);
+    }
+  }
+  hardenDataDir(config.dataDir, config.dbPath, config.backupDir);
+
+  // 6. 当前库留底：先 checkpoint 再复制主文件（WAL 里的写入才算完整现场）
   mkdirSync(config.backupDir, { recursive: true });
   const stamp = DateTime.fromMillis(nowMs, { zone: TZ }).toFormat("yyyyMMdd-HHmmss");
   let preRestoreBackup: string | null = null;
   if (existsSync(config.dbPath)) {
     checkpointCurrentDatabase(config.dbPath);
-    preRestoreBackup = uniquePath(
+    preRestoreBackup = uniqueFilePath(
       resolve(config.backupDir, `life-assistant-pre-restore-${stamp}.db`),
     );
     copyFileSync(config.dbPath, preRestoreBackup);
     restoreFileMode(preRestoreBackup);
   }
 
-  // 6. 覆盖主库并清掉 WAL/SHM：旧 WAL 属于旧库，留着会让新库读到不属于它的页
+  // 7. 覆盖主库并清掉 WAL/SHM：旧 WAL 属于旧库，留着会让新库读到不属于它的页
   copyFileSync(target, config.dbPath);
   for (const suffix of ["-wal", "-shm"]) {
     rmSync(`${config.dbPath}${suffix}`, { force: true });
   }
 
-  // 7. 重新打开校验（quick_check + schema），失败就用留底回滚
+  // 8. 重新打开校验（quick_check + schema），失败就用留底回滚
   try {
     const restoredVersion = verifyDatabaseFile(config.dbPath);
     if (restoredVersion !== schemaVersion) {
@@ -244,6 +257,10 @@ function main(): void {
   const env = { ...process.env };
   if (args.dataDir !== undefined) env.DATA_DIR = args.dataDir;
   const config = loadConfig(env);
+  // 这里只收紧进程 umask（不碰任何现有文件）：恢复过程会新建备份目录/留底文件，需要 0600/0700。
+  // 对**已有**数据目录/库/备份的 chmod 推迟到 runRestore 内、前置校验全部通过之后（R3-2）：
+  // 目标备份不存在/校验失败/daemon 在跑/锁损坏/dry-run 等失败路径不得改动任何权限元数据。
+  applySecureUmask();
 
   const result = runRestore(config, {
     file: args.file,

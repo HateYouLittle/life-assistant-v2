@@ -546,6 +546,121 @@ describe("holiday 工具：日期校验", () => {
   });
 });
 
+describe("holiday 工具：view=month 的数据覆盖口径（B5）", () => {
+  function toolCtx(env: ReturnType<typeof makeTestEnv>) {
+    return {
+      profileId: "default",
+      db: env.db,
+      config: env.config,
+      services: {
+        publishProfile: async () => ({ id: "x", deduped: false }),
+        publishGlobal: async () => ({ materialized: 0 }),
+      },
+    };
+  }
+
+  it("年份数据未就绪：返回「未知」而不是「当月无安排」，且不猜测", async () => {
+    const env = makeTestEnv();
+    try {
+      const ctx = toolCtx(env);
+      const result = await holidayTool({ view: "month", month: "2026-10" }, ctx);
+      assert.equal(result.isError, undefined);
+      const payload = JSON.parse(result.content[0]?.text ?? "{}") as {
+        安排: string;
+        数据覆盖年份: number[];
+      };
+      assert.match(payload.安排, /未知（2026 年节假日数据未就绪/);
+      assert.doesNotMatch(
+        payload.安排,
+        /当月无法定节假日/,
+        "数据未就绪时不能给出「当月没有安排」的确定性结论",
+      );
+      assert.deepEqual(payload.数据覆盖年份, []);
+
+      // 只导入了相邻年份（2025）时，2026 仍是未知
+      importYear(
+        env.db,
+        { year: 2025, days: [{ name: "元旦", date: "2025-01-01", isOffDay: true }] },
+        "test",
+      );
+      const again = JSON.parse(
+        (await holidayTool({ view: "month", month: "2026-10" }, ctx)).content[0]?.text ?? "{}",
+      ) as { 安排: string };
+      assert.match(again.安排, /未知（2026 年节假日数据未就绪/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("年份就绪：有安排时给表格，没有安排的月份才说「当月无法定节假日/调休安排」", async () => {
+    const env = makeTestEnv();
+    try {
+      importYear(env.db, payload2026(), "test");
+      const ctx = toolCtx(env);
+      const october = JSON.parse(
+        (await holidayTool({ view: "month", month: "2026-10" }, ctx)).content[0]?.text ?? "{}",
+      ) as { 安排: { rows: string[][] } };
+      assert.ok(Array.isArray(october.安排.rows), "10 月有国庆安排，应返回表格");
+      assert.ok(october.安排.rows.some((row) => row[0] === "2026-10-01"));
+
+      // 3 月没有任何法定节假日/调休
+      const march = JSON.parse(
+        (await holidayTool({ view: "month", month: "2026-03" }, ctx)).content[0]?.text ?? "{}",
+      ) as { 安排: string };
+      assert.equal(march.安排, "当月无法定节假日/调休安排");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("月份越界（2026-13）直接报错，不静默返回「无安排」", async () => {
+    const env = makeTestEnv();
+    try {
+      importYear(env.db, payload2026(), "test");
+      const result = await holidayTool({ view: "month", month: "2026-13" }, toolCtx(env));
+      assert.equal(result.isError, true);
+      assert.match(result.content[0]?.text ?? "", /月份不合法/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("跨年日期：年份元数据未就绪但月内已有行时照常出表（M4，与 dayType 口径一致）", async () => {
+    const env = makeTestEnv();
+    try {
+      // 真实数据同形态：2027 年度文件里带一条跨年行的 2026-12-31（2023.json 含 2022-12-31）。
+      // 2026 年元数据没有 ready，但该行已入库 —— is_workday 对 2026-12-31 给出确定答案，
+      // month 不能反过来报「未知」。
+      importYear(
+        env.db,
+        {
+          year: 2027,
+          days: [
+            { name: "元旦", date: "2026-12-31", isOffDay: true },
+            { name: "元旦", date: "2027-01-01", isOffDay: true },
+          ],
+        },
+        "test",
+      );
+      const ctx = toolCtx(env);
+
+      const december = JSON.parse(
+        (await holidayTool({ view: "month", month: "2026-12" }, ctx)).content[0]?.text ?? "{}",
+      ) as { 安排: { rows: string[][] } };
+      assert.ok(Array.isArray(december.安排.rows), "有行的月份必须出表，不能因年份未 ready 报未知");
+      assert.deepEqual(december.安排.rows[0]?.slice(0, 2), ["2026-12-31", "休息"]);
+
+      // 同一年份里没有任何行的月份：仍按「年份未就绪」返回未知
+      const november = JSON.parse(
+        (await holidayTool({ view: "month", month: "2026-11" }, ctx)).content[0]?.text ?? "{}",
+      ) as { 安排: string };
+      assert.match(november.安排, /未知（2026 年节假日数据未就绪/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
 describe("holiday 工具：view=next 的进行中标志", () => {
   function toolCtx(env: ReturnType<typeof makeTestEnv>) {
     return {

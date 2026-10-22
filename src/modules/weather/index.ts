@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { DateTime } from "luxon";
-import { TZ, isDate, localToInstant, todayIso } from "../../time.js";
+import { TZ, isDate, localToInstant, now, todayIso } from "../../time.js";
 import {
   errorMessage,
   fail,
@@ -133,6 +133,9 @@ interface ResolvedPlace {
  * 按 Profile 解析当前位置（简报与预警巡检共用，口径与工具查询一致）：
  * 窗口内 travel_plan > 已保存 location > DEFAULT_CITY。
  * travel_plan 直接复用保存的 lat/lon/cityId，**绝不**重新请求 GeoAPI。
+ *
+ * `today` = 判断出行计划是否生效所用的本地日历日：工具/预警巡检传当前日；简报按
+ * `at` 锚定的业务日传（启动补发跨午夜时，「原定触发那天」的行程才是对的）。
  */
 async function resolveProfilePlace(
   db: DatabaseSync,
@@ -141,9 +144,10 @@ async function resolveProfilePlace(
   defaultCity: string,
   profileId: string,
   cityCache: Map<string, LocationInfo>,
+  today: string = todayIso(),
 ): Promise<ResolvedPlace> {
   const state = readTravelPlan(db, profileId);
-  if (state.kind === "plan" && isTravelActive(state.plan, todayIso())) {
+  if (state.kind === "plan" && isTravelActive(state.plan, today)) {
     const plan = state.plan;
     return {
       loc: { city: plan.city, cityId: plan.cityId, lat: plan.lat, lon: plan.lon },
@@ -542,8 +546,15 @@ function appendAgendaNotes(
   }
 }
 
-/** 每日简报：确定性组装，无 LLM；单边数据失败用另一侧，全部失败不发送 */
-export async function runDailyBrief(): Promise<void> {
+/**
+ * 每日简报：确定性组装，无 LLM；单边数据失败用另一侧，全部失败不发送。
+ *
+ * `at` = 这次运行对应的**参考时刻**：cron/手动调用传当前时刻（缺省 now()），
+ * 启动补发则传「错过的那次原定触发时刻」。`DAILY_BRIEF_CRON` 是可配置项，配到 18:00
+ * 之后时 6 小时补发窗口会跨午夜：若仍按 now() 取业务日，凌晨补发会写入「新一天」的
+ * dedupeKey 并吞掉当晚的正常简报（与 B1 是同一缺陷的另一半）。
+ */
+export async function runDailyBrief(at?: DateTime): Promise<void> {
   const rt = runtime();
   if (rt.config.qweatherHost === undefined || rt.config.qweatherKey === undefined) {
     logger.warn("每日简报跳过：未配置 QWeather");
@@ -556,7 +567,8 @@ export async function runDailyBrief(): Promise<void> {
   // 永远收不到简报。
   const profiles = listProfiles(rt.db);
   const cityCache = new Map<string, LocationInfo>();
-  const calendarToday = todayIso();
+  // 业务日锚定参考时刻：简报里的「今日日程/下个假期/假期提示」与 dedupeKey 都用它。
+  const calendarToday = (at ?? now()).toISODate() ?? todayIso();
   // 预警缓存与巡检间隔对齐（P1-9）：早报与巡检共用同一缓存键，若这里按固定 10 分钟
   // 写缓存，会让随后那一轮巡检重新出网；用同一个 TTL 口径让两次自动查询共享结果。
   const alertTtlMs = alertCacheTtlMs(rt.config);
@@ -572,6 +584,7 @@ export async function runDailyBrief(): Promise<void> {
         rt.config.defaultCity,
         profileId,
         cityCache,
+        calendarToday,
       );
       const loc = place.loc;
       const [cur, fc, air, alertList] = await Promise.all([
@@ -853,7 +866,16 @@ async function eveningBriefBlocks(
   let weatherText = "未知";
   try {
     // 与早报同一解析口径：窗口内出行计划 > 已保存位置 > DEFAULT_CITY（含出行模式标注）。
-    const place = await resolveProfilePlace(db, host, key, defaultCity, profileId, cityCache);
+    // 出行计划的生效判定同样用本次运行的业务日（补发跨午夜时按原定触发那天算）。
+    const place = await resolveProfilePlace(
+      db,
+      host,
+      key,
+      defaultCity,
+      profileId,
+      cityCache,
+      today,
+    );
     travel = place.travel;
     const list = await forecast(db, host, key, place.loc, 7);
     // 「第 2 天」按日期匹配而不是按下标取：上游跨零点/少返回一天时下标会错位；
@@ -910,8 +932,13 @@ async function eveningBriefBlocks(
  * 覆盖所有已知 Profile（与早报同口径：无推送路由也保留，供 notify.pull 兜底）。
  * 同一天重复触发由 dedupeKey 去重；expiresAt 设为明天中午 12:00 ——
  * 晚报是睡前信息，静默时段结束后也不再补投一条已经过期的「明日安排」。
+ *
+ * `at` = 这次运行对应的**参考时刻**：cron/手动调用传当前时刻（缺省 now()），
+ * 启动补发则传「错过的那次原定触发时刻」。跨午夜补发（21:00 的触发在次日 00:00–03:00
+ * 才补跑）若仍按 now() 推导「今天/明天」，内容与 dedupeKey 都会漂移一天：补发算出的
+ * `evening:<profile>:<后天>` 会与当天 21:00 的正常运行同键，把当晚的晚报静默吞掉。
  */
-export async function runEveningBrief(): Promise<void> {
+export async function runEveningBrief(at?: DateTime): Promise<void> {
   const rt = runtime();
   if (rt.config.qweatherHost === undefined || rt.config.qweatherKey === undefined) {
     logger.warn("晚报跳过：未配置 QWeather");
@@ -919,7 +946,7 @@ export async function runEveningBrief(): Promise<void> {
   }
   const host = rt.config.qweatherHost;
   const key = rt.config.qweatherKey;
-  const today = todayIso();
+  const today = (at ?? now()).toISODate() ?? todayIso();
   const tomorrow = addDays(today, 1);
   if (tomorrow === null) {
     logger.warn(`晚报跳过：无法从 ${today} 推算明天`);

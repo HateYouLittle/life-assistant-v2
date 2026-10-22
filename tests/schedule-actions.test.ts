@@ -353,6 +353,29 @@ describe("schedule complete：循环日程必须显式指定单次或结束系�
     }
   });
 
+  it("一次性待办带 occurrence_key complete：日程也转 done，不再留在 active 列表（B3）", (t) => {
+    freeze(t, `${D}T17:00:00+08:00`);
+    const env = makeTestEnv();
+    try {
+      const id = addOnce(env, { date: "2026-10-21" });
+      const key = normalKeys(env, id)[0] as string;
+      const done = payload<{ 已完成: { 状态: string } }>(
+        tool(env, { action: "complete", id, occurrence_key: key }),
+      );
+      assert.equal(done.已完成.状态, "done", "回执状态必须与「已完成」一致");
+      assert.equal(scheduleStatus(env, id), "done", "一次性待办只有这一次发生，完成后应终态");
+      assert.equal(occurrenceStatus(env, id, key), "done");
+
+      const listed = payload<{ 日程: { id: string }[] }>(tool(env, { action: "list" }));
+      assert.ok(
+        listed.日程.every((row) => row.id !== id),
+        "完成后不得再出现在默认（active）列表里",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("list 的「待办发生」给出可直接用于 complete 的 occurrence_key", (t) => {
     freeze(t, `${D}T17:00:00+08:00`);
     const env = makeTestEnv();
@@ -494,7 +517,9 @@ describe("schedule snooze：推迟单次提醒", () => {
     freeze(t, `${D}T17:00:00+08:00`);
     const env = makeTestEnv();
     try {
-      const id = addOnce(env, { time: "18:00" });
+      // 用循环日程：一次性待办带 key 完成后整条日程会转 done（B3），这里要验的是
+      // 「已完成的 occurrence 不能 snooze」，因此需要一个完成后仍 active 的系列。
+      const id = addDaily(env);
       const key = `${D}T18:00#0`;
       tool(env, { action: "complete", id, occurrence_key: key });
       const done = tool(env, { action: "snooze", id, occurrence_key: key, minutes: 10 }) as {
@@ -627,6 +652,47 @@ describe("schedule skip：跳过单次发生，系列继续", () => {
       ).已跳过.剩余未完成;
       assert.ok(remaining > 1);
       assert.equal(scheduleStatus(env, id), "active");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
+describe("schedule upcoming：同一事件只出现一条（B7）", () => {
+  it("多偏移日程只列一条，且返回的 occurrence_key 可直接 snooze", (t) => {
+    freeze(t, `${D}T10:00:00+08:00`);
+    const env = makeTestEnv();
+    try {
+      // 未来事件 + 两个偏移（提前 60 分钟、正点）：两条 pending 行属于同一个事件
+      const id = addOnce(env, {
+        date: "2026-10-21",
+        time: "09:00",
+        remind_offsets: [-60, 0],
+      });
+      const up = payload<{
+        即将到来: { id: string; occurrence_key: string }[];
+      }>(tool(env, { action: "upcoming", limit: 10 }));
+      const mine = up.即将到来.filter((item) => item.id === id);
+      assert.equal(mine.length, 1, "同一事件的两个提醒偏移只能出现一条");
+      assert.equal(
+        mine[0]?.occurrence_key,
+        "2026-10-21T09:00#0",
+        "优先普通提醒行（最早那次的偏移）",
+      );
+
+      // 该 key 对 complete/snooze/skip 三个动作都可用（派生 key 会被 snooze 拒绝）
+      const snoozed = tool(env, {
+        action: "snooze",
+        id,
+        occurrence_key: mine[0]?.occurrence_key,
+        minutes: 10,
+      }) as { isError?: boolean; content: { text: string }[] };
+      assert.notEqual(snoozed.isError, true, text(snoozed));
+      assert.equal(
+        occurrenceStatus(env, id, mine[0]?.occurrence_key as string),
+        "pending",
+        "snooze 后该普通提醒行仍在 pending，等新的 due_at 触发",
+      );
     } finally {
       cleanupTestEnv(env);
     }

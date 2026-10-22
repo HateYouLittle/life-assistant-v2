@@ -109,6 +109,35 @@ describe("listExpenses：offset 分页（service）", () => {
       cleanupTestEnv(env);
     }
   });
+
+  it("spent_on 与 created_at 完全相同的行：id 兜底保证翻页不重不漏（B6）", () => {
+    const env = makeTestEnv();
+    try {
+      const ledger = createLedger(env.db, "并列键");
+      // 导入/快速连续记账完全可能产生 spent_on + created_at（毫秒）都相同的行
+      const insert = env.db.prepare(
+        `INSERT INTO expenses (id, ledger_id, amount_cents, category, spent_on, created_by_profile, created_at)
+         VALUES (?, ?, ?, '餐饮', '2026-09-15', 'default', '2026-09-15T12:00:00.000Z')`,
+      );
+      for (let i = 1; i <= 7; i += 1) {
+        insert.run(`tie-${String(i).padStart(2, "0")}`, ledger.id, 100 + i);
+      }
+
+      const seen: string[] = [];
+      for (let offset = 0; offset < 7; offset += 3) {
+        seen.push(...idsOf(listExpenses(env.db, ledger.id, { limit: 3, offset })));
+      }
+      assert.equal(seen.length, 7, "三页恰好覆盖全部");
+      assert.equal(new Set(seen).size, 7, "翻页不重复");
+      assert.deepEqual(
+        seen,
+        ["tie-07", "tie-06", "tie-05", "tie-04", "tie-03", "tie-02", "tie-01"],
+        "并列键按 id DESC 兜底，顺序稳定",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
 });
 
 describe("expense {action:'list'}：offset 与分页回执", () => {

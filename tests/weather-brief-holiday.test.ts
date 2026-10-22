@@ -182,3 +182,82 @@ describe("每日简报：下个假期倒计时", () => {
     }
   });
 });
+
+describe("每日简报：启动补发按原定触发日（M2）", () => {
+  /** 该 Profile 所有每日简报通知的 dedupeKey（按建库顺序） */
+  function briefKeys(env: TestEnv): string[] {
+    return (
+      env.db
+        .prepare(
+          "SELECT dedupe_key FROM notifications WHERE kind = 'weather.brief' ORDER BY created_at, id",
+        )
+        .all() as { dedupe_key: string | null }[]
+    ).map((row) => row.dedupe_key ?? "");
+  }
+
+  function briefBodies(env: TestEnv): string[] {
+    return (
+      env.db
+        .prepare(
+          "SELECT body_md FROM notifications WHERE kind = 'weather.brief' ORDER BY created_at, id",
+        )
+        .all() as { body_md: string }[]
+    ).map((row) => row.body_md);
+  }
+
+  it("晚 cron 跨午夜补发：dedupeKey 与内容都锚定原定触发日，不吞当晚正常简报", async (t) => {
+    t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-22T01:00:00+08:00") });
+    const env = makeTestEnv(ENV);
+    try {
+      // 种一个 10-23 开始的假期：用来验证「下个假期」倒计时也是按业务日算的
+      importYear(
+        env.db,
+        { year: 2026, days: [{ name: "测试节", date: "2026-10-23", isOffDay: true }] },
+        "test",
+      );
+
+      // 模拟「21 日 22:00 的 daily_brief 错过、22 日 01:00 启动补发」：
+      // daemon 会把原定触发时刻（本地 10-21 22:00）作为 at 传给 handler。
+      const catchupAt = DateTime.fromISO("2026-10-21T22:00:00", { zone: TZ });
+      await withMockFetch(handlerFor, () => runDailyBrief(catchupAt));
+      assert.deepEqual(
+        briefKeys(env),
+        ["brief:default:北京:2026-10-21"],
+        "补发必须写原定触发日的键",
+      );
+      assert.match(
+        briefBodies(env)[0] ?? "",
+        /10-23 起，还有 2 天/,
+        "「下个假期」倒计时也按原定触发日（10-21）算，而不是凌晨补跑的 10-22",
+      );
+
+      // 当晚 22:00 正常触发：业务日 10-22 → 新键 → 新增一条，不被凌晨那次吞掉
+      t.mock.timers.setTime(Date.parse("2026-10-22T22:00:00+08:00"));
+      await withMockFetch(handlerFor, () =>
+        runDailyBrief(DateTime.fromISO("2026-10-22T22:00:00", { zone: TZ })),
+      );
+      assert.deepEqual(
+        briefKeys(env).sort(),
+        ["brief:default:北京:2026-10-21", "brief:default:北京:2026-10-22"],
+        "跨午夜补发与当晚正常触发必须是两个不同的 dedupe 键",
+      );
+      assert.match(briefBodies(env)[1] ?? "", /10-23 起，还有 1 天/, "当晚简报按 10-22 算倒计时");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("同一天重复触发仍只发一条（at 与缺省 now() 共用同一业务日）", async () => {
+    const env = makeTestEnv(ENV);
+    try {
+      const at = DateTime.fromISO("2026-10-21T22:00:00", { zone: TZ });
+      await withMockFetch(handlerFor, async () => {
+        await runDailyBrief(at);
+        await runDailyBrief(at);
+      });
+      assert.equal(briefKeys(env).length, 1);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});

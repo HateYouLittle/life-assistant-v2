@@ -1323,3 +1323,106 @@ describe("import:v1", () => {
     }
   });
 });
+
+describe("import:v1 提醒偏移收口（M6）", () => {
+  it("越界/非整数的 minutesBefore：trunc + clamp 到 ±43200，并在 warning 里留痕", () => {
+    const env = makeTestEnv();
+    try {
+      const oldPath = `${env.dir}/old-reminders.db`;
+      const old = new DatabaseSync(oldPath);
+      old.exec(OLD_DDL);
+      const ts = "2026-01-01T00:00:00.000Z";
+      old.prepare("INSERT INTO profiles VALUES ('p1', ?)").run(ts);
+      old
+        .prepare(
+          `INSERT INTO schedules (profile_id, id, type, title, status, calendar, date, lunar_month, lunar_day,
+             leap_month_policy, time, all_day, timezone, recurrence_json, reminders_json, reminder_interval_minutes,
+             enabled, version, created_at, updated_at)
+           VALUES ('p1', 's-clamp', 'todo', '越界偏移', 'active', 'solar', '2026-01-01', NULL, NULL,
+             NULL, '09:00', 0, 'Asia/Shanghai', '{"frequency":"daily","interval":1}', ?, NULL, 1, 1, ?, ?)`,
+        )
+        .run(
+          JSON.stringify([
+            { minutesBefore: 999999 },
+            { minutesBefore: 1.5 },
+            { minutesBefore: 30 },
+          ]),
+          ts,
+          ts,
+        );
+      old.close();
+
+      const report = runImport(env.db, oldPath);
+      assert.equal(report.schedules, 1);
+      const row = env.db
+        .prepare("SELECT remind_offsets_json FROM schedules WHERE id = 's-clamp'")
+        .get() as { remind_offsets_json: string };
+      assert.equal(
+        row.remind_offsets_json,
+        "[-43200,-1,-30]",
+        "999999 收敛到 30 天上限、1.5 截断为 1、合法值原样保留",
+      );
+      const warnings = report.scheduleWarnings.filter(
+        (w) => w.includes("越界偏移") && w.includes("已收敛"),
+      );
+      assert.equal(
+        warnings.length,
+        2,
+        `每个被调整的偏移都要写一条 warning：${JSON.stringify(report.scheduleWarnings)}`,
+      );
+      assert.ok(warnings.some((w) => w.includes("999999")));
+      assert.ok(warnings.some((w) => w.includes("1.5")));
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
+describe("import:v1 提醒过多时截断留痕（J4）", () => {
+  it("6 条提醒：只保留前 5 条，并在 scheduleWarnings 里说明丢弃了 1 条", () => {
+    const env = makeTestEnv();
+    try {
+      const oldPath = `${env.dir}/old-too-many-reminders.db`;
+      const old = new DatabaseSync(oldPath);
+      old.exec(OLD_DDL);
+      const ts = "2026-01-01T00:00:00.000Z";
+      old.prepare("INSERT INTO profiles VALUES ('p1', ?)").run(ts);
+      old
+        .prepare(
+          `INSERT INTO schedules (profile_id, id, type, title, status, calendar, date, lunar_month, lunar_day,
+             leap_month_policy, time, all_day, timezone, recurrence_json, reminders_json, reminder_interval_minutes,
+             enabled, version, created_at, updated_at)
+           VALUES ('p1', 's-many', 'todo', '提醒太多', 'active', 'solar', '2026-01-01', NULL, NULL,
+             NULL, '09:00', 0, 'Asia/Shanghai', '{"frequency":"daily","interval":1}', ?, NULL, 1, 1, ?, ?)`,
+        )
+        .run(
+          JSON.stringify([10, 20, 30, 40, 50, 60].map((minutesBefore) => ({ minutesBefore }))),
+          ts,
+          ts,
+        );
+      old.close();
+
+      const report = runImport(env.db, oldPath);
+      assert.equal(report.schedules, 1);
+      const row = env.db
+        .prepare("SELECT remind_offsets_json FROM schedules WHERE id = 's-many'")
+        .get() as { remind_offsets_json: string };
+      assert.equal(
+        row.remind_offsets_json,
+        "[-10,-20,-30,-40,-50]",
+        "v2 每个日程最多 5 条提醒，保留前 5 条",
+      );
+      const warning = report.scheduleWarnings.find(
+        (w) => w.includes("提醒太多") && w.includes("已丢弃"),
+      );
+      assert.ok(
+        warning !== undefined,
+        `截断必须写 warning（不能静默丢提醒）：${JSON.stringify(report.scheduleWarnings)}`,
+      );
+      assert.match(warning ?? "", /6 个提醒/);
+      assert.match(warning ?? "", /已丢弃其后 1 个/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});

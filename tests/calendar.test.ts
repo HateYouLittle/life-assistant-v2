@@ -9,6 +9,7 @@ import {
   signCalendarUrl,
   verifyCalendarSignature,
 } from "../src/core/ics.js";
+import { counterValue, resetCountersForTests } from "../src/core/metrics.js";
 import { ensureProfile } from "../src/core/settings.js";
 import { createCalendarApp } from "../src/server/calendar.js";
 import { createStatusApp } from "../src/server/status.js";
@@ -498,6 +499,80 @@ describe("GET /calendar.ics", () => {
       assert.ok((await res.text()).includes("组合挂载"));
     } finally {
       cleanupTestEnv(env);
+    }
+  });
+});
+
+describe("日历签名失败的可见性", () => {
+  it("缺参/过期（401）与签名被改（403）都计入 auth_failed_total", async () => {
+    const env = makeTestEnv({ WEB_API_TOKEN: TOKEN });
+    try {
+      resetCountersForTests();
+      const a = app(env);
+      assert.equal(
+        (await a.request(`/calendar.ics?p=default&exp=1&sig=${"0".repeat(64)}`)).status,
+        401,
+      );
+      assert.equal(counterValue("auth_failed_total"), 1, "过期/缺参应计一次鉴权失败");
+
+      const url = signCalendarUrl(env.config, "default", Date.now() + 3600_000);
+      const u = new URL(url, "http://localhost");
+      u.searchParams.set("sig", "f".repeat(64));
+      assert.equal((await a.request(`${u.pathname}${u.search}`)).status, 403);
+      assert.equal(counterValue("auth_failed_total"), 2, "签名被改也应计一次鉴权失败");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("未配置 WEB_API_TOKEN 的 503 是配置问题，不计入鉴权失败", async () => {
+    const env = makeTestEnv();
+    try {
+      resetCountersForTests();
+      const res = await app(env).request(
+        `/calendar.ics?p=default&exp=9999999999&sig=${"0".repeat(64)}`,
+      );
+      assert.equal(res.status, 503);
+      assert.equal(counterValue("auth_failed_total"), 0);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("非法 p 的 ESC/换行/超长文本不得进入鉴权失败日志（单行、长度受限）", async () => {
+    const env = makeTestEnv({ WEB_API_TOKEN: TOKEN });
+    const logs: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => {
+      logs.push(args.map(String).join(" "));
+    };
+    try {
+      const a = app(env);
+      // %1B=ESC、%0A/%0D=换行/回车：Hono 会解码 query，旧实现会把它们原样拼进日志
+      const evil = "%1B%5B2J%1B%5B31mRED%20INJECTED%0AFAKE-LOG-LINE%0D%0A";
+      const injected = await a.request(
+        `/calendar.ics?p=${evil}&exp=9999999999&sig=${"0".repeat(64)}`,
+      );
+      assert.equal(injected.status, 401);
+      // 超长 p：日志不能被单一请求撑大
+      const longP = await a.request(
+        `/calendar.ics?p=${"x".repeat(3000)}&exp=1&sig=${"0".repeat(64)}`,
+      );
+      assert.equal(longP.status, 401);
+    } finally {
+      console.error = original;
+      cleanupTestEnv(env);
+    }
+
+    const authLogs = logs.filter((line) => line.includes("鉴权失败: /calendar.ics"));
+    assert.equal(authLogs.length, 2, `两次失败应各一行日志：${JSON.stringify(logs)}`);
+    for (const line of authLogs) {
+      assert.ok(!line.includes("\x1b"), `ESC 不得进入日志：${JSON.stringify(line)}`);
+      assert.ok(!line.includes("\n") && !line.includes("\r"), "日志必须单行");
+      assert.ok(!line.includes("INJECTED"), `不得回显非法 p 的文本：${JSON.stringify(line)}`);
+      assert.ok(!line.includes("x".repeat(200)), "超长 p 不得原样进日志");
+      assert.ok(line.length < 400, `单行日志长度必须受限：${line.length}`);
+      assert.match(line, /Profile 名不合法/, "含用户输入的原因只记固定文案");
     }
   });
 });

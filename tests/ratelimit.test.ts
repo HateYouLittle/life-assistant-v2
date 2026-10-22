@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import type { IncomingMessage } from "node:http";
 import { describe, it } from "node:test";
-import { clientAddress, FixedWindowLimiter, rateLimitKey } from "../src/core/ratelimit.js";
+import { clientAddress, envClientAddress, FixedWindowLimiter } from "../src/core/ratelimit.js";
 
 function fakeRequest(over: {
   authorization?: string;
@@ -54,9 +54,43 @@ describe("FixedWindowLimiter：固定窗口限流", () => {
     limiter.prune();
     assert.equal(limiter.size, 0);
   });
+
+  it("桶数量硬上限：超限淘汰最旧的桶，内存有界（伪 key 轮换不能撑爆 Map）", () => {
+    let now = 1_000;
+    const limiter = new FixedWindowLimiter(1, 60_000, () => now, { maxBuckets: 1 });
+    assert.equal(limiter.take("a").allowed, true);
+    now += 1;
+    assert.equal(limiter.take("b").allowed, true);
+    assert.equal(limiter.size, 1, "插入新 key 后必须淘汰到上限内");
+    now += 1;
+    assert.equal(
+      limiter.take("a").allowed,
+      true,
+      "a 已被淘汰：重新计数而不是沿用旧窗口（limit=1 的第二次才会拒绝）",
+    );
+    assert.equal(limiter.size, 1, "上限始终成立");
+  });
+
+  it("硬上限先清过期：过期桶被清掉后不必淘汰仍有效的桶", () => {
+    let now = 1_000;
+    const limiter = new FixedWindowLimiter(10, 1_000, () => now, { maxBuckets: 3 });
+    for (const key of ["a", "b", "c"]) limiter.take(key);
+    assert.equal(limiter.size, 3);
+    now += 1_001;
+    for (const key of ["d", "e"]) limiter.take(key);
+    assert.equal(limiter.size, 2, "过期的 a/b/c 应在写入时被清掉，只留新桶");
+  });
+
+  it("maxBuckets 必须是正整数", () => {
+    assert.throws(() => new FixedWindowLimiter(1, 1_000, () => 0, { maxBuckets: 0 }), /maxBuckets/);
+    assert.throws(
+      () => new FixedWindowLimiter(1, 1_000, () => 0, { maxBuckets: 1.5 }),
+      /maxBuckets/,
+    );
+  });
 });
 
-describe("clientAddress / rateLimitKey：反代与身份归并", () => {
+describe("clientAddress / envClientAddress：反代与地址口径", () => {
   it("默认不信任 X-Forwarded-For；TRUST_PROXY 开启后取第一段", () => {
     const request = fakeRequest({
       remoteAddress: "192.168.31.40",
@@ -66,19 +100,15 @@ describe("clientAddress / rateLimitKey：反代与身份归并", () => {
     assert.equal(clientAddress(request, true), "1.2.3.4");
   });
 
-  it("带 Bearer 时按 token 指纹归并（同一人不同 IP 仍共用一个桶）", () => {
-    const token = "t".repeat(64);
-    const a = rateLimitKey(
-      fakeRequest({ authorization: `Bearer ${token}`, remoteAddress: "1.1.1.1" }),
-      false,
-    );
-    const b = rateLimitKey(
-      fakeRequest({ authorization: `Bearer ${token}`, remoteAddress: "2.2.2.2" }),
-      false,
-    );
-    assert.equal(a, b);
-    assert.match(a, /^t:[0-9a-f]{16}$/);
-    // 无凭据时退回 IP
-    assert.equal(rateLimitKey(fakeRequest({ remoteAddress: "1.1.1.1" }), false), "ip:1.1.1.1");
+  it("envClientAddress：从 Hono 的 c.env.incoming 取地址，口径与 clientAddress 一致", () => {
+    const incoming = fakeRequest({
+      remoteAddress: "192.168.31.40",
+      forwardedFor: "1.2.3.4, 10.0.0.1",
+    });
+    assert.equal(envClientAddress({ incoming }, false), "192.168.31.40");
+    assert.equal(envClientAddress({ incoming }, true), "1.2.3.4", "TRUST_PROXY=1 才采信 XFF");
+    // 直接 app.request()/非 node-server 适配器拿不到 Node 请求：如实返回 unknown
+    assert.equal(envClientAddress(undefined, false), "unknown");
+    assert.equal(envClientAddress({}, false), "unknown");
   });
 });

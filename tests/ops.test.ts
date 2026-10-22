@@ -3,6 +3,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { Hono } from "hono";
+import { sanitizeLogText } from "../src/core/logger.js";
 import { allJobs } from "../src/core/registry.js";
 import { createOpsApp, escapeLabelValue } from "../src/server/ops.js";
 import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
@@ -199,11 +200,22 @@ describe("/metrics", () => {
       HOST: "0.0.0.0",
       PROFILE_TOKENS_JSON: JSON.stringify({ bestie }),
     });
+    const logs: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => {
+      logs.push(args.map(String).join(" "));
+    };
     try {
       const a = app(env);
       const denied = await a.request("/metrics");
       assert.equal(denied.status, 401, "无凭据必须拒绝");
       assert.equal(denied.headers.get("cache-control"), "no-store");
+      // 与状态页/quick/calendar 同口径：失败鉴权既计数也写 warn 日志（公网扫描要可见）
+      assert.ok(
+        logs.some((line) => line.includes("鉴权失败: /metrics")),
+        `应写鉴权失败日志：${logs.join("\n")}`,
+      );
+      assert.ok(!logs.join("\n").includes(master), "日志不得包含 token 原文");
       assert.equal(
         (await a.request("/metrics", { headers: { Authorization: `Bearer ${bestie}` } })).status,
         403,
@@ -222,6 +234,7 @@ describe("/metrics", () => {
         "未出现过的计数器键必须按 0 输出（缺样本与值为 0 要能区分）",
       );
     } finally {
+      console.error = original;
       cleanupTestEnv(env);
     }
   });
@@ -317,5 +330,61 @@ describe("Prometheus 文本编码", () => {
     } finally {
       cleanupTestEnv(env);
     }
+  });
+});
+
+describe("日志净化（请求可控字段）", () => {
+  it("sanitizeLogText：去掉 C0/DEL/C1 与 U+2028/U+2029 并截断", () => {
+    assert.equal(sanitizeLogText("a\u001b[31mb\nc\rd\u007f", 200), "a[31mbcd");
+    assert.equal(sanitizeLogText("a\u0085b\u2028c\u2029d", 200), "abcd");
+    assert.equal(sanitizeLogText("x".repeat(300), 10), `${"x".repeat(10)}…`);
+    assert.equal(sanitizeLogText("normal", 200), "normal");
+  });
+
+  it("/metrics 401 日志：来源里的控制字符/超长文本被净化，日志单行", async () => {
+    const env = makeTestEnv({
+      WEB_API_TOKEN: "t".repeat(32),
+      HOST: "0.0.0.0",
+      TRUST_PROXY: "1",
+    });
+    const logs: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => {
+      logs.push(args.map(String).join(" "));
+    };
+    try {
+      // c.env.incoming 由 @hono/node-server 注入（真实 HTTP 下 Node 会拒绝 C0 控制字符的头；
+      // 这里直接给桩，覆盖 C0/C1（含 NEL U+0085）/U+2028/U+2029 混入来源文本的极端情况）。
+      const bindings: Record<string, unknown> = {
+        incoming: {
+          headers: {
+            "x-forwarded-for": `1.2.3.4\u001b[2J\u000afake\u0085\u2028\u2029\u000d${"9".repeat(200)}`,
+          },
+          socket: { remoteAddress: "127.0.0.1" },
+        },
+      };
+      const res = await app(env).request("/metrics", {}, bindings);
+      assert.equal(res.status, 401);
+    } finally {
+      console.error = original;
+      cleanupTestEnv(env);
+    }
+    const line = logs.find((l) => l.includes("鉴权失败: /metrics")) ?? "";
+    assert.ok(line !== "", `应记录鉴权失败日志：${logs.join("\n")}`);
+    // 用码点判断而不是含控制字符的正则字面量（Biome noControlCharactersInRegex 会拦）
+    const hasUnsafeCodepoint = [...line].some((ch) => {
+      const code = ch.codePointAt(0) ?? 0;
+      return (
+        code < 0x20 ||
+        code === 0x7f ||
+        (code >= 0x80 && code <= 0x9f) ||
+        code === 0x2028 ||
+        code === 0x2029
+      );
+    });
+    assert.ok(!hasUnsafeCodepoint, `C0/C1/DEL/U+2028/U+2029 必须被过滤：${JSON.stringify(line)}`);
+    assert.ok(line.includes("1.2.3.4[2Jfake"), `可读部分应保留：${line}`);
+    assert.ok(!line.includes("9".repeat(120)), `超长来源必须被截断：${line.length}`);
+    assert.ok(line.length < 400, `日志长度受限：${line.length}`);
   });
 });
