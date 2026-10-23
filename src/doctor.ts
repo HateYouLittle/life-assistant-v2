@@ -319,13 +319,27 @@ function checkJobFreshness(items: LiveJobItem[], at: DateTime): CheckResult[] {
       results.push(warn(name, "daemon 未注册该任务（程序版本不一致？）"));
       continue;
     }
-    if (previousFireTime(item.cron, at) === null) {
+    const previous = previousFireTime(item.cron, at);
+    if (previous === null) {
       results.push(
         warn(name, `cron "${item.cron}" 无法反向求值（仅支持日/月为 *），不能判断是否新鲜`),
       );
       continue;
     }
-    const limitHours = withinHours * 2;
+    // 新鲜度阈值不能只看补发窗口：日报/晚报/调休/备份是**每天一次**的任务，自然间隔
+    // 就有 24h，而 CATCHUP_POLICY 的窗口是 6h/24h —— 按「窗口×2」会在
+    // 「上次成功已过 12h（如 21:00 晚报到次日 09:00）」时误报停更（更新/首次部署后的
+    // 凌晨同理）。用 cron 的**实际触发间隔**（再反推一次上一次触发）把阈值放宽到
+    // 「间隔×1.5 + 1h」，再与「窗口×2」取大；*/20 这种高频任务的窗口阈值仍占主导。
+    // 注意 previousFireTime 按 `at` 所在时区解释分钟/小时字段，必须把 UTC 返回值
+    // 换回本地时区再喂进去，否则 7 点会被当成 UTC 7 点，算出的间隔会错位 8 小时。
+    const previousLocal = previous.setZone(at.zone);
+    const previousPrevious = previousFireTime(item.cron, previousLocal.minus({ minutes: 1 }));
+    const cadenceHours =
+      previousPrevious === null
+        ? 0
+        : Math.max(1 / 60, previous.diff(previousPrevious, "hours").hours);
+    const limitHours = Math.max(withinHours * 2, Math.round(cadenceHours * 1.5 + 1));
     if (item.last_ok_at === null) {
       results.push(
         warn(

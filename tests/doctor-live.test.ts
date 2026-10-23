@@ -171,6 +171,43 @@ describe("doctor --live", () => {
     }
   });
 
+  it("每日任务新鲜度按 cron 周期放宽：21:00 晚报到次日 09:00 不算停更（回归）", async () => {
+    // 回归：阈值曾固定为「补发窗口×2」=12h，导致每天一次的任务（晚报/日报/备份）
+    // 在两次触发之间的正常空档被误判为停更（如 21:00 晚报在次日 09:00 必报 fail）。
+    const jobs = FRESH_JOBS.map((item) => {
+      const name = item["name"] as string;
+      const age = name === "evening_brief" ? 13 : name === "daily_brief" ? 20 : 0.2;
+      return jobItem({
+        module: item["module"] as string,
+        name,
+        cron: item["cron"] as string,
+        lastOkAgoHours: age,
+      });
+    });
+    const stub = await startStub({
+      "/healthz": { body: { ok: true, version: "2.0.0", uptime_s: 60 } },
+      "/api/status": { body: { ok: true } },
+      "/api/jobs": { body: { items: jobs } },
+    });
+    const doctorEnv = makeDoctorEnv(stub.port);
+    try {
+      seedBackup(doctorEnv.dir, { ageHours: 1 });
+      const report = await runDoctor(doctorEnv.env, { live: true });
+      for (const key of ["weather.daily_brief", "weather.evening_brief"]) {
+        assert.equal(
+          levelOf(report.checks, `任务新鲜度：${key}`),
+          "ok",
+          `${key} 在日周期内的正常空档不应被判停更：${detailOf(report.checks, `任务新鲜度：${key}`)}`,
+        );
+        assert.match(detailOf(report.checks, `任务新鲜度：${key}`), /阈值 37 小时/);
+      }
+      assert.equal(report.failed, 0, "日周期空档不应有失败项");
+    } finally {
+      await stub.close();
+      doctorEnv.cleanup();
+    }
+  });
+
   it("HOST 是通配绑定（0.0.0.0）时 live 自检走回环，而不是拿 0.0.0.0 当 URL", async () => {
     // 回归：为局域网/反代把 HOST 改成 0.0.0.0 后，doctor --live 用 http://0.0.0.0:3080
     // 连不上，还容易被误判成「daemon 挂了」。自检一律探回环。
@@ -205,12 +242,12 @@ describe("doctor --live", () => {
       "/api/jobs": {
         body: {
           items: [
-            // 阈值 = 6h × 2 = 12h，已 20 小时没成功
+            // 阈值 = max(补发窗口 6h×2, cron 日间隔 24h×1.5+1=37h)，已 40 小时没成功
             jobItem({
               module: "weather",
               name: "daily_brief",
               cron: "0 7 * * *",
-              lastOkAgoHours: 20,
+              lastOkAgoHours: 40,
             }),
             // evening_brief 故意缺失（例如旧版本 daemon）
             // 升级/首次部署后 job_runs 还没有记录：只 warn（真停摆要靠「有记录但超窗」判定）
@@ -248,7 +285,7 @@ describe("doctor --live", () => {
       const report = await runDoctor(doctorEnv.env, { live: true });
       assert.equal(levelOf(report.checks, "daemon 存活"), "ok");
       assert.equal(levelOf(report.checks, "任务新鲜度：weather.daily_brief"), "fail");
-      assert.match(detailOf(report.checks, "任务新鲜度：weather.daily_brief"), /阈值 12 小时/);
+      assert.match(detailOf(report.checks, "任务新鲜度：weather.daily_brief"), /阈值 37 小时/);
       assert.equal(levelOf(report.checks, "任务新鲜度：maintenance.daily_backup"), "fail");
       assert.equal(
         levelOf(report.checks, "任务新鲜度：weather.evening_brief"),
