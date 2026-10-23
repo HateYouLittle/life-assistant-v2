@@ -328,3 +328,25 @@ Round2/3 修复后，又由 2 名全新独立审查员对**本轮新增改动**�
      恢复过程本身仍假定「已停机」这一前提（README 已知取舍）。
 - 上一轮（2026-10-17）的 18 条修复经逐条复核无回归。
 
+
+## 部署冒烟与后续修复（2026-10-23）
+
+评审循环收敛后，按建议做了部署侧冒烟（新构建先在隔离临时 DATA_DIR 启动，再刷新本机 launchd 实例）：
+
+1. **隔离冒烟**：`node dist/daemon.js` + 临时 DATA_DIR（无 token/QWeather）启动正常；`/healthz` 200、
+   `/readyz` 200、`/api/status`、`/metrics`、状态页、`/calendar.ics`（无 token 时 503 并给中文原因）、
+   `/mcp` initialize（200 + `mcp-session-id`）均符合预期；`doctor` 与 `doctor --live`（离线/在线）通过；
+   SIGTERM 优雅退出并删除 `daemon.lock`。
+2. **本机正式实例刷新**：`launchctl kickstart -k gui/501/ai.life-assistant.daemon` 后，正式 daemon 从旧进程
+   （pid 56497，10-21 启动）换为新构建（pid 44368）：`/healthz`、`/readyz`、`/api/status`、`/api/jobs`、
+   `/metrics`、状态页、带 Bearer 的鉴权矩阵均正常；锁文件 pid 一致；日志无启动错误。
+3. **冒烟发现并修复 1 条既有缺陷（P3，非评审引入）**：`doctor --live` 的任务新鲜度阈值固定为
+   「补发窗口×2」（日报/晚报 6h→12h），但每日任务的自然间隔是 24h —— 21:00 的晚报在次日 09:00
+   必然报 fail（正式库冒烟实际出现），日报在凌晨同理，属监控误报。
+   修复（commit `bc88089`）：阈值改为 `max(窗口×2, cron 实际触发间隔×1.5+1h)`，并对 `previousFireTime`
+   的 UTC 返回值先换回本地时区再反推间隔（避免 7 点被当 UTC 7 点、间隔错位 8h）。
+   修复后正式库 `doctor --live`：**0 项失败、1 项警告**（仅剩「2 个非规范命名备份文件（迁移前快照）」
+   的预期提示），日报/晚报/调休阈值均为 37 小时，备份 48 小时。全链路回归 1044 tests / 239 suites / 0 fail。
+4. **遗留观察（非仓库问题）**：`daemon.err.log` 中有约每 5 分钟一次的 `鉴权失败: /mcp from 127.0.0.1`
+   （重启前即存在，重启后仅见一轮重连尝试）——说明某个本地 MCP 客户端未带正确 Bearer；鉴权按设计拒绝了它，
+   不影响 daemon 健康。若 Hermes 侧 MCP 工具报未授权，检查该客户端的 `WEB_API_TOKEN`/`MCP_DAEMON_TOKEN` 配置。
