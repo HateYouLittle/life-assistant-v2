@@ -187,9 +187,12 @@ function notifyToolInner(args: Record<string, unknown>, ctx: ToolContext) {
       });
       return okJson({
         推送路由: route,
-        说明: channel.requiresSecret
-          ? "URL 仅允许回环地址；secret 来自环境变量"
-          : "本地日志通道：不需要 URL 与 secret，通知写入进程日志并标记为已投递",
+        说明:
+          channel.name === "openclaw"
+            ? "OpenClaw 回环通道：token 来自 daemon 的 OPENCLAW_HOOK_TOKEN"
+            : channel.requiresSecret
+              ? "URL 仅允许回环地址；secret 来自环境变量"
+              : "本地日志通道：不需要 URL 与 secret，通知写入进程日志并标记为已投递",
       });
     }
     if (enabled !== undefined) {
@@ -208,7 +211,7 @@ function notifyToolInner(args: Record<string, unknown>, ctx: ToolContext) {
     if (current === null)
       return okJson({
         推送路由: null,
-        说明: `用 url 参数配置（回环地址），secret 在 PROFILE_ROUTE_SECRETS_JSON；channel 可选 ${supportedChannels().join(" / ")}（默认 ${DEFAULT_CHANNEL}）`,
+        说明: `用 url 参数配置（webhook/openclaw 限回环地址），webhook secret 在 PROFILE_ROUTE_SECRETS_JSON，openclaw token 在 OPENCLAW_HOOK_TOKEN；channel 可选 ${supportedChannels().join(" / ")}（默认 ${DEFAULT_CHANNEL}）`,
       });
     return okJson({
       推送路由: {
@@ -505,7 +508,7 @@ registerModule({
     {
       name: "notify",
       description:
-        "通知管理：action=pull 拉取未读通知（会话开始时调用一次，作为主动推送失败的兜底，会标记已读并取消待投递）；history 查看通知历史（limit/offset 分页，可按 kind 精确过滤、unread=true 只看未读；**不改变已读状态**，每条带最近一条投递的状态/尝试次数/最后错误，用于回答「哪条没发出去、为什么」）；retry 手动重试投递（notification_id 一条通知的全部投递 / delivery_id 单条投递 / all=true 批量重试该 Profile 所有 failed+fallback；重新入队后立即触发一轮投递）；quiet_hours 设置/查看/清除静默时段（HH:MM，支持跨午夜）；route 配置/查看主动推送通道（channel=webhook 默认，HMAC V2 回环 webhook、secret 在 env；channel=log 本地日志通道，不需要 URL/secret）；prefs 查看/设置按类型的推送偏好（不带 kind 返回已保存+内置默认+最终生效值；带 kind+push 或 kind+channels 写入，push=false 表示不主动推送但通知仍入库、可用 pull 取回；bookkeeping.entry 默认不推，由每日摘要取代）；test 发一条测试通知验证通道（返回是否建立投递与所用通道，无路由时仅入库）；cancel 取消某条通知的待投递。",
+        "通知管理：action=pull 拉取未读通知（会话开始时调用一次，作为主动推送失败的兜底，会标记已读并取消待投递）；history 查看通知历史（limit/offset 分页，可按 kind 精确过滤、unread=true 只看未读；**不改变已读状态**，每条带最近一条投递的状态/尝试次数/最后错误，用于回答「哪条没发出去、为什么」）；retry 手动重试投递（notification_id 一条通知的全部投递 / delivery_id 单条投递 / all=true 批量重试该 Profile 所有 failed+fallback；重新入队后立即触发一轮投递）；quiet_hours 设置/查看/清除静默时段（HH:MM，支持跨午夜）；route 配置/查看主动推送通道（channel=webhook 默认，HMAC V2 回环 webhook、secret 在 env；channel=openclaw OpenClaw Gateway 回环 hook、token 在 OPENCLAW_HOOK_TOKEN；channel=log 本地日志通道，不需要 URL/secret）；prefs 查看/设置按类型的推送偏好（不带 kind 返回已保存+内置默认+最终生效值；带 kind+push 或 kind+channels 写入，push=false 表示不主动推送但通知仍入库、可用 pull 取回；bookkeeping.entry 默认不推，由每日摘要取代）；test 发一条测试通知验证通道（返回是否建立投递与所用通道，无路由时仅入库）；cancel 取消某条通知的待投递。",
       inputSchema: {
         action: z.enum([
           "pull",
@@ -538,11 +541,16 @@ registerModule({
         start: z.string().regex(TIME_RE).optional(),
         end: z.string().regex(TIME_RE).optional(),
         clear: z.boolean().optional().describe("清除静默时段"),
-        url: z.string().optional().describe("推送 webhook 地址（127.0.0.1/localhost/[::1]）"),
+        url: z
+          .string()
+          .optional()
+          .describe("推送通道 URL（webhook/openclaw 仅允许 127.0.0.1/localhost/[::1] 回环地址）"),
         channel: z
           .enum(CHANNEL_NAMES)
           .optional()
-          .describe("推送通道：webhook（默认，回环 HMAC V2）或 log（本地日志，不需要 URL/secret）"),
+          .describe(
+            "推送通道：webhook（默认，回环 HMAC V2）、openclaw（OpenClaw 回环 hook，token 在 OPENCLAW_HOOK_TOKEN）或 log（本地日志，不需要 URL/secret）",
+          ),
         platform: z.string().optional().describe("目标平台标识（如 wechat），仅记录"),
         name: z.string().max(80).optional().describe("路由名，默认 life-assistant-<profile>"),
         enabled: z.boolean().optional().describe("启用/停用路由"),

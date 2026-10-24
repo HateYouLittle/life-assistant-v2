@@ -65,6 +65,8 @@ export interface ResolvedConfig {
   qweatherAuth?: QweatherAuth;
   defaultCity: string;
   profileRouteSecrets: Record<string, string>;
+  /** OpenClaw Gateway hooks token（OPENCLAW_HOOK_TOKEN）；仅 openclaw 通道投递时使用。 */
+  openclawHookToken?: string;
   dailyBriefCron: string;
   /** 气象预警巡检 cron（Asia/Shanghai） */
   alertWatchCron: string;
@@ -498,6 +500,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
     qweatherAuth,
     defaultCity: env.DEFAULT_CITY?.trim() || "北京",
     profileRouteSecrets: parseSecrets(env.PROFILE_ROUTE_SECRETS_JSON),
+    openclawHookToken: env.OPENCLAW_HOOK_TOKEN?.trim() || undefined,
     dailyBriefCron,
     alertWatchCron,
     alertMinLevel: alertMinLevel.data,

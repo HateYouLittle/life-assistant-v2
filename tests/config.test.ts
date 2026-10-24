@@ -29,6 +29,7 @@ describe("config", () => {
     assert.equal(config.backupKeep, 14);
     assert.equal(config.defaultCity, "北京");
     assert.equal(config.webApiToken, undefined);
+    assert.equal(config.openclawHookToken, undefined);
     assert.equal(config.requireAuth, false);
     assert.deepEqual(config.allowedHosts, []);
   });
@@ -198,6 +199,14 @@ describe("config", () => {
       PROFILE_ROUTE_SECRETS_JSON: JSON.stringify({ default: SECRET }),
     });
     assert.equal(config.profileRouteSecrets.default, SECRET);
+  });
+
+  it("OPENCLAW_HOOK_TOKEN 可选、去空白，空值不影响配置加载", () => {
+    assert.equal(
+      loadConfig({ ...BASE, OPENCLAW_HOOK_TOKEN: "  hook-token  " }).openclawHookToken,
+      "hook-token",
+    );
+    assert.equal(loadConfig({ ...BASE, OPENCLAW_HOOK_TOKEN: "  " }).openclawHookToken, undefined);
   });
 
   it("PROFILE_TOKENS_JSON：合法映射生效；非 JSON / 短 token / 非法名 / 重复 token / 与 master 相同都拒绝", () => {

@@ -3,9 +3,11 @@ import { createHmac } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { describe, it } from "node:test";
 import {
+  type ChannelDeliveryInput,
   DEFAULT_CHANNEL,
   getChannel,
   type NotificationChannel,
+  openclawChannel,
   supportedChannels,
 } from "../src/core/channels.js";
 import {
@@ -58,6 +60,49 @@ function withHookServer(
   });
 }
 
+function unusedPort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      assert.ok(addr !== null && typeof addr === "object");
+      const port = addr.port;
+      server.close(() => resolve(port));
+    });
+  });
+}
+
+function openclawDeliveryInput(
+  url: string,
+  over: Partial<ChannelDeliveryInput> = {},
+): ChannelDeliveryInput {
+  return {
+    profileId: "default",
+    notificationId: "n-openclaw",
+    kind: "test.kind",
+    title: "OpenClaw 标题",
+    bodyMd: "OpenClaw 正文",
+    createdAt: "2026-10-24T00:00:00.000Z",
+    requestId: "request-openclaw-1",
+    generation: 0,
+    route: { name: "openclaw-route", url },
+    ...over,
+  };
+}
+
+async function withOpenclawToken<T>(token: string | undefined, fn: () => Promise<T>): Promise<T> {
+  const previous = process.env.OPENCLAW_HOOK_TOKEN;
+  if (token === undefined) delete process.env.OPENCLAW_HOOK_TOKEN;
+  else process.env.OPENCLAW_HOOK_TOKEN = token;
+  try {
+    return await fn();
+  } finally {
+    if (previous === undefined) delete process.env.OPENCLAW_HOOK_TOKEN;
+    else process.env.OPENCLAW_HOOK_TOKEN = previous;
+  }
+}
+
 function forceDue(db: TestEnv["db"]): void {
   db.exec("UPDATE deliveries SET next_attempt_at = '2000-01-01T00:00:00.000Z'");
 }
@@ -85,7 +130,15 @@ function text(result: { content: { text: string }[] }): string {
 describe("投递通道抽象", () => {
   it("通道清单与默认通道稳定（工具 schema 与文档共用这份清单）", () => {
     assert.equal(DEFAULT_CHANNEL, "webhook");
-    assert.deepEqual(supportedChannels(), ["webhook", "log", "bark", "ntfy", "telegram", "smtp"]);
+    assert.deepEqual(supportedChannels(), [
+      "webhook",
+      "log",
+      "bark",
+      "ntfy",
+      "telegram",
+      "smtp",
+      "openclaw",
+    ]);
     const channel: NotificationChannel = getChannel(undefined);
     assert.equal(channel.name, DEFAULT_CHANNEL, "缺省 channel 必须解析为 webhook");
   });
@@ -357,5 +410,160 @@ describe("投递通道抽象", () => {
     } finally {
       cleanupTestEnv(env);
     }
+  });
+});
+
+describe("OpenClaw 通道", () => {
+  it("注册、回环 URL 校验与路径/query 保留", () => {
+    assert.equal(getChannel("openclaw"), openclawChannel);
+    assert.equal(openclawChannel.requiresSecret, false);
+    assert.equal(openclawChannel.requiresUrl, true);
+
+    for (const url of [
+      "http://127.0.0.1:18789/hooks/life-default",
+      "http://localhost:18789/hooks/x",
+    ]) {
+      assert.equal(openclawChannel.validateRoute({ url }), url);
+    }
+    assert.equal(
+      openclawChannel.validateRoute({ url: "http://127.0.0.1:18789/hooks/x/" }),
+      "http://127.0.0.1:18789/hooks/x",
+    );
+    assert.equal(
+      openclawChannel.validateRoute({ url: "http://127.0.0.1:18789/hooks/x/?token=a/" }),
+      "http://127.0.0.1:18789/hooks/x/?token=a/",
+      "有 query 时不能剥掉路径或 query 末尾的斜杠",
+    );
+
+    for (const url of [
+      "http://192.168.1.5/hook",
+      "https://example.com/hook",
+      "ftp://127.0.0.1/hook",
+    ]) {
+      assert.throws(() => openclawChannel.validateRoute({ url }), /openclaw/);
+    }
+  });
+
+  it("deliver 发送 Bearer token、幂等头与通知 JSON", async () => {
+    await withOpenclawToken("  openclaw-test-token  ", async () => {
+      await withHookServer(
+        (_req, res) => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end('{"ok":true}');
+        },
+        async (url, captured) => {
+          const input = openclawDeliveryInput(url, {
+            title: "交房租",
+            bodyMd: "**今天**记得转账",
+            requestId: "req-openclaw-123",
+          });
+          const outcome = await openclawChannel.deliver(input);
+          assert.equal(outcome.status, "sent");
+
+          const request = captured[0];
+          assert.ok(request !== undefined);
+          assert.equal(request.headers.authorization, "Bearer openclaw-test-token");
+          assert.equal(request.headers["content-type"], "application/json");
+          assert.equal(request.headers["x-request-id"], "req-openclaw-123");
+          assert.equal(request.headers["idempotency-key"], "req-openclaw-123");
+
+          const payload = JSON.parse(request.body) as {
+            event_type: string;
+            notification: {
+              profileId: string;
+              source: string;
+              title: string;
+              body: string;
+              createdAt: string;
+            };
+          };
+          assert.equal(payload.event_type, EVENT_TYPE);
+          assert.deepEqual(payload.notification, {
+            profileId: "default",
+            source: "test.kind",
+            title: "交房租",
+            body: "**今天**记得转账",
+            createdAt: "2026-10-24T00:00:00.000Z",
+          });
+        },
+      );
+    });
+  });
+
+  it("状态码映射：2xx sent、429 confirmed、400 terminal；闭端口 transport", async () => {
+    await withOpenclawToken("openclaw-test-token", async () => {
+      for (const [status, expected] of [
+        [200, "sent"],
+        [429, "confirmed_failure"],
+        [400, "terminal_failure"],
+      ] as const) {
+        await withHookServer(
+          (_req, res) => {
+            res.writeHead(status);
+            res.end("boom");
+          },
+          async (url) => {
+            const outcome = await openclawChannel.deliver(openclawDeliveryInput(url));
+            assert.equal(outcome.status, expected, `HTTP ${status}`);
+            if (outcome.status !== "sent") assert.match(outcome.error, /^openclaw 返回 HTTP/);
+          },
+        );
+      }
+
+      const port = await unusedPort();
+      const outcome = await openclawChannel.deliver(
+        openclawDeliveryInput(`http://127.0.0.1:${port}/hook`),
+      );
+      assert.equal(outcome.status, "transport_failure");
+      if (outcome.status === "transport_failure") {
+        assert.match(outcome.error, /^openclaw 投递失败：/);
+      }
+    });
+  });
+
+  it("缺少 OPENCLAW_HOOK_TOKEN 时终结本次投递并给出中文配置提示", async () => {
+    await withOpenclawToken(undefined, async () => {
+      const outcome = await openclawChannel.deliver(
+        openclawDeliveryInput("http://127.0.0.1:1/hook"),
+      );
+      assert.deepEqual(outcome, {
+        status: "terminal_failure",
+        error:
+          "openclaw 通道缺少 OPENCLAW_HOOK_TOKEN（在 daemon 的 .env 里配置 OpenClaw hooks.token）",
+      });
+    });
+  });
+
+  it("notify route 接受 openclaw，outbox 无 profile secret 也能按 Profile 投递", async () => {
+    await withOpenclawToken("openclaw-test-token", async () => {
+      const env = makeTestEnv();
+      try {
+        await withHookServer(
+          (_req, res) => {
+            res.writeHead(200);
+            res.end("ok");
+          },
+          async (url, captured) => {
+            const configured = tool(env, { action: "route", channel: "openclaw", url });
+            assert.ok(!configured.isError, "openclaw 不应要求 PROFILE_ROUTE_SECRETS_JSON");
+            const pub = publishProfile(env.db, env.config, "default", {
+              kind: "test.kind",
+              title: "OpenClaw outbox",
+              blocks: {},
+            });
+            await drainDue(env.db, env.config);
+
+            const row = env.db
+              .prepare("SELECT status, last_error FROM deliveries WHERE notification_id = ?")
+              .get(pub.id) as { status: string; last_error: string | null } | undefined;
+            assert.ok(row !== undefined);
+            assert.equal(row.status, "sent", row.last_error ?? "");
+            assert.equal(captured.length, 1);
+          },
+        );
+      } finally {
+        cleanupTestEnv(env);
+      }
+    });
   });
 });

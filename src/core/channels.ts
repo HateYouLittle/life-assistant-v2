@@ -9,11 +9,11 @@ import { parseSmtpRouteUrl, type SmtpRoute, sendSmtpMail } from "./smtp.js";
  * 仍由 src/core/notify.ts 统一落库 —— 这样换通道不会改变幂等与重试语义。
  * 路由的 channel 字段缺省（旧数据）等同 webhook，旧 push_route 不需要迁移。
  *
- * 内置通道：webhook（回环 Hermes 网关，HMAC V2）、log（本地日志）、
- * bark（iOS 推送，URL 即凭据）、ntfy（自建/公共 topic）、
+ * 内置通道：webhook（回环 Hermes 网关，HMAC V2）、openclaw（回环 OpenClaw Gateway hook）、
+ * log（本地日志）、bark（iOS 推送，URL 即凭据）、ntfy（自建/公共 topic）、
  * telegram（Bot API，token+chat_id 在 URL 里）、smtp（邮件，协议实现在 core/smtp.ts）。
- * 除 webhook 与 log 外都投递到外部服务，因此**不**做 webhook 那样的回环限制 ——
- * 它们不带 secret，URL 本身就是凭据。
+ * webhook 与 openclaw 限制回环地址；log 只写本地日志；其余通道投递到外部服务，
+ * 因此**不**做 webhook 那样的回环限制 —— 它们不带 secret，URL 本身就是凭据。
  */
 
 export const EVENT_TYPE = "life_assistant.reminder";
@@ -24,7 +24,7 @@ export interface ChannelRoute {
   url: string;
 }
 
-/** 通道专属的路由校验输入：webhook/bark/ntfy/telegram/smtp 从 url 取地址，log 不需要 URL */
+/** 通道专属的路由校验输入：webhook/openclaw/bark/ntfy/telegram/smtp 从 url 取地址，log 不需要 URL */
 export interface ChannelRouteInput {
   url?: string;
 }
@@ -289,6 +289,75 @@ async function postDelivery(
 }
 
 /**
+ * OpenClaw Gateway hooks 通道：route.url 是本机 Gateway 的 hook 地址。
+ * hooks.token 不进入路由或数据库，每次投递从 daemon 环境读取；缺失时只终结本次投递，
+ * 不影响 daemon 启动，也不改变 webhook 的 HMAC V2 协议。
+ */
+export const openclawChannel: NotificationChannel = {
+  name: "openclaw",
+  requiresSecret: false,
+  requiresUrl: true,
+
+  validateRoute(input: ChannelRouteInput): string {
+    const raw = input.url;
+    if (raw === undefined || raw === "") {
+      throw new Error("openclaw 通道需要 url（127.0.0.1 / localhost / [::1] 回环地址）");
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(raw);
+    } catch {
+      throw new Error(`openclaw URL 不合法: ${raw}`);
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      throw new Error(`openclaw URL 仅支持 http/https: ${raw}`);
+    }
+    const hostname = parsed.hostname.replace(/^\[/, "").replace(/\]$/, "");
+    if (!LOOPBACK_HOSTS.has(hostname.toLowerCase())) {
+      throw new Error(
+        `openclaw URL 仅接受 127.0.0.1 / localhost / [::1] 主机名，收到: ${hostname}`,
+      );
+    }
+    const serialized = parsed.toString();
+    // 与 bark/ntfy 一样只在无 query/hash 时去尾斜杠，避免改动 query/hash 的内容。
+    return parsed.search === "" && parsed.hash === "" ? serialized.replace(/\/+$/, "") : serialized;
+  },
+
+  async deliver(input: ChannelDeliveryInput): Promise<ChannelOutcome> {
+    const token = process.env.OPENCLAW_HOOK_TOKEN?.trim();
+    if (!token) {
+      return {
+        status: "terminal_failure",
+        error:
+          "openclaw 通道缺少 OPENCLAW_HOOK_TOKEN（在 daemon 的 .env 里配置 OpenClaw hooks.token）",
+      };
+    }
+
+    const payload = JSON.stringify({
+      event_type: EVENT_TYPE,
+      notification: {
+        profileId: input.profileId,
+        source: input.kind,
+        title: input.title,
+        body: input.bodyMd,
+        createdAt: input.createdAt,
+      },
+    });
+    return postDelivery(
+      "openclaw",
+      input.route.url,
+      {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+        "X-Request-ID": input.requestId,
+        "Idempotency-Key": input.requestId,
+      },
+      payload,
+    );
+  },
+};
+
+/**
  * Bark 通道（iOS 推送）：route.url 是 Bark 基地址 `https://api.day.app/<device_key>`
  * （自建服务器同理，只要形如 `https://<host>/<device_key>`）。
  * 官方协议：POST 该地址，JSON `{title, body, group, level}`。
@@ -489,6 +558,7 @@ const CHANNELS: readonly NotificationChannel[] = [
   ntfyChannel,
   telegramChannel,
   smtpChannel,
+  openclawChannel,
 ];
 const BY_NAME = new Map(CHANNELS.map((channel) => [channel.name, channel]));
 
