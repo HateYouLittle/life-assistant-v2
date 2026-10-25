@@ -293,6 +293,43 @@ async function postDelivery(
  * hooks.token 不进入路由或数据库，每次投递从 daemon 环境读取；缺失时只终结本次投递，
  * 不影响 daemon 启动，也不改变 webhook 的 HMAC V2 协议。
  */
+/**
+ * 直连 /hooks/agent 的目标：agent/channel/to/accountId 写在路由 URL 的 query 上。
+ * hook 映射（/hooks/<name>）不暴露 accountId，多账号通道（微信/QQ）必须走直连，
+ * 否则会从默认账号发出，收件人会话不匹配时静默失败。
+ */
+interface OpenclawDirectTarget {
+  agentId?: string;
+  channel: string;
+  to: string;
+  accountId?: string;
+}
+
+/**
+ * 识别「直连 /hooks/agent」路由：路径以 /hooks/agent 结尾且带 channel/to query。
+ * 非直连（如 /hooks/life-bestie 映射）返回 null，继续走映射式投递。
+ */
+function parseOpenclawDirectTarget(rawUrl: string): OpenclawDirectTarget | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return null;
+  }
+  if (!parsed.pathname.replace(/\/+$/, "").endsWith("/hooks/agent")) return null;
+  const channel = parsed.searchParams.get("channel")?.trim() ?? "";
+  const to = parsed.searchParams.get("to")?.trim() ?? "";
+  if (channel === "" || to === "") return null;
+  const agentId = parsed.searchParams.get("agentId")?.trim() || undefined;
+  const accountId = parsed.searchParams.get("accountId")?.trim() || undefined;
+  return { channel, to, ...(agentId ? { agentId } : {}), ...(accountId ? { accountId } : {}) };
+}
+
+/** 直连投递时给 agent 的指令：明确要求原样发送，否则模型可能回静默、投递被吞 */
+function openclawDirectMessage(input: ChannelDeliveryInput): string {
+  return `【life-assistant 主动通知】请把下面这条通知原样发送给用户：保留标题与正文，不要添加任何评论，不要调用工具，不要回复 NO_REPLY。\n\n${input.title}\n\n${input.bodyMd}`;
+}
+
 export const openclawChannel: NotificationChannel = {
   name: "openclaw",
   requiresSecret: false,
@@ -333,6 +370,30 @@ export const openclawChannel: NotificationChannel = {
       };
     }
 
+    const headers = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+      "X-Request-ID": input.requestId,
+      "Idempotency-Key": input.requestId,
+    };
+
+    // 直连 /hooks/agent：目标写在 URL query 上，可带 accountId（多账号通道必需）。
+    const direct = parseOpenclawDirectTarget(input.route.url);
+    if (direct !== null) {
+      const body = JSON.stringify({
+        message: openclawDirectMessage(input),
+        name: "life-assistant",
+        sessionMode: "isolated",
+        deliver: true,
+        channel: direct.channel,
+        to: direct.to,
+        ...(direct.agentId === undefined ? {} : { agentId: direct.agentId }),
+        ...(direct.accountId === undefined ? {} : { accountId: direct.accountId }),
+        idempotencyKey: input.requestId,
+      });
+      return postDelivery("openclaw", input.route.url, headers, body);
+    }
+
     const payload = JSON.stringify({
       event_type: EVENT_TYPE,
       notification: {
@@ -343,17 +404,7 @@ export const openclawChannel: NotificationChannel = {
         createdAt: input.createdAt,
       },
     });
-    return postDelivery(
-      "openclaw",
-      input.route.url,
-      {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-        "X-Request-ID": input.requestId,
-        "Idempotency-Key": input.requestId,
-      },
-      payload,
-    );
+    return postDelivery("openclaw", input.route.url, headers, payload);
   },
 };
 

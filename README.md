@@ -162,10 +162,21 @@ OpenClaw 侧的 hook 映射按 profile 分：每个 profile 一条 `mappings` �
 {{notification.body}}
 ```
 
-另外，hook 映射不暴露 `accountId`。微信这类多账号通道在主动投递时要用**收件人所属的
-那个账号**发；如果默认账号不是收件人的账号（如 bestie 的 peer 只与她的微信账号有会话），
-投递会以「缺 contextToken」静默失败。多账号场景建议把该 profile 的主动推送路由到
-有稳定会话窗口的通道（如 QQ）。
+另外，hook 映射不暴露 `accountId`。微信/QQ 这类多账号通道在主动投递时必须用**收件人所属的
+那个账号**发；如果默认账号不是收件人的账号，投递会以「缺 contextToken」或静默方式失败。
+
+多账号场景用**直连模式**：路由 URL 指向 `/hooks/agent`，把目标写在 query 上（可带 `accountId`）：
+
+```
+http://127.0.0.1:18789/hooks/agent?channel=qqbot&to=qqbot%3Ac2c%3A<openid>&agentId=bestie&accountId=bestie
+```
+
+daemon 识别到以 `/hooks/agent` 结尾且带 `channel`/`to` 的 URL 时，会改发 `/hooks/agent` 直连
+载荷（`message` 里已带「原样发送」指令，另带 `idempotencyKey`），而不是映射式
+`event_type/notification` 载荷。`to` 用通道自己的目标格式（QQ 私聊为
+`qqbot:c2c:<openid>`）；`accountId` 必须是该通道里已配置并启用的账号。
+
+只用单账号通道（如飞书）时，映射式（`/hooks/life-<profile>`）更省事；需要指定账号就走直连。
 
 注意：路由是「从此刻起生效」，不会把配置之前已产生的通知补推一遍（那些仍可由
 `notify.pull` 取到）；配置后新产生的通知才会走已配置的通道。
