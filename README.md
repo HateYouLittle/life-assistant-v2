@@ -23,7 +23,7 @@
 相对 v1 的主要变化：**单守护进程**（去掉 stdio 查询进程与 scheduler 的双进程并发防护）；**46 个工具收敛为 7 个**（域内 action 参数化）；**舍弃**油价、共享账本角色、生活指数、自动化 DSL、Open-Meteo 多源回退、React 仪表盘；通知改为 **Markdown 表格**渲染（微信/企业微信）。
 
 阶段进度与后续路线图见 [ROADMAP.md](ROADMAP.md)（当前：v2.0.0 / schema v5，阶段一「可靠性 + 安全基线 + 每日闭环」与阶段二「个人化入口 + 通知治理 + 可观测性」已完成）。
-手机/公网访问（局域网 + NAS Lucky 反代）的目标架构与施工清单见 [docs/remote-access.md](docs/remote-access.md)（阶段二，待实施）。
+手机/公网访问（局域网 + NAS Lucky 反代）的目标架构与施工清单见 [docs/remote-access.md](docs/remote-access.md)（阶段二功能已落地，Lucky 侧施工尚未开始）。
 
 ## 安装
 
