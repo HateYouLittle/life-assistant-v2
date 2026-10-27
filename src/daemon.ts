@@ -11,7 +11,7 @@ import cron from "node-cron";
 import { bindHost, loadConfig, parseProfileId, type ResolvedConfig, urlHost } from "./config.js";
 import { bearerToken, resolveIdentity, tokenFingerprint } from "./core/auth.js";
 import { openDatabase } from "./core/database.js";
-import { createInFlightTracker } from "./core/inflight.js";
+import { createInFlightTracker, type InFlightTracker } from "./core/inflight.js";
 import { createJobRunner } from "./core/job-runner.js";
 import { markInterruptedJobRuns, runStartupCatchups } from "./core/jobs.js";
 import { acquireDaemonLock } from "./core/lock.js";
@@ -60,8 +60,8 @@ const SESSION_IDLE_MS = 2 * 3600 * 1000;
 const MAX_SESSIONS = 200;
 /** 停机时等待在途 cron job / tick 的上限（它们可能正在发布通知） */
 const JOB_SHUTDOWN_WAIT_MS = 10_000;
-/** 停机时等在途 HTTP/MCP 请求收敛的上界：写工具多在毫秒~秒级，3s 足够；长连接由后续强制收敛 */
-const HTTP_SHUTDOWN_WAIT_MS = 3_000;
+/** 停机时等在途 HTTP/MCP 请求收敛的上界：写工具可能发通知/写 SMTP（5~10s），取 8s */
+const HTTP_SHUTDOWN_WAIT_MS = 8_000;
 
 async function buildMcpServer(
   profileId: string,
@@ -278,9 +278,22 @@ function isProbeExemptPath(url: string): boolean {
 }
 
 /** HTTP 入口（/mcp 走 MCP，其余走状态页）；导出以便不启动调度器即可测试 */
+export interface HttpHandlerHooks {
+  /**
+   * 在途请求追踪（P2-8）。MCP 请求按 **handler Promise** 计（工具执行本身），
+   * 其余请求按响应结束/连接关闭计 —— MCP 的 SSE 长连接不参与，避免停机白等。
+   */
+  inFlight?: InFlightTracker;
+  /**
+   * 停机拒绝新请求。由 daemon 的 server 包装层在 `inflight.closed` 时返回 true 后处理，
+   * 这里只在入口再兜一次（防止测试直接调 handler 时漏判）。
+   */
+}
+
 export function createHttpHandler(
   config: ResolvedConfig,
   db: DatabaseSync,
+  hooks: HttpHandlerHooks = {},
 ): (req: IncomingMessage, res: ServerResponse) => void {
   // 手机入口（/quick、/api/quick/*）、日历订阅（/calendar.ics）与运维端点（/metrics、/readyz）
   // 都是独立子应用，挂在同一个 Hono 上：共享 createHttpHandler 的 Host/Origin 守卫与限流。
@@ -350,19 +363,26 @@ export function createHttpHandler(
       }
     }
     if (req.url !== undefined && isMcpPath(req.url)) {
-      handleMcp(req, res, db, config).catch((e) => {
-        logger.error(`MCP 请求处理失败: ${errorMessage(e)}`);
-        if (!res.headersSent) res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            jsonrpc: "2.0",
-            error: { code: -32603, message: "Internal error" },
-            id: null,
-          }),
-        );
-      });
+      // MCP 按 handler Promise 追踪（工具执行真正结束才算完），不跟 SSE socket 走
+      const done = hooks.inFlight?.begin();
+      handleMcp(req, res, db, config)
+        .catch((e) => {
+          logger.error(`MCP 请求处理失败: ${errorMessage(e)}`);
+          if (!res.headersSent) res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              error: { code: -32603, message: "Internal error" },
+              id: null,
+            }),
+          );
+        })
+        .finally(() => done?.());
       return;
     }
+    // 其余（状态页/quick/api/metrics/readyz）都是短响应：按响应结束/连接关闭计
+    const done = hooks.inFlight?.begin();
+    if (done !== undefined) res.once("close", done);
     honoListener(req, res);
   };
 }
@@ -403,7 +423,7 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
   // 在途 HTTP/MCP 请求追踪（P2-8）：停机时先拒绝新请求、再等在途收敛，最后才关库。
   // `httpServer.close()` 只停止 accept，keep-alive 上的 MCP 长连接仍能发新请求。
   const inFlightHttp = createInFlightTracker();
-  const requestHandler = createHttpHandler(config, db);
+  const requestHandler = createHttpHandler(config, db, { inFlight: inFlightHttp });
   const httpServer = createServer((req, res) => {
     if (inFlightHttp.closed) {
       // 停机窗口内的新请求直接 503，并明确 Connection: close，让客户端重试到新实例
@@ -414,15 +434,10 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
       res.end(JSON.stringify({ ok: false, error: "shutting down" }));
       return;
     }
-    const done = inFlightHttp.begin();
-    // 'close' 在响应完成或连接被掐断时触发（Node ≥16 的语义）；SSE 长连接会拖到掐断，
-    // 所以下面的 waitForIdle 必须有上限。
-    res.once("close", done);
     try {
       requestHandler(req, res);
     } catch (e) {
       logger.error(`请求处理异常: ${errorMessage(e)}`);
-      done();
       if (!res.headersSent) res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: false, error: "internal error" }));
     }
@@ -559,13 +574,11 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
             scheduledFor,
           },
         ),
-    })
-      .then((result) => {
-        // 汇总日志由 core/jobs 的 runStartupCatchups 统一输出（区分尝试/成功/失败，P2-16）
-      })
-      .catch((e) => {
-        logger.error(`启动补发失败: ${errorMessage(e)}`);
-      }),
+    }).then(
+      // 汇总日志由 core/jobs 的 runStartupCatchups 统一输出（区分尝试/成功/跳过/失败）
+      () => undefined,
+      (e: unknown) => logger.error(`启动补发失败: ${errorMessage(e)}`),
+    ),
   );
   for (const module of getModules()) {
     if (module.onStart === undefined) continue;

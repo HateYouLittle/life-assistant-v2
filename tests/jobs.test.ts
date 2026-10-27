@@ -615,10 +615,11 @@ describe("runStartupCatchups（串行执行 + 失败隔离）", () => {
         jobs: [{ module: "weather", def: def("daily_brief", "0 7 * * *") }],
         runJob: async (module, jobDef, trigger, scheduledFor) => {
           calls.push({ module, name: jobDef.name, trigger, scheduledFor });
+          return "ok";
         },
         now: atLocal("2026-10-20T09:00:00"),
       });
-      assert.deepEqual(result, { scheduled: 1, succeeded: 1, failed: 0 });
+      assert.deepEqual(result, { scheduled: 1, succeeded: 1, skipped: 0, failed: 0 });
       assert.deepEqual(calls, [
         {
           module: "weather",
@@ -645,6 +646,7 @@ describe("runStartupCatchups（串行执行 + 失败隔离）", () => {
         runJob: async (_module, jobDef) => {
           attempted.push(jobDef.name);
           if (jobDef.name === "refresh") throw new Error("上游 503");
+          return "ok";
         },
         now: atLocal("2026-10-20T09:00:00"),
       });
@@ -652,9 +654,24 @@ describe("runStartupCatchups（串行执行 + 失败隔离）", () => {
       assert.deepEqual(attempted, ["refresh", "daily_brief"], "第一个失败不应中断第二个");
       assert.deepEqual(
         result,
-        { scheduled: 2, succeeded: 1, failed: 1 },
+        { scheduled: 2, succeeded: 1, skipped: 0, failed: 1 },
         "失败算 failed，不能把「尝试数」当「成功数」（P2-16）",
       );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("runJob 返回 skipped 单独计数（未执行 ≠ 成功 ≠ 失败）", async () => {
+    const env = makeTestEnv();
+    try {
+      const result = await runStartupCatchups({
+        db: env.db,
+        jobs: [{ module: "weather", def: def("daily_brief", "0 7 * * *") }],
+        runJob: async () => "skipped",
+        now: atLocal("2026-10-20T09:00:00"),
+      });
+      assert.deepEqual(result, { scheduled: 1, succeeded: 0, skipped: 1, failed: 0 });
     } finally {
       cleanupTestEnv(env);
     }
@@ -670,7 +687,7 @@ describe("runStartupCatchups（串行执行 + 失败隔离）", () => {
         runJob: async () => "failed",
         now: atLocal("2026-10-20T09:00:00"),
       });
-      assert.deepEqual(result, { scheduled: 1, succeeded: 0, failed: 1 });
+      assert.deepEqual(result, { scheduled: 1, succeeded: 0, skipped: 0, failed: 1 });
     } finally {
       cleanupTestEnv(env);
     }
@@ -685,11 +702,12 @@ describe("runStartupCatchups（串行执行 + 失败隔离）", () => {
         jobs: [{ module: "weather", def: def("daily_brief", "0 7 * * *") }],
         runJob: async () => {
           called += 1;
+          return "ok";
         },
         // 07:00 之后 8 小时：超出 6 小时窗口
         now: atLocal("2026-10-20T15:00:00"),
       });
-      assert.deepEqual(result, { scheduled: 0, succeeded: 0, failed: 0 });
+      assert.deepEqual(result, { scheduled: 0, succeeded: 0, skipped: 0, failed: 0 });
       assert.equal(called, 0);
     } finally {
       cleanupTestEnv(env);

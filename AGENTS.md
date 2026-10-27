@@ -167,12 +167,16 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   连带删旁车，并清理孤儿旁车与过期的 `.verified.tmp-*`。同秒撞名时 `runBackup` 顺延 1s 换名
   重试（最多 5 次），绝不覆盖已有备份。
 - **停机收敛**：`stop()` 先 `inFlightHttp.close()` 拒绝新请求（keep-alive 上的新请求回 503），
-  再依次等 onStart / job / 僵尸 / **在途 HTTP/MCP 请求（3s 上界）** / drain，最后才 `db.close()`。
-  `src/core/inflight.ts` 是这套在途追踪的纯逻辑（begin/waitForIdle/close），可单测。
+  再依次等 onStart / job / 僵尸 / **在途 HTTP/MCP 请求（8s 上界）** / drain，最后才 `db.close()`。
+  `src/core/inflight.ts` 是这套在途追踪的纯逻辑（begin/waitForIdle/close），可单测；
+  MCP 请求按 handler Promise 追踪（工具执行本身），**SSE 长连接不参与计数** —— 否则每次停机
+  都会被挂着的 SSE 白等满上界。
 - `/readyz` 结论缓存 1s（`createOpsApp` 的 `readyzCacheMs`）：无鉴权且豁免限流，每次请求都
-  `BEGIN IMMEDIATE` + 多条查询会被高频轮询占满事件循环；1s 陈旧对可观测性无影响。
-- 启动补发的汇总日志区分「尝试 / 成功 / 失败」：`runExclusive` 吞异常后 resolve，必须靠
-  `JobRunOutcome` 返回值计失败，不能把尝试数当成功数。
+  `BEGIN IMMEDIATE` + 多条查询会被高频轮询占满事件循环。它是**秒级近似探针**（含 503→200
+  的恢复也会延迟最多 1s），别当实时看门狗用。
+- 启动补发的汇总日志区分「尝试 / 成功 / 跳过 / 失败」四态：`runExclusive` 吞异常后 resolve，
+  必须靠 `JobRunOutcome`（`skipped` = 同名 job 被重叠/僵尸占着、根本没执行）计数，
+  不能把尝试数当成功数，也不能把跳过算成功。
 - `verifyDatabaseFile(path, { thorough: true })` 额外跑 `integrity_check` + `foreign_key_check`：
   只用于低频且「错了会毁数据」的路径（`db:restore` 选目标/恢复后复验、`doctor --live` 的 deep）；
   每日备份自校验仍只用 `quick_check`（成本）。

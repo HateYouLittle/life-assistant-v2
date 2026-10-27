@@ -55,9 +55,21 @@ export interface RestoreResult {
  * 现在坏文件会被跳过并 warn，全部不可用才报错。
  */
 export function resolveRestoreTarget(config: ResolvedConfig, opts: RestoreOptions): string {
+  return resolveRestoreTargetInfo(config, opts).target;
+}
+
+/**
+ * 与 resolveRestoreTarget 相同，但把「选目标时已经做过的 thorough 校验」结果带回来：
+ * runRestore 不必对同一个文件再跑一遍 integrity_check/foreign_key_check（大库上白白多等几秒）。
+ * `--file` 显式指定时不预校验（schemaVersion=null），由 runRestore 按原流程校验。
+ */
+function resolveRestoreTargetInfo(
+  config: ResolvedConfig,
+  opts: RestoreOptions,
+): { target: string; schemaVersion: number | null } {
   if (opts.file !== undefined && opts.file.trim() !== "") {
     if (opts.latest === true) throw new Error("--file 与 --latest 不能同时使用");
-    return resolve(opts.file.trim());
+    return { target: resolve(opts.file.trim()), schemaVersion: null };
   }
   const status = backupStatus(config, opts.nowMs ?? Date.now());
   const candidates = status.files
@@ -72,11 +84,11 @@ export function resolveRestoreTarget(config: ResolvedConfig, opts: RestoreOption
   for (const candidate of candidates) {
     try {
       // 选目标属于低频且「选错就毁数据」的路径：thorough 校验索引/外键，不只看页
-      verifyDatabaseFile(candidate.path, { thorough: true });
+      const schemaVersion = verifyDatabaseFile(candidate.path, { thorough: true });
       if (skipped.length > 0) {
         logger.warn(`已跳过 ${skipped.length} 份校验失败的备份，改用 ${candidate.name}`);
       }
-      return candidate.path;
+      return { target: candidate.path, schemaVersion };
     } catch (e) {
       const reason = e instanceof Error ? e.message : String(e);
       skipped.push(`${candidate.name}（${reason}）`);
@@ -127,19 +139,26 @@ export function runRestore(config: ResolvedConfig, opts: RestoreOptions = {}): R
   const dryRun = opts.dryRun === true;
   const nowMs = opts.nowMs ?? Date.now();
 
-  // 1. 解析目标：--latest 只看规范命名，避免把迁移前快照/坏文件当成最新备份
-  const target = resolveRestoreTarget(config, opts);
+  // 1. 解析目标：--latest 只看规范命名，避免把迁移前快照/坏文件当成最新备份。
+  //    --latest 路径在选目标时已经 thorough 校验过，这里复用结果，避免同一份库跑两遍
+  //    integrity_check（复审 T-1027-02e 观察 b）。
+  const resolved = resolveRestoreTargetInfo(config, opts);
+  const target = resolved.target;
   if (!existsSync(target)) throw new Error(`备份文件不存在: ${target}`);
   if (!statSync(target).isFile()) throw new Error(`备份不是普通文件: ${target}`);
 
   // 2. 校验备份：quick_check + schema 版本可读 + 不高于程序支持版本
   let schemaVersion: number;
-  try {
-    schemaVersion = verifyDatabaseFile(target, { thorough: true });
-  } catch (e) {
-    throw new Error(
-      `备份校验失败，拒绝恢复（当前库未改动）: ${target}：${e instanceof Error ? e.message : String(e)}`,
-    );
+  if (resolved.schemaVersion !== null) {
+    schemaVersion = resolved.schemaVersion;
+  } else {
+    try {
+      schemaVersion = verifyDatabaseFile(target, { thorough: true });
+    } catch (e) {
+      throw new Error(
+        `备份校验失败，拒绝恢复（当前库未改动）: ${target}：${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
   }
   if (schemaVersion > SCHEMA_VERSION) {
     throw new Error(

@@ -452,7 +452,7 @@ export interface StartupCatchupOptions {
     def: JobDef,
     trigger: "catchup",
     scheduledFor: string,
-  ) => Promise<JobRunOutcome | void>;
+  ) => Promise<JobRunOutcome>;
   now?: DateTime;
 }
 
@@ -464,18 +464,18 @@ export interface StartupCatchupOptions {
  */
 export async function runStartupCatchups(
   opts: StartupCatchupOptions,
-): Promise<{ scheduled: number; succeeded: number; failed: number }> {
+): Promise<{ scheduled: number; succeeded: number; skipped: number; failed: number }> {
   const at = opts.now ?? localNow();
   let plans: CatchupPlan[];
   try {
     plans = planCatchups(opts.db, opts.jobs, at);
   } catch (e) {
     logger.error(`启动补发规划失败: ${errorMessage(e)}`);
-    return { scheduled: 0, succeeded: 0, failed: 0 };
+    return { scheduled: 0, succeeded: 0, skipped: 0, failed: 0 };
   }
   if (plans.length === 0) {
     logger.debug("启动补发：没有需要补发的任务");
-    return { scheduled: 0, succeeded: 0, failed: 0 };
+    return { scheduled: 0, succeeded: 0, skipped: 0, failed: 0 };
   }
   logger.info(
     `启动补发：${plans.length} 个任务（${plans
@@ -484,6 +484,7 @@ export async function runStartupCatchups(
   );
   let scheduled = 0;
   let succeeded = 0;
+  let skipped = 0;
   let failed = 0;
   for (const plan of plans) {
     // 规划到执行之间可能已被 cron/另一次补发跑过（同一分钟内启动的竞态），执行前再确认一次
@@ -494,7 +495,10 @@ export async function runStartupCatchups(
     scheduled += 1;
     try {
       const outcome = await opts.runJob(plan.module, plan.def, "catchup", plan.scheduledFor);
+      // 三态计数（复审 T-1027-02e 的 d 项）：skipped = 根本没执行（另一个实例/僵尸占着同名 job），
+      // 算「成功」会误报「补发成功」，算「失败」也不准确；单独计数并在汇总里 warn。
       if (outcome === "failed") failed += 1;
+      else if (outcome === "skipped") skipped += 1;
       else succeeded += 1;
     } catch (e) {
       failed += 1;
@@ -503,8 +507,10 @@ export async function runStartupCatchups(
   }
   // 汇总必须区分「尝试 / 成功 / 失败」：runExclusive 会把异常吞掉后 resolve，
   // 旧实现只报尝试数，失败时看起来像「补跑成功」了（P2-16）
-  const summary = `启动补发完成：尝试 ${scheduled} 个（成功 ${succeeded}、失败 ${failed}）`;
+  const summary = `启动补发完成：尝试 ${scheduled} 个（成功 ${succeeded}、跳过 ${skipped}、失败 ${failed}）`;
   if (failed > 0) logger.warn(summary);
+  else if (skipped > 0)
+    logger.warn(`${summary}；跳过表示同名 job 未执行（被重叠/僵尸占着），本轮未补发`);
   else logger.info(summary);
-  return { scheduled, succeeded, failed };
+  return { scheduled, succeeded, skipped, failed };
 }
