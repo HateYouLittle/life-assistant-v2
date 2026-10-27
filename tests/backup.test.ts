@@ -175,7 +175,8 @@ describe("db:backup CLI", () => {
     try {
       const target = runBackup(env.config);
       const files = readdirSync(env.config.backupDir);
-      assert.deepEqual(files, [target.slice(target.lastIndexOf("/") + 1)]);
+      const dbName = target.slice(target.lastIndexOf("/") + 1);
+      assert.deepEqual(files.sort(), [dbName, `${dbName}.verified`].sort());
       assert.equal(
         files.filter((name) => name.includes(".partial-")).length,
         0,
@@ -244,6 +245,28 @@ describe("db:backup CLI", () => {
       publishBackupFile(partial, target);
       assert.equal(readFileSync(target, "utf8"), "snapshot");
       assert.equal(existsSync(partial), false);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("清理旧备份时连带删除校验旁车，孤儿旁车也会被清掉（P1-4 复审 e）", () => {
+    const env = makeTestEnv();
+    try {
+      // keep=1：第二份备份发布后，第一份（含其旁车）应被 prune 掉
+      const first = runBackup(env.config, Date.UTC(2026, 8, 12, 1, 0, 0), { keep: 1 });
+      assert.equal(existsSync(`${first}.verified`), true);
+      // 孤儿旁车：对应 .db 不存在（模拟手工删库/复制残留）
+      const orphan = join(env.config.backupDir, "life-assistant-20200101-000000.db.verified");
+      writeFileSync(orphan, "{}");
+
+      const second = runBackup(env.config, Date.UTC(2026, 8, 12, 2, 0, 0), { keep: 1 });
+
+      assert.equal(existsSync(first), false, "超出保留份数的旧备份应被清掉");
+      assert.equal(existsSync(`${first}.verified`), false, "旁车要跟着备份一起删");
+      assert.equal(existsSync(orphan), false, "孤儿旁车也会在 prune 时清理");
+      assert.equal(existsSync(second), true);
+      assert.equal(existsSync(`${second}.verified`), true);
     } finally {
       cleanupTestEnv(env);
     }

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { Hono } from "hono";
@@ -87,6 +87,8 @@ describe("/metrics", () => {
       assert.equal(metricValue(body, "life_assistant_qweather_requests_today"), 0);
       // 没有备份目录 → -1（而不是 0：0 会被误读成「刚刚备份过」）
       assert.equal(metricValue(body, "life_assistant_backup_latest_age_seconds"), -1);
+      // 没有备份 → 也没有可信的校验旁车
+      assert.equal(metricValue(body, "life_assistant_backup_latest_verified"), 0);
       assert.ok(metricValue(body, "life_assistant_db_bytes") > 0, "主库文件应已存在");
       assert.ok(metricValue(body, "life_assistant_wal_bytes") >= 0);
     } finally {
@@ -154,6 +156,24 @@ describe("/metrics", () => {
       );
       const age = metricValue(body, "life_assistant_backup_latest_age_seconds");
       assert.ok(age >= 0 && age < 60, `备份年龄应接近 0，实际 ${age}`);
+      assert.equal(
+        metricValue(body, "life_assistant_backup_latest_verified"),
+        0,
+        "没有旁车时 verified 指标应为 0",
+      );
+
+      // 写一份内容与大小都对得上的旁车：零开库口径应变为 1
+      const backupPath = join(env.config.backupDir, "life-assistant-20260101-030000.db");
+      writeFileSync(
+        `${backupPath}.verified`,
+        JSON.stringify({
+          schemaVersion: 5,
+          verifiedAt: new Date().toISOString(),
+          sizeBytes: statSync(backupPath).size,
+        }),
+      );
+      const verifiedBody = await (await app(env).request("/metrics")).text();
+      assert.equal(metricValue(verifiedBody, "life_assistant_backup_latest_verified"), 1);
     } finally {
       cleanupTestEnv(env);
     }

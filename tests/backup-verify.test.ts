@@ -1,5 +1,14 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  unlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
@@ -140,7 +149,11 @@ describe("备份状态 backupStatus", () => {
       assert.equal(status.latest?.path, canonical, "latest 只看 life-assistant-<时间戳>.db");
       assert.equal(status.files.length, 4);
       assert.equal(status.files.filter((file) => file.canonical).length, 1);
-      assert.equal(readdirSync(env.config.backupDir).length, 4);
+      assert.equal(
+        readdirSync(env.config.backupDir).filter((name) => name.endsWith(".db")).length,
+        4,
+        "目录里还应有 <name>.db.verified 旁车，按 *.db 计仍是 4 份",
+      );
     } finally {
       cleanupTestEnv(env);
     }
@@ -165,6 +178,66 @@ describe("备份状态 backupStatus", () => {
       assert.equal(status.latest?.path, broken, "latest 仍按 mtime 选");
       assert.equal(status.latestVerified, false);
       assert.equal(status.stale, true, "最新备份不可用时必须报 stale，而不是「新鲜健康」");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("sidecar：备份成功写校验旁车，零开库口径给出 latestVerified（P1-4 复审 e）", () => {
+    const env = makeTestEnv();
+    try {
+      const target = runBackup(env.config);
+      const sidecar = `${target}.verified`;
+      assert.equal(existsSync(sidecar), true, "备份成功应写 <name>.db.verified 旁车");
+      const payload = JSON.parse(readFileSync(sidecar, "utf8")) as {
+        schemaVersion: number;
+        verifiedAt: string;
+        sizeBytes: number;
+      };
+      assert.equal(payload.schemaVersion, 5);
+      assert.equal(payload.sizeBytes, statSync(target).size);
+      assert.ok(!Number.isNaN(Date.parse(payload.verifiedAt)));
+
+      assert.equal(backupStatus(env.config).latestVerified, null, "默认不读旁车也不开库");
+      assert.equal(
+        backupStatus(env.config, Date.now(), { sidecar: true }).latestVerified,
+        true,
+        "零开库口径应信任与大小匹配的旁车",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("sidecar：缺失时零开库口径不可信，但现场校验仍能证明备份可用", () => {
+    const env = makeTestEnv();
+    try {
+      const target = runBackup(env.config);
+      unlinkSync(`${target}.verified`);
+
+      const bySidecar = backupStatus(env.config, Date.now(), { sidecar: true });
+      assert.equal(bySidecar.latestVerified, false);
+      assert.equal(bySidecar.stale, true, "没有可信旁车时不能再报「新鲜健康」");
+
+      const byDb = backupStatus(env.config, Date.now(), { verifyLatest: true });
+      assert.equal(byDb.latestVerified, true, "doctor --live 的开库校验仍是最终事实");
+      assert.equal(byDb.stale, false);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("sidecar：大小对不上（复制/覆盖过的旧旁车）按不可信处理", () => {
+    const env = makeTestEnv();
+    try {
+      const target = runBackup(env.config);
+      const sidecar = `${target}.verified`;
+      const payload = JSON.parse(readFileSync(sidecar, "utf8")) as Record<string, unknown>;
+      writeFileSync(
+        sidecar,
+        JSON.stringify({ ...payload, sizeBytes: (payload.sizeBytes as number) + 1 }),
+      );
+      assert.equal(backupStatus(env.config, Date.now(), { sidecar: true }).latestVerified, false);
     } finally {
       cleanupTestEnv(env);
     }

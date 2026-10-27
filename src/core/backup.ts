@@ -3,10 +3,13 @@ import {
   existsSync,
   linkSync,
   mkdirSync,
+  readFileSync,
   readdirSync,
+  renameSync,
   type Stats,
   statSync,
   unlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -33,6 +36,17 @@ const PARTIAL_RE = /^life-assistant-\d{8}-\d{6}\.db\.partial-\d+-[0-9a-f]+$/;
 
 /** 残留半截备份的清理年龄：可能还有进程正在写，1 小时内的不动 */
 const PARTIAL_STALE_MS = 60 * 60 * 1000;
+
+/**
+ * 备份校验旁车（sidecar）：`<name>.db.verified`，内容 `{schemaVersion, verifiedAt, sizeBytes}`。
+ *
+ * 为什么需要：`backupStatus({verifyLatest:true})` 要打开备份库做 quick_check，状态页/
+ * `/metrics` 这类高频调用承受不起；而只看 mtime 又会被「很新的坏备份」骗成健康。
+ * 备份成功时把校验结果写在这里，读旁车即可零开库判断 `latestVerified`
+ * （大小不一致/内容坏/缺失都按不可信处理）。深度校验仍以 `doctor --live` 开库为准。
+ */
+const VERIFIED_SUFFIX = ".verified";
+const VERIFIED_TMP_PREFIX = ".verified.tmp-";
 
 /** 超过这个时长没有新备份即视为过期（内置 job 每日一次，36h 能容忍一次错过/延迟） */
 export const BACKUP_STALE_HOURS = 36;
@@ -65,11 +79,16 @@ export interface BackupFileInfo {
 
 export interface BackupStatusOptions {
   /**
-   * 是否校验 `latest` 的完整性（quick_check + schema 可读）。默认 false：
-   * 状态页/`/metrics` 高频调用不做 DB 打开；`doctor --live` 这类手动检查才需要，
-   * 否则「最新备份其实是坏文件」会被 mtime 判成新鲜健康（P1-4）。
+   * 是否现场校验 `latest` 的完整性（打开备份库跑 quick_check + schema 可读）。
+   * 默认 false；`doctor --live` 用这个口径，因为它必须能发现「旁车说好、实际库坏了」。
+   * 打开 DB 有成本，状态页/`/metrics` 请用 sidecar。
    */
   verifyLatest?: boolean;
+  /**
+   * 是否只读 `<latest>.verified` 旁车来判定 `latestVerified`（零开库）。
+   * 旁车缺失/内容坏/大小对不上都按不可信（false）处理；两者同时给出时 verifyLatest 优先。
+   */
+  sidecar?: boolean;
 }
 
 export interface BackupStatus {
@@ -183,14 +202,16 @@ export function runBackup(
     } finally {
       db.close();
     }
+    let schemaVersion: number;
     try {
-      verifyDatabaseFile(partial);
+      schemaVersion = verifyDatabaseFile(partial);
     } catch (e) {
       throw new Error(
         `备份自校验失败，已删除半截产物: ${partial}（${e instanceof Error ? e.message : String(e)}）`,
       );
     }
     publishBackupFile(partial, target);
+    writeVerifiedSidecar(target, schemaVersion, nowMs);
   } catch (e) {
     // 任何失败都不留半截文件（删不掉也要让原始错误暴露，不能被清理错误掩盖）
     try {
@@ -234,6 +255,62 @@ export function publishBackupFile(partialPath: string, targetPath: string): void
   }
 }
 
+/** 写校验旁车（原子：先写唯一临时名再 rename）。失败只 warn —— 旁车只是增强信息 */
+function writeVerifiedSidecar(targetPath: string, schemaVersion: number, nowMs: number): void {
+  const path = `${targetPath}${VERIFIED_SUFFIX}`;
+  const tmp = `${path}${VERIFIED_TMP_PREFIX}${process.pid}-${randomUUID().slice(0, 8)}`;
+  try {
+    const sizeBytes = statSync(targetPath).size;
+    const payload = { schemaVersion, verifiedAt: new Date(nowMs).toISOString(), sizeBytes };
+    writeFileSync(tmp, JSON.stringify(payload), { mode: 0o600 });
+    renameSync(tmp, path);
+  } catch (e) {
+    logger.warn(
+      `写备份校验旁车失败（不影响备份本身）: ${path} ${e instanceof Error ? e.message : e}`,
+    );
+    try {
+      unlinkSync(tmp);
+    } catch {
+      // 临时文件可能根本没写出来
+    }
+  }
+}
+
+/**
+ * 读校验旁车：`true` 可信、`false` 存在但不可信（内容坏/大小对不上）、`null` 不存在。
+ * 大小必须与当前文件一致：旁车可能来自被复制/覆盖过的旧备份（mtime 与内容都变了）。
+ */
+function readVerifiedSidecar(file: BackupFileInfo): boolean | null {
+  const path = `${file.path}${VERIFIED_SUFFIX}`;
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "ENOENT" ? null : false;
+  }
+  try {
+    const parsed = JSON.parse(raw) as {
+      schemaVersion?: unknown;
+      verifiedAt?: unknown;
+      sizeBytes?: unknown;
+    };
+    if (
+      typeof parsed.schemaVersion !== "number" ||
+      !Number.isInteger(parsed.schemaVersion) ||
+      parsed.schemaVersion < 1
+    ) {
+      return false;
+    }
+    if (typeof parsed.verifiedAt !== "string" || Number.isNaN(Date.parse(parsed.verifiedAt))) {
+      return false;
+    }
+    if (typeof parsed.sizeBytes !== "number" || parsed.sizeBytes !== file.sizeBytes) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function prune(dir: string, keep: number, nowMs: number = Date.now()): void {
   const files = readdirSync(dir)
     .filter((f) => FILE_RE.test(f))
@@ -245,6 +322,32 @@ function prune(dir: string, keep: number, nowMs: number = Date.now()): void {
       logger.info(`已清理旧备份: ${stale}`);
     } catch (e) {
       logger.warn(`清理旧备份失败: ${stale} ${e instanceof Error ? e.message : e}`);
+    }
+    // 旁车跟着备份一起删；删不掉只是留个孤儿（下面的孤儿清理会兜底）
+    try {
+      unlinkSync(join(dir, `${stale}${VERIFIED_SUFFIX}`));
+    } catch {
+      // 没有旁车（旧备份/写旁车失败）是正常情况
+    }
+  }
+
+  // 孤儿旁车（对应 .db 已不存在）与写到一半的旁车临时文件：保留它们只会误导排障
+  const present = new Set(readdirSync(dir));
+  for (const name of present) {
+    const isOrphan =
+      name.endsWith(VERIFIED_SUFFIX) && !present.has(name.slice(0, -VERIFIED_SUFFIX.length));
+    const isStaleTmp = name.includes(VERIFIED_TMP_PREFIX);
+    if (!isOrphan && !isStaleTmp) continue;
+    const path = join(dir, name);
+    if (isStaleTmp) {
+      const stat = statSync(path, { throwIfNoEntry: false });
+      if (stat !== undefined && nowMs - stat.mtimeMs < PARTIAL_STALE_MS) continue;
+    }
+    try {
+      unlinkSync(path);
+      logger.info(`已清理孤儿备份旁车: ${name}`);
+    } catch (e) {
+      logger.warn(`清理备份旁车失败: ${name} ${e instanceof Error ? e.message : e}`);
     }
   }
   // 清理被 kill 打断的备份留下的 .partial-*：1 小时内的可能还有进程在写，不动。
@@ -322,18 +425,24 @@ export function backupStatus(
     if (latest === null || file.mtimeMs > latest.mtimeMs) latest = file;
   }
   const ageHours = latest === null ? null : Math.max(0, (nowMs - latest.mtimeMs) / 3_600_000);
-  // 只在被要求时打开数据库校验：坏备份的 mtime 往往很新，只看 mtime 会得出
+  // 只在被要求时判定 latest：坏备份的 mtime 往往很新，只看 mtime 会得出
   // 「备份新鲜健康」的相反结论（P1-4）。校验失败时 stale 必须为 true。
+  // - verifyLatest：开库现场校验（doctor --live，最终事实）；
+  // - sidecar：只读旁车，零开库（状态页/metrics）。
   let latestVerified: boolean | null = null;
-  if (opts.verifyLatest === true && latest !== null) {
-    try {
-      verifyDatabaseFile(latest.path);
-      latestVerified = true;
-    } catch (e) {
-      latestVerified = false;
-      logger.warn(
-        `最新备份校验失败（${latest.path}）：${e instanceof Error ? e.message : String(e)}`,
-      );
+  if (latest !== null) {
+    if (opts.verifyLatest === true) {
+      try {
+        verifyDatabaseFile(latest.path);
+        latestVerified = true;
+      } catch (e) {
+        latestVerified = false;
+        logger.warn(
+          `最新备份校验失败（${latest.path}）：${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    } else if (opts.sidecar === true) {
+      latestVerified = readVerifiedSidecar(latest) === true;
     }
   }
   return {

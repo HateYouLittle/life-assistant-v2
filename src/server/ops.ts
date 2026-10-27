@@ -172,6 +172,14 @@ function metricsText(config: ResolvedConfig, db: DatabaseSync, nowMs: number): s
     "最新规范备份距今秒数（无备份为 -1）",
     backup.ageHours === null ? -1 : backup.ageHours * 3600,
   );
+  // 零开库口径：读备份成功时写的 <name>.verified 旁车。1=最新备份有可信校验，
+  // 0=没有/不可信（深度校验以 doctor --live 的开库结果为准）
+  const backupVerify = backupStatus(config, nowMs, { sidecar: true });
+  gauge(
+    "life_assistant_backup_latest_verified",
+    "最新规范备份是否有可信的校验旁车（1=有，0=无/不可信；深度校验见 doctor --live）",
+    backupVerify.latestVerified === true ? 1 : 0,
+  );
 
   gauge("life_assistant_db_bytes", "主库文件字节数", fileBytes(config.dbPath));
   // SQLite 的 WAL 文件名就是主库路径加 -wal 后缀；无 WAL（已 checkpoint/非 WAL 模式）为 0
