@@ -11,13 +11,8 @@ import cron from "node-cron";
 import { bindHost, loadConfig, parseProfileId, type ResolvedConfig, urlHost } from "./config.js";
 import { bearerToken, resolveIdentity, tokenFingerprint } from "./core/auth.js";
 import { openDatabase } from "./core/database.js";
-import {
-  finishJobRun,
-  type JobTrigger,
-  markInterruptedJobRuns,
-  runStartupCatchups,
-  startJobRun,
-} from "./core/jobs.js";
+import { createJobRunner } from "./core/job-runner.js";
+import { markInterruptedJobRuns, runStartupCatchups } from "./core/jobs.js";
 import { acquireDaemonLock } from "./core/lock.js";
 import { logger, maskSensitiveUrl, sanitizeLogText, setLogLevel } from "./core/logger.js";
 import { incCounter } from "./core/metrics.js";
@@ -404,63 +399,10 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
 
   const httpServer = createServer(createHttpHandler(config, db));
 
-  const busy = new Set<string>();
-  /** job 运行记录的元信息；tick/未登记任务不传（不记 job_runs，避免每分钟刷一行） */
-  interface JobRunMeta {
-    module: string;
-    jobName: string;
-    trigger: JobTrigger;
-    scheduledFor: string;
-  }
-  /**
-   * 在途 job/tick 的 Promise。停机时必须等它们收敛：job 可能在 await 之后才写库/
-   * 发布通知，直接 db.close() 会留下 "database is not open" 并丢掉当次提醒。
-   * 按 name 存（name 在 busy 保护下唯一），避免在 Promise 初始化器里自引用。
-   */
-  const inFlightJobs = new Map<string, Promise<void>>();
-  function runExclusive(
-    name: string,
-    fn: () => Promise<void> | void,
-    meta?: JobRunMeta,
-  ): Promise<void> {
-    if (busy.has(name)) {
-      logger.debug(`跳过重叠触发: ${name}`);
-      // 记一条 skipped：状态页/doctor 能看出「这次是被上一轮挡掉的」，而不是静默消失
-      if (meta !== undefined) {
-        try {
-          finishJobRun(db, startJobRun(db, meta), "skipped");
-        } catch (e) {
-          logger.warn(`写入 job 跳过记录失败: ${errorMessage(e)}`);
-        }
-      }
-      return Promise.resolve();
-    }
-    busy.add(name);
-    const runId = meta === undefined ? undefined : startJobRun(db, meta);
-    const task = Promise.resolve()
-      .then(fn)
-      .then(() => {
-        if (runId !== undefined) finishJobRun(db, runId, "ok");
-      })
-      .catch((e) => {
-        logger.error(`${name} 执行失败: ${errorMessage(e)}`);
-        // 记录失败不能反过来让 job 崩溃：db 可能恰好处于关闭过程中
-        if (runId !== undefined) {
-          try {
-            finishJobRun(db, runId, "failed", errorMessage(e));
-          } catch (recordError) {
-            logger.warn(`写入 job 失败记录失败: ${errorMessage(recordError)}`);
-          }
-        }
-      })
-      .finally(() => {
-        busy.delete(name);
-        inFlightJobs.delete(name);
-      });
-    inFlightJobs.set(name, task);
-    return task;
-  }
-
+  // job 互斥执行 + 运行记录：见 core/job-runner.ts（P1-3 修 busy 泄漏）。
+  // inFlightJobs 是停机时等待收敛的在途 Promise（按 name 存）。
+  const jobRunner = createJobRunner(db);
+  const inFlightJobs = jobRunner.inFlight;
   async function tickAll(at: DateTime): Promise<void> {
     for (const module of getModules()) {
       if (module.tick === undefined) continue;
@@ -500,31 +442,45 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
     throw e;
   });
 
+  /**
+   * node-cron 会把回调里抛出的同步异常吞掉（emit('task-failed')，没人监听就彻底静默，
+   * 见 node_modules/node-cron/src/task.js）。jobRunner.run 已经不会向调用方抛出，
+   * 这里再挂一个监听作为最后一道兜底：任何漏网异常至少进日志，而不是零痕迹。
+   */
+  const watchCronTask = (task: cron.ScheduledTask, label: string): cron.ScheduledTask => {
+    task.on("task-failed", (e: unknown) => {
+      logger.error(`定时任务 ${label} 触发异常: ${errorMessage(e)}`);
+    });
+    return task;
+  };
+
   const tasks: cron.ScheduledTask[] = [];
   for (const { module, def, expr } of jobSpecs) {
-    tasks.push(
-      cron.schedule(
-        expr,
-        () => {
-          const at = now();
-          void runExclusive(`job:${def.name}`, () => def.handler(at), {
-            module,
-            jobName: def.name,
-            trigger: "cron",
-            // job_runs 的时间口径是 UTC ISO（字符串比较即时间比较）：本地 +08:00 偏移串
-            // 与 Z 串做字典序会得出错误结论，必须显式转 UTC。
-            scheduledFor: at.toUTC().toISO() ?? "",
-          });
-        },
-        { timezone: TZ },
-      ),
+    const task = cron.schedule(
+      expr,
+      () => {
+        const at = now();
+        void jobRunner.run(`job:${def.name}`, () => def.handler(at), {
+          module,
+          jobName: def.name,
+          trigger: "cron",
+          // job_runs 的时间口径是 UTC ISO（字符串比较即时间比较）：本地 +08:00 偏移串
+          // 与 Z 串做字典序会得出错误结论，必须显式转 UTC。
+          scheduledFor: at.toUTC().toISO() ?? "",
+        });
+      },
+      { timezone: TZ },
     );
+    tasks.push(watchCronTask(task, `${module}.${def.name}`));
     logger.info(`注册定时任务 ${module}.${def.name}: "${expr}" (${TZ})`);
   }
   tasks.push(
-    cron.schedule("* * * * *", () => void runExclusive("tick", () => tickAll(now())), {
-      timezone: TZ,
-    }),
+    watchCronTask(
+      cron.schedule("* * * * *", () => void jobRunner.run("tick", () => tickAll(now())), {
+        timezone: TZ,
+      }),
+      "tick",
+    ),
   );
   const drainTimer = setInterval(() => {
     void drainDue(db, config).catch((e) => logger.error(`outbox drain 失败: ${errorMessage(e)}`));
@@ -561,7 +517,7 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
       runJob: (module, def, trigger, scheduledFor) =>
         // 补发时把该次「原本应触发」的时刻传给 handler（而不是 now()）：
         // 晚报/摘要/周报等按时刻取业务日期的 job 才能补对那一天的班。
-        runExclusive(
+        jobRunner.run(
           `job:${def.name}`,
           () => {
             const at = DateTime.fromISO(scheduledFor, { zone: "utc" }).setZone(TZ);
