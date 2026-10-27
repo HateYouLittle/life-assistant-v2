@@ -11,6 +11,7 @@ import {
   fireDue,
   getSchedule,
   materializeSchedule,
+  snoozeSchedule,
   updateSchedule,
   validateRemindOffsets,
 } from "../src/modules/schedule/service.js";
@@ -1420,6 +1421,115 @@ describe("schedule update：rewind 只作用于进行中的最近事件", () => 
       cleanupTestEnv(env);
     }
   });
+
+  /**
+   * P1-1 的真实场景：**无 count** 的 daily + 双偏移，今天 #0 已 notified、#1 仍 pending。
+   * 物化预填 62 天，旧实现的 `MAX(event_at)` 恒为远期全 pending 事件 → 恒不 rewind。
+   */
+  function seedLiveTodayEvent(env: TestEnv) {
+    const created = createSchedule(env.db, "default", {
+      ...onceInput("09:00"),
+      recurrence: { freq: "daily", interval: 1 },
+      remindOffsets: [-30, 0],
+    });
+    const todayPrefix = `${todayIso()}T09:00`;
+    env.db
+      .prepare(
+        "UPDATE occurrences SET status = 'notified' WHERE schedule_id = ? AND occurrence_key = ?",
+      )
+      .run(created.id, `${todayPrefix}#0`);
+    const maxAt = (
+      env.db
+        .prepare("SELECT MAX(event_at) AS m FROM occurrences WHERE schedule_id = ?")
+        .get(created.id) as { m: string }
+    ).m;
+    assert.ok(
+      instantToLocalDate(maxAt) > todayIso(),
+      `构造前提：物化应已预填到远期（旧实现据此判定永不 rewind），实际 MAX=${maxAt}`,
+    );
+    return { created, todayPrefix };
+  }
+
+  it("无 count 的 daily：改标题不丢当天 pending 兄弟提醒（P1-1 回归）", () => {
+    const env = makeTestEnv();
+    try {
+      const { created, todayPrefix } = seedLiveTodayEvent(env);
+      const beforeFuture = occurrenceRows(env, created.id).filter(
+        (r) => instantToLocalDate(String(r.event_at)) > todayIso(),
+      ).length;
+
+      updateSchedule(env.db, "default", created.id, { title: "改个名" });
+
+      const rows = occurrenceRows(env, created.id).filter((r) =>
+        String(r.occurrence_key).startsWith(todayPrefix),
+      );
+      assert.deepEqual(
+        rows.map((r) => [String(r.occurrence_key).slice(-2), r.status]),
+        [
+          ["#0", "notified"],
+          ["#1", "pending"],
+        ],
+        `当天兄弟提醒不得因改标题丢失，实际 ${JSON.stringify(rows)}`,
+      );
+      assert.equal(
+        occurrenceRows(env, created.id).filter(
+          (r) => instantToLocalDate(String(r.event_at)) > todayIso(),
+        ).length,
+        beforeFuture,
+        "只改元数据不该重建/丢失远期 pending 行",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("无 count 的 daily：改偏移按「进行中事件」回退，补回当天兄弟提醒（P1-1 回归）", () => {
+    const env = makeTestEnv();
+    try {
+      const { created, todayPrefix } = seedLiveTodayEvent(env);
+      updateSchedule(env.db, "default", created.id, { remindOffsets: [-30, 0, 15] });
+      const rows = occurrenceRows(env, created.id).filter((r) =>
+        String(r.occurrence_key).startsWith(todayPrefix),
+      );
+      // #0 保持 notified（INSERT OR IGNORE 吸收既有行），#1 被补回，#2 是新偏移
+      assert.deepEqual(
+        rows.map((r) => [String(r.occurrence_key).slice(-2), r.status]),
+        [
+          ["#0", "notified"],
+          ["#1", "pending"],
+          ["#2", "pending"],
+        ],
+        `被删掉的当天 pending 兄弟提醒必须重建，实际 ${JSON.stringify(rows)}`,
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("snooze 过的提醒在改标题后保留顺延时间（P1-1 回归）", () => {
+    const env = makeTestEnv();
+    try {
+      const { created, todayPrefix } = seedLiveTodayEvent(env);
+      const snoozed = snoozeSchedule(env.db, "default", created.id, {
+        occurrenceKey: `${todayPrefix}#1`,
+        minutes: 30,
+      });
+
+      updateSchedule(env.db, "default", created.id, { title: "改个名" });
+
+      const row = occurrenceRows(env, created.id).find(
+        (r) => String(r.occurrence_key) === `${todayPrefix}#1`,
+      );
+      assert.equal(row?.status, "pending");
+      assert.equal(
+        row?.due_at,
+        snoozed.dueAt,
+        "只改元数据不得把 snooze 的 due_at 重置回原始偏移（旧实现删掉 pending 行后按原始偏移重建）",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
 });
 
 describe("schedule 创建/更新的原子性", () => {
@@ -1462,9 +1572,19 @@ describe("schedule 创建/更新的原子性", () => {
     const env = makeTestEnv();
     try {
       const created = createSchedule(env.db, "default", dailyInput("原标题"));
+      const before = occurrenceRows(env, created.id);
       blockOccurrenceInserts(env);
-      assert.throws(() => updateSchedule(env.db, "default", created.id, { title: "改坏" }), /boom/);
-      assert.equal(getSchedule(env.db, "default", created.id)?.title, "原标题");
+      // 只改标题不再触发删行/重物化（P1-1 保留 snooze 的改动），所以用「改 time」
+      // 这种会影响物化的 patch 来验证「更新 + 重物化同事务」。
+      assert.throws(() => updateSchedule(env.db, "default", created.id, { time: "10:00" }), /boom/);
+      const row = getSchedule(env.db, "default", created.id);
+      assert.equal(row?.title, "原标题");
+      assert.equal(row?.time, "09:00", "重物化失败必须回滚时间改动");
+      assert.deepEqual(
+        occurrenceRows(env, created.id).map((r) => r.occurrence_key),
+        before.map((r) => r.occurrence_key),
+        "重物化失败必须回滚被删的 pending 行",
+      );
     } finally {
       cleanupTestEnv(env);
     }

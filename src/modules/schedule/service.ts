@@ -455,42 +455,51 @@ const MATERIALIZE_ITERATIONS = 10;
 const EXEMPT_SCAN_ITERATIONS = 500;
 
 /**
- * update 时是否需要回退重物化（rewind）。只有「最近一个事件处于进行中」才需要：
- * - 全 pending：删除后游标自然回退，前向物化即可重建；
- * - 全 notified / 已被 occurrence_key 完成：事件已结束，rewind 会按新排期重复补发，
- *   甚至为 count 日程造出额外事件（本轮复核发现的回归）；
- * - 既有 notified 又有 pending：删除会丢掉 pending 兄弟行，而游标停在 notified 行上，
- *   只有 rewind 才能把该事件的提醒补回来（本轮修复的目标场景）。
+ * update 时回退重物化（rewind）的锚点：**最近一个「已发过提醒、又有未触发正常提醒」的事件**。
+ *
+ * 不能拿 `MAX(event_at)` 当锚点（P1-1 / T-1027-02b）：循环日程的物化会预填到
+ * NEAR_HORIZON_DAYS=62 天，`MAX(event_at)` 永远是 62 天后那个全 pending 的事件 →
+ * 判定为「不进行中」→ 不 rewind；可 update 随后又删掉了当天事件的 pending 兄弟行
+ * （#1），游标落在当天已 notified 的 #0 上，前向物化严格取更晚日期 → 当天 #1 永久丢失。
+ *
+ * 现在改为按「最近一个 notified 事件」判定，并返回**该事件**作为回退锚点：
+ * - 该事件没有 pending 正常行（全 notified/已完成）：事件已结束，不 rewind，
+ *   避免按新排期重复补发或为 count 日程造出额外事件；
+ * - 全 pending：没有 notified 行，返回 null；删除后游标自然回退，前向物化即可重建；
+ * - 无事件：返回 null。
+ *
+ * 只统计「正常提醒行」（key 以 #数字 结尾）：DELETE 只删这些行，:resend / #esc:N
+ * 会被保留，不该触发回退（否则派生行 pending 会让已通知事件被补行）。
  */
-function latestEventNeedsRewind(db: DatabaseSync, scheduleId: string): boolean {
+function latestInterruptedEvent(db: DatabaseSync, scheduleId: string): string | null {
   const last = db
     .prepare(
-      "SELECT MAX(event_at) AS m FROM occurrences WHERE schedule_id = ? AND status != 'cancelled'",
+      "SELECT MAX(event_at) AS m FROM occurrences WHERE schedule_id = ? AND status = 'notified'",
     )
     .get(scheduleId) as { m: string | null };
-  if (last.m === null) return false;
+  if (last.m === null) return null;
   const rows = db
     .prepare(
-      "SELECT occurrence_key, status FROM occurrences WHERE schedule_id = ? AND event_at = ?",
+      "SELECT occurrence_key FROM occurrences WHERE schedule_id = ? AND event_at = ? AND status = 'pending'",
     )
-    .all(scheduleId, last.m) as { occurrence_key: string; status: string }[];
-  const hasNotified = rows.some((r) => r.status === "notified");
-  // 只统计「正常提醒行」（key 以 #数字 结尾）：update 的 DELETE 只删这些行，
-  // :resend / #esc:N 会被保留，不该触发回退重物化（否则全通知的事件会因派生行被补发）。
-  const hasPendingNormal = rows.some(
-    (r) => r.status === "pending" && /#\d+$/.test(r.occurrence_key),
-  );
-  return hasNotified && hasPendingNormal;
+    .all(scheduleId, last.m) as { occurrence_key: string }[];
+  return rows.some((r) => isNormalReminderKey(r.occurrence_key)) ? last.m : null;
 }
 
 export interface MaterializeOptions {
   /**
-   * true：从「最近一个事件」本身开始产出（而不是严格晚于它）。
-   * update 会删掉所有 pending 的正常提醒行并立即重物化；若不回退，最近事件里已提醒的
+   * true：从回退锚点（缺省「最近一个事件」）本身开始产出（而不是严格晚于它）。
+   * update 会删掉所有 pending 的正常提醒行并立即重物化；若不回退，被删掉的
    * 兄弟偏移（如 #0 已 notified、#1 仍 pending）不会重现，用户永久丢失该次提醒。
-   * INSERT OR IGNORE 保证回退不会重复既有行；调用方必须先经 latestEventNeedsRewind 判定。
+   * INSERT OR IGNORE 保证回退不会重复既有行；调用方必须先经 latestInterruptedEvent 判定。
    */
   rewind?: boolean;
+  /**
+   * 回退锚点（UTC ISO 瞬间）。缺省取当前 MAX(event_at)。
+   * 有它才能处理「锚点事件之后还有 done/cancelled 事件」的情形：删除 pending 行后
+   * MAX(event_at) 会落在那些更晚的终态行上，光靠 rewind 会跳过真正要补的事件。
+   */
+  rewindFrom?: string;
 }
 
 /** 物化接下来一段时间的 occurrence（含提醒偏移）；节假日数据缺失时暂停在该日期之前 */
@@ -529,9 +538,11 @@ export function materializeSchedule(
       ? DateTime.fromISO(last.m, { zone: TZ })
       : now().minus({ days: 1 }).startOf("day");
   if (opts.rewind === true && last.m !== null) {
-    // 回退一天：nextDate 会把「最近一个事件」本身再次产出（若它在当前规则下成立），
+    // 回退一天：nextDate 会把锚点事件本身再次产出（若它在当前规则下成立），
     // 既有行被 INSERT OR IGNORE 吸收，缺失的偏移行被补回。
-    after = DateTime.fromISO(last.m, { zone: TZ }).minus({ days: 1 });
+    const anchor = opts.rewindFrom ?? last.m;
+    const anchorAt = DateTime.fromISO(anchor, { zone: TZ });
+    if (anchorAt.isValid) after = anchorAt.minus({ days: 1 });
   }
   const horizon = now().plus({ days: FAR_HORIZON_DAYS });
   const nearHorizon = now().plus({ days: NEAR_HORIZON_DAYS });
@@ -774,11 +785,31 @@ export function updateSchedule(
     patch.recurrence === undefined && patch.calendar === "lunar" && row.calendar !== "lunar"
       ? collapseLunarInterval(merged.calendar, merged.recurrence)
       : merged.recurrence;
+  // 只有「会影响物化结果」的字段真的变了才删行 + 重建：只改标题/备注/类型时保留既有
+  // occurrence 行（尤其 snooze 过的 due_at —— 删掉后按原始偏移重建会静默丢失顺延，
+  // P1-1 的第二个症状）。
+  const materializationAffected =
+    (patch.time !== undefined && merged.time !== row.time) ||
+    (patch.allDay !== undefined && merged.allDay !== (row.all_day === 1)) ||
+    (patch.calendar !== undefined && merged.calendar !== row.calendar) ||
+    (patch.startDate !== undefined && (merged.startDate ?? null) !== row.start_date) ||
+    (patch.lunarMonth !== undefined && merged.lunarMonth !== row.lunar_month) ||
+    (patch.lunarDay !== undefined && merged.lunarDay !== row.lunar_day) ||
+    (patch.leapPolicy !== undefined &&
+      (merged.leapPolicy ?? "follow") !== (row.leap_policy ?? "follow")) ||
+    (patch.lunarClamp !== undefined && merged.lunarClamp !== (row.lunar_clamp === 1)) ||
+    (patch.remindOffsets !== undefined &&
+      patch.remindOffsets !== null &&
+      JSON.stringify(merged.remindOffsets) !== row.remind_offsets_json) ||
+    patch.recurrence !== undefined ||
+    (patch.workdayFilter !== undefined && merged.workdayFilter !== row.workday_filter) ||
+    (patch.status !== undefined && status !== row.status);
   const ts = nowIso();
   withTransaction(db, () => {
-    // 必须在 DELETE 之前判定：删除 pending 行后「最近事件是否进行中」的信息就没了。
-    // 只有进行中的最近事件才允许回退重物化（否则全通知/已完成的事件会被重复补发）。
-    const rewind = latestEventNeedsRewind(db, id);
+    // 必须在 DELETE 之前取锚点：删除 pending 行后「最近一个 notified 事件还有 pending
+    // 兄弟」的信息就没了（2026-10-27 P1-1：此前用 MAX(event_at) 判定，被 62 天前瞻
+    // 的全 pending 行带偏，导致当天兄弟提醒与 snooze 被删后不再重建）。
+    const rewindFrom = materializationAffected ? latestInterruptedEvent(db, id) : null;
     db.prepare(
       `UPDATE schedules SET title = ?, note = ?, kind = ?, calendar = ?, start_date = ?, lunar_month = ?,
          lunar_day = ?, leap_policy = ?, lunar_clamp = ?, time = ?, all_day = ?, recurrence_json = ?,
@@ -806,16 +837,18 @@ export function updateSchedule(
       ts,
       id,
     );
-    // 保留 :resend 与 #esc:* 行：它们的有效性由 fireDue 的触发前校验按当前排期判定
-    // （改了 time/escalation、父事件被删/重排时在触发前作废），不能在这里一律删掉。
-    db.prepare(
-      `DELETE FROM occurrences WHERE schedule_id = ? AND status = 'pending'
-         AND occurrence_key NOT LIKE '%' || ? AND occurrence_key NOT LIKE '%' || ?`,
-    ).run(id, RESEND_SUFFIX, `${ESCALATION_SUFFIX}%`);
-    // 更新与重物化同事务：物化失败整体回滚，不留「报错但改动已生效」；
-    // rewind 让最近一个事件缺失的偏移行（如已 notified 的 #0 之外那条）补回来。
-    const updated = getSchedule(db, profileId, id) as ScheduleRow;
-    materializeSchedule(db, updated, { rewind });
+    if (materializationAffected) {
+      // 保留 :resend 与 #esc:* 行：它们的有效性由 fireDue 的触发前校验按当前排期判定
+      // （改了 time/escalation、父事件被删/重排时在触发前作废），不能在这里一律删掉。
+      db.prepare(
+        `DELETE FROM occurrences WHERE schedule_id = ? AND status = 'pending'
+           AND occurrence_key NOT LIKE '%' || ? AND occurrence_key NOT LIKE '%' || ?`,
+      ).run(id, RESEND_SUFFIX, `${ESCALATION_SUFFIX}%`);
+      // 更新与重物化同事务：物化失败整体回滚，不留「报错但改动已生效」；
+      // rewind 从「最近一个进行中事件」回退，补回被删掉的兄弟偏移行。
+      const updated = getSchedule(db, profileId, id) as ScheduleRow;
+      materializeSchedule(db, updated, rewindFrom === null ? {} : { rewind: true, rewindFrom });
+    }
   });
   return getSchedule(db, profileId, id) as ScheduleRow;
 }
