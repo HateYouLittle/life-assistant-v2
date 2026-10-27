@@ -11,6 +11,7 @@ import cron from "node-cron";
 import { bindHost, loadConfig, parseProfileId, type ResolvedConfig, urlHost } from "./config.js";
 import { bearerToken, resolveIdentity, tokenFingerprint } from "./core/auth.js";
 import { openDatabase } from "./core/database.js";
+import { createInFlightTracker } from "./core/inflight.js";
 import { createJobRunner } from "./core/job-runner.js";
 import { markInterruptedJobRuns, runStartupCatchups } from "./core/jobs.js";
 import { acquireDaemonLock } from "./core/lock.js";
@@ -59,6 +60,8 @@ const SESSION_IDLE_MS = 2 * 3600 * 1000;
 const MAX_SESSIONS = 200;
 /** 停机时等待在途 cron job / tick 的上限（它们可能正在发布通知） */
 const JOB_SHUTDOWN_WAIT_MS = 10_000;
+/** 停机时等在途 HTTP/MCP 请求收敛的上界：写工具多在毫秒~秒级，3s 足够；长连接由后续强制收敛 */
+const HTTP_SHUTDOWN_WAIT_MS = 3_000;
 
 async function buildMcpServer(
   profileId: string,
@@ -397,7 +400,33 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
   initRuntime({ db, config, services: createServices(db, config) });
   registerAllModules();
 
-  const httpServer = createServer(createHttpHandler(config, db));
+  // 在途 HTTP/MCP 请求追踪（P2-8）：停机时先拒绝新请求、再等在途收敛，最后才关库。
+  // `httpServer.close()` 只停止 accept，keep-alive 上的 MCP 长连接仍能发新请求。
+  const inFlightHttp = createInFlightTracker();
+  const requestHandler = createHttpHandler(config, db);
+  const httpServer = createServer((req, res) => {
+    if (inFlightHttp.closed) {
+      // 停机窗口内的新请求直接 503，并明确 Connection: close，让客户端重试到新实例
+      res.writeHead(503, {
+        "Content-Type": "application/json; charset=utf-8",
+        Connection: "close",
+      });
+      res.end(JSON.stringify({ ok: false, error: "shutting down" }));
+      return;
+    }
+    const done = inFlightHttp.begin();
+    // 'close' 在响应完成或连接被掐断时触发（Node ≥16 的语义）；SSE 长连接会拖到掐断，
+    // 所以下面的 waitForIdle 必须有上限。
+    res.once("close", done);
+    try {
+      requestHandler(req, res);
+    } catch (e) {
+      logger.error(`请求处理异常: ${errorMessage(e)}`);
+      done();
+      if (!res.headersSent) res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error: "internal error" }));
+    }
+  });
 
   // job 互斥执行 + 运行记录：见 core/job-runner.ts（P1-3 修 busy 泄漏）。
   // inFlightJobs 是停机时等待收敛的在途 Promise（按 name 存）。
@@ -532,7 +561,7 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
         ),
     })
       .then((result) => {
-        if (result.scheduled > 0) logger.info(`启动补发完成：补跑 ${result.scheduled} 个任务`);
+        // 汇总日志由 core/jobs 的 runStartupCatchups 统一输出（区分尝试/成功/失败，P2-16）
       })
       .catch((e) => {
         logger.error(`启动补发失败: ${errorMessage(e)}`);
@@ -553,6 +582,8 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
     if (stopped) return;
     stopped = true;
     try {
+      // 先拒绝新请求（含 keep-alive 连接上的新请求），再停定时器
+      inFlightHttp.close();
       for (const task of tasks) task.stop();
       clearInterval(drainTimer);
       // 先停止接受新连接（已建立的在途请求继续处理），避免更长的 job/drain 等待期间
@@ -597,6 +628,15 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
             `仍有 ${jobRunner.zombies.size} 个超时任务未收敛（${[...jobRunner.zombies.keys()].join(", ")}），继续关库`,
           );
         }
+      }
+      // 在途 HTTP/MCP 请求：写工具可能正在处理（甚至正在 await 外部服务），直接
+      // db.close() 会让客户端 500、重试还可能重复写。给一个有界等待（3s），收不回的
+      // 长连接由后面的 closeAllConnections 强制收敛，只 warn 不阻塞停机。
+      const leftHttp = await inFlightHttp.waitForIdle(HTTP_SHUTDOWN_WAIT_MS);
+      if (leftHttp > 0) {
+        logger.warn(
+          `停机时仍有 ${leftHttp} 个在途 HTTP/MCP 请求未收敛（最多等 ${HTTP_SHUTDOWN_WAIT_MS}ms），继续关库`,
+        );
       }
       // job 可能刚刚通过 publish 排了一个 100ms drain；在关库前把它取消掉。
       // 已落库但未投出的行留着，下次启动会由 outbox 继续投递（不丢）。
