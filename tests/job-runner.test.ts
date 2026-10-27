@@ -175,4 +175,105 @@ describe("core/job-runner（P1-3）", () => {
       cleanupTestEnv(env);
     }
   });
+
+  it("看门狗：handler 挂死 → 超时后记 failed、释放 busy，同名 job 下次仍能跑（P2-9）", async () => {
+    const env = makeTestEnv();
+    try {
+      const runner = createJobRunner(env.db, { timeoutMs: 30 });
+      const started = Date.now();
+      // 永不 settle 的 handler（没有定时器，不会拖住测试进程）
+      await runner.run("job:hang", () => new Promise<void>(() => {}), meta);
+      assert.ok(Date.now() - started >= 25, "run 应在看门狗超时后才返回");
+      assert.equal(runner.inFlight.size, 0, "超时后必须清掉在途登记，停机不能被挂死 handler 卡住");
+
+      const rows = env.db.prepare("SELECT status, error FROM job_runs ORDER BY id").all() as {
+        status: string;
+        error: string | null;
+      }[];
+      assert.deepEqual(
+        rows.map((r) => r.status),
+        ["failed"],
+      );
+      assert.match(rows[0]?.error ?? "", /执行超时/);
+
+      // busy 已释放：同名 job 下一次触发必须能真正执行
+      let ran = 0;
+      await runner.run(
+        "job:hang",
+        () => {
+          ran += 1;
+        },
+        meta,
+      );
+      assert.equal(ran, 1);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("看门狗：正常 handler 快于超时不受影响，仍记 ok（P2-9）", async () => {
+    const env = makeTestEnv();
+    try {
+      const runner = createJobRunner(env.db, { timeoutMs: 5_000 });
+      let ran = 0;
+      await runner.run(
+        "job:fast",
+        () => {
+          ran += 1;
+        },
+        meta,
+      );
+      assert.equal(ran, 1);
+      const row = env.db.prepare("SELECT status FROM job_runs ORDER BY id DESC LIMIT 1").get() as {
+        status: string;
+      };
+      assert.equal(row.status, "ok");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("看门狗：超时后 handler 迟到的 resolve/异常不产生第二次记录（P2-9）", async () => {
+    const env = makeTestEnv();
+    try {
+      const runner = createJobRunner(env.db, { timeoutMs: 20 });
+      // 50ms 后才 resolve：超时判定已经发生
+      await runner.run(
+        "job:late",
+        () => new Promise<void>((resolve) => setTimeout(resolve, 50)),
+        meta,
+      );
+      // 再等迟到的那次 settle 走完
+      await new Promise((resolve) => setTimeout(resolve, 80));
+
+      const rows = env.db.prepare("SELECT status, error FROM job_runs ORDER BY id").all() as {
+        status: string;
+        error: string | null;
+      }[];
+      assert.deepEqual(
+        rows.map((r) => r.status),
+        ["failed"],
+        "只能有超时那一条 failed，不得再写 ok",
+      );
+      assert.match(rows[0]?.error ?? "", /执行超时/);
+
+      // 迟到的 reject 同样不该触发二次记录/未处理异常
+      await runner.run(
+        "job:late-reject",
+        () =>
+          new Promise<void>((_resolve, reject) => {
+            setTimeout(() => reject(new Error("late boom")), 50);
+          }),
+        meta,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      const fails = env.db
+        .prepare("SELECT COUNT(*) AS n FROM job_runs WHERE job_name = ? AND status = 'failed'")
+        .get(meta.jobName) as { n: number };
+      assert.ok(fails.n >= 1);
+      assert.equal(runner.inFlight.size, 0);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
 });

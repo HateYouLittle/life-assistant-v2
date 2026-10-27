@@ -22,6 +22,14 @@ export interface JobRunMeta {
   scheduledFor: string;
 }
 
+export interface JobRunnerOptions {
+  /**
+   * 单次 job 执行超时（毫秒；<=0 表示关闭看门狗）。来自 `config.jobTimeoutMs`
+   * （JOB_TIMEOUT_MINUTES，默认 15 分钟）。
+   */
+  timeoutMs?: number;
+}
+
 export interface JobRunner {
   /**
    * 同名任务不重叠执行；**不会向调用方抛出**任何异常（同步/异步都在内部记录），
@@ -36,9 +44,14 @@ function errorText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-export function createJobRunner(db: DatabaseSync): JobRunner {
+function timeoutText(timeoutMs: number): string {
+  return timeoutMs % 60_000 === 0 ? `${timeoutMs / 60_000} 分钟` : `${timeoutMs} 毫秒`;
+}
+
+export function createJobRunner(db: DatabaseSync, opts: JobRunnerOptions = {}): JobRunner {
   const busy = new Set<string>();
   const inFlight = new Map<string, Promise<void>>();
+  const timeoutMs = opts.timeoutMs ?? 0;
 
   function recordSkip(meta: JobRunMeta): void {
     // 记一条 skipped：状态页/doctor 能看出「这次是被上一轮挡掉的」，而不是静默消失
@@ -66,11 +79,15 @@ export function createJobRunner(db: DatabaseSync): JobRunner {
       logger.error(`${name} 记录运行开始失败，本轮未执行: ${errorText(e)}`);
       return Promise.resolve();
     }
-    const task = Promise.resolve()
+    // 看门狗：handler 永不 settle 时释放 busy 并记 failed，否则该 job 永久只记 skipped。
+    let timedOut = false;
+    let timer: NodeJS.Timeout | undefined;
+    const finished = Promise.resolve()
       .then(fn)
       .then(() => {
         // 成功记录写失败（同样可能是 SQLITE_BUSY）不能落进下面的 .catch 被记成
         // 「执行失败」—— handler 明明成功了（复审 T-1027-02b 指出）。只 warn。
+        if (timedOut) return;
         if (runId !== undefined) {
           try {
             finishJobRun(db, runId, "ok");
@@ -80,6 +97,11 @@ export function createJobRunner(db: DatabaseSync): JobRunner {
         }
       })
       .catch((e) => {
+        // 超时已经记过 failed，挂死 handler 迟到的异常不再二次落库
+        if (timedOut) {
+          logger.debug(`${name} 超时后才失败（已按超时记 failed）: ${errorText(e)}`);
+          return;
+        }
         logger.error(`${name} 执行失败: ${errorText(e)}`);
         // 记录失败不能反过来让 job 崩溃：db 可能恰好处于关闭过程中
         if (runId !== undefined) {
@@ -89,11 +111,32 @@ export function createJobRunner(db: DatabaseSync): JobRunner {
             logger.warn(`写入 job 失败记录失败: ${errorText(recordError)}`);
           }
         }
-      })
-      .finally(() => {
-        busy.delete(name);
-        inFlight.delete(name);
       });
+    const watchdog =
+      timeoutMs > 0
+        ? new Promise<void>((resolve) => {
+            timer = setTimeout(() => {
+              timedOut = true;
+              const text = `执行超时（${timeoutText(timeoutMs)}）`;
+              logger.error(`${name} ${text}，已按失败记录并释放互斥；handler 仍在后台运行`);
+              if (runId !== undefined) {
+                try {
+                  finishJobRun(db, runId, "failed", text);
+                } catch (recordError) {
+                  logger.warn(`写入 job 超时记录失败: ${errorText(recordError)}`);
+                }
+              }
+              resolve();
+            }, timeoutMs);
+            // 看门狗本身不该拖住进程退出（daemon 停机不看它，只看 inFlight）
+            timer.unref?.();
+          })
+        : null;
+    const task = (watchdog === null ? finished : Promise.race([finished, watchdog])).finally(() => {
+      if (timer !== undefined) clearTimeout(timer);
+      busy.delete(name);
+      inFlight.delete(name);
+    });
     inFlight.set(name, task);
     return task;
   }

@@ -92,6 +92,12 @@ export interface ResolvedConfig {
   /** 轮转后保留的份数（LOG_KEEP，默认 7） */
   logKeep: number;
   logLevel: LogLevel;
+  /**
+   * 单个 job 的执行超时（毫秒，JOB_TIMEOUT_MINUTES × 60000，默认 15 分钟；0 = 关闭看门狗）。
+   * handler 挂死会永久占用 busy，让该 job 之后每次触发都只记 skipped；超时后记 failed
+   * 并释放 busy，挂死的 handler 继续在后台跑但不阻塞后续触发与停机。
+   */
+  jobTimeoutMs: number;
 }
 
 function parseSecrets(raw: string | undefined): Record<string, string> {
@@ -471,6 +477,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
     throw new Error(`BACKUP_KEEP 必须是 1..365 之间的整数: ${backupKeepRaw}`);
   }
 
+  const jobTimeoutRaw = env.JOB_TIMEOUT_MINUTES?.trim() || "15";
+  const jobTimeoutMinutes = Number(jobTimeoutRaw);
+  if (!Number.isInteger(jobTimeoutMinutes) || jobTimeoutMinutes < 0 || jobTimeoutMinutes > 1440) {
+    throw new Error(
+      `JOB_TIMEOUT_MINUTES 必须是 0..1440 之间的整数（0 = 关闭看门狗）: ${jobTimeoutRaw}`,
+    );
+  }
+
   const portRaw = env.PORT?.trim() || "3080";
   const port = Number(portRaw);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -513,6 +527,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
     logMaxBytes: logMaxMb * 1024 * 1024,
     logKeep,
     logLevel: logLevel.data,
+    jobTimeoutMs: jobTimeoutMinutes * 60_000,
   };
 }
 

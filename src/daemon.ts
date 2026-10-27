@@ -401,7 +401,7 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
 
   // job 互斥执行 + 运行记录：见 core/job-runner.ts（P1-3 修 busy 泄漏）。
   // inFlightJobs 是停机时等待收敛的在途 Promise（按 name 存）。
-  const jobRunner = createJobRunner(db);
+  const jobRunner = createJobRunner(db, { timeoutMs: config.jobTimeoutMs });
   const inFlightJobs = jobRunner.inFlight;
   async function tickAll(at: DateTime): Promise<void> {
     for (const module of getModules()) {
