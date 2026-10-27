@@ -1,11 +1,19 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 import { DateTime } from "luxon";
 import { runBackup } from "../src/backup.js";
+import { publishBackupFile } from "../src/core/backup.js";
 import { MissingDatabaseError, runBackup as runCoreBackup } from "../src/core/backup.js";
 import { TZ } from "../src/time.js";
 import { cleanupTestEnv, makeTestEnv } from "./helpers.js";
@@ -204,6 +212,38 @@ describe("db:backup CLI", () => {
         1,
         ".partial 不能被 backupStatus/恢复当成规范备份",
       );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("发布用 link 保持「同名备份拒绝覆盖」契约（复审 T-1027-02b）", () => {
+    const env = makeTestEnv();
+    try {
+      mkdirSync(env.config.backupDir, { recursive: true });
+      const partial = join(env.config.backupDir, "life-assistant-20260101-000000.db.partial-1-aa");
+      const target = join(env.config.backupDir, "life-assistant-20260101-000000.db");
+      writeFileSync(partial, "new-snapshot");
+      writeFileSync(target, "existing-snapshot");
+
+      assert.throws(() => publishBackupFile(partial, target), /拒绝覆盖/);
+      assert.equal(readFileSync(target, "utf8"), "existing-snapshot", "不得静默覆盖已有备份");
+      assert.equal(existsSync(partial), true, "发布失败时临时文件应留给调用方清理/排障");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("发布成功：目标出现且临时文件被清掉", () => {
+    const env = makeTestEnv();
+    try {
+      mkdirSync(env.config.backupDir, { recursive: true });
+      const partial = join(env.config.backupDir, "life-assistant-20260101-000000.db.partial-1-bb");
+      const target = join(env.config.backupDir, "life-assistant-20260101-000000.db");
+      writeFileSync(partial, "snapshot");
+      publishBackupFile(partial, target);
+      assert.equal(readFileSync(target, "utf8"), "snapshot");
+      assert.equal(existsSync(partial), false);
     } finally {
       cleanupTestEnv(env);
     }

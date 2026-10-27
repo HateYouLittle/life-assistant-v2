@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 import {
   existsSync,
+  linkSync,
   mkdirSync,
   readdirSync,
-  renameSync,
   type Stats,
   statSync,
   unlinkSync,
@@ -190,8 +190,7 @@ export function runBackup(
         `备份自校验失败，已删除半截产物: ${partial}（${e instanceof Error ? e.message : String(e)}）`,
       );
     }
-    // 同一目录内 rename 是原子的：要么备份以规范名完整出现，要么根本没有
-    renameSync(partial, target);
+    publishBackupFile(partial, target);
   } catch (e) {
     // 任何失败都不留半截文件（删不掉也要让原始错误暴露，不能被清理错误掩盖）
     try {
@@ -203,6 +202,31 @@ export function runBackup(
   }
   prune(config.backupDir, keep, nowMs);
   return target;
+}
+
+/**
+ * 把校验通过的临时备份发布成规范文件名。
+ *
+ * 用 `link` 而不是 `rename`：同一目录内 link 是原子的，且目标已存在时返回 EEXIST
+ * （rename 在 POSIX 上会静默覆盖）。这保留了「同名备份拒绝覆盖」的既有契约 ——
+ * 两个备份进程撞在同一秒时，后者必须报错，而不是悄悄覆盖前者的快照
+ * （复审 T-1027-02b 指出 rename 把契约改没了）。
+ */
+export function publishBackupFile(partialPath: string, targetPath: string): void {
+  try {
+    linkSync(partialPath, targetPath);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new Error(`备份已存在，拒绝覆盖: ${targetPath}`);
+    }
+    throw e;
+  }
+  try {
+    unlinkSync(partialPath);
+  } catch (e) {
+    // 发布已经成功，临时文件删不掉只是多占一点磁盘，交给 prune 的残留清理
+    logger.warn(`清理备份临时文件失败: ${partialPath} ${e instanceof Error ? e.message : e}`);
+  }
 }
 
 function prune(dir: string, keep: number, nowMs: number = Date.now()): void {
