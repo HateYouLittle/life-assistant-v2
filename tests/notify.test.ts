@@ -344,6 +344,18 @@ describe("outbox 投递", () => {
           await drainDue(env.db, env.config);
           assert.equal(deliveryRows(env.db)[0]?.status, "queued");
 
+          // P2-7：静默段跳过时必须把 next_attempt_at 推到窗口结束，否则整窗内
+          // /readyz 的 outbox_stalled 与 /metrics 的「最老待投」必然误报。
+          const deferred = deliveryRows(env.db)[0] as { next_attempt_at: string };
+          assert.ok(
+            Date.parse(deferred.next_attempt_at) > Date.now(),
+            `静默行应被推迟到窗口结束，实际 next_attempt_at=${deferred.next_attempt_at}`,
+          );
+
+          // 模拟「静默窗口结束、到点可投」：把 next_attempt_at 拨回现在再 drain
+          env.db
+            .prepare("UPDATE deliveries SET next_attempt_at = ? WHERE status = 'queued'")
+            .run(new Date().toISOString());
           setSetting(env.db, "default", "quiet_hours", futureQuietWindow());
           await drainDue(env.db, env.config);
           assert.equal(deliveryRows(env.db)[0]?.status, "sent");

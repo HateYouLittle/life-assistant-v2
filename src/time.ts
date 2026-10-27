@@ -52,6 +52,24 @@ export function inQuietWindow(
   return start < end ? minutes >= start && minutes < end : minutes >= start || minutes < end;
 }
 
+/**
+ * 静默窗口内的「恢复时刻」：当前时刻在静默窗口内时返回窗口结束的那个瞬间，否则 null。
+ * 用于 drain 把静默行 `next_attempt_at` 推到窗口结束——否则整窗内它一直是最老 queued，
+ * `/readyz` 与 `/metrics` 会把「按设计等待」误报成 outbox 卡死（P2-7）。
+ */
+export function quietResumeAt(
+  value: { start: string; end: string } | null | undefined,
+  at: DateTime = now(),
+): DateTime | null {
+  if (!value || !isTime(value.start) || !isTime(value.end) || value.start === value.end)
+    return null;
+  if (!inQuietWindow(value, at)) return null;
+  const [hour, minute] = value.end.split(":").map(Number) as [number, number];
+  let end = at.set({ hour, minute, second: 0, millisecond: 0 });
+  if (end <= at) end = end.plus({ days: 1 });
+  return end;
+}
+
 function quietMinutes(hhmm: string): number {
   const [h, m] = hhmm.split(":");
   return Number(h) * 60 + Number(m);

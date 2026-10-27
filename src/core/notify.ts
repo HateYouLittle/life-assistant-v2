@@ -1,6 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { ResolvedConfig } from "../config.js";
-import { inQuietWindow, nowIso } from "../time.js";
+import { inQuietWindow, nowIso, quietResumeAt } from "../time.js";
 import { findChannel, getChannel, type NotificationChannel } from "./channels.js";
 import { withTransaction } from "./database.js";
 import { logger } from "./logger.js";
@@ -553,13 +553,26 @@ export function drainDue(
             }
             continue;
           }
-          if (skip !== "quiet-hours") {
-            db.prepare(
-              "UPDATE deliveries SET status = 'fallback', last_error = ?, updated_at = ? WHERE id = ?",
-            ).run(skip, nowIso(), row.id);
-            advanced = true;
+          if (skip === "quiet-hours") {
+            // 把 next_attempt_at 推到静默窗口结束再 continue（P2-7）：旧实现行原样留在
+            // 待投集合里，整窗内 created_at 不变 —— `/readyz` 的 outbox_stalled 与
+            // `/metrics` 的「最老待投」在静默窗口超过 30 分钟时必然误报。
+            // 推进后判定口径改为 MIN(next_attempt_at)：等待是「还没到点」而不是「卡住」。
+            const quiet =
+              getSetting<{ start: string; end: string }>(db, row.profile_id, "quiet_hours") ?? null;
+            const resumeAt = quietResumeAt(quiet);
+            if (resumeAt !== null) {
+              db.prepare(
+                "UPDATE deliveries SET next_attempt_at = ?, updated_at = ? WHERE id = ?",
+              ).run(resumeAt.toUTC().toISO() ?? nowIso(), nowIso(), row.id);
+              advanced = true;
+            }
+            continue;
           }
-          // quiet-hours：行原样留在待投集合里，等窗口结束后的下一轮 drain。
+          db.prepare(
+            "UPDATE deliveries SET status = 'fallback', last_error = ?, updated_at = ? WHERE id = ?",
+          ).run(skip, nowIso(), row.id);
+          advanced = true;
           continue;
         }
         deliverable.push(row);
