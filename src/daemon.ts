@@ -578,6 +578,24 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
           ),
         ]);
       }
+      // 超时僵尸：已从 inFlight 摘掉、但 handler 仍在后台跑。给 2s grace 让它们收敛，
+      // 收不回就 warn 后继续关库 —— 迟到写入会撞 "database is not open"（job-runner 里
+      // 已被 catch 成 warn），但不能让停机无限等一个挂死 handler。
+      if (jobRunner.zombies.size > 0) {
+        const names = [...jobRunner.zombies.keys()].join(", ");
+        logger.warn(
+          `停机时仍有 ${jobRunner.zombies.size} 个超时任务在后台运行（${names}），最多再等 2s`,
+        );
+        await Promise.race([
+          Promise.allSettled([...jobRunner.zombies.values()]),
+          new Promise<void>((resolve) => setTimeout(resolve, 2000).unref()),
+        ]);
+        if (jobRunner.zombies.size > 0) {
+          logger.warn(
+            `仍有 ${jobRunner.zombies.size} 个超时任务未收敛（${[...jobRunner.zombies.keys()].join(", ")}），继续关库`,
+          );
+        }
+      }
       // job 可能刚刚通过 publish 排了一个 100ms drain；在关库前把它取消掉。
       // 已落库但未投出的行留着，下次启动会由 outbox 继续投递（不丢）。
       cancelPendingDrain();

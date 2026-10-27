@@ -477,12 +477,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
     throw new Error(`BACKUP_KEEP 必须是 1..365 之间的整数: ${backupKeepRaw}`);
   }
 
+  // 看门狗超时：默认 15 分钟。按任务书「0 或负数表示关闭」：负数不该被当成配置错误
+  // 拒绝启动（那会让「关掉看门狗」反变成停机事故），统一折算成 0。上界 1440 分钟只是
+  // 拦住误写的天文数字；秒级超时留给测试直接给 createJobRunner 传 timeoutMs。
   const jobTimeoutRaw = env.JOB_TIMEOUT_MINUTES?.trim() || "15";
   const jobTimeoutMinutes = Number(jobTimeoutRaw);
-  if (!Number.isInteger(jobTimeoutMinutes) || jobTimeoutMinutes < 0 || jobTimeoutMinutes > 1440) {
+  if (!Number.isInteger(jobTimeoutMinutes) || jobTimeoutMinutes > 1440) {
     throw new Error(
-      `JOB_TIMEOUT_MINUTES 必须是 0..1440 之间的整数（0 = 关闭看门狗）: ${jobTimeoutRaw}`,
+      `JOB_TIMEOUT_MINUTES 必须是整数且不超过 1440（0 或负数 = 关闭看门狗）: ${jobTimeoutRaw}`,
     );
+  }
+  if (jobTimeoutMinutes <= 0) {
+    logger.warn("JOB_TIMEOUT_MINUTES <= 0：job 看门狗已关闭，挂死的 handler 会永久占住互斥");
   }
 
   const portRaw = env.PORT?.trim() || "3080";
@@ -527,7 +533,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
     logMaxBytes: logMaxMb * 1024 * 1024,
     logKeep,
     logLevel: logLevel.data,
-    jobTimeoutMs: jobTimeoutMinutes * 60_000,
+    // 负数按 0 折算（= 关闭看门狗），不要出现负的 setTimeout 延迟
+    jobTimeoutMs: Math.max(0, jobTimeoutMinutes) * 60_000,
   };
 }
 

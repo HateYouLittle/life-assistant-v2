@@ -160,6 +160,25 @@ describe("config", () => {
     assert.equal(loadConfig({ ...BASE, BACKUP_KEEP: "365" }).backupKeep, 365);
   });
 
+  it("JOB_TIMEOUT_MINUTES：默认 15 分钟，0 或负数关闭看门狗，非法值拒绝启动", () => {
+    assert.equal(loadConfig(BASE).jobTimeoutMs, 15 * 60_000);
+    assert.equal(loadConfig({ ...BASE, JOB_TIMEOUT_MINUTES: "2" }).jobTimeoutMs, 2 * 60_000);
+    assert.equal(loadConfig({ ...BASE, JOB_TIMEOUT_MINUTES: "1440" }).jobTimeoutMs, 1_440 * 60_000);
+    // 0 与负数都是「关闭看门狗」：负数不该被当成配置错误拒绝启动（那会让「关掉看门狗」
+    // 反而变成停机事故），统一折算成 0，不产生负的 setTimeout 延迟。
+    assert.equal(loadConfig({ ...BASE, JOB_TIMEOUT_MINUTES: "0" }).jobTimeoutMs, 0);
+    assert.equal(loadConfig({ ...BASE, JOB_TIMEOUT_MINUTES: "-5" }).jobTimeoutMs, 0);
+    // 空串等同未设置，走默认值
+    assert.equal(loadConfig({ ...BASE, JOB_TIMEOUT_MINUTES: "  " }).jobTimeoutMs, 15 * 60_000);
+    for (const bad of ["1441", "1.5", "abc"]) {
+      assert.throws(
+        () => loadConfig({ ...BASE, JOB_TIMEOUT_MINUTES: bad }),
+        /JOB_TIMEOUT_MINUTES/,
+        bad,
+      );
+    }
+  });
+
   it("WORKDAY_REMIND_DAYS_BEFORE 非法拒绝启动，合法则生效", () => {
     assert.throws(
       () => loadConfig({ ...BASE, WORKDAY_REMIND_DAYS_BEFORE: "abc" }),
