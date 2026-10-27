@@ -5,6 +5,8 @@ import {
   existsSync,
   mkdirSync,
   readdirSync,
+  renameSync,
+  rmSync,
   statSync,
   utimesSync,
   writeFileSync,
@@ -424,6 +426,63 @@ describe("db:restore CLI", () => {
         "一份可用的都没有时必须明确报错，而不是静默选坏文件",
       );
       assert.deepEqual(ledgerIds(env.config.dbPath), ["keep-me"], "失败路径不得改动当前库");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("恢复期间真正持有锁：stale 锁被接管、恢复后锁文件释放（P1-2）", () => {
+    const env = makeTestEnv();
+    try {
+      seedLedger(env, "keep-me");
+      env.db.close();
+      const backupPath = runBackup(env.config);
+      // 崩溃残留的 stale 锁（pid 已死）：旧实现只是「放行」，锁文件原样留着；
+      // 新实现必须原子接管，并在恢复结束（成功或失败）后释放。
+      writeFileSync(
+        daemonLockPath(env.dir),
+        JSON.stringify({
+          pid: 999_999,
+          startedAt: "2026-01-01T00:00:00.000Z",
+          hostname: "test-host",
+        }),
+      );
+
+      const result = runRestore(env.config, {
+        latest: true,
+        nowMs: Date.UTC(2026, 8, 12, 2, 0, 0),
+      });
+      assert.equal(result.target, backupPath);
+      assert.deepEqual(ledgerIds(env.config.dbPath), ["keep-me"]);
+      assert.equal(
+        existsSync(daemonLockPath(env.dir)),
+        false,
+        "恢复结束后必须释放锁，否则下一次 restore 会误判 daemon 在跑",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("恢复中途失败也会释放自己持有的锁（P1-2）", () => {
+    const env = makeTestEnv();
+    try {
+      seedLedger(env, "keep-me");
+      env.db.close();
+      const backupPath = runBackup(env.config);
+      // 把备份挪到独立目录，再把 backupDir 换成普通文件：走 --file 能通过前面的
+      // 校验，失败发生在「拿到锁之后」的写盘阶段，用来验证 finally 一定 release。
+      const keptBackup = join(env.dir, "kept-backup.db");
+      renameSync(backupPath, keptBackup);
+      rmSync(env.config.backupDir, { recursive: true, force: true });
+      writeFileSync(env.config.backupDir, "not-a-dir");
+
+      assert.throws(() => runRestore(env.config, { file: keptBackup }), /不是目录/);
+      assert.equal(
+        existsSync(daemonLockPath(env.dir)),
+        false,
+        "失败路径也要释放锁：否则用户「修好问题再重试」会被自己的锁挡住",
+      );
     } finally {
       cleanupTestEnv(env);
     }

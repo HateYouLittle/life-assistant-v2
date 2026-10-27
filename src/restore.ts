@@ -5,7 +5,7 @@ import { DateTime } from "luxon";
 import { loadConfig, type ResolvedConfig } from "./config.js";
 import { backupStatus, verifyDatabaseFile } from "./core/backup.js";
 import { SCHEMA_VERSION, uniqueFilePath } from "./core/database.js";
-import { daemonLockPath, inspectDaemonLock } from "./core/lock.js";
+import { acquireDaemonLock, daemonLockPath, inspectDaemonLock } from "./core/lock.js";
 import { logger } from "./core/logger.js";
 import { applySecureUmask, hardenDataDir } from "./core/security.js";
 import { TZ } from "./time.js";
@@ -170,69 +170,89 @@ export function runRestore(config: ResolvedConfig, opts: RestoreOptions = {}): R
     );
   }
 
-  // 5. 前置校验全部通过、确认要写盘：此刻才收紧已有数据目录/库/WAL/SHM/备份的权限。
-  //    失败路径（--file 不存在、备份坏/版本过高、daemon 在跑、锁损坏、dry-run）不碰权限
-  //    元数据 —— 这些是常见的误操作，不该顺带改动目录/文件 mode（R3-2）。
-  //    先确认两个「目录」路径确实是目录（或尚不存在）：`--data-dir` 手滑指向普通文件时，
-  //    hardenDataDir 的 chmod 会先把那个文件 600→700，再在 mkdir 时以 ENOTDIR 失败。
-  for (const dir of [config.dataDir, config.backupDir]) {
-    const stat = statSync(dir, { throwIfNoEntry: false });
-    if (stat !== undefined && !stat.isDirectory()) {
-      throw new Error(`数据目录不是目录: ${dir}（检查 DATA_DIR / --data-dir 是否指错）`);
-    }
-  }
-  hardenDataDir(config.dataDir, config.dbPath, config.backupDir);
-
-  // 6. 当前库留底：先 checkpoint 再复制主文件（WAL 里的写入才算完整现场）
-  mkdirSync(config.backupDir, { recursive: true });
-  const stamp = DateTime.fromMillis(nowMs, { zone: TZ }).toFormat("yyyyMMdd-HHmmss");
-  let preRestoreBackup: string | null = null;
-  if (existsSync(config.dbPath)) {
-    checkpointCurrentDatabase(config.dbPath);
-    preRestoreBackup = uniqueFilePath(
-      resolve(config.backupDir, `life-assistant-pre-restore-${stamp}.db`),
-    );
-    copyFileSync(config.dbPath, preRestoreBackup);
-    restoreFileMode(preRestoreBackup);
-  }
-
-  // 7. 覆盖主库并清掉 WAL/SHM：旧 WAL 属于旧库，留着会让新库读到不属于它的页
-  copyFileSync(target, config.dbPath);
-  for (const suffix of ["-wal", "-shm"]) {
-    rmSync(`${config.dbPath}${suffix}`, { force: true });
-  }
-
-  // 8. 重新打开校验（quick_check + schema），失败就用留底回滚
+  // 5. 真正拿到锁：把「检查时没在跑」升级成「恢复期间谁也别想启动」。
+  //    旧实现只读一次锁状态就放行，检查与覆盖主库之间的多次文件 IO（checkpoint、
+  //    留底 copy、覆盖、删 -wal）里 daemon 可以正常启动（它没绕过锁，是恢复没占锁），
+  //    随后恢复覆盖活库并删 -wal/-shm = 未合并写入丢失。acquireDaemonLock 会原子
+  //    接管 stale 锁；遇到活进程则抛错（语义与上面的 locked/corrupt 判定一致）。
+  let lock: ReturnType<typeof acquireDaemonLock>;
   try {
-    const restoredVersion = verifyDatabaseFile(config.dbPath);
-    if (restoredVersion !== schemaVersion) {
-      throw new Error(
-        `恢复后 schema 版本 (${restoredVersion}) 与备份校验结果 (${schemaVersion}) 不一致`,
-      );
-    }
+    lock = acquireDaemonLock(config.dataDir);
   } catch (e) {
-    const reason = e instanceof Error ? e.message : String(e);
-    if (preRestoreBackup === null) {
-      throw new Error(`恢复后校验失败：${reason}（当前库原本不存在，没有可回滚的留底）`);
-    }
-    try {
-      copyFileSync(preRestoreBackup, config.dbPath);
-      for (const suffix of ["-wal", "-shm"]) {
-        rmSync(`${config.dbPath}${suffix}`, { force: true });
-      }
-    } catch (rollbackError) {
-      throw new Error(
-        `恢复后校验失败（${reason}），且回滚也失败（${
-          rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
-        }）：请手工从 ${preRestoreBackup} 恢复`,
-      );
-    }
-    throw new Error(`恢复后校验失败（${reason}），已用留底回滚当前库: ${preRestoreBackup}`);
+    throw new Error(
+      `无法取得 daemon 独占锁，拒绝恢复（${e instanceof Error ? e.message : String(e)}）。` +
+        "请先确认 daemon 已停止（如 systemctl stop life-assistant）再重试",
+    );
   }
-  restoreFileMode(config.dbPath);
+  try {
+    // 6. 前置校验全部通过、确认要写盘：此刻才收紧已有数据目录/库/WAL/SHM/备份的权限。
+    //    失败路径（--file 不存在、备份坏/版本过高、daemon 在跑、锁损坏、dry-run）不碰权限
+    //    元数据 —— 这些是常见的误操作，不该顺带改动目录/文件 mode（R3-2）。
+    //    先确认两个「目录」路径确实是目录（或尚不存在）：`--data-dir` 手滑指向普通文件时，
+    //    hardenDataDir 的 chmod 会先把那个文件 600→700，再在 mkdir 时以 ENOTDIR 失败。
+    for (const dir of [config.dataDir, config.backupDir]) {
+      const stat = statSync(dir, { throwIfNoEntry: false });
+      if (stat !== undefined && !stat.isDirectory()) {
+        throw new Error(`数据目录不是目录: ${dir}（检查 DATA_DIR / --data-dir 是否指错）`);
+      }
+    }
+    hardenDataDir(config.dataDir, config.dbPath, config.backupDir);
 
-  logger.info(`数据库已从备份恢复: ${target}（schema v${schemaVersion}）`);
-  return { target, schemaVersion, preRestoreBackup, dryRun: false };
+    // 7. 当前库留底：先 checkpoint 再复制主文件（WAL 里的写入才算完整现场）
+    mkdirSync(config.backupDir, { recursive: true });
+    const stamp = DateTime.fromMillis(nowMs, { zone: TZ }).toFormat("yyyyMMdd-HHmmss");
+    let preRestoreBackup: string | null = null;
+    if (existsSync(config.dbPath)) {
+      checkpointCurrentDatabase(config.dbPath);
+      preRestoreBackup = uniqueFilePath(
+        resolve(config.backupDir, `life-assistant-pre-restore-${stamp}.db`),
+      );
+      copyFileSync(config.dbPath, preRestoreBackup);
+      restoreFileMode(preRestoreBackup);
+    }
+
+    // 8. 覆盖主库并清掉 WAL/SHM：旧 WAL 属于旧库，留着会让新库读到不属于它的页
+    copyFileSync(target, config.dbPath);
+    for (const suffix of ["-wal", "-shm"]) {
+      rmSync(`${config.dbPath}${suffix}`, { force: true });
+    }
+
+    // 9. 重新打开校验（quick_check + schema），失败就用留底回滚
+    try {
+      const restoredVersion = verifyDatabaseFile(config.dbPath);
+      if (restoredVersion !== schemaVersion) {
+        throw new Error(
+          `恢复后 schema 版本 (${restoredVersion}) 与备份校验结果 (${schemaVersion}) 不一致`,
+        );
+      }
+    } catch (e) {
+      const reason = e instanceof Error ? e.message : String(e);
+      if (preRestoreBackup === null) {
+        throw new Error(`恢复后校验失败：${reason}（当前库原本不存在，没有可回滚的留底）`);
+      }
+      try {
+        copyFileSync(preRestoreBackup, config.dbPath);
+        for (const suffix of ["-wal", "-shm"]) {
+          rmSync(`${config.dbPath}${suffix}`, { force: true });
+        }
+      } catch (rollbackError) {
+        throw new Error(
+          `恢复后校验失败（${reason}），且回滚也失败（${
+            rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
+          }）：请手工从 ${preRestoreBackup} 恢复`,
+        );
+      }
+      throw new Error(`恢复后校验失败（${reason}），已用留底回滚当前库: ${preRestoreBackup}`);
+    }
+    restoreFileMode(config.dbPath);
+
+    logger.info(`数据库已从备份恢复: ${target}（schema v${schemaVersion}）`);
+
+    return { target, schemaVersion, preRestoreBackup, dryRun: false };
+  } finally {
+    // 恢复失败/回滚也要释放：留下的锁文件会让下一次恢复误判「daemon 在跑」
+    lock.release();
+  }
 }
 
 interface CliArgs {
