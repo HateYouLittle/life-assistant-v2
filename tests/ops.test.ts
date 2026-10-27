@@ -11,8 +11,8 @@ import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
 import "../src/modules/index.js";
 
 /** 按生产挂载方式驱动：子 app 挂在根路径，不起真实 HTTP 端口 */
-function app(env: TestEnv): Hono {
-  return new Hono().route("/", createOpsApp(env.config, env.db));
+function app(env: TestEnv, opts?: { readyzCacheMs?: number }): Hono {
+  return new Hono().route("/", createOpsApp(env.config, env.db, opts));
 }
 
 function seedNotification(env: TestEnv, id: string, createdAt: string): void {
@@ -344,6 +344,26 @@ describe("/readyz", () => {
       });
       const response = await app(env).request("/readyz");
       assert.equal(response.status, 200, "按设计等待静默窗口结束的行不是 outbox 卡死");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("/readyz 结论在缓存窗口内复用，避免每次请求都做写锁探针（P2-15）", async () => {
+    const env = makeTestEnv();
+    try {
+      const cachedApp = app(env, { readyzCacheMs: 60 });
+      assert.equal((await cachedApp.request("/readyz")).status, 200);
+      // 缓存窗口内即使库已关闭也返回上次结论：探针要的是「最近一次健康状态」，
+      // 1s 级的陈旧对可观测性没有影响，却能把每次请求的 BEGIN IMMEDIATE 省掉。
+      env.db.close();
+      assert.equal((await cachedApp.request("/readyz")).status, 200);
+      await new Promise((resolve) => setTimeout(resolve, 70));
+      assert.equal(
+        (await cachedApp.request("/readyz")).status,
+        503,
+        "缓存过期后必须重新探测（不能永远缓存健康）",
+      );
     } finally {
       cleanupTestEnv(env);
     }

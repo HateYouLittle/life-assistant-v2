@@ -284,7 +284,20 @@ function readinessReasons(config: ResolvedConfig, db: DatabaseSync, nowMs: numbe
   return reasons;
 }
 
-export function createOpsApp(config: ResolvedConfig, db: DatabaseSync): Hono {
+export interface OpsAppOptions {
+  /**
+   * `/readyz` 结论的缓存时长（毫秒，默认 1000）。探针无鉴权且豁免限流，每次请求都
+   * BEGIN IMMEDIATE + 多条查询；高频轮询会占满单进程事件循环（P2-15）。1s 内复用上次
+   * 结论对「现在是否健康」没有实质影响。测试可传更小的值。
+   */
+  readyzCacheMs?: number;
+}
+
+export function createOpsApp(
+  config: ResolvedConfig,
+  db: DatabaseSync,
+  opts: OpsAppOptions = {},
+): Hono {
   const app = new Hono();
 
   // no-store 逐路由设置，而不用 app.use("*")：本 app 会被 .route("/", …) 挂到根路径上，
@@ -327,8 +340,17 @@ export function createOpsApp(config: ResolvedConfig, db: DatabaseSync): Hono {
 
   // 就绪探针：不鉴权（外部监控不该持有 token），也只回答健康与否 ——
   // 不返回计数/年龄/库路径，避免把个人数据或主机细节暴露给无凭据的调用方。
+  // 探针结论缓存：/readyz 无鉴权、豁免限流，却每次都要 BEGIN IMMEDIATE + 若干查询。
+  // 公网/反代后任意客户端都能高频打它，单进程事件循环会被同步 SQLite 探针占满，
+  // 挤占 cron 与 outbox（P2-15）。缓存窗口内直接复用上次结论，成本降到一次 Map 读取。
+  const readyzCacheMs = opts.readyzCacheMs ?? 1000;
+  let readyzCache: { at: number; reasons: string[] } | null = null;
   app.get("/readyz", (c) => {
-    const reasons = readinessReasons(config, db, Date.now());
+    const nowMs = Date.now();
+    if (readyzCache === null || nowMs - readyzCache.at >= readyzCacheMs) {
+      readyzCache = { at: nowMs, reasons: readinessReasons(config, db, nowMs) };
+    }
+    const reasons = readyzCache.reasons;
     if (reasons.length === 0) return c.json({ ok: true }, 200, NO_STORE);
     return c.json({ ok: false, reasons }, 503, NO_STORE);
   });
