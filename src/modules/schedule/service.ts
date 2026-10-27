@@ -799,7 +799,6 @@ export function updateSchedule(
       (merged.leapPolicy ?? "follow") !== (row.leap_policy ?? "follow")) ||
     (patch.lunarClamp !== undefined && merged.lunarClamp !== (row.lunar_clamp === 1)) ||
     (patch.remindOffsets !== undefined &&
-      patch.remindOffsets !== null &&
       JSON.stringify(merged.remindOffsets) !== row.remind_offsets_json) ||
     patch.recurrence !== undefined ||
     (patch.workdayFilter !== undefined && merged.workdayFilter !== row.workday_filter) ||
@@ -1621,6 +1620,9 @@ function escalationDueOrNull(
 ): string | null {
   const step = escalationStepOf(occurrenceKey);
   if (step === null) return null;
+  // 升级提醒只属于 todo（截止型）：kind 被改成生日/纪念日后遗留的 escalation_json
+  // 不该继续按阶梯发（复审 T-1027-02c 指出：派生行不参与 update 的删行，这里是唯一守卫）
+  if (schedule.kind !== "todo") return null;
   const escalation = parseEscalation(schedule.escalation_json);
   if (escalation === null) return null;
   // 第 0 步是截止时刻的 #0，不走此路径；#esc:N 只在第 N 个偏移仍存在时有效
