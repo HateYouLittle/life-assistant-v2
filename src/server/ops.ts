@@ -150,6 +150,18 @@ function metricsText(config: ResolvedConfig, db: DatabaseSync, nowMs: number): s
     Number.isFinite(oldestMs) ? Math.max(0, (nowMs - oldestMs) / 1000) : 0,
   );
 
+  // 多次重试仍失败的投递数：`outbox_oldest_pending_seconds` 改用 next_attempt_at 后，
+  // 退避到几小时外的失败行在指标上会显示「不旧」—— 这个计数补上「投不出去」这个信号
+  // （复审 T-1027-02d 观察 a 的漏报盲区）。
+  const failingRow = db
+    .prepare("SELECT COUNT(*) AS n FROM deliveries WHERE status = 'failed' AND attempts >= 3")
+    .get() as { n: number } | undefined;
+  gauge(
+    "life_assistant_outbox_failed_retrying",
+    "已重试 >=3 次仍失败的投递数（换 next_attempt_at 口径后用来兜住「投不出去」的漏报）",
+    failingRow?.n ?? 0,
+  );
+
   // 通知总行数：保留策略会按天删行，因此不是单调递增的 counter，按 gauge 导出
   gauge(
     "life_assistant_notifications_total",

@@ -240,6 +240,7 @@ export function runBackup(
     // 规范名只精确到秒，冲突时顺延 1s 换名重试（最多 5 次）。文件内容仍是同一时刻的快照，
     // 名称差 1s 无害；比「这次没有备份、只留一条报错」好（P2-13）。
     let published: string | null = null;
+    let publishedAt = nowMs;
     for (let attempt = 0; attempt < 5; attempt += 1) {
       const candidate =
         attempt === 0
@@ -251,10 +252,12 @@ export function runBackup(
       try {
         publishBackupFile(partial, candidate);
         published = candidate;
+        publishedAt = nowMs + attempt * 1000;
         break;
       } catch (e) {
-        // 只对「目标已存在」重试；其它 IO 错误照常抛出
-        if (!(e instanceof Error) || !e.message.includes("备份已存在，拒绝覆盖")) throw e;
+        // 只对「目标已存在」重试；其它 IO 错误照常抛出。用类型化错误而不是字符串匹配，
+        // 以后改文案不会静默失去重试（复审 T-1027-02d 观察 b）
+        if (!(e instanceof BackupTargetExistsError)) throw e;
       }
     }
     if (published === null) {
@@ -262,7 +265,7 @@ export function runBackup(
         `备份发布失败：同一秒及后 4 秒的规范名都已被占用（${config.backupDir}），请检查是否有异常频繁的备份进程`,
       );
     }
-    writeVerifiedSidecar(published, schemaVersion, nowMs);
+    writeVerifiedSidecar(published, schemaVersion, publishedAt);
     prune(config.backupDir, keep, nowMs);
     return published;
   } catch (e) {
@@ -289,12 +292,21 @@ export function runBackup(
  * 若将来允许临时目录与 BACKUP_DIR 跨挂载点，link 会报 EXDEV，需要退回
  * copy + rename 的发布方式并重新考虑「同名不覆盖」语义（复审 T-1027-02b 观察 1）。
  */
+/** 发布目标已存在（同秒撞名）：runBackup 据此换名重试，其它 IO 错误照常上抛 */
+export class BackupTargetExistsError extends Error {
+  readonly code = "BACKUP_TARGET_EXISTS";
+  constructor(targetPath: string) {
+    super(`备份已存在，拒绝覆盖: ${targetPath}`);
+    this.name = "BackupTargetExistsError";
+  }
+}
+
 export function publishBackupFile(partialPath: string, targetPath: string): void {
   try {
     linkSync(partialPath, targetPath);
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === "EEXIST") {
-      throw new Error(`备份已存在，拒绝覆盖: ${targetPath}`);
+      throw new BackupTargetExistsError(targetPath);
     }
     throw e;
   }

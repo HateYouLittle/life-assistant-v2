@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { unlinkSync, writeFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import { Hono } from "hono";
 import { sanitizeLogText } from "../src/core/logger.js";
@@ -96,6 +95,8 @@ describe("/metrics", () => {
       assert.equal(metricValue(body, "life_assistant_qweather_requests_today"), 0);
       // 没有备份目录 → -1（而不是 0：0 会被误读成「刚刚备份过」）
       assert.equal(metricValue(body, "life_assistant_backup_latest_age_seconds"), -1);
+      // 新指标必须有样本（否则「指标消失」与「值为 0」分不清）
+      assert.equal(metricValue(body, "life_assistant_outbox_failed_retrying"), 0);
       // 没有备份 → 也没有可信的校验旁车
       assert.equal(metricValue(body, "life_assistant_backup_latest_verified"), 0);
       // 没有超时僵尸：指标必须存在且为 0（缺失会让抓取端看不到「任务卡死」这个信号）
@@ -128,6 +129,8 @@ describe("/metrics", () => {
           createdAt: new Date(now).toISOString(),
         });
       }
+      // 重试 >=3 次仍失败的投递：永远「不到期」也不会让最老待投变旧，必须单独计数
+      env.db.prepare("UPDATE deliveries SET attempts = 3 WHERE id = 'd-failed'").run();
 
       // 一次成功运行：时间戳口径是 finished_at（「跑完并成功」才算成功）
       const finished = new Date(now - 3600 * 1000);
@@ -163,6 +166,11 @@ describe("/metrics", () => {
         ),
         Math.floor(finished.getTime() / 1000),
         "job 最近成功时间戳应取 finished_at",
+      );
+      assert.equal(
+        metricValue(body, "life_assistant_outbox_failed_retrying"),
+        1,
+        "attempts>=3 的 failed 行必须计入 failed_retrying",
       );
       const age = metricValue(body, "life_assistant_backup_latest_age_seconds");
       assert.ok(age >= 0 && age < 60, `备份年龄应接近 0，实际 ${age}`);
