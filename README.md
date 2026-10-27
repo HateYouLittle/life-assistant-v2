@@ -75,7 +75,7 @@ npm run build
 | `WORKDAY_REMIND_DAYS_BEFORE` | | 假期首日前几天推放假安排，默认 `3`（上限 30）；`0` 表示关闭「假期临近」提醒（首日当天也不推） |
 | `BACKUP_CRON` | | daemon 内置每日备份时间，默认 `'0 3 * * *'`（含空格需单引号，Asia/Shanghai）；非法 cron 拒绝启动 |
 | `BACKUP_KEEP` | | 备份保留份数，默认 `14`（1..365）；超出部分按文件名时间戳清理最旧的 |
-| `JOB_TIMEOUT_MINUTES` | | 单个定时任务执行超时，默认 `15`（0..1440，`0` 关闭看门狗）。超时后该次记 `failed`、释放互斥并允许下次触发；挂死的 handler 继续在后台跑但不阻塞停机 |
+| `JOB_TIMEOUT_MINUTES` | | 单个定时任务执行超时，默认 `15`（整数、上限 1440；`0` 或负数 = 关闭看门狗）。超时后该次记 `failed`（`执行超时 N 分钟`）、释放互斥；挂死的 handler 进入后台僵尸，**收敛前同名任务跳过**（防 tick 堆积），停机时最多再等 2s |
 | `MCP_DAEMON_URL` | | stdio 壳连接的 daemon 地址，默认 `http://127.0.0.1:3080` |
 | `LOG_LEVEL` | | `debug`/`info`/`warn`/`error`，默认 `info` |
 
@@ -217,6 +217,13 @@ systemctl daemon-reload && systemctl enable --now life-assistant
 daemon 内置每日备份 job（`BACKUP_CRON`，默认 `'0 3 * * *'` Asia/Shanghai）：用 `VACUUM INTO`
 生成 `$DATA_DIR/backups/life-assistant-<时间戳>.db`，只保留最近 `BACKUP_KEEP`（默认 14）份。
 备份是只读快照，daemon 运行中执行是安全的，不需要停服。
+
+每份备份成功后还会写一个旁车文件 `<时间戳>.db.verified`（JSON：schema 版本 / 校验时间 / 字节数，
+先写临时名再 rename，原子发布）。它记录「这份备份生成时已通过 `quick_check` + schema 校验」，
+让状态页与 `/metrics`（`life_assistant_backup_latest_verified`）**零开库**知道最新备份是否可信；
+旁车缺失、JSON 非法或 `sizeBytes` 与实际文件不符都按不可信处理。`doctor --live` 不看旁车、
+仍现场开库校验，因此「旁车说好、库其实坏了」照样会被发现。清理旧备份时连带删除对应旁车，
+孤儿旁车与残留的旁车临时文件也会在 prune 时清掉。
 
 - 想立刻备份：`npm run db:backup`（与内置 job 共用同一实现，CLI 会打印产物路径，同样执行保留清理）。
 - **daemon 停机期间不会产生备份**：如果机器会长期停机、或希望备份与运行解耦，可以继续用外部
@@ -361,7 +368,7 @@ npm run db:cleanup:preview   # 零业务删除预演：occurrence 与保留策�
 - **身份与可见性**：`WEB_API_TOKEN` 是 master（家庭看板、运维、doctor、Hermes stdio 壳）；`PROFILE_TOKENS_JSON` 给每人一个 token，MCP、`/api/quick/*` 与看板 `/api/*` 都按 token 反查 Profile（不再信任 `X-Hermes-Profile`），会话与 token 所属 Profile 不一致直接 403。看板可见性矩阵：支出（master=家庭账本；profile=家庭+本人个人）、日程/通知/投递/Profile 列表（master=全部；profile=仅自己）、预算与 CSV（始终家庭账本）、jobs/holidays（共享）；`/api/status` 返回 `identity` 字段供页面渲染「家庭看板 / 个人视图」。除 `/healthz`、`/readyz` 外的请求做两层固定窗口限流（所有请求按来源 IP 计一层，鉴权通过且带 Bearer 时再按 token 指纹加一层；无效/缺失凭据只计 IP 桶，轮换伪 token 不能绕过；429 + `Retry-After`），鉴权失败写 warn 日志并计入 `/metrics`。
 - **手机快捷入口**：`/quick` 是零构建 PWA（记一笔 / 设提醒，token 引导、常用分类 chips、`?type=&amount=&category=&title=` 预填），写接口 `POST /api/quick/expenses|schedules` 复用 MCP 同一份 service —— 幂等键、家庭账本回执、预算提醒、occurrence 物化语义完全一致；`GET /api/quick/bootstrap` 只返回该 Profile 可见账本与常用分类。OPPO/ColorOS 的 PWA、HTTP Shortcuts（可直接导入 `docs/http-shortcuts.json`，或按 [docs/quick-entry.md](docs/quick-entry.md) 用 cURL 导入）、小布指令/NFC 三种用法见 [docs/quick-entry.md](docs/quick-entry.md)。
 - **日历订阅**：`GET /calendar.ics?p=&exp=&sig=` 用 HMAC-SHA256(master, `"<profile>.<exp>"`) 签发**只读单个 Profile、带有效期**的链接（日历客户端无法附加请求头，所以不能直接用 token）；`npm run calendar:url -- --profile bestie --days 30 --base https://<域名>` 生成。只导出该 Profile **活跃**日程在未来 62 天内、状态为 `pending/notified` 的 occurrence；空数据也返回合法空日历。
-- **运维端点**：`GET /metrics`（Prometheus 文本：鉴权/限流计数器、投递六状态、outbox 最老排队秒数、每个 job 最近成功时间、备份年龄、DB/WAL 大小、今日 QWeather 用量）仅 master token；`GET /readyz` 无需凭据，做 DB 可写探针、WAL 阈值与 outbox 卡住判定，异常 503 + `reasons`。两者与 `/healthz` 一样对外可用，但只有 `/readyz`/`/healthz` 豁免限流。
+- **运维端点**：`GET /metrics`（Prometheus 文本：鉴权/限流计数器、投递六状态、outbox 最老排队秒数、每个 job 最近成功时间、备份年龄与 `life_assistant_backup_latest_verified`（读旁车、零开库）、DB/WAL 大小、今日 QWeather 用量）仅 master token；`GET /readyz` 无需凭据，做 DB 可写探针、WAL 阈值与 outbox 卡住判定，异常 503 + `reasons`。两者与 `/healthz` 一样对外可用，但只有 `/readyz`/`/healthz` 豁免限流。
 - **时区**：全部调度固定 Asia/Shanghai，无 DST。
 - **任务运行记录与启动补发**：每次 job 执行写一行 `job_runs`（cron/startup/catchup/manual，running→ok/failed/skipped；进程崩溃遗留的 running 行在下次启动收敛为 failed），状态页「定时任务」卡片、`GET /api/jobs` 与 `doctor --live` 共用这份事实。启动补发只针对 `CATCHUP_POLICY` 白名单内的任务（早报、晚报、每日记账摘要、周报、日志轮转、预警巡检、调休提醒、节假日刷新、备份、WAL checkpoint、occurrence 清理、保留策略）：用自写的 cron 反向求值算出「上一次应触发时刻」，超窗口不补、已有成功记录不补，执行前再确认一次以避开与 cron 的竞态；单个失败只记日志。补发把「原定触发时刻」传给 handler，早报/晚报/记账摘要/周报/调休提醒按该时刻取业务日期与去重键（跨午夜补发不会用错日期、也不会占错 dedupe 键吞掉当晚正常推送）。`job_runs` 由保留策略顺带清理 30 天前的行。cron 反向求值支持 `*`、单值、逗号列表、`a-b` 范围与 `a-b/n` 步长（步长按 node-cron 的「展开范围后取模」语义，分钟/小时/星期统一按此口径）；星期字段的 `7` 只允许出现在单值/单值列表里（含 `7` 的范围/步长不做反向求值）；日/月字段不是 `*`、或出现「列表与步长混用」等无法确定语义的写法时不做反向求值（宁可漏补，不猜）。
 - **部署安全基线**：启动先原子取 `daemon.lock`（写完整临时文件后 `link` 抢占；PID 存活探测，死进程锁原子接管，不再有并发双持窗口）再开库 —— 两个 daemon 同时跑会让 outbox 重复投递；`umask(0o077)` 并把数据目录/库/备份收紧到 0700/0600，daemon 与 `db:backup` / `db:restore` / `db:cleanup:preview` / `db:fingerprint` 等会建库/备份的 CLI 同口径（库不存在时只收紧 umask、不 chmod 可能写错的目录；`import:v1` 只收紧 umask——目标库可能尚未创建；doctor 只收紧 umask，不改用户现有文件权限）；HTTP 入口统一校验 Host（缺失或不在允许名单即 403）与 Origin（存在时必须同源，CLI/agent 这类无 Origin 的请求放行），挡 DNS rebinding 与跨站请求；`REQUIRE_AUTH=1` 让回环部署也强制 token。

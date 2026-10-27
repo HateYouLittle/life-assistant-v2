@@ -149,8 +149,17 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
 - **限流豁免**：`/healthz` 与 `/readyz` 不参与限流（外部监控高频轮询会被 429 误判）；
   `/metrics` 与业务接口一样受限流。`RATE_LIMIT_PER_MINUTE=0` 时整体关闭限流（仅本地调试）。
   改 `createHttpHandler` 的豁免名单要同步 `docs/remote-access.md`。
-- 定时任务有看门狗（`JOB_TIMEOUT_MINUTES`，默认 15 分钟，0 关闭）：handler 挂死会记 `failed`
-  并释放互斥，不会让该 job 永久只记 `skipped`；但挂死的 handler 无法取消，仍在后台跑。
+- 定时任务有看门狗（`JOB_TIMEOUT_MINUTES`，默认 15 分钟，0 或负数关闭）：handler 挂死会记 `failed`
+  并释放互斥；但 JS 无法取消 handler，它会进 `JobRunner.zombies` 继续在后台跑——**僵尸收敛前同名
+  任务一律跳过**（否则 tick 每分钟一次会堆出十几个并发僵尸），停机时给 2s grace 后 warn 继续关库。
+  `createJobRunner` 的 `.finally` 必须挂在 `Promise.race([finished, watchdog])` 上而不是 handler
+  的 promise 上 —— 否则迟到 settle 会把**下一轮**的 busy/inFlight 删掉，等于放行重叠执行。
+- **备份校验旁车**：`runBackup` 发布成功后写 `<备份>.db.verified`（JSON：`schemaVersion` /
+  `verifiedAt` / `sizeBytes`，先写 `.verified.tmp-<pid>-<随机>` 再 rename，失败只 warn）。
+  `backupStatus` 三档口径：默认不读任何文件返回 `null`；`{verifyLatest:true}` 先信旁车
+  （`sizeBytes` 必须与文件一致），旁车缺失/不可信才回退开库；`{sidecar:true}` 零开库只读旁车
+  （状态页/`/metrics` 用）；`{deep:true}` 强制开库（`doctor --live` 用，能发现「旁车说好、
+  库其实坏了」）。prune 删旧备份连带删旁车，并清理孤儿旁车与过期的 `.verified.tmp-*`。
 - `daemon.lock` 存在表示同机已有实例；stale 锁（pid 已死/内容损坏）启动时会原子接管。`db:restore`
   在锁内 pid 仍存活时拒绝执行；锁文件存在但内容损坏/不可读时无法确认 daemon 已停，同样拒绝
   （dead-pid 残留仍放行），需先确认停服再手工删锁。别绕过它直接覆盖库文件。
