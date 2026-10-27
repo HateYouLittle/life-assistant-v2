@@ -246,6 +246,35 @@ describe("core/job-runner（P1-3）", () => {
     }
   });
 
+  it("run 返回执行结果 ok/failed/skipped，供启动补发区分尝试与成功（P2-16）", async () => {
+    const env = makeTestEnv();
+    try {
+      const runner = createJobRunner(env.db, { timeoutMs: 5_000 });
+      assert.equal(await runner.run("job:outcome-ok", () => {}), "ok");
+      assert.equal(
+        await runner.run("job:outcome-fail", () => {
+          throw new Error("boom");
+        }),
+        "failed",
+      );
+
+      let release: () => void = () => {};
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const running = runner.run("job:outcome-skip", () => gate);
+      assert.equal(
+        await runner.run("job:outcome-skip", () => {}),
+        "skipped",
+        "重叠触发必须返回 skipped（启动补发据此不计入成功）",
+      );
+      release();
+      await running;
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("看门狗：正常 handler 快于超时不受影响，仍记 ok（P2-9）", async () => {
     const env = makeTestEnv();
     try {

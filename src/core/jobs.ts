@@ -3,6 +3,7 @@ import type { DateTime } from "luxon";
 import type { JobDef } from "./registry.js";
 import { errorMessage } from "./registry.js";
 import { logger } from "./logger.js";
+import type { JobRunOutcome } from "./job-runner.js";
 import { now as localNow } from "../time.js";
 
 /**
@@ -441,8 +442,17 @@ export function planCatchups(
 export interface StartupCatchupOptions {
   db: DatabaseSync;
   jobs: { module: string; def: JobDef }[];
-  /** 由 daemon 注入：负责给 job 包一层 job_runs 记录（trigger='catchup'） */
-  runJob: (module: string, def: JobDef, trigger: "catchup", scheduledFor: string) => Promise<void>;
+  /**
+   * 由 daemon 注入：负责给 job 包一层 job_runs 记录（trigger='catchup'）。
+   * 返回该次执行结果：`failed` 才计入失败数（runExclusive 内部吞异常，不看返回值
+   * 就分不清「尝试」和「成功」——P2-16）。
+   */
+  runJob: (
+    module: string,
+    def: JobDef,
+    trigger: "catchup",
+    scheduledFor: string,
+  ) => Promise<JobRunOutcome | void>;
   now?: DateTime;
 }
 
@@ -454,18 +464,18 @@ export interface StartupCatchupOptions {
  */
 export async function runStartupCatchups(
   opts: StartupCatchupOptions,
-): Promise<{ scheduled: number }> {
+): Promise<{ scheduled: number; succeeded: number; failed: number }> {
   const at = opts.now ?? localNow();
   let plans: CatchupPlan[];
   try {
     plans = planCatchups(opts.db, opts.jobs, at);
   } catch (e) {
     logger.error(`启动补发规划失败: ${errorMessage(e)}`);
-    return { scheduled: 0 };
+    return { scheduled: 0, succeeded: 0, failed: 0 };
   }
   if (plans.length === 0) {
     logger.debug("启动补发：没有需要补发的任务");
-    return { scheduled: 0 };
+    return { scheduled: 0, succeeded: 0, failed: 0 };
   }
   logger.info(
     `启动补发：${plans.length} 个任务（${plans
@@ -473,6 +483,8 @@ export async function runStartupCatchups(
       .join("、")}）`,
   );
   let scheduled = 0;
+  let succeeded = 0;
+  let failed = 0;
   for (const plan of plans) {
     // 规划到执行之间可能已被 cron/另一次补发跑过（同一分钟内启动的竞态），执行前再确认一次
     if (hasSuccessfulRunCovering(opts.db, plan.def.name, plan.scheduledFor)) {
@@ -481,10 +493,18 @@ export async function runStartupCatchups(
     }
     scheduled += 1;
     try {
-      await opts.runJob(plan.module, plan.def, "catchup", plan.scheduledFor);
+      const outcome = await opts.runJob(plan.module, plan.def, "catchup", plan.scheduledFor);
+      if (outcome === "failed") failed += 1;
+      else succeeded += 1;
     } catch (e) {
+      failed += 1;
       logger.error(`启动补发 ${plan.module}.${plan.def.name} 失败: ${errorMessage(e)}`);
     }
   }
-  return { scheduled };
+  // 汇总必须区分「尝试 / 成功 / 失败」：runExclusive 会把异常吞掉后 resolve，
+  // 旧实现只报尝试数，失败时看起来像「补跑成功」了（P2-16）
+  const summary = `启动补发完成：尝试 ${scheduled} 个（成功 ${succeeded}、失败 ${failed}）`;
+  if (failed > 0) logger.warn(summary);
+  else logger.info(summary);
+  return { scheduled, succeeded, failed };
 }

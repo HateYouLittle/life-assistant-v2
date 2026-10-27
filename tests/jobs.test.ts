@@ -618,7 +618,7 @@ describe("runStartupCatchups（串行执行 + 失败隔离）", () => {
         },
         now: atLocal("2026-10-20T09:00:00"),
       });
-      assert.deepEqual(result, { scheduled: 1 });
+      assert.deepEqual(result, { scheduled: 1, succeeded: 1, failed: 0 });
       assert.deepEqual(calls, [
         {
           module: "weather",
@@ -650,7 +650,27 @@ describe("runStartupCatchups（串行执行 + 失败隔离）", () => {
       });
       // planCatchups 按 module.name 排序：holiday.refresh 先于 weather.daily_brief
       assert.deepEqual(attempted, ["refresh", "daily_brief"], "第一个失败不应中断第二个");
-      assert.deepEqual(result, { scheduled: 2 }, "失败也算「尝试补发过」，便于日志核对");
+      assert.deepEqual(
+        result,
+        { scheduled: 2, succeeded: 1, failed: 1 },
+        "失败算 failed，不能把「尝试数」当「成功数」（P2-16）",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("runJob 返回 failed（runExclusive 吞掉异常）也计入失败，不能当成功", async () => {
+    const env = makeTestEnv();
+    try {
+      const result = await runStartupCatchups({
+        db: env.db,
+        jobs: [{ module: "weather", def: def("daily_brief", "0 7 * * *") }],
+        // 真实 daemon 里 runExclusive 捕获异常后 resolve，只能靠返回值区分成败
+        runJob: async () => "failed",
+        now: atLocal("2026-10-20T09:00:00"),
+      });
+      assert.deepEqual(result, { scheduled: 1, succeeded: 0, failed: 1 });
     } finally {
       cleanupTestEnv(env);
     }
@@ -669,7 +689,7 @@ describe("runStartupCatchups（串行执行 + 失败隔离）", () => {
         // 07:00 之后 8 小时：超出 6 小时窗口
         now: atLocal("2026-10-20T15:00:00"),
       });
-      assert.deepEqual(result, { scheduled: 0 });
+      assert.deepEqual(result, { scheduled: 0, succeeded: 0, failed: 0 });
       assert.equal(called, 0);
     } finally {
       cleanupTestEnv(env);

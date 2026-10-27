@@ -44,14 +44,18 @@ export interface JobRunnerOptions {
   timeoutMs?: number;
 }
 
+/** 一次执行的结果：调用方（启动补发）据此区分「尝试」与「成功」（P2-16） */
+export type JobRunOutcome = "ok" | "failed" | "skipped";
+
 export interface JobRunner {
   /**
    * 同名任务不重叠执行；**不会向调用方抛出**任何异常（同步/异步都在内部记录），
    * 调用方可以 `void runner.run(...)` 而不产生 unhandled rejection。
+   * 返回值是该次执行的结果（超时/异常/写运行记录失败都算 failed，重叠跳过为 skipped）。
    */
-  run(name: string, fn: () => Promise<void> | void, meta?: JobRunMeta): Promise<void>;
+  run(name: string, fn: () => Promise<void> | void, meta?: JobRunMeta): Promise<JobRunOutcome>;
   /** 在途任务（name → Promise）；停机时必须等它们收敛，否则 db.close() 会撞上在途写入 */
-  readonly inFlight: Map<string, Promise<void>>;
+  readonly inFlight: Map<string, Promise<JobRunOutcome>>;
   /**
    * 已超时但仍在后台跑的「僵尸」handler（name → 其收敛 Promise）。
    * - 同名任务在僵尸收敛前一律跳过：否则 tick（每分钟）会在 15 分钟窗口里堆出十几个
@@ -75,7 +79,7 @@ function timeoutText(timeoutMs: number): string {
 
 export function createJobRunner(db: DatabaseSync, opts: JobRunnerOptions = {}): JobRunner {
   const busy = new Set<string>();
-  const inFlight = new Map<string, Promise<void>>();
+  const inFlight = new Map<string, Promise<JobRunOutcome>>();
   const zombies = new Map<string, Promise<void>>();
   const timeoutMs = opts.timeoutMs ?? DEFAULT_JOB_TIMEOUT_MS;
 
@@ -88,18 +92,22 @@ export function createJobRunner(db: DatabaseSync, opts: JobRunnerOptions = {}): 
     }
   }
 
-  function run(name: string, fn: () => Promise<void> | void, meta?: JobRunMeta): Promise<void> {
+  function run(
+    name: string,
+    fn: () => Promise<void> | void,
+    meta?: JobRunMeta,
+  ): Promise<JobRunOutcome> {
     if (busy.has(name)) {
       logger.debug(`跳过重叠触发: ${name}`);
       if (meta !== undefined) recordSkip(meta);
-      return Promise.resolve();
+      return Promise.resolve("skipped");
     }
     if (zombies.has(name)) {
       // 上一轮已超时但 handler 仍挂在后台：再开一轮会和它对同一份数据并发写，
       // 违背「同名不重叠」的初衷（tick 每分钟一次 → 15 分钟内能堆 15 个僵尸）。
       logger.warn(`${name} 上一次执行已超时但仍在后台运行，本轮跳过（防僵尸堆积）`);
       if (meta !== undefined) recordSkip(meta);
-      return Promise.resolve();
+      return Promise.resolve("skipped");
     }
     busy.add(name);
     let runId: number | undefined;
@@ -110,13 +118,14 @@ export function createJobRunner(db: DatabaseSync, opts: JobRunnerOptions = {}): 
       // 否则该 job 之后每次都走「重叠跳过」分支，永久停摆。
       busy.delete(name);
       logger.error(`${name} 记录运行开始失败，本轮未执行: ${errorText(e)}`);
-      return Promise.resolve();
+      return Promise.resolve("failed");
     }
     // 看门狗：handler 永不 settle 时释放 busy 并记 failed，否则该 job 永久只记 skipped。
     // timedOut 是「本轮已判超时」的标记：迟到的 resolve/reject 靠它跳过二次落库；
     // settled 是反向保护——handler 恰好抢在定时器之前落库时，看门狗不能再把它改写成 failed。
     let timedOut = false;
     let settled = false;
+    let outcome: JobRunOutcome = "ok";
     let timer: NodeJS.Timeout | undefined;
     const finished = Promise.resolve()
       .then(fn)
@@ -140,6 +149,7 @@ export function createJobRunner(db: DatabaseSync, opts: JobRunnerOptions = {}): 
           return;
         }
         settled = true;
+        outcome = "failed";
         logger.error(`${name} 执行失败: ${errorText(e)}`);
         // 记录失败不能反过来让 job 崩溃：db 可能恰好处于关闭过程中
         if (runId !== undefined) {
@@ -156,6 +166,7 @@ export function createJobRunner(db: DatabaseSync, opts: JobRunnerOptions = {}): 
             timer = setTimeout(() => {
               if (!settled) {
                 timedOut = true;
+                outcome = "failed";
                 const text = `执行超时 ${timeoutText(timeoutMs)}`;
                 logger.error(`${name} ${text}，已按失败记录并释放互斥；handler 仍在后台运行`);
                 if (runId !== undefined) {
@@ -187,11 +198,13 @@ export function createJobRunner(db: DatabaseSync, opts: JobRunnerOptions = {}): 
     // `.finally` 挂在**竞赛**结果上（不是挂在 handler 的 promise 上）：超时那一刻就执行一次，
     // 因此不存在「挂死的 handler 迟到的 settle 再删一遍 busy、误删新一轮标记」的问题 ——
     // 迟到 settle 只走 finished 里的 timedOut 分支，不碰 busy/inFlight、也不落库。
-    const task = (watchdog === null ? finished : Promise.race([finished, watchdog])).finally(() => {
-      if (timer !== undefined) clearTimeout(timer);
-      busy.delete(name);
-      inFlight.delete(name);
-    });
+    const task = (watchdog === null ? finished : Promise.race([finished, watchdog]))
+      .then(() => outcome)
+      .finally(() => {
+        if (timer !== undefined) clearTimeout(timer);
+        busy.delete(name);
+        inFlight.delete(name);
+      });
     inFlight.set(name, task);
     return task;
   }
