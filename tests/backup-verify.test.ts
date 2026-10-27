@@ -76,6 +76,40 @@ describe("备份自校验", () => {
   });
 });
 
+describe("数据库校验深度（P2-12）", () => {
+  it("悬空外键：quick_check 默认放行，thorough 的 foreign_key_check 必须抓出", () => {
+    const env = makeTestEnv();
+    try {
+      env.db.exec("CREATE TABLE fk_parent (id INTEGER PRIMARY KEY)");
+      env.db.exec(
+        "CREATE TABLE fk_child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES fk_parent(id))",
+      );
+      env.db.exec("PRAGMA foreign_keys = OFF");
+      env.db.prepare("INSERT INTO fk_child (id, parent_id) VALUES (1, 999)").run();
+      env.db.exec("PRAGMA foreign_keys = ON");
+
+      // 默认口径（页级 quick_check）不会发现悬空外键
+      assert.equal(verifyDatabaseFile(env.config.dbPath), SCHEMA_VERSION);
+      // thorough 才检查索引/外键一致性（restore / doctor --live 用）
+      assert.throws(
+        () => verifyDatabaseFile(env.config.dbPath, { thorough: true }),
+        /foreign_key_check/,
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("健康库：thorough 也通过，返回 schema 版本", () => {
+    const env = makeTestEnv();
+    try {
+      assert.equal(verifyDatabaseFile(env.config.dbPath, { thorough: true }), SCHEMA_VERSION);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
 describe("备份状态 backupStatus", () => {
   it("备份目录不存在：无文件、无最新、视为过期", () => {
     const env = makeTestEnv();

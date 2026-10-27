@@ -71,7 +71,8 @@ export function resolveRestoreTarget(config: ResolvedConfig, opts: RestoreOption
   const skipped: string[] = [];
   for (const candidate of candidates) {
     try {
-      verifyDatabaseFile(candidate.path);
+      // 选目标属于低频且「选错就毁数据」的路径：thorough 校验索引/外键，不只看页
+      verifyDatabaseFile(candidate.path, { thorough: true });
       if (skipped.length > 0) {
         logger.warn(`已跳过 ${skipped.length} 份校验失败的备份，改用 ${candidate.name}`);
       }
@@ -134,7 +135,7 @@ export function runRestore(config: ResolvedConfig, opts: RestoreOptions = {}): R
   // 2. 校验备份：quick_check + schema 版本可读 + 不高于程序支持版本
   let schemaVersion: number;
   try {
-    schemaVersion = verifyDatabaseFile(target);
+    schemaVersion = verifyDatabaseFile(target, { thorough: true });
   } catch (e) {
     throw new Error(
       `备份校验失败，拒绝恢复（当前库未改动）: ${target}：${e instanceof Error ? e.message : String(e)}`,
@@ -219,7 +220,7 @@ export function runRestore(config: ResolvedConfig, opts: RestoreOptions = {}): R
 
     // 9. 重新打开校验（quick_check + schema），失败就用留底回滚
     try {
-      const restoredVersion = verifyDatabaseFile(config.dbPath);
+      const restoredVersion = verifyDatabaseFile(config.dbPath, { thorough: true });
       if (restoredVersion !== schemaVersion) {
         throw new Error(
           `恢复后 schema 版本 (${restoredVersion}) 与备份校验结果 (${schemaVersion}) 不一致`,

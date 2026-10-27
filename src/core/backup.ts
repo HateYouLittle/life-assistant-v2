@@ -139,8 +139,17 @@ export interface BackupStatus {
  *
  * 备份生成后、恢复前都走这里 —— 一份「打不开/缺 meta 表」的文件绝不能冒充可用数据。
  * 只读打开：校验动作不修改文件，也不会在旁边留下 -wal/-shm。
+ *
+ * 默认只做 `quick_check`（页级检查，成本低，适合每日备份自校验）；`thorough` 额外跑
+ * `integrity_check`（索引/表一致性）与 `foreign_key_check`（悬空外键）。后两者慢，
+ * 只用于「错了会毁数据」的低频路径：`db:restore` 选目标/恢复后复验、`doctor --live`
+ * 的 deep 校验（P2-12：quick_check 通过 ≠ 索引/外键没问题）。
  */
-export function verifyDatabaseFile(path: string): number {
+export interface VerifyDatabaseOptions {
+  thorough?: boolean;
+}
+
+export function verifyDatabaseFile(path: string, opts: VerifyDatabaseOptions = {}): number {
   let db: DatabaseSync | undefined;
   try {
     db = new DatabaseSync(path, { readOnly: true });
@@ -150,6 +159,24 @@ export function verifyDatabaseFile(path: string): number {
     const result = integrity?.quick_check;
     if (result !== "ok") {
       throw new Error(`完整性检查未通过（quick_check: ${result ?? "无结果"}）`);
+    }
+    if (opts.thorough === true) {
+      // integrity_check 正常时只返回单行 "ok"；有问题时返回多行错误明细
+      const rows = db.prepare("PRAGMA integrity_check").all() as {
+        integrity_check?: string;
+      }[];
+      const errors = rows
+        .map((row) => row.integrity_check ?? "")
+        .filter((value) => value !== "ok" && value !== "");
+      if (errors.length > 0 || rows.length === 0) {
+        throw new Error(
+          `完整性检查未通过（integrity_check: ${errors.slice(0, 3).join("; ") || "无结果"}）`,
+        );
+      }
+      const fkViolations = db.prepare("PRAGMA foreign_key_check").all() as unknown[];
+      if (fkViolations.length > 0) {
+        throw new Error(`foreign_key_check 发现 ${fkViolations.length} 条悬空外键`);
+      }
     }
     const row = readSchemaVersionRow(db);
     const version = row === undefined ? Number.NaN : Number(row.value);
@@ -584,12 +611,13 @@ function verifyLatestBackup(
   opts: BackupStatusOptions,
   sidecarState: BackupSidecarState,
 ): boolean | null {
-  if (opts.deep === true) return verifyByOpening(file, "现场校验");
+  if (opts.deep === true) return verifyByOpening(file, "现场校验", true);
   if (opts.verifyLatest === true) {
     // 旁车只是「备份成功时已经校验过」的声明：size/mtime/首尾指纹都对上才采信，
     // 不可信时回退到开库 —— 旁车缺失的老部署也照旧能得到真实结论。
     if (sidecarState === "trusted") return true;
-    return verifyByOpening(file, "最新备份校验");
+    // 旁车不可信才走到这里（低频路径）：既然要开库，就顺带做 thorough 检查索引/外键
+    return verifyByOpening(file, "最新备份校验", true);
   }
   if (opts.sidecar === true) {
     if (sidecarState === "trusted") return true;
@@ -604,9 +632,9 @@ function verifyLatestBackup(
 }
 
 /** 开库校验（quick_check + schema 可读）；失败只 warn 并把结论降级为 false，绝不抛错 */
-function verifyByOpening(file: BackupFileInfo, label: string): boolean {
+function verifyByOpening(file: BackupFileInfo, label: string, thorough = false): boolean {
   try {
-    verifyDatabaseFile(file.path);
+    verifyDatabaseFile(file.path, { thorough });
     return true;
   } catch (e) {
     logger.warn(`${label}失败（${file.path}）：${errorText(e)}`);
