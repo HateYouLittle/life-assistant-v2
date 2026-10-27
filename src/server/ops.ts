@@ -165,20 +165,21 @@ function metricsText(config: ResolvedConfig, db: DatabaseSync, nowMs: number): s
     );
   }
 
+  // 只走零开库口径（读 `<name>.verified` 旁车）：/metrics 会被监控高频抓取，不能为了
+  // 「有没有可信校验」在每次抓取时打开备份库做 quick_check。
+  const backup = backupStatus(config, nowMs, { sidecar: true });
   // 无备份为 -1（而不是 0）：0 会被误读成「刚刚备份过」，-1 在图上能一眼看出缺失
-  const backup = backupStatus(config, nowMs);
   gauge(
     "life_assistant_backup_latest_age_seconds",
     "最新规范备份距今秒数（无备份为 -1）",
     backup.ageHours === null ? -1 : backup.ageHours * 3600,
   );
-  // 零开库口径：读备份成功时写的 <name>.verified 旁车。1=最新备份有可信校验，
-  // 0=没有/不可信（深度校验以 doctor --live 的开库结果为准）
-  const backupVerify = backupStatus(config, nowMs, { sidecar: true });
+  // 1=最新规范备份有可信校验（旁车大小一致），0=没有/不可信（无备份也记 0）。
+  // 想确认「旁车说好、库其实坏了」这种极端情况，仍以 `doctor --live` 的现场开库为准。
   gauge(
     "life_assistant_backup_latest_verified",
     "最新规范备份是否有可信的校验旁车（1=有，0=无/不可信；深度校验见 doctor --live）",
-    backupVerify.latestVerified === true ? 1 : 0,
+    backup.latestVerified === true ? 1 : 0,
   );
 
   gauge("life_assistant_db_bytes", "主库文件字节数", fileBytes(config.dbPath));

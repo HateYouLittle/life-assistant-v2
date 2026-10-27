@@ -372,9 +372,13 @@ function checkJobFreshness(items: LiveJobItem[], at: DateTime): CheckResult[] {
  */
 function checkLiveBackup(config: ResolvedConfig): CheckResult[] {
   const name = "备份新鲜度";
-  // verifyLatest：坏备份的 mtime 往往很新，只看 mtime 会报「备份新鲜健康」，
-  // 而真正要恢复时才发现用不了（P1-4）。这是手动 --live 检查，做一次 quick_check 值得。
-  const status = backupStatus(config, Date.now(), { verifyLatest: true });
+  // deep：**无条件开库**校验（quick_check + schema 可读），不吃旁车结论。
+  // 坏备份的 mtime 往往很新，只看 mtime（或只信旁车）会报「备份新鲜健康」，而真正要恢复
+  // 时才发现用不了（P1-4）。旁车可能来自复制/篡改/磁盘坏块，只有开库才是最终事实 ——
+  // 这是手动 --live 检查，做一次 quick_check 值得。
+  const status = backupStatus(config, Date.now(), { deep: true });
+  // 零开库口径：只为在「旁车说好、实际库坏了」时给出可操作的提示（复制/篡改/坏块的典型特征）
+  const bySidecar = backupStatus(config, Date.now(), { sidecar: true });
   const results: CheckResult[] = [];
   const canonical = status.files.filter((file) => file.canonical);
   if (status.latest === null) {
@@ -388,10 +392,14 @@ function checkLiveBackup(config: ResolvedConfig): CheckResult[] {
     const age = status.ageHours ?? 0;
     const detail = `${canonical.length} 份规范备份，最新 ${status.latest.name}（${hoursText(age)}前，${bytesText(status.latest.sizeBytes)}）`;
     if (status.latestVerified === false) {
+      const sidecarHint =
+        bySidecar.latestVerified === true
+          ? "；旁车 .verified 仍声称已校验通过（旁车被复制/伪造或磁盘坏块），本次以开库结果为准"
+          : "";
       results.push(
         fail(
           name,
-          `${detail}：最新备份**校验失败**（quick_check/schema 读不出），不能当成可恢复的快照；` +
+          `${detail}：最新备份**校验失败**（quick_check/schema 读不出），不能当成可恢复的快照${sidecarHint}；` +
             "检查磁盘与备份日志。可用 `npm run db:restore -- --latest`（会自动跳过坏文件，回退到上一份可用备份）",
         ),
       );

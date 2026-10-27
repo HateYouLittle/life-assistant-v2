@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -393,6 +393,40 @@ describe("doctor --live", () => {
       const report = await runDoctor(doctorEnv.env, { live: true });
       assert.equal(levelOf(report.checks, "备份新鲜度"), "fail");
       assert.match(detailOf(report.checks, "备份新鲜度"), /校验失败/);
+    } finally {
+      await stub.close();
+      doctorEnv.cleanup();
+    }
+  });
+
+  it("伪造旁车说「已校验通过」但库其实坏了 → 仍判 fail，并在明细里点出旁车说谎", async () => {
+    const stub = await startStub({
+      "/healthz": { body: { ok: true, version: "2.0.0", uptime_s: 60 } },
+      "/api/status": { body: { ok: true } },
+      "/api/jobs": { body: { items: FRESH_JOBS } },
+    });
+    const doctorEnv = makeDoctorEnv(stub.port);
+    try {
+      seedCorruptBackup(doctorEnv.dir);
+      const backupPath = join(doctorEnv.dir, "backups", "life-assistant-20261020-030000.db");
+      // 旁车大小与坏文件一致：零开库口径会信它，doctor 必须靠开库推翻
+      writeFileSync(
+        `${backupPath}.verified`,
+        JSON.stringify({
+          schemaVersion: SCHEMA_VERSION,
+          verifiedAt: new Date().toISOString(),
+          sizeBytes: statSync(backupPath).size,
+        }),
+      );
+
+      const report = await runDoctor(doctorEnv.env, { live: true });
+      assert.equal(
+        levelOf(report.checks, "备份新鲜度"),
+        "fail",
+        "doctor --live 必须忽略旁车结论、现场开库校验",
+      );
+      assert.match(detailOf(report.checks, "备份新鲜度"), /旁车/);
+      assert.match(detailOf(report.checks, "备份新鲜度"), /以开库结果为准/);
     } finally {
       await stub.close();
       doctorEnv.cleanup();

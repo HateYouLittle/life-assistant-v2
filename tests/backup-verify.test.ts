@@ -194,7 +194,7 @@ describe("备份状态 backupStatus", () => {
         verifiedAt: string;
         sizeBytes: number;
       };
-      assert.equal(payload.schemaVersion, 5);
+      assert.equal(payload.schemaVersion, SCHEMA_VERSION);
       assert.equal(payload.sizeBytes, statSync(target).size);
       assert.ok(!Number.isNaN(Date.parse(payload.verifiedAt)));
 
@@ -203,6 +203,13 @@ describe("备份状态 backupStatus", () => {
         backupStatus(env.config, Date.now(), { sidecar: true }).latestVerified,
         true,
         "零开库口径应信任与大小匹配的旁车",
+      );
+      // 旁车不能混进「备份文件」清单：*.db 口径与 FILE_RE 都不该收它
+      const files = backupStatus(env.config, Date.now(), { sidecar: true }).files;
+      assert.deepEqual(
+        files.map((file) => file.name),
+        [target.slice(target.lastIndexOf("/") + 1)],
+        ".db.verified 不能被当备份文件（否则 latest/恢复会选中旁车）",
       );
     } finally {
       cleanupTestEnv(env);
@@ -238,6 +245,82 @@ describe("备份状态 backupStatus", () => {
         JSON.stringify({ ...payload, sizeBytes: (payload.sizeBytes as number) + 1 }),
       );
       assert.equal(backupStatus(env.config, Date.now(), { sidecar: true }).latestVerified, false);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("sidecar：JSON 非法或字段缺失也按不可信处理（不能把损坏旁车当通过）", () => {
+    const env = makeTestEnv();
+    try {
+      const target = runBackup(env.config);
+      const sidecar = `${target}.verified`;
+      for (const payload of [
+        "{不是 JSON",
+        JSON.stringify({}),
+        JSON.stringify({ schemaVersion: "5", verifiedAt: "x", sizeBytes: 1 }),
+        JSON.stringify({ schemaVersion: 5, verifiedAt: "not-a-date", sizeBytes: 1 }),
+      ]) {
+        writeFileSync(sidecar, payload);
+        assert.equal(
+          backupStatus(env.config, Date.now(), { sidecar: true }).latestVerified,
+          false,
+          `旁车内容应判不可信：${payload}`,
+        );
+      }
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("verifyLatest：旁车可信时不开库，旁车缺失时回退开库（兼容老部署）", () => {
+    const env = makeTestEnv();
+    try {
+      const target = runBackup(env.config);
+      // 旁车可信 → true；把备份内容换成**等长**的坏字节（大小仍与旁车一致）后
+      // 仍返回 true，证明这条路径没有开库 —— 这正是「旁车优先」的语义，
+      // 「库真的坏了」由 deep/doctor 的开库校验负责（见下一个用例）。
+      const size = statSync(target).size;
+      writeFileSync(target, Buffer.alloc(size, 0x58));
+      assert.equal(statSync(target).size, size, "前置条件：文件大小不能变，否则旁车本就该失效");
+      assert.equal(
+        backupStatus(env.config, Date.now(), { verifyLatest: true }).latestVerified,
+        true,
+        "旁车大小一致时应直接采信，不打开备份库",
+      );
+
+      // 旁车缺失 → 回退开库，坏库被识破
+      unlinkSync(`${target}.verified`);
+      const fallback = backupStatus(env.config, Date.now(), { verifyLatest: true });
+      assert.equal(fallback.latestVerified, false, "旁车缺失时必须回退到开库校验");
+      assert.equal(fallback.stale, true);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("deep：旁车说好但库已损坏时仍判 false（doctor --live 的最终事实）", () => {
+    const env = makeTestEnv();
+    try {
+      const target = runBackup(env.config);
+      // 伪造「大小一致」的旁车：模拟旁车被复制/篡改，或磁盘坏块只坏了数据页
+      writeFileSync(target, "corrupted-after-verification");
+      writeFileSync(
+        `${target}.verified`,
+        JSON.stringify({
+          schemaVersion: 5,
+          verifiedAt: new Date().toISOString(),
+          sizeBytes: statSync(target).size,
+        }),
+      );
+      assert.equal(
+        backupStatus(env.config, Date.now(), { sidecar: true }).latestVerified,
+        true,
+        "前置条件：伪造旁车骗得过零开库口径",
+      );
+      const deep = backupStatus(env.config, Date.now(), { deep: true });
+      assert.equal(deep.latestVerified, false, "deep 必须忽略旁车、以开库结果为准");
+      assert.equal(deep.stale, true);
     } finally {
       cleanupTestEnv(env);
     }

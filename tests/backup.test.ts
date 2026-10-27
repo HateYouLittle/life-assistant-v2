@@ -271,4 +271,30 @@ describe("db:backup CLI", () => {
       cleanupTestEnv(env);
     }
   });
+
+  it("旁车临时文件：超过 1 小时的 .verified.tmp-* 清掉，刚写的留着（可能还在写）", () => {
+    const env = makeTestEnv();
+    try {
+      mkdirSync(env.config.backupDir, { recursive: true });
+      const staleTmp = join(
+        env.config.backupDir,
+        "life-assistant-20200101-000000.db.verified.tmp-12345678-abcd1234",
+      );
+      writeFileSync(staleTmp, "{半截");
+      const twoHoursAgo = Date.now() / 1000 - 2 * 3600;
+      utimesSync(staleTmp, twoHoursAgo, twoHoursAgo);
+      const liveTmp = join(
+        env.config.backupDir,
+        `life-assistant-20200102-000000.db.verified.tmp-${process.pid}-deadbeef`,
+      );
+      writeFileSync(liveTmp, "{半截");
+
+      runBackup(env.config);
+
+      assert.equal(existsSync(staleTmp), false, "残留的旁车临时文件应在 prune 时清掉");
+      assert.equal(existsSync(liveTmp), true, "1 小时内的旁车临时文件不能删（可能正在写）");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
 });
