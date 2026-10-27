@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
 import { createJobRunner } from "../src/core/job-runner.js";
+import { gaugeValue, resetCountersForTests } from "../src/core/metrics.js";
 import { cleanupTestEnv, makeTestEnv } from "./helpers.js";
 
 /**
@@ -189,6 +190,7 @@ describe("core/job-runner（P1-3）", () => {
       assert.ok(Date.now() - started >= 25, "run 应在看门狗超时后才返回");
       assert.equal(runner.inFlight.size, 0, "超时后必须清掉在途登记，停机不能被挂死 handler 卡住");
       assert.equal(runner.zombies.size, 1, "超时 handler 仍在后台跑，必须登记为僵尸");
+      assert.equal(gaugeValue("job_zombies"), 1, "僵尸数必须暴露到 /metrics（复审观察 1）");
 
       const rows = env.db.prepare("SELECT status, error FROM job_runs ORDER BY id").all() as {
         status: string;
@@ -229,6 +231,7 @@ describe("core/job-runner（P1-3）", () => {
       await gate;
       await new Promise<void>((resolve) => setImmediate(resolve));
       assert.equal(runner.zombies.size, 0, "handler 收敛后必须摘掉僵尸");
+      assert.equal(gaugeValue("job_zombies"), 0, "僵尸收敛后指标必须归零");
       await runner.run(
         "job:hang",
         () => {
@@ -238,6 +241,7 @@ describe("core/job-runner（P1-3）", () => {
       );
       assert.equal(ran, 1, "僵尸收敛后同名任务必须能真正执行");
     } finally {
+      resetCountersForTests();
       cleanupTestEnv(env);
     }
   });

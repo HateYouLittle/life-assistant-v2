@@ -151,7 +151,8 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   改 `createHttpHandler` 的豁免名单要同步 `docs/remote-access.md`。
 - 定时任务有看门狗（`JOB_TIMEOUT_MINUTES`，默认 15 分钟，0 或负数关闭）：handler 挂死会记 `failed`
   并释放互斥；但 JS 无法取消 handler，它会进 `JobRunner.zombies` 继续在后台跑——**僵尸收敛前同名
-  任务一律跳过**（否则 tick 每分钟一次会堆出十几个并发僵尸），停机时给 2s grace 后 warn 继续关库。
+  任务一律跳过**（否则 tick 每分钟一次会堆出十几个并发僵尸），停机时给 2s grace 后 warn 继续关库；
+  僵尸数通过 `/metrics` 的 `life_assistant_job_zombies` 暴露（>0 = 有任务卡死、正在被跳过）。
   `createJobRunner` 的 `.finally` 必须挂在 `Promise.race([finished, watchdog])` 上而不是 handler
   的 promise 上 —— 否则迟到 settle 会把**下一轮**的 busy/inFlight 删掉，等于放行重叠执行。
 - **备份校验旁车**：`runBackup` 发布成功后写 `<备份>.db.verified`（JSON：`schemaVersion` /

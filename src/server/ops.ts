@@ -6,7 +6,7 @@ import { resolveIdentity } from "../core/auth.js";
 import { backupStatus } from "../core/backup.js";
 import { lastJobRun } from "../core/jobs.js";
 import { logger, sanitizeLogText } from "../core/logger.js";
-import { incCounter, snapshotCounters } from "../core/metrics.js";
+import { gaugeValue, incCounter, snapshotCounters } from "../core/metrics.js";
 import { qweatherUsage } from "../core/qweather.js";
 import { envClientAddress } from "../core/ratelimit.js";
 import { allJobs } from "../core/registry.js";
@@ -180,6 +180,14 @@ function metricsText(config: ResolvedConfig, db: DatabaseSync, nowMs: number): s
     "life_assistant_backup_latest_verified",
     "最新规范备份是否有可信的校验旁车（1=有，0=无/不可信；深度校验见 doctor --live）",
     backup.latestVerified === true ? 1 : 0,
+  );
+
+  // 超时僵尸数：>0 表示有 job handler 挂死、相关 job 正在被跳过。只靠 job_runs 的
+  // skipped 无法区分「正常重叠跳过」与「僵尸永久停摆」，这个指标是唯一的直接信号。
+  gauge(
+    "life_assistant_job_zombies",
+    "当前超时后仍在后台运行的 job handler 数量（>0 说明有任务卡死、相关任务在被跳过）",
+    gaugeValue("job_zombies"),
   );
 
   gauge("life_assistant_db_bytes", "主库文件字节数", fileBytes(config.dbPath));

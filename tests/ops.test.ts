@@ -89,6 +89,8 @@ describe("/metrics", () => {
       assert.equal(metricValue(body, "life_assistant_backup_latest_age_seconds"), -1);
       // 没有备份 → 也没有可信的校验旁车
       assert.equal(metricValue(body, "life_assistant_backup_latest_verified"), 0);
+      // 没有超时僵尸：指标必须存在且为 0（缺失会让抓取端看不到「任务卡死」这个信号）
+      assert.equal(metricValue(body, "life_assistant_job_zombies"), 0);
       assert.ok(metricValue(body, "life_assistant_db_bytes") > 0, "主库文件应已存在");
       assert.ok(metricValue(body, "life_assistant_wal_bytes") >= 0);
     } finally {

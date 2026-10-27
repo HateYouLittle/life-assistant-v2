@@ -1,6 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { finishJobRun, type JobTrigger, startJobRun } from "./jobs.js";
 import { logger } from "./logger.js";
+import { setGauge } from "./metrics.js";
 
 /**
  * job 互斥执行器（P1-3 / T-1027-02）。
@@ -167,9 +168,15 @@ export function createJobRunner(db: DatabaseSync, opts: JobRunnerOptions = {}): 
                 // 登记僵尸：它收敛前同名任务一律跳过（见 run 开头的 zombies.has 分支）
                 let zombie: Promise<void>;
                 zombie = finished.finally(() => {
-                  if (zombies.get(name) === zombie) zombies.delete(name);
+                  if (zombies.get(name) === zombie) {
+                    zombies.delete(name);
+                    // 僵尸数暴露到 /metrics：永久跳过的 job 在 job_runs 里只是一堆 skipped，
+                    // 与正常重叠跳过无法区分（复审观察 1）
+                    setGauge("job_zombies", zombies.size);
+                  }
                 });
                 zombies.set(name, zombie);
+                setGauge("job_zombies", zombies.size);
               }
               resolve();
             }, timeoutMs);

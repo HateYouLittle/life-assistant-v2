@@ -588,7 +588,9 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
         );
         await Promise.race([
           Promise.allSettled([...jobRunner.zombies.values()]),
-          new Promise<void>((resolve) => setTimeout(resolve, 2000).unref()),
+          // 这里**不能** unref：停机时事件循环很可能只剩这一个 handle，unref 后这个
+          // race 可能永远不 resolve，后面的 cancelPendingDrain/db.close() 就都被跳过
+          new Promise<void>((resolve) => setTimeout(resolve, 2000)),
         ]);
         if (jobRunner.zombies.size > 0) {
           logger.warn(
