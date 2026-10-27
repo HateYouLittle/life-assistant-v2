@@ -175,12 +175,12 @@ describe("doctor --live", () => {
     // 回归：阈值曾固定为「补发窗口×2」=12h，导致每天一次的任务（晚报/日报/备份）
     // 在两次触发之间的正常空档被误判为停更（如 21:00 晚报在次日 09:00 必报 fail）。
     const jobs = FRESH_JOBS.map((item) => {
-      const name = item["name"] as string;
+      const name = item.name as string;
       const age = name === "evening_brief" ? 13 : name === "daily_brief" ? 20 : 0.2;
       return jobItem({
-        module: item["module"] as string,
+        module: item.module as string,
         name,
-        cron: item["cron"] as string,
+        cron: item.cron as string,
         lastOkAgoHours: age,
       });
     });
