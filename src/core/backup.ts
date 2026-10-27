@@ -211,6 +211,11 @@ export function runBackup(
  * （rename 在 POSIX 上会静默覆盖）。这保留了「同名备份拒绝覆盖」的既有契约 ——
  * 两个备份进程撞在同一秒时，后者必须报错，而不是悄悄覆盖前者的快照
  * （复审 T-1027-02b 指出 rename 把契约改没了）。
+ *
+ * 前提：`partialPath` 与 `targetPath` 必须在**同一个文件系统**上（本函数只用于
+ * `runBackup` 的 `<backupDir>/<name>.partial-*` → `<backupDir>/<name>`，天然满足）。
+ * 若将来允许临时目录与 BACKUP_DIR 跨挂载点，link 会报 EXDEV，需要退回
+ * copy + rename 的发布方式并重新考虑「同名不覆盖」语义（复审 T-1027-02b 观察 1）。
  */
 export function publishBackupFile(partialPath: string, targetPath: string): void {
   try {
