@@ -70,6 +70,17 @@ describe("config", () => {
     assert.equal(config.eveningBriefCron, "30 20 * * *");
   });
 
+  it("6 段（带秒）cron 拒绝启动：补发反向求值只支持 5 段（P2-19）", () => {
+    assert.throws(
+      () => loadConfig({ ...BASE, BACKUP_CRON: "0 0 3 * * *" }),
+      /5 段 cron|不支持秒级 6 段/,
+      "6 段能通过 node-cron 校验但永远反查不出上次触发时刻，必须启动时拒绝",
+    );
+    assert.throws(() => loadConfig({ ...BASE, DAILY_BRIEF_CRON: "30 0 7 * * *" }), /5 段 cron/);
+    // 5 段照常
+    assert.equal(loadConfig({ ...BASE, BACKUP_CRON: "0 3 * * *" }).backupCron, "0 3 * * *");
+  });
+
   it("非回环 HOST 无 token 拒绝启动，有 token 允许", () => {
     assert.throws(() => loadConfig({ ...BASE, HOST: "0.0.0.0" }), /WEB_API_TOKEN/);
     const config = loadConfig({ ...BASE, HOST: "0.0.0.0", WEB_API_TOKEN: SECRET });

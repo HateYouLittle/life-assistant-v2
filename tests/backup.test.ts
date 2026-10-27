@@ -53,12 +53,41 @@ describe("db:backup", () => {
     }
   });
 
-  it("同名备份拒绝覆盖", () => {
+  it("同秒撞名自动顺延 1s 换名，不覆盖已有备份（P2-13 回归）", () => {
     const env = makeTestEnv();
     try {
       const stamp = Date.UTC(2026, 8, 12, 3, 4, 5);
-      runBackup(env.config, stamp);
-      assert.throws(() => runBackup(env.config, stamp), /拒绝覆盖/);
+      const first = runBackup(env.config, stamp);
+      // 同一秒再跑一次（模拟 daemon 备份与手动 db:backup 撞车）：旧实现直接抛
+      // 「备份已存在，拒绝覆盖」，当次备份就没了；现在应顺延 1s 换名成功。
+      const second = runBackup(env.config, stamp);
+      assert.notEqual(second, first, "不得覆盖第一份备份");
+      assert.match(first, new RegExp(`life-assistant-${stampOf(stamp)}\\.db$`));
+      assert.match(
+        second,
+        new RegExp(`life-assistant-${stampOf(stamp + 1000)}\\.db$`),
+        "撞名时顺延 1 秒换名",
+      );
+      assert.equal(existsSync(first), true);
+      assert.equal(existsSync(`${first}.verified`), true);
+      assert.equal(existsSync(`${second}.verified`), true);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("连续 5 个规范名都被占用时报错（不再无限重试）", () => {
+    const env = makeTestEnv();
+    try {
+      const stamp = Date.UTC(2026, 8, 12, 3, 4, 5);
+      mkdirSync(env.config.backupDir, { recursive: true });
+      for (let i = 0; i < 5; i += 1) {
+        writeFileSync(
+          join(env.config.backupDir, `life-assistant-${stampOf(stamp + i * 1000)}.db`),
+          "occupied",
+        );
+      }
+      assert.throws(() => runBackup(env.config, stamp), /同一秒及后 4 秒/);
     } finally {
       cleanupTestEnv(env);
     }

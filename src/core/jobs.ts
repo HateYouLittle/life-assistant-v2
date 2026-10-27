@@ -284,7 +284,11 @@ function parseCronField(raw: string, min: number, max: number): Set<number> | nu
  */
 export function previousFireTime(expr: string, at: DateTime): DateTime | null {
   if (!at.isValid) return null;
-  const parts = expr.trim().split(/\s+/);
+  const rawParts = expr.trim().split(/\s+/);
+  // 6 段（带秒）表达式：按分钟粒度补发只需丢掉秒字段，否则「能通过启动校验、却永远
+  // 反查不出上次触发时刻」→ 停机错过后静默不补发（P2-19）。配置层已拒绝 6 段，
+  // 这里兜住代码里新增的 job 定义；秒级触发最多差 59s，对「每天一次」的补发无影响。
+  const parts = rawParts.length === 6 ? rawParts.slice(1) : rawParts;
   if (parts.length !== 5) {
     logger.debug(`补发：cron 不是 5 段，无法反向求值: "${expr}"`);
     return null;
@@ -412,7 +416,15 @@ export function planCatchups(
     const expr = jobCronExpr(def);
     if (expr === null) continue;
     const previous = previousFireTime(expr, now);
-    if (previous === null) continue;
+    if (previous === null) {
+      // 反向求值失败 = 这个 job 停机后永远不补发，旧实现只打 debug（日志级别 info 时
+      // 完全看不见）。这里用 warn，让「日/月字段受限或写法特殊」在启动时就暴露（P2-19）。
+      logger.warn(
+        `启动补发无法反向求值 ${module}.${def.name} 的 cron "${expr}"（需 5 段、且日/月为 *），` +
+          "该任务停机错过时不会补发",
+      );
+      continue;
+    }
     // 超窗口：错过了太久，补发只会打扰用户（且数据已过时）
     if (now.toMillis() - previous.toMillis() > withinHours * 3600 * 1000) continue;
     const scheduledFor = previous.toISO();

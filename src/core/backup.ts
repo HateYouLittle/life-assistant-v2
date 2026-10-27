@@ -1,10 +1,13 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
+  closeSync,
   existsSync,
   linkSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
+  readSync,
   renameSync,
   type Stats,
   statSync,
@@ -120,6 +123,12 @@ export interface BackupStatus {
    * false 表示「最新备份不可信/打不开」——此时 stale 也置 true，不能再报「备份新鲜健康」。
    */
   latestVerified: boolean | null;
+  /**
+   * 旁车状态（只在请求了 `sidecar`/`verifyLatest` 时计算；默认 null）：
+   * `trusted` 可信 / `untrusted` 存在但内容或大小/mtime/指纹不符 / `missing` 不存在。
+   * `/metrics` 用它区分 2/1/0 三态，排障时能分清「没旁车」和「旁车不可信」。
+   */
+  sidecarState: BackupSidecarState | null;
   /** 不符合规范命名的 `*.db`（迁移前快照、恢复留底、手工拷贝等） */
   nonCanonical: string[];
 }
@@ -205,10 +214,8 @@ export function runBackup(
   // 00:00–08:00 生成的备份被标成前一天，且与「保留最近 N 份」的字典序语义不一致。
   const stamp = DateTime.fromMillis(nowMs, { zone: TZ }).toFormat("yyyyMMdd-HHmmss");
   const target = join(config.backupDir, `life-assistant-${stamp}.db`);
-  if (statSync(target, { throwIfNoEntry: false }) !== undefined) {
-    throw new Error(`备份已存在，拒绝覆盖: ${target}`);
-  }
-  // 先写唯一临时名，校验通过再 rename 成规范名：被打断只留 .partial，不留「规范名坏备份」。
+  // 先写唯一临时名，校验通过再发布：被打断只留 .partial，不留「规范名坏备份」。
+  // 临时名与最终名解耦后，同秒撞名可以换名重试（见下方 publish 循环，P2-13）。
   const partial = `${target}.partial-${process.pid}-${randomUUID().slice(0, 8)}`;
   try {
     const db = new DatabaseSync(config.dbPath);
@@ -229,8 +236,35 @@ export function runBackup(
         `备份自校验失败，已删除半截产物: ${partial}（${e instanceof Error ? e.message : String(e)}）`,
       );
     }
-    publishBackupFile(partial, target);
-    writeVerifiedSidecar(target, schemaVersion, nowMs);
+    // 同秒撞名（daemon 内置备份与手动 db:backup 恰好同一秒）不该让当次备份直接失败：
+    // 规范名只精确到秒，冲突时顺延 1s 换名重试（最多 5 次）。文件内容仍是同一时刻的快照，
+    // 名称差 1s 无害；比「这次没有备份、只留一条报错」好（P2-13）。
+    let published: string | null = null;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const candidate =
+        attempt === 0
+          ? target
+          : join(
+              config.backupDir,
+              `life-assistant-${DateTime.fromMillis(nowMs + attempt * 1000, { zone: TZ }).toFormat("yyyyMMdd-HHmmss")}.db`,
+            );
+      try {
+        publishBackupFile(partial, candidate);
+        published = candidate;
+        break;
+      } catch (e) {
+        // 只对「目标已存在」重试；其它 IO 错误照常抛出
+        if (!(e instanceof Error) || !e.message.includes("备份已存在，拒绝覆盖")) throw e;
+      }
+    }
+    if (published === null) {
+      throw new Error(
+        `备份发布失败：同一秒及后 4 秒的规范名都已被占用（${config.backupDir}），请检查是否有异常频繁的备份进程`,
+      );
+    }
+    writeVerifiedSidecar(published, schemaVersion, nowMs);
+    prune(config.backupDir, keep, nowMs);
+    return published;
   } catch (e) {
     // 任何失败都不留半截文件（删不掉也要让原始错误暴露，不能被清理错误掩盖）
     try {
@@ -240,8 +274,6 @@ export function runBackup(
     }
     throw e;
   }
-  prune(config.backupDir, keep, nowMs);
-  return target;
 }
 
 /**
@@ -274,15 +306,51 @@ export function publishBackupFile(partialPath: string, targetPath: string): void
   }
 }
 
+/**
+ * 备份文件的轻量指纹：首尾各 4KB 的 sha256。
+ *
+ * 为什么不是整文件哈希：备份是 MB 级、旁车在状态页/`/metrics` 路径上会被频繁读取；
+ * 首尾各 4KB 足以识别「等长覆盖/旧备份拷回/半截写」，成本却是常数级。真正的内容完整性
+ * 仍以 quick_check 开库校验为准（`deep` / doctor --live）。
+ */
+function fileDigest(path: string): string {
+  const CHUNK = 4096;
+  const fd = openSync(path, "r");
+  try {
+    const size = statSync(path).size;
+    const headLen = Math.min(CHUNK, size);
+    const head = Buffer.alloc(headLen);
+    if (headLen > 0) readSync(fd, head, 0, headLen, 0);
+    const tailLen = Math.min(CHUNK, size);
+    const tail = Buffer.alloc(tailLen);
+    if (tailLen > 0) readSync(fd, tail, 0, tailLen, Math.max(0, size - tailLen));
+    return createHash("sha256").update(head).update(tail).digest("hex");
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** 旁车判定结果：`trusted` 可信、`untrusted` 存在但不可信、`missing` 不存在 */
+export type BackupSidecarState = "trusted" | "untrusted" | "missing";
+
 /** 写校验旁车（原子：先写唯一临时名再 rename）。失败只 warn —— 旁车只是增强信息 */
 function writeVerifiedSidecar(targetPath: string, schemaVersion: number, nowMs: number): void {
   const path = `${targetPath}${VERIFIED_SUFFIX}`;
   const tmp = `${path}${VERIFIED_TMP_SUFFIX}${process.pid}-${randomUUID().slice(0, 8)}`;
   try {
-    const sizeBytes = statSync(targetPath).size;
+    const stat = statSync(targetPath);
+    const sizeBytes = stat.size;
     // verifiedAt 取「这次备份对应的逻辑时刻」而不是 wall clock：runBackup 的 nowMs 是
     // 唯一时间口径（测试可钉死），旁车与文件名、stale 判定才对得上。
-    const payload = { schemaVersion, verifiedAt: new Date(nowMs).toISOString(), sizeBytes };
+    // mtimeMs + digest 是「同内容」的证据：size 相同但被等长覆盖/拷回旧文件时，
+    // 光看 size 会误判 verified（复审 T-1027-02c 观察 c）。
+    const payload = {
+      schemaVersion,
+      verifiedAt: new Date(nowMs).toISOString(),
+      sizeBytes,
+      mtimeMs: stat.mtimeMs,
+      digest: fileDigest(targetPath),
+    };
     writeFileSync(tmp, JSON.stringify(payload), { mode: 0o600 });
     // rename 在同一目录内是原子的：读方要么看到完整 JSON，要么看不到旁车（回退开库），
     // 绝不会读到写了一半的 `{` 从而把一份健康备份判成不可信。
@@ -298,37 +366,46 @@ function writeVerifiedSidecar(targetPath: string, schemaVersion: number, nowMs: 
 }
 
 /**
- * 读校验旁车：`true` 可信、`false` 存在但不可信（内容坏/大小对不上）、`null` 不存在。
- * 大小必须与当前文件一致：旁车可能来自被复制/覆盖过的旧备份（mtime 与内容都变了）。
+ * 读校验旁车并判定可信度：`trusted` / `untrusted` / `missing`。
+ *
+ * 可信要求全部吻合：schemaVersion 正整数、verifiedAt 可解析、sizeBytes 与当前文件一致、
+ * mtimeMs 与当前文件一致、digest（首尾 4KB sha256）重算一致。任何一项不符都判
+ * `untrusted`（不要回退成「大概可信」）—— 复制/覆盖/等长改写都会让 mtime 或 digest 变化。
  */
-function readVerifiedSidecar(file: BackupFileInfo): boolean | null {
+function readVerifiedSidecar(file: BackupFileInfo): BackupSidecarState {
   const path = `${file.path}${VERIFIED_SUFFIX}`;
   let raw: string;
   try {
     raw = readFileSync(path, "utf8");
   } catch (e) {
-    return (e as NodeJS.ErrnoException).code === "ENOENT" ? null : false;
+    return (e as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "untrusted";
   }
   try {
     const parsed = JSON.parse(raw) as {
       schemaVersion?: unknown;
       verifiedAt?: unknown;
       sizeBytes?: unknown;
+      mtimeMs?: unknown;
+      digest?: unknown;
     };
     if (
       typeof parsed.schemaVersion !== "number" ||
       !Number.isInteger(parsed.schemaVersion) ||
       parsed.schemaVersion < 1
     ) {
-      return false;
+      return "untrusted";
     }
     if (typeof parsed.verifiedAt !== "string" || Number.isNaN(Date.parse(parsed.verifiedAt))) {
-      return false;
+      return "untrusted";
     }
-    if (typeof parsed.sizeBytes !== "number" || parsed.sizeBytes !== file.sizeBytes) return false;
-    return true;
+    if (typeof parsed.sizeBytes !== "number" || parsed.sizeBytes !== file.sizeBytes)
+      return "untrusted";
+    if (typeof parsed.mtimeMs !== "number" || parsed.mtimeMs !== file.mtimeMs) return "untrusted";
+    if (typeof parsed.digest !== "string" || parsed.digest !== fileDigest(file.path))
+      return "untrusted";
+    return "trusted";
   } catch {
-    return false;
+    return "untrusted";
   }
 }
 
@@ -426,6 +503,7 @@ export function backupStatus(
       ageHours: null,
       stale: true,
       latestVerified: null,
+      sidecarState: opts.sidecar === true || opts.verifyLatest === true ? "missing" : null,
       nonCanonical: [],
     };
   }
@@ -462,7 +540,14 @@ export function backupStatus(
   // - sidecar：只读旁车，零开库（状态页/metrics）；
   // - verifyLatest：先信旁车，旁车不可信才开库（默认的「尽量省、但要给出结论」）；
   // - deep：无条件开库现场校验（doctor --live，能发现「旁车说好、实际库坏了」）。
-  const latestVerified = latest === null ? null : verifyLatestBackup(latest, opts);
+  const requested = opts.sidecar === true || opts.verifyLatest === true;
+  const sidecarState: BackupSidecarState | null = !requested
+    ? null
+    : latest === null
+      ? "missing"
+      : readVerifiedSidecar(latest);
+  const latestVerified =
+    latest === null ? null : verifyLatestBackup(latest, opts, sidecarState ?? "missing");
   return {
     dir: config.backupDir,
     files,
@@ -470,6 +555,7 @@ export function backupStatus(
     ageHours,
     stale: ageHours === null || ageHours > BACKUP_STALE_HOURS || latestVerified === false,
     latestVerified,
+    sidecarState,
     nonCanonical: files.filter((file) => !file.canonical).map((file) => file.name),
   };
 }
@@ -481,20 +567,23 @@ export function backupStatus(
  * - `sidecar` 只读旁车、永不开库，不可信即 false；
  * - `verifyLatest` 先读旁车，旁车缺失/内容坏/大小对不上再回退开库，保持旧行为兼容。
  */
-function verifyLatestBackup(file: BackupFileInfo, opts: BackupStatusOptions): boolean | null {
+function verifyLatestBackup(
+  file: BackupFileInfo,
+  opts: BackupStatusOptions,
+  sidecarState: BackupSidecarState,
+): boolean | null {
   if (opts.deep === true) return verifyByOpening(file, "现场校验");
   if (opts.verifyLatest === true) {
-    // 旁车只是「备份成功时已经校验过」的声明：大小一致才采信（防复制/覆盖过的陈旧旁车），
+    // 旁车只是「备份成功时已经校验过」的声明：size/mtime/首尾指纹都对上才采信，
     // 不可信时回退到开库 —— 旁车缺失的老部署也照旧能得到真实结论。
-    if (readVerifiedSidecar(file) === true) return true;
+    if (sidecarState === "trusted") return true;
     return verifyByOpening(file, "最新备份校验");
   }
   if (opts.sidecar === true) {
-    const sidecar = readVerifiedSidecar(file);
-    if (sidecar === true) return true;
+    if (sidecarState === "trusted") return true;
     logger.debug(
       `最新备份旁车不可信（${file.path}${VERIFIED_SUFFIX}）：${
-        sidecar === null ? "旁车不存在" : "内容坏或大小与备份不一致"
+        sidecarState === "missing" ? "旁车不存在" : "内容坏或大小/mtime/指纹与备份不一致"
       }`,
     );
     return false;

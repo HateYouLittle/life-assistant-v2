@@ -135,9 +135,13 @@ function metricsText(config: ResolvedConfig, db: DatabaseSync, nowMs: number): s
   }
 
   // 最老待投递：只算 queued/failed（sending 是在途、sent/cancelled 是终态）。
+  // 口径用 next_attempt_at（与 /readyz 一致，P2-7）：静默时段/退避中的行只是「还没到点」，
+  // 用 created_at 会让每个静默窗口把指标顶到 30 分钟以上，监控天天夜里报警。
   // 时间戳可能被手工改库写坏：解析失败或落在未来一律按 0，宁可少报积压也不误报。
   const oldestRow = db
-    .prepare("SELECT MIN(created_at) AS oldest FROM deliveries WHERE status IN ('queued','failed')")
+    .prepare(
+      "SELECT MIN(next_attempt_at) AS oldest FROM deliveries WHERE status IN ('queued','failed')",
+    )
     .get() as { oldest: string | null } | undefined;
   const oldestMs = oldestRow?.oldest == null ? Number.NaN : Date.parse(oldestRow.oldest);
   gauge(
@@ -174,12 +178,14 @@ function metricsText(config: ResolvedConfig, db: DatabaseSync, nowMs: number): s
     "最新规范备份距今秒数（无备份为 -1）",
     backup.ageHours === null ? -1 : backup.ageHours * 3600,
   );
-  // 1=最新规范备份有可信校验（旁车大小一致），0=没有/不可信（无备份也记 0）。
-  // 想确认「旁车说好、库其实坏了」这种极端情况，仍以 `doctor --live` 的现场开库为准。
+  // 三态（复审 T-1027-02c 观察 c）：2=旁车可信（size/mtime/首尾指纹一致）、
+  // 1=旁车存在但不可信（被复制/覆盖/等长改写）、0=没有旁车或没有备份。
+  // 二值口径会把「没旁车」和「旁车说好但不可信」混成 0，排障时分不清。
+  // 想确认「旁车说好、库其实坏了」，仍以 `doctor --live` 的现场开库为准。
   gauge(
     "life_assistant_backup_latest_verified",
-    "最新规范备份是否有可信的校验旁车（1=有，0=无/不可信；深度校验见 doctor --live）",
-    backup.latestVerified === true ? 1 : 0,
+    "最新规范备份的旁车状态（2=可信，1=存在但不可信，0=无旁车/无备份；深度校验见 doctor --live）",
+    backup.sidecarState === "trusted" ? 2 : backup.sidecarState === "untrusted" ? 1 : 0,
   );
 
   // 超时僵尸数：>0 表示有 job handler 挂死、相关 job 正在被跳过。只靠 job_runs 的
@@ -229,11 +235,17 @@ function probeWritable(db: DatabaseSync): boolean {
   }
 }
 
-/** 最老 `queued` 投递的创建时刻（毫秒）；没有 queued 或时间戳不可解析返回 null（不误报卡住） */
+/**
+ * 最老 `queued` 投递的**到期时刻**（毫秒）；没有 queued 或时间戳不可解析返回 null（不误报卡住）。
+ *
+ * 用 `next_attempt_at` 而不是 `created_at`（P2-7）：静默时段的行会被 drain 推到窗口结束，
+ * 用创建时刻判定会让每个静默窗口（常配 8h）在 30 分钟后必然报警；而 `next_attempt_at`
+ * 在未来的行只是「还没到投递时间」，不是卡住。
+ */
 function oldestQueuedMs(db: DatabaseSync): number | null {
   try {
     const row = db
-      .prepare("SELECT MIN(created_at) AS oldest FROM deliveries WHERE status = 'queued'")
+      .prepare("SELECT MIN(next_attempt_at) AS oldest FROM deliveries WHERE status = 'queued'")
       .get() as { oldest: string | null } | undefined;
     if (row?.oldest == null) return null;
     const at = Date.parse(row.oldest);

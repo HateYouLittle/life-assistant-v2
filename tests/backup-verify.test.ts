@@ -273,51 +273,65 @@ describe("备份状态 backupStatus", () => {
     }
   });
 
-  it("verifyLatest：旁车可信时不开库，旁车缺失时回退开库（兼容老部署）", () => {
+  it("verifyLatest：旁车可信时直接采信；等长覆盖后旁车失效并回退开库（复审 c）", () => {
     const env = makeTestEnv();
     try {
       const target = runBackup(env.config);
-      // 旁车可信 → true；把备份内容换成**等长**的坏字节（大小仍与旁车一致）后
-      // 仍返回 true，证明这条路径没有开库 —— 这正是「旁车优先」的语义，
-      // 「库真的坏了」由 deep/doctor 的开库校验负责（见下一个用例）。
-      const size = statSync(target).size;
-      writeFileSync(target, Buffer.alloc(size, 0x58));
-      assert.equal(statSync(target).size, size, "前置条件：文件大小不能变，否则旁车本就该失效");
-      assert.equal(
-        backupStatus(env.config, Date.now(), { verifyLatest: true }).latestVerified,
-        true,
-        "旁车大小一致时应直接采信，不打开备份库",
-      );
+      const trusted = backupStatus(env.config, Date.now(), { verifyLatest: true });
+      assert.equal(trusted.sidecarState, "trusted");
+      assert.equal(trusted.latestVerified, true);
 
-      // 旁车缺失 → 回退开库，坏库被识破
-      unlinkSync(`${target}.verified`);
-      const fallback = backupStatus(env.config, Date.now(), { verifyLatest: true });
-      assert.equal(fallback.latestVerified, false, "旁车缺失时必须回退到开库校验");
-      assert.equal(fallback.stale, true);
+      // 等长覆盖：size 不变，首尾指纹变了 → 旁车必须失效；回退开库把坏库识破。
+      // （旧「只看 size」的口径在这里会误判 verified）
+      const st = statSync(target);
+      writeFileSync(target, Buffer.alloc(st.size, 0x58));
+      utimesSync(target, st.atime, st.mtime);
+      const corrupted = backupStatus(env.config, Date.now(), { verifyLatest: true });
+      assert.equal(corrupted.sidecarState, "untrusted", "等长覆盖必须让旁车失效");
+      assert.equal(corrupted.latestVerified, false, "回退开库必须识破坏库");
+      assert.equal(corrupted.stale, true);
     } finally {
       cleanupTestEnv(env);
     }
   });
 
-  it("deep：旁车说好但库已损坏时仍判 false（doctor --live 的最终事实）", () => {
+  it("verifyLatest：旁车缺失时回退开库（兼容旁车功能上线前的老部署）", () => {
     const env = makeTestEnv();
     try {
       const target = runBackup(env.config);
-      // 伪造「大小一致」的旁车：模拟旁车被复制/篡改，或磁盘坏块只坏了数据页
-      writeFileSync(target, "corrupted-after-verification");
-      writeFileSync(
-        `${target}.verified`,
-        JSON.stringify({
-          schemaVersion: 5,
-          verifiedAt: new Date().toISOString(),
-          sizeBytes: statSync(target).size,
-        }),
-      );
-      assert.equal(
-        backupStatus(env.config, Date.now(), { sidecar: true }).latestVerified,
-        true,
-        "前置条件：伪造旁车骗得过零开库口径",
-      );
+      unlinkSync(`${target}.verified`);
+      const noSidecar = backupStatus(env.config, Date.now(), { verifyLatest: true });
+      assert.equal(noSidecar.sidecarState, "missing");
+      assert.equal(noSidecar.latestVerified, true, "健康库应通过开库校验");
+      assert.equal(noSidecar.stale, false);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("deep：旁车仍可信但库中间页损坏 → deep 判 false（doctor --live 的最终事实）", () => {
+    const env = makeTestEnv();
+    try {
+      const target = runBackup(env.config);
+      // 旁车只覆盖首尾各 4KB 指纹：损坏中间页、并把 mtime 伪装回去 → 零开库口径仍判可信，
+      // 只有开库的 quick_check 能发现（磁盘坏块/等长改写的典型形态）。
+      const buf = readFileSync(target);
+      assert.ok(buf.length > 16 * 1024, `前置条件：备份要足够大，实际 ${buf.length} 字节`);
+      const pageSize = 4096;
+      const pageStart = Math.floor(Math.floor(buf.length / 2) / pageSize) * pageSize;
+      for (let i = pageStart; i < pageStart + pageSize && i < buf.length; i += 1) buf[i] = 0xff;
+      writeFileSync(target, buf);
+      // 同步旁车里的 mtime（模拟「mtime 也没变」的坏块/等长改写）：首尾指纹未变 → 可信
+      const payload = JSON.parse(readFileSync(`${target}.verified`, "utf8")) as {
+        mtimeMs: number;
+      };
+      payload.mtimeMs = statSync(target).mtimeMs;
+      writeFileSync(`${target}.verified`, JSON.stringify(payload));
+
+      const bySidecar = backupStatus(env.config, Date.now(), { sidecar: true });
+      assert.equal(bySidecar.sidecarState, "trusted", "前置条件：中间页损坏不影响首尾指纹");
+      assert.equal(bySidecar.latestVerified, true);
+
       const deep = backupStatus(env.config, Date.now(), { deep: true });
       assert.equal(deep.latestVerified, false, "deep 必须忽略旁车、以开库结果为准");
       assert.equal(deep.stale, true);

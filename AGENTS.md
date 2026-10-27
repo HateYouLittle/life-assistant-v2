@@ -134,8 +134,9 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
 - 所有 HTTP 请求都过 Host/Origin 守卫：缺 Host 或不在允许名单 → 403；带 Origin 时必须同源
   （无 Origin 的 CLI/agent 放行）。绑定 `0.0.0.0` 或经反代/域名访问时，把实际 Host 写进
   `WEB_ALLOWED_HOSTS`，否则是预期内的 403。
-- 启动补发只覆盖 `CATCHUP_POLICY` 白名单内的 job，且只补最近一次；cron 的日与月字段
-  必须为 `*`；分钟/小时/星期支持 `*`、单值、逗号列表、`a-b` 范围与 `a-b/n` 步长（步长按
+- 启动补发只覆盖 `CATCHUP_POLICY` 白名单内的 job，且只补最近一次；cron **环境变量必须恰好
+  5 段**（不支持秒字段，否则补发反向求值永远失败、停机后静默不补发；配置层直接拒绝）；
+  cron 的日与月字段必须为 `*`；分钟/小时/星期支持 `*`、单值、逗号列表、`a-b` 范围与 `a-b/n` 步长（步长按
   node-cron 展开后取模语义），星期 `7` 只允许单值/单值列表，含 `7` 的范围/步长与特殊写法
   保守不反查。补发会把「原定触发时刻」
   传给 handler。新增「每天必须发生一次」的任务时记得加进策略表；`tests/jobs.test.ts`
@@ -156,11 +157,15 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   `createJobRunner` 的 `.finally` 必须挂在 `Promise.race([finished, watchdog])` 上而不是 handler
   的 promise 上 —— 否则迟到 settle 会把**下一轮**的 busy/inFlight 删掉，等于放行重叠执行。
 - **备份校验旁车**：`runBackup` 发布成功后写 `<备份>.db.verified`（JSON：`schemaVersion` /
-  `verifiedAt` / `sizeBytes`，先写 `.verified.tmp-<pid>-<随机>` 再 rename，失败只 warn）。
+  `verifiedAt` / `sizeBytes` / `mtimeMs` / 首尾各 4KB 的 `digest`（sha256），先写
+  `.verified.tmp-<pid>-<随机>` 再 rename，失败只 warn）。可信要求 size/mtime/指纹全部吻合，
+  否则判不可信（等长覆盖/拷回/截断都会失效；中间页坏块只有 `deep` 开库能发现）。
   `backupStatus` 三档口径：默认不读任何文件返回 `null`；`{verifyLatest:true}` 先信旁车
-  （`sizeBytes` 必须与文件一致），旁车缺失/不可信才回退开库；`{sidecar:true}` 零开库只读旁车
-  （状态页/`/metrics` 用）；`{deep:true}` 强制开库（`doctor --live` 用，能发现「旁车说好、
-  库其实坏了」）。prune 删旧备份连带删旁车，并清理孤儿旁车与过期的 `.verified.tmp-*`。
+  （size/mtime/指纹吻合才算可信），旁车缺失/不可信才回退开库；`{sidecar:true}` 零开库只读旁车
+  （状态页/`/metrics` 用；`sidecarState` 给 trusted/untrusted/missing，metrics 输出 2/1/0 三态）；
+  `{deep:true}` 强制开库（`doctor --live` 用，能发现「旁车说好、库其实坏了」）。prune 删旧备份
+  连带删旁车，并清理孤儿旁车与过期的 `.verified.tmp-*`。同秒撞名时 `runBackup` 顺延 1s 换名
+  重试（最多 5 次），绝不覆盖已有备份。
 - `daemon.lock` 存在表示同机已有实例；stale 锁（pid 已死/内容损坏）启动时会原子接管。`db:restore`
   在锁内 pid 仍存活时拒绝执行；锁文件存在但内容损坏/不可读时无法确认 daemon 已停，同样拒绝
   （dead-pid 残留仍放行），需先确认停服再手工删锁。别绕过它直接覆盖库文件。

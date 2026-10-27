@@ -1,11 +1,21 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
-import { SCHEMA_VERSION } from "../src/core/database.js";
+import { loadConfig } from "../src/config.js";
+import { runBackup } from "../src/core/backup.js";
+import { openDatabase, SCHEMA_VERSION } from "../src/core/database.js";
 import { type CheckResult, runDoctor } from "../src/doctor.js";
 
 /**
@@ -154,6 +164,39 @@ function seedCorruptBackup(dir: string): void {
   mkdirSync(backups, { recursive: true });
   const path = join(backups, "life-assistant-20261020-030000.db");
   writeFileSync(path, "not-a-sqlite-db");
+}
+
+/**
+ * 造一份「旁车仍可信、但库中间页已损坏」的备份：真实 backup + 可信旁车，然后覆盖中间
+ * 一个 4KB 页并把旁车里的 mtime 同步成新值（首尾 4KB 指纹不变）。
+ * 这是零开库口径无法识破、只有 doctor 的 deep 开库校验能抓到的形态。
+ */
+function seedTrustedButMiddleCorruptedBackup(dir: string, port: number): string {
+  const config = loadConfig({
+    DATA_DIR: dir,
+    HOST: "127.0.0.1",
+    PORT: String(port),
+    LOG_LEVEL: "error",
+  });
+  const db = openDatabase(config.dbPath);
+  try {
+    db.exec("CREATE TABLE filler (id INTEGER PRIMARY KEY, blob BLOB)");
+    const blob = Buffer.alloc(64 * 1024, 7);
+    for (let i = 0; i < 4; i += 1) db.prepare("INSERT INTO filler (blob) VALUES (?)").run(blob);
+  } finally {
+    db.close();
+  }
+  const backupPath = runBackup(config);
+  const buf = readFileSync(backupPath);
+  const pageSize = 4096;
+  const pageStart = Math.floor(Math.floor(buf.length / 2) / pageSize) * pageSize;
+  for (let i = pageStart; i < pageStart + pageSize && i < buf.length; i += 1) buf[i] = 0xff;
+  writeFileSync(backupPath, buf);
+  const sidecarPath = `${backupPath}.verified`;
+  const payload = JSON.parse(readFileSync(sidecarPath, "utf8")) as { mtimeMs: number };
+  payload.mtimeMs = statSync(backupPath).mtimeMs;
+  writeFileSync(sidecarPath, JSON.stringify(payload));
+  return backupPath;
 }
 
 describe("doctor --live", () => {
@@ -407,17 +450,8 @@ describe("doctor --live", () => {
     });
     const doctorEnv = makeDoctorEnv(stub.port);
     try {
-      seedCorruptBackup(doctorEnv.dir);
-      const backupPath = join(doctorEnv.dir, "backups", "life-assistant-20261020-030000.db");
-      // 旁车大小与坏文件一致：零开库口径会信它，doctor 必须靠开库推翻
-      writeFileSync(
-        `${backupPath}.verified`,
-        JSON.stringify({
-          schemaVersion: SCHEMA_VERSION,
-          verifiedAt: new Date().toISOString(),
-          sizeBytes: statSync(backupPath).size,
-        }),
-      );
+      // 旁车可信（首尾指纹一致）但中间页损坏：零开库口径会信它，doctor 必须靠开库推翻
+      seedTrustedButMiddleCorruptedBackup(doctorEnv.dir, stub.port);
 
       const report = await runDoctor(doctorEnv.env, { live: true });
       assert.equal(

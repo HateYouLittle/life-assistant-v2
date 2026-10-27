@@ -136,6 +136,24 @@ function normalizeHost(raw: string): string {
   return host;
 }
 
+/**
+ * 校验 cron 环境变量：必须**恰好 5 段**（分 时 日 月 周）。
+ *
+ * node-cron 也接受 6 段（带秒）表达式，但启动补发的反向求值 `previousFireTime` 只按 5 段
+ * 实现：6 段能通过启动校验却永远反查不出「上次触发时刻」，停机错过后静默不补发（P2-19）。
+ * 与其让配置看起来生效、实际补发失效，不如启动时就拒绝并说清原因。
+ */
+function fiveFieldCron(name: string, value: string): string {
+  const fields = value.trim().split(/\s+/).length;
+  if (fields !== 5) {
+    throw new Error(
+      `${name} 需要 5 段 cron（分 时 日 月 周），不支持秒级 6 段（当前 ${fields} 段）: ${value}`,
+    );
+  }
+  if (!cron.validate(value)) throw new Error(`${name} 不是合法 cron 表达式: ${value}`);
+  return value;
+}
+
 const TRUE_FLAGS = new Set(["1", "true", "yes", "on"]);
 const FALSE_FLAGS = new Set(["0", "false", "no", "off"]);
 
@@ -407,16 +425,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
     );
   }
 
-  const dailyBriefCron = env.DAILY_BRIEF_CRON?.trim() || "0 7 * * *";
-  if (!cron.validate(dailyBriefCron)) {
-    throw new Error(`DAILY_BRIEF_CRON 不是合法 cron 表达式: ${dailyBriefCron}`);
-  }
+  const dailyBriefCron = fiveFieldCron(
+    "DAILY_BRIEF_CRON",
+    env.DAILY_BRIEF_CRON?.trim() || "0 7 * * *",
+  );
 
   // 晚报与早报同一套 cron 校验：非法表达式在启动期拒绝，而不是等 21:00 才静默不触发
-  const eveningBriefCron = env.EVENING_BRIEF_CRON?.trim() || "0 21 * * *";
-  if (!cron.validate(eveningBriefCron)) {
-    throw new Error(`EVENING_BRIEF_CRON 不是合法 cron 表达式: ${eveningBriefCron}`);
-  }
+  const eveningBriefCron = fiveFieldCron(
+    "EVENING_BRIEF_CRON",
+    env.EVENING_BRIEF_CRON?.trim() || "0 21 * * *",
+  );
 
   const logDirRaw = env.LOG_DIR?.trim() || join(homedir(), "Library/Logs/life-assistant");
   const logMaxMbRaw = env.LOG_MAX_MB?.trim() || "20";
@@ -430,20 +448,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
     throw new Error(`LOG_KEEP 必须是 1..100 的整数: ${logKeepRaw}`);
   }
 
-  const weeklyReportCron = env.WEEKLY_REPORT_CRON?.trim() || "0 20 * * 0";
-  if (!cron.validate(weeklyReportCron)) {
-    throw new Error(`WEEKLY_REPORT_CRON 不是合法 cron 表达式: ${weeklyReportCron}`);
-  }
+  const weeklyReportCron = fiveFieldCron(
+    "WEEKLY_REPORT_CRON",
+    env.WEEKLY_REPORT_CRON?.trim() || "0 20 * * 0",
+  );
 
-  const ledgerDigestCron = env.LEDGER_DIGEST_CRON?.trim() || "30 21 * * *";
-  if (!cron.validate(ledgerDigestCron)) {
-    throw new Error(`LEDGER_DIGEST_CRON 不是合法 cron 表达式: ${ledgerDigestCron}`);
-  }
+  const ledgerDigestCron = fiveFieldCron(
+    "LEDGER_DIGEST_CRON",
+    env.LEDGER_DIGEST_CRON?.trim() || "30 21 * * *",
+  );
 
-  const alertWatchCron = env.ALERT_WATCH_CRON?.trim() || "*/20 * * * *";
-  if (!cron.validate(alertWatchCron)) {
-    throw new Error(`ALERT_WATCH_CRON 不是合法 cron 表达式: ${alertWatchCron}`);
-  }
+  const alertWatchCron = fiveFieldCron(
+    "ALERT_WATCH_CRON",
+    env.ALERT_WATCH_CRON?.trim() || "*/20 * * * *",
+  );
 
   const alertMinLevelRaw = env.ALERT_MIN_LEVEL?.trim() || "blue";
   const alertMinLevel = z.enum(["blue", "yellow", "orange", "red"]).safeParse(alertMinLevelRaw);
@@ -451,10 +469,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
     throw new Error(`ALERT_MIN_LEVEL 不合法: ${alertMinLevelRaw}（可选 blue|yellow|orange|red）`);
   }
 
-  const workdayWatchCron = env.WORKDAY_WATCH_CRON?.trim() || "0 7 * * *";
-  if (!cron.validate(workdayWatchCron)) {
-    throw new Error(`WORKDAY_WATCH_CRON 不是合法 cron 表达式: ${workdayWatchCron}`);
-  }
+  const workdayWatchCron = fiveFieldCron(
+    "WORKDAY_WATCH_CRON",
+    env.WORKDAY_WATCH_CRON?.trim() || "0 7 * * *",
+  );
 
   const remindDaysRaw = env.WORKDAY_REMIND_DAYS_BEFORE?.trim() || "3";
   const workdayRemindDaysBefore = Number(remindDaysRaw);
@@ -466,10 +484,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
     throw new Error(`WORKDAY_REMIND_DAYS_BEFORE 必须是 0..30 之间的整数: ${remindDaysRaw}`);
   }
 
-  const backupCron = env.BACKUP_CRON?.trim() || "0 3 * * *";
-  if (!cron.validate(backupCron)) {
-    throw new Error(`BACKUP_CRON 不是合法 cron 表达式: ${backupCron}`);
-  }
+  const backupCron = fiveFieldCron("BACKUP_CRON", env.BACKUP_CRON?.trim() || "0 3 * * *");
 
   const backupKeepRaw = env.BACKUP_KEEP?.trim() || "14";
   const backupKeep = Number(backupKeepRaw);

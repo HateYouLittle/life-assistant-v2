@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdirSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { Hono } from "hono";
 import { sanitizeLogText } from "../src/core/logger.js";
+import { runBackup } from "../src/core/backup.js";
 import { allJobs } from "../src/core/registry.js";
 import { createOpsApp, escapeLabelValue } from "../src/server/ops.js";
 import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
@@ -26,14 +27,22 @@ function seedNotification(env: TestEnv, id: string, createdAt: string): void {
 
 function seedDelivery(
   env: TestEnv,
-  over: { id: string; notificationId: string; status: string; createdAt: string },
+  over: {
+    id: string;
+    notificationId: string;
+    status: string;
+    createdAt: string;
+    /** 缺省 = createdAt；静默/退避中的行要显式给未来时刻 */
+    nextAttemptAt?: string;
+  },
 ): void {
+  const next = over.nextAttemptAt ?? over.createdAt;
   env.db
     .prepare(
       `INSERT INTO deliveries (id, notification_id, route_name, status, next_attempt_at, created_at, updated_at)
        VALUES (?, ?, 'r', ?, ?, ?, ?)`,
     )
-    .run(over.id, over.notificationId, over.status, over.createdAt, over.createdAt, over.createdAt);
+    .run(over.id, over.notificationId, over.status, next, over.createdAt, over.createdAt);
 }
 
 /**
@@ -133,9 +142,8 @@ describe("/metrics", () => {
           finished.toISOString(),
         );
 
-      // 规范命名的备份文件：mtime 就是生成时间，年龄应接近 0
-      mkdirSync(env.config.backupDir, { recursive: true });
-      writeFileSync(join(env.config.backupDir, "life-assistant-20260101-030000.db"), "backup");
+      // 真备份（带可信旁车）：mtime 就是生成时间，年龄应接近 0；verified 应为 2
+      const backupPath = runBackup(env.config);
 
       const body = await (await app(env).request("/metrics")).text();
       for (const status of STATUSES) {
@@ -160,22 +168,19 @@ describe("/metrics", () => {
       assert.ok(age >= 0 && age < 60, `备份年龄应接近 0，实际 ${age}`);
       assert.equal(
         metricValue(body, "life_assistant_backup_latest_verified"),
-        0,
-        "没有旁车时 verified 指标应为 0",
+        2,
+        "真备份的旁车可信 → 2",
       );
 
-      // 写一份内容与大小都对得上的旁车：零开库口径应变为 1
-      const backupPath = join(env.config.backupDir, "life-assistant-20260101-030000.db");
-      writeFileSync(
-        `${backupPath}.verified`,
-        JSON.stringify({
-          schemaVersion: 5,
-          verifiedAt: new Date().toISOString(),
-          sizeBytes: statSync(backupPath).size,
-        }),
-      );
-      const verifiedBody = await (await app(env).request("/metrics")).text();
-      assert.equal(metricValue(verifiedBody, "life_assistant_backup_latest_verified"), 1);
+      // 旁车被写坏：存在但不可信 → 1（与「没有旁车」的 0 区分开，排障时能分清）
+      writeFileSync(`${backupPath}.verified`, "{}");
+      const untrustedBody = await (await app(env).request("/metrics")).text();
+      assert.equal(metricValue(untrustedBody, "life_assistant_backup_latest_verified"), 1);
+
+      // 旁车缺失 → 0
+      unlinkSync(`${backupPath}.verified`);
+      const missingBody = await (await app(env).request("/metrics")).text();
+      assert.equal(metricValue(missingBody, "life_assistant_backup_latest_verified"), 0);
     } finally {
       cleanupTestEnv(env);
     }
@@ -312,6 +317,25 @@ describe("/readyz", () => {
       });
       const response = await app(env).request("/readyz");
       assert.equal(response.status, 200, "failed 由 drain 按 next_attempt_at 退避重试，不是卡住");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("静默/退避中的 queued（next_attempt_at 在未来）不算卡住（P2-7 回归）", async () => {
+    const env = makeTestEnv();
+    try {
+      seedNotification(env, "n1", new Date().toISOString());
+      // 创建于 40 分钟前、但被静默窗口推到 1 小时后才可投：旧口径（created_at）必然误报 503
+      seedDelivery(env, {
+        id: "d-quiet",
+        notificationId: "n1",
+        status: "queued",
+        createdAt: new Date(Date.now() - 40 * 60 * 1000).toISOString(),
+        nextAttemptAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      });
+      const response = await app(env).request("/readyz");
+      assert.equal(response.status, 200, "按设计等待静默窗口结束的行不是 outbox 卡死");
     } finally {
       cleanupTestEnv(env);
     }

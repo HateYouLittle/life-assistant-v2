@@ -89,6 +89,17 @@ describe("previousFireTime（cron 反向求值）", () => {
     );
   });
 
+  it("6 段带秒表达式：丢掉秒字段按分钟反查（P2-19 兼容兜底）", () => {
+    // 配置层已拒绝 6 段；这里兜住代码内新增的 job 定义。秒级触发最多差 59s，
+    // 对「每天一次」的补发语义无影响，但绝不能返回 null 导致静默不补发。
+    assert.equal(
+      previousFireTime("30 0 7 * * *", atLocal("2026-10-20T08:30:00"))
+        ?.setZone(TZ)
+        .toFormat("yyyy-LL-dd HH:mm"),
+      "2026-10-20 07:00",
+    );
+  });
+
   it("*/20 每 20 分钟：08:05 → 08:00，08:00 → 08:00", () => {
     assert.equal(
       previousFireTime("*/20 * * * *", atLocal("2026-10-20T08:05:00"))
