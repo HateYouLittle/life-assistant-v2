@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
@@ -367,6 +375,55 @@ describe("db:restore CLI", () => {
       assert.equal(result.status, 1, result.stderr);
       assert.match(result.stderr, /恢复失败：/);
       assert.doesNotMatch(result.stderr, /\n\s+at /, "不应输出裸堆栈");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("--latest 跳过校验失败的更新备份，回退到上一份可用备份（P1-4）", () => {
+    const env = makeTestEnv();
+    try {
+      seedLedger(env, "keep-me");
+      env.db.close();
+      const good = runBackup(env.config, Date.UTC(2026, 8, 12, 1, 0, 0));
+      // 更新的「规范名坏备份」：旧实现恒选 mtime 最新的规范文件，会直接拒绝恢复
+      const bad = join(env.config.backupDir, "life-assistant-20260912-173000.db");
+      writeFileSync(bad, "not-a-sqlite-db");
+      const newer = Date.now() / 1000 + 10;
+      utimesSync(bad, newer, newer);
+
+      assert.equal(
+        resolveRestoreTarget(env.config, { latest: true }),
+        good,
+        "--latest 必须回退到第一份校验通过的备份",
+      );
+      const result = runRestore(env.config, {
+        latest: true,
+        nowMs: Date.UTC(2026, 8, 12, 3, 0, 0),
+      });
+      assert.equal(result.target, good);
+      assert.deepEqual(ledgerIds(env.config.dbPath), ["keep-me"]);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("--latest 全部校验失败时报错，并指出最近的坏备份", () => {
+    const env = makeTestEnv();
+    try {
+      seedLedger(env, "keep-me");
+      env.db.close();
+      mkdirSync(env.config.backupDir, { recursive: true });
+      writeFileSync(
+        join(env.config.backupDir, "life-assistant-20260912-010000.db"),
+        "not-a-sqlite-db",
+      );
+      assert.throws(
+        () => resolveRestoreTarget(env.config, { latest: true }),
+        /全部校验失败/,
+        "一份可用的都没有时必须明确报错，而不是静默选坏文件",
+      );
+      assert.deepEqual(ledgerIds(env.config.dbPath), ["keep-me"], "失败路径不得改动当前库");
     } finally {
       cleanupTestEnv(env);
     }

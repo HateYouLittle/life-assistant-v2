@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
@@ -160,5 +160,52 @@ describe("db:backup CLI", () => {
     assert.equal(result.status, 1, result.stderr);
     assert.match(result.stderr, /备份失败：/);
     assert.doesNotMatch(result.stderr, /\n\s+at /, "不应输出裸堆栈");
+  });
+
+  it("原子发布：成功后备份以规范名出现，目录里不留 .partial 临时产物", () => {
+    const env = makeTestEnv();
+    try {
+      const target = runBackup(env.config);
+      const files = readdirSync(env.config.backupDir);
+      assert.deepEqual(files, [target.slice(target.lastIndexOf("/") + 1)]);
+      assert.equal(
+        files.filter((name) => name.includes(".partial-")).length,
+        0,
+        "校验通过的临时文件必须 rename 掉，不能留在目录里",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("清理被打断的半截备份：超过 1 小时的 .partial 删除，刚写的保留（可能还有进程在写）", () => {
+    const env = makeTestEnv();
+    try {
+      mkdirSync(env.config.backupDir, { recursive: true });
+      const stalePartial = join(
+        env.config.backupDir,
+        "life-assistant-20200101-000000.db.partial-12345678-abcd1234",
+      );
+      writeFileSync(stalePartial, "half-written");
+      const twoHoursAgo = Date.now() / 1000 - 2 * 3600;
+      utimesSync(stalePartial, twoHoursAgo, twoHoursAgo);
+      const livePartial = join(
+        env.config.backupDir,
+        `life-assistant-20200102-000000.db.partial-${process.pid}-deadbeef`,
+      );
+      writeFileSync(livePartial, "in-progress");
+
+      runBackup(env.config);
+
+      assert.equal(existsSync(stalePartial), false, "残留半截备份应在 prune 时清掉");
+      assert.equal(existsSync(livePartial), true, "1 小时内的 .partial 可能还在写，不能删");
+      assert.equal(
+        readdirSync(env.config.backupDir).filter((name) => name.endsWith(".db")).length,
+        1,
+        ".partial 不能被 backupStatus/恢复当成规范备份",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
   });
 });

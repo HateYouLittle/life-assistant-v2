@@ -3,7 +3,9 @@ import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
+import { SCHEMA_VERSION } from "../src/core/database.js";
 import { type CheckResult, runDoctor } from "../src/doctor.js";
 
 /**
@@ -119,13 +121,39 @@ const FRESH_JOBS = [
 ];
 
 /** 写一份规范命名的备份文件，并把 mtime 拨到 ageHours 小时前 */
+/**
+ * 种一份备份。规范命名的备份必须是**真能打开**的库：checkLiveBackup 会做
+ * verifyLatest（quick_check + schema 可读），拿假字节会让「备份新鲜度」误报成
+ * 校验失败。非规范命名的夹具（迁移前快照等）保持假内容即可。
+ */
 function seedBackup(dir: string, over: { name?: string; ageHours?: number } = {}): void {
   const backups = join(dir, "backups");
   mkdirSync(backups, { recursive: true });
-  const path = join(backups, over.name ?? "life-assistant-20261020-030000.db");
-  writeFileSync(path, "backup-bytes");
+  const name = over.name ?? "life-assistant-20261020-030000.db";
+  const path = join(backups, name);
+  if (/^life-assistant-\d{8}-\d{6}\.db$/.test(name)) {
+    const db = new DatabaseSync(path);
+    try {
+      db.exec("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+      db.prepare("INSERT INTO meta (key, value) VALUES ('schema_version', ?)").run(
+        String(SCHEMA_VERSION),
+      );
+    } finally {
+      db.close();
+    }
+  } else {
+    writeFileSync(path, "backup-bytes");
+  }
   const stamp = new Date(Date.now() - (over.ageHours ?? 1) * 3600 * 1000);
   utimesSync(path, stamp, stamp);
+}
+
+/** 种一份「内容损坏但文件名规范」的备份：模拟磁盘坏块/半截库 */
+function seedCorruptBackup(dir: string): void {
+  const backups = join(dir, "backups");
+  mkdirSync(backups, { recursive: true });
+  const path = join(backups, "life-assistant-20261020-030000.db");
+  writeFileSync(path, "not-a-sqlite-db");
 }
 
 describe("doctor --live", () => {
@@ -347,6 +375,24 @@ describe("doctor --live", () => {
         false,
         "「备份新鲜度」是 --live 的检查，默认不应出现（默认行为必须完全不变）",
       );
+    } finally {
+      await stub.close();
+      doctorEnv.cleanup();
+    }
+  });
+
+  it("最新备份损坏 → 备份新鲜度 fail，不能被很新的 mtime 骗成健康（P1-4）", async () => {
+    const stub = await startStub({
+      "/healthz": { body: { ok: true, version: "2.0.0", uptime_s: 60 } },
+      "/api/status": { body: { ok: true } },
+      "/api/jobs": { body: { items: FRESH_JOBS } },
+    });
+    const doctorEnv = makeDoctorEnv(stub.port);
+    try {
+      seedCorruptBackup(doctorEnv.dir);
+      const report = await runDoctor(doctorEnv.env, { live: true });
+      assert.equal(levelOf(report.checks, "备份新鲜度"), "fail");
+      assert.match(detailOf(report.checks, "备份新鲜度"), /校验失败/);
     } finally {
       await stub.close();
       doctorEnv.cleanup();

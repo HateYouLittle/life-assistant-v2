@@ -1,4 +1,13 @@
-import { existsSync, mkdirSync, readdirSync, type Stats, statSync, unlinkSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  renameSync,
+  type Stats,
+  statSync,
+  unlinkSync,
+} from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { DateTime } from "luxon";
@@ -11,6 +20,19 @@ export const DEFAULT_BACKUP_KEEP = 14;
 
 /** 规范化备份文件名：`life-assistant-<yyyyMMdd-HHmmss>.db`（Asia/Shanghai 本地时间） */
 const FILE_RE = /^life-assistant-\d{8}-\d{6}\.db$/;
+
+/**
+ * 半截备份产物：`life-assistant-<yyyyMMdd-HHmmss>.db.partial-<pid>-<随机串>`。
+ *
+ * 备份不再直接写规范文件名，而是先写这个临时名、自校验通过后再 rename 成规范名
+ * （原子发布）。进程在 VACUUM INTO 期间被杀（SIGKILL/断电/磁盘满）只会留下一个
+ * `.partial-*` 垃圾，绝不会出现「规范命名的半截库」被 `--latest` 选中、被监控当成
+ * 「刚备份成功」。随机串保证并发备份（CLI + daemon）不会共用同一个临时文件。
+ */
+const PARTIAL_RE = /^life-assistant-\d{8}-\d{6}\.db\.partial-\d+-[0-9a-f]+$/;
+
+/** 残留半截备份的清理年龄：可能还有进程正在写，1 小时内的不动 */
+const PARTIAL_STALE_MS = 60 * 60 * 1000;
 
 /** 超过这个时长没有新备份即视为过期（内置 job 每日一次，36h 能容忍一次错过/延迟） */
 export const BACKUP_STALE_HOURS = 36;
@@ -41,6 +63,15 @@ export interface BackupFileInfo {
   canonical: boolean;
 }
 
+export interface BackupStatusOptions {
+  /**
+   * 是否校验 `latest` 的完整性（quick_check + schema 可读）。默认 false：
+   * 状态页/`/metrics` 高频调用不做 DB 打开；`doctor --live` 这类手动检查才需要，
+   * 否则「最新备份其实是坏文件」会被 mtime 判成新鲜健康（P1-4）。
+   */
+  verifyLatest?: boolean;
+}
+
 export interface BackupStatus {
   dir: string;
   /** 目录下所有 `*.db`（规范与非规范都在，canonical 标记区分） */
@@ -49,8 +80,13 @@ export interface BackupStatus {
   latest: BackupFileInfo | null;
   /** latest 距今小时数；没有备份为 null */
   ageHours: number | null;
-  /** 无备份或最新备份超过 BACKUP_STALE_HOURS */
+  /** 无备份、最新备份超过 BACKUP_STALE_HOURS，或（请求校验时）latest 校验失败 */
   stale: boolean;
+  /**
+   * `latest` 是否通过完整性校验；未请求校验（默认）为 null。
+   * false 表示「最新备份打不开/损坏」——此时 stale 也置 true，不能再报「备份新鲜健康」。
+   */
+  latestVerified: boolean | null;
   /** 不符合规范命名的 `*.db`（迁移前快照、恢复留底、手工拷贝等） */
   nonCanonical: string[];
 }
@@ -106,7 +142,11 @@ function readSchemaVersionRow(db: DatabaseSync): { value: string } | undefined {
  *
  * 生成后立即自校验：VACUUM INTO 也可能因磁盘满/权限/IO 错误产出半截文件，
  * 而「坏备份冒充可用」比「没有备份」更危险（用户以为有后路，恢复时才发现没有）。
- * 校验失败即删除产物并抛错，绝不留在 backups 目录里。
+ *
+ * 关键：产物先写唯一临时名 `<target>.partial-<pid>-<随机>`，校验通过后 rename 成
+ * 规范名（原子发布）。旧实现直接写规范名、失败才删——若进程在 VACUUM INTO 期间被
+ * SIGKILL/断电/磁盘满打断，「删」那一步永远不执行，规范名下就留下一个半截库，
+ * `--latest` 会一直选中它并拒绝恢复（P1-4）。
  */
 export function runBackup(
   config: ResolvedConfig,
@@ -130,33 +170,42 @@ export function runBackup(
   if (statSync(target, { throwIfNoEntry: false }) !== undefined) {
     throw new Error(`备份已存在，拒绝覆盖: ${target}`);
   }
-  const db = new DatabaseSync(config.dbPath);
+  // 先写唯一临时名，校验通过再 rename 成规范名：被打断只留 .partial，不留「规范名坏备份」。
+  const partial = `${target}.partial-${process.pid}-${randomUUID().slice(0, 8)}`;
   try {
-    // daemon 运行中备份时，主连接可能正处于写事务：默认 busy_timeout=0 会让
-    // VACUUM INTO 立刻 SQLITE_BUSY，把一次正常备份误报成失败。与主库一致的 5s
-    // 等待窗口足够跨过一次短暂写入，又不会在库被长时间占用时无限阻塞。
-    db.exec("PRAGMA busy_timeout = 5000");
-    db.prepare("VACUUM INTO ?").run(target);
-  } finally {
-    db.close();
-  }
-  try {
-    verifyDatabaseFile(target);
-  } catch (e) {
+    const db = new DatabaseSync(config.dbPath);
     try {
-      unlinkSync(target);
-    } catch {
-      // 删不掉坏备份也要让「备份失败」这个原始结论暴露出来，而不是被清理错误掩盖
+      // daemon 运行中备份时，主连接可能正处于写事务：默认 busy_timeout=0 会让
+      // VACUUM INTO 立刻 SQLITE_BUSY，把一次正常备份误报成失败。与主库一致的 5s
+      // 等待窗口足够跨过一次短暂写入，又不会在库被长时间占用时无限阻塞。
+      db.exec("PRAGMA busy_timeout = 5000");
+      db.prepare("VACUUM INTO ?").run(partial);
+    } finally {
+      db.close();
     }
-    throw new Error(
-      `备份自校验失败，已删除坏备份: ${target}（${e instanceof Error ? e.message : String(e)}）`,
-    );
+    try {
+      verifyDatabaseFile(partial);
+    } catch (e) {
+      throw new Error(
+        `备份自校验失败，已删除半截产物: ${partial}（${e instanceof Error ? e.message : String(e)}）`,
+      );
+    }
+    // 同一目录内 rename 是原子的：要么备份以规范名完整出现，要么根本没有
+    renameSync(partial, target);
+  } catch (e) {
+    // 任何失败都不留半截文件（删不掉也要让原始错误暴露，不能被清理错误掩盖）
+    try {
+      unlinkSync(partial);
+    } catch {
+      // 文件可能根本没创建成功
+    }
+    throw e;
   }
-  prune(config.backupDir, keep);
+  prune(config.backupDir, keep, nowMs);
   return target;
 }
 
-function prune(dir: string, keep: number): void {
+function prune(dir: string, keep: number, nowMs: number = Date.now()): void {
   const files = readdirSync(dir)
     .filter((f) => FILE_RE.test(f))
     .sort()
@@ -169,6 +218,20 @@ function prune(dir: string, keep: number): void {
       logger.warn(`清理旧备份失败: ${stale} ${e instanceof Error ? e.message : e}`);
     }
   }
+  // 清理被 kill 打断的备份留下的 .partial-*：1 小时内的可能还有进程在写，不动。
+  for (const name of readdirSync(dir)) {
+    if (!PARTIAL_RE.test(name)) continue;
+    const path = join(dir, name);
+    const stat = statSync(path, { throwIfNoEntry: false });
+    if (stat === undefined) continue;
+    if (nowMs - stat.mtimeMs < PARTIAL_STALE_MS) continue;
+    try {
+      unlinkSync(path);
+      logger.info(`已清理残留的半截备份: ${name}`);
+    } catch (e) {
+      logger.warn(`清理半截备份失败: ${name} ${e instanceof Error ? e.message : e}`);
+    }
+  }
 }
 
 /**
@@ -179,7 +242,11 @@ function prune(dir: string, keep: number): void {
  * 它们占据磁盘、让人误以为备份更多，而恢复 CLI 的 `--latest` 只认规范命名。
  * 这里把口径亮出来，由 doctor/状态页展示（Lead 接线）。
  */
-export function backupStatus(config: ResolvedConfig, nowMs: number = Date.now()): BackupStatus {
+export function backupStatus(
+  config: ResolvedConfig,
+  nowMs: number = Date.now(),
+  opts: BackupStatusOptions = {},
+): BackupStatus {
   let names: string[];
   try {
     names = readdirSync(config.backupDir).filter((name) => name.endsWith(".db"));
@@ -195,6 +262,7 @@ export function backupStatus(config: ResolvedConfig, nowMs: number = Date.now())
       latest: null,
       ageHours: null,
       stale: true,
+      latestVerified: null,
       nonCanonical: [],
     };
   }
@@ -225,12 +293,27 @@ export function backupStatus(config: ResolvedConfig, nowMs: number = Date.now())
     if (latest === null || file.mtimeMs > latest.mtimeMs) latest = file;
   }
   const ageHours = latest === null ? null : Math.max(0, (nowMs - latest.mtimeMs) / 3_600_000);
+  // 只在被要求时打开数据库校验：坏备份的 mtime 往往很新，只看 mtime 会得出
+  // 「备份新鲜健康」的相反结论（P1-4）。校验失败时 stale 必须为 true。
+  let latestVerified: boolean | null = null;
+  if (opts.verifyLatest === true && latest !== null) {
+    try {
+      verifyDatabaseFile(latest.path);
+      latestVerified = true;
+    } catch (e) {
+      latestVerified = false;
+      logger.warn(
+        `最新备份校验失败（${latest.path}）：${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  }
   return {
     dir: config.backupDir,
     files,
     latest,
     ageHours,
-    stale: ageHours === null || ageHours > BACKUP_STALE_HOURS,
+    stale: ageHours === null || ageHours > BACKUP_STALE_HOURS || latestVerified === false,
+    latestVerified,
     nonCanonical: files.filter((file) => !file.canonical).map((file) => file.name),
   };
 }

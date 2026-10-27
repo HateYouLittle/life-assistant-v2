@@ -45,19 +45,47 @@ export interface RestoreResult {
   dryRun: boolean;
 }
 
-/** 选择要恢复的备份文件：显式路径优先，否则取 backups 下最新一份规范命名备份 */
+/**
+ * 选择要恢复的备份文件：显式路径优先，否则按 mtime 从新到旧挑**第一份校验通过**的
+ * 规范命名备份。
+ *
+ * 为什么不能只取最新一份：旧实现 `--latest` 恒选 mtime 最新的规范文件，校验失败就
+ * 直接抛错、不回退——而被 VACUUM INTO 打断留下的半截库恰恰可能又新又是规范名（旧
+ * 备份实现直接写规范名）。此时明明还有上一份可用备份，用户却被卡死（P1-4）。
+ * 现在坏文件会被跳过并 warn，全部不可用才报错。
+ */
 export function resolveRestoreTarget(config: ResolvedConfig, opts: RestoreOptions): string {
   if (opts.file !== undefined && opts.file.trim() !== "") {
     if (opts.latest === true) throw new Error("--file 与 --latest 不能同时使用");
     return resolve(opts.file.trim());
   }
   const status = backupStatus(config, opts.nowMs ?? Date.now());
-  if (status.latest === null) {
+  const candidates = status.files
+    .filter((file) => file.canonical)
+    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+  if (candidates.length === 0) {
     throw new Error(
       `没有可用备份：${status.dir} 下没有规范命名的 life-assistant-<时间戳>.db（可先 npm run db:backup 生成，或用 --file 指定文件）`,
     );
   }
-  return status.latest.path;
+  const skipped: string[] = [];
+  for (const candidate of candidates) {
+    try {
+      verifyDatabaseFile(candidate.path);
+      if (skipped.length > 0) {
+        logger.warn(`已跳过 ${skipped.length} 份校验失败的备份，改用 ${candidate.name}`);
+      }
+      return candidate.path;
+    } catch (e) {
+      const reason = e instanceof Error ? e.message : String(e);
+      skipped.push(`${candidate.name}（${reason}）`);
+      logger.warn(`跳过校验失败的备份 ${candidate.path}: ${reason}`);
+    }
+  }
+  throw new Error(
+    `没有可用备份：${status.dir} 下 ${candidates.length} 份规范命名备份全部校验失败，` +
+      `最近的坏备份是 ${skipped[0]}。请先排查磁盘/写入是否正常，或用 --file 指定一份可信备份`,
+  );
 }
 
 /** 把当前库的 WAL 并回主文件，保证随后复制到的主文件包含最近写入 */

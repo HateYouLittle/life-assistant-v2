@@ -145,4 +145,28 @@ describe("备份状态 backupStatus", () => {
       cleanupTestEnv(env);
     }
   });
+
+  it("verifyLatest：健康备份判 true；损坏的规范备份判 false 且 stale（P1-4）", () => {
+    const env = makeTestEnv();
+    try {
+      const target = runBackup(env.config);
+      const healthy = backupStatus(env.config, Date.now(), { verifyLatest: true });
+      assert.equal(healthy.latest?.path, target);
+      assert.equal(healthy.latestVerified, true);
+      assert.equal(healthy.stale, false);
+
+      // 默认不校验：省掉状态页/`/metrics` 高频调用的 DB 打开开销
+      assert.equal(backupStatus(env.config).latestVerified, null);
+
+      // 用坏字节覆盖成「规范名但打不开」：mtime 依旧很新，旧口径会报健康
+      const broken = join(env.config.backupDir, "life-assistant-20990101-000000.db");
+      writeFileSync(broken, "not-a-sqlite-db");
+      const status = backupStatus(env.config, Date.now(), { verifyLatest: true });
+      assert.equal(status.latest?.path, broken, "latest 仍按 mtime 选");
+      assert.equal(status.latestVerified, false);
+      assert.equal(status.stale, true, "最新备份不可用时必须报 stale，而不是「新鲜健康」");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
 });
