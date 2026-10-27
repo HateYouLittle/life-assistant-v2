@@ -69,7 +69,15 @@ export function createJobRunner(db: DatabaseSync): JobRunner {
     const task = Promise.resolve()
       .then(fn)
       .then(() => {
-        if (runId !== undefined) finishJobRun(db, runId, "ok");
+        // 成功记录写失败（同样可能是 SQLITE_BUSY）不能落进下面的 .catch 被记成
+        // 「执行失败」—— handler 明明成功了（复审 T-1027-02b 指出）。只 warn。
+        if (runId !== undefined) {
+          try {
+            finishJobRun(db, runId, "ok");
+          } catch (recordError) {
+            logger.warn(`写入 job 成功记录失败: ${errorText(recordError)}`);
+          }
+        }
       })
       .catch((e) => {
         logger.error(`${name} 执行失败: ${errorText(e)}`);

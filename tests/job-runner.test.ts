@@ -132,4 +132,47 @@ describe("core/job-runner（P1-3）", () => {
       cleanupTestEnv(env);
     }
   });
+
+  it("成功记录写入抛错（如 SQLITE_BUSY）不会被误记成「执行失败」（复审 T-1027-02b）", async () => {
+    const env = makeTestEnv();
+    try {
+      const real = env.db;
+      // 只让 finishJobRun 的 UPDATE 失败，INSERT（startJobRun）走真库
+      const busyOnUpdate = {
+        prepare(sql: string) {
+          if (sql.includes("UPDATE job_runs SET status = ?")) {
+            return {
+              run: () => {
+                throw new Error("database is locked");
+              },
+            };
+          }
+          return real.prepare(sql);
+        },
+      } as unknown as DatabaseSync;
+      const runner = createJobRunner(busyOnUpdate);
+      let ran = 0;
+      await runner.run(
+        "job:ok-record",
+        () => {
+          ran += 1;
+        },
+        meta,
+      );
+      assert.equal(ran, 1, "handler 本身是成功的");
+      const rows = real.prepare("SELECT status, error FROM job_runs ORDER BY id").all() as {
+        status: string;
+        error: string | null;
+      }[];
+      assert.deepEqual(
+        rows.map((row) => row.status),
+        ["running"],
+        "写 ok 失败只能 warn，不能把这次运行记成 failed",
+      );
+      assert.equal(rows[0]?.error, null, "成功运行的 error 列必须为空");
+      assert.equal(runner.inFlight.size, 0);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
 });
