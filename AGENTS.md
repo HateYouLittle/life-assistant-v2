@@ -149,6 +149,8 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
 - **限流豁免**：`/healthz` 与 `/readyz` 不参与限流（外部监控高频轮询会被 429 误判）；
   `/metrics` 与业务接口一样受限流。`RATE_LIMIT_PER_MINUTE=0` 时整体关闭限流（仅本地调试）。
   改 `createHttpHandler` 的豁免名单要同步 `docs/remote-access.md`。
+- 定时任务有看门狗（`JOB_TIMEOUT_MINUTES`，默认 15 分钟，0 关闭）：handler 挂死会记 `failed`
+  并释放互斥，不会让该 job 永久只记 `skipped`；但挂死的 handler 无法取消，仍在后台跑。
 - `daemon.lock` 存在表示同机已有实例；stale 锁（pid 已死/内容损坏）启动时会原子接管。`db:restore`
   在锁内 pid 仍存活时拒绝执行；锁文件存在但内容损坏/不可读时无法确认 daemon 已停，同样拒绝
   （dead-pid 残留仍放行），需先确认停服再手工删锁。别绕过它直接覆盖库文件。
