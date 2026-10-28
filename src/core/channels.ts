@@ -411,10 +411,24 @@ export const openclawChannel: NotificationChannel = {
     // 路径收紧：只接受 Gateway 的 hook 前缀。去掉尾部斜杠后必须以 /hooks/<name> 开头，
     // 裸 `/hooks` 或 `/hooks/`（没有 hook 名）同样拒绝 —— 它们只会得到 Gateway 的 404，
     // 却会让用户以为「已配置」。
-    const path = parsed.pathname.replace(/\/+$/, "");
+    //
+    // N-3：前缀检查只看字符串，`/hooks/..%2fadmin`、`/hooks//evil` 这类畸形路径能骗过去 ——
+    // 反代/Gateway 按**规范化后**的路径路由，实际可能落到 /hooks/ 之外。这里显式拒绝：
+    // 含 `.`/`..` 段、空段（`//`）、或任何百分号编码的 %2e/%2f（大小写不敏感）。
+    const rawPath = parsed.pathname;
+    if (
+      /%2e|%2f/i.test(rawPath) ||
+      rawPath.split("/").some((segment) => segment === "." || segment === "..") ||
+      rawPath.includes("//")
+    ) {
+      throw new Error(
+        `openclaw URL 路径不允许 .. 段、空段或百分号编码的 %2e/%2f（会被归一化成 /hooks/ 之外的路径），收到: ${rawPath}`,
+      );
+    }
+    const path = rawPath.replace(/\/+$/, "");
     if (!path.startsWith("/hooks/")) {
       throw new Error(
-        `openclaw URL 路径必须是 /hooks/<name>（如 http://127.0.0.1:18789/hooks/life-default 或 /hooks/agent?channel=&to=），收到: ${parsed.pathname}`,
+        `openclaw URL 路径必须是 /hooks/<name>（如 http://127.0.0.1:18789/hooks/life-default 或 /hooks/agent?channel=&to=），收到: ${rawPath}`,
       );
     }
     const serialized = parsed.toString();

@@ -340,6 +340,9 @@ describe("OpenClaw 通道凭据边界（P2-17）", () => {
         "http://127.0.0.1:18789/",
         "http://127.0.0.1:18789/hooks",
         "http://127.0.0.1:18789/admin?x=1",
+        // N-3：畸形路径过去能通过字符串前缀检查；工具层同样必须拒绝
+        "http://127.0.0.1:18789/hooks/..%2fadmin",
+        "http://127.0.0.1:18789/hooks//evil",
       ]) {
         assert.throws(() => openclawChannel.validateRoute({ url }), /\/hooks\//, url);
         // 部署自身 profile 也一样拒绝：路径收紧与身份无关

@@ -451,6 +451,10 @@ describe("OpenClaw 通道", () => {
       "http://127.0.0.1:18789/hooks",
       "http://127.0.0.1:18789/hooks/",
       "http://127.0.0.1:18789/hooksx/life-default",
+      // N-3：这三条过去都能通过「以 /hooks/ 开头」的字符串前缀检查
+      "http://127.0.0.1:18789/hooks/..%2fadmin",
+      "http://127.0.0.1:18789/hooks/%2e%2e/admin",
+      "http://127.0.0.1:18789/hooks//evil",
     ]) {
       assert.throws(
         () => openclawChannel.validateRoute({ url }),
@@ -458,6 +462,24 @@ describe("OpenClaw 通道", () => {
         `非 /hooks/<name> 路径必须拒绝: ${url}`,
       );
     }
+    // N-3：畸形路径的报错必须说明原因（不是笼统的「路径必须是 /hooks/<name>」）
+    for (const url of [
+      "http://127.0.0.1:18789/hooks/..%2fadmin",
+      "http://127.0.0.1:18789/hooks//evil",
+      "http://127.0.0.1:18789/hooks/..%2Fadmin",
+    ]) {
+      assert.throws(
+        () => openclawChannel.validateRoute({ url }),
+        /不允许 \.\. 段、空段或百分号编码的 %2e\/%2f/,
+        `畸形路径必须按 N-3 的理由拒绝: ${url}`,
+      );
+    }
+    // %2e%2e 已被 WHATWG URL 归一化成 /admin（URL 本身就带出去了），仍必须拒绝
+    assert.throws(
+      () => openclawChannel.validateRoute({ url: "http://127.0.0.1:18789/hooks/%2E%2E/admin" }),
+      /\/hooks\//,
+      "归一化后的路径已不在 /hooks/ 下，必须拒绝",
+    );
     assert.equal(
       openclawChannel.validateRoute({
         url: "http://127.0.0.1:18789/hooks/agent?channel=qqbot&to=qqbot%3Ac2c%3Ax",
