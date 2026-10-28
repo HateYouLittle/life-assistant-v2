@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { DateTime } from "luxon";
 import { z } from "zod";
+import type { ResolvedConfig } from "../../config.js";
 import {
   DEFAULT_CHANNEL,
   findChannel,
@@ -75,6 +76,19 @@ function clampInt(value: unknown, fallback: number, min: number, max: number): n
   const n = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(n)) return fallback;
   return Math.min(max, Math.max(min, Math.trunc(n)));
+}
+
+/**
+ * openclaw 通道的 master 口径（P2-17 凭据边界）：全局 OPENCLAW_HOOK_TOKEN 属于 daemon
+ * 运维者（master），只能投给 master 自己配置的回环 hook。PROFILE_TOKENS_JSON 里登记了
+ * 独立 token 的 profile 是**隔离用户**，不能借用这个全局 token —— 它必须提供自己的
+ * route secret（PROFILE_ROUTE_SECRETS_JSON[profile]，投递时作为 Bearer token，不再回退
+ * 全局 token）。PROFILE_TOKENS_JSON 为空（回环零配置 / 仅 master 部署）时没有独立用户
+ * 身份，所有 profile 都由 master 代表，按 master 处理以保持既有行为。
+ */
+function isIsolatedProfile(config: ResolvedConfig, profileId: string): boolean {
+  // Object.hasOwn：profile 名允许 "constructor" 这类原型键，直接取值会命中 Object.prototype
+  return Object.hasOwn(config.profileTokens, profileId);
 }
 
 /** retry 的人话说明：区分「没命中」「都不可重试」「已入队」三种情况 */
@@ -173,9 +187,23 @@ function notifyToolInner(args: Record<string, unknown>, ctx: ToolContext) {
     if (url !== undefined || channelArg !== undefined) {
       // 先解析通道：未知通道名直接失败，不落任何设置
       const channel = getChannel(channelArg);
-      if (channel.requiresSecret && routeSecret(ctx.config, profileId) === undefined) {
+      const ownSecret = routeSecret(ctx.config, profileId);
+      if (channel.requiresSecret && ownSecret === undefined) {
         return fail(
           `PROFILE_ROUTE_SECRETS_JSON 中没有 profile "${profileId}" 的 secret，无法启用推送`,
+        );
+      }
+      // openclaw 的凭据是 daemon 全局 OPENCLAW_HOOK_TOKEN（属于 master）：有独立 Profile
+      // token 的隔离用户必须先提供自己的 secret，否则拒绝配置 —— 否则 daemon 会把全局
+      // token 投到该用户自己填的回环地址（P2-17）。明确报错，不静默降级。
+      if (
+        channel.name === "openclaw" &&
+        ownSecret === undefined &&
+        isIsolatedProfile(ctx.config, profileId)
+      ) {
+        return fail(
+          `openclaw 通道使用 daemon 全局 OPENCLAW_HOOK_TOKEN（仅 master 可配置）：profile "${profileId}" 有独立的 Profile token，` +
+            `请先在 PROFILE_ROUTE_SECRETS_JSON 里为它配置独立 secret（投递将用它作为 Bearer token，不再回退全局 token）`,
         );
       }
       const route = setPushRoute(db, profileId, {
@@ -189,13 +217,27 @@ function notifyToolInner(args: Record<string, unknown>, ctx: ToolContext) {
         推送路由: route,
         说明:
           channel.name === "openclaw"
-            ? "OpenClaw 回环通道：token 来自 daemon 的 OPENCLAW_HOOK_TOKEN"
+            ? "OpenClaw 回环通道（路径限 /hooks/<name>）：有独立 secret 时用它，否则用 daemon 的 OPENCLAW_HOOK_TOKEN（仅 master）"
             : channel.requiresSecret
               ? "URL 仅允许回环地址；secret 来自环境变量"
               : "本地日志通道：不需要 URL 与 secret，通知写入进程日志并标记为已投递",
       });
     }
     if (enabled !== undefined) {
+      // 已经存在的 openclaw 路由（可能是收紧前由隔离用户配置的）不允许被非 master 重新启用：
+      // 启用会 requeue 停用期间的投递，等于把全局 token 又送出去一次。
+      const current = getPushRoute(db, profileId);
+      if (
+        enabled &&
+        current?.channel === "openclaw" &&
+        routeSecret(ctx.config, profileId) === undefined &&
+        isIsolatedProfile(ctx.config, profileId)
+      ) {
+        return fail(
+          `profile "${profileId}" 的 openclaw 路由使用 daemon 全局 OPENCLAW_HOOK_TOKEN（仅 master 可用），不能由隔离用户重新启用：` +
+            `请先在 PROFILE_ROUTE_SECRETS_JSON 里为它配置独立 secret，或改用其它通道`,
+        );
+      }
       // 必须走 core 的 setPushRouteEnabled：它在启用时会调 requeueRoute，
       // 把路由停用期间落入 fallback 的投递重新入队。直接 setSetting 会让
       // 那批通知永远停在 fallback（状态页只显示计数，用户无从补救）。
@@ -211,7 +253,7 @@ function notifyToolInner(args: Record<string, unknown>, ctx: ToolContext) {
     if (current === null)
       return okJson({
         推送路由: null,
-        说明: `用 url 参数配置（webhook/openclaw 限回环地址），webhook secret 在 PROFILE_ROUTE_SECRETS_JSON，openclaw token 在 OPENCLAW_HOOK_TOKEN；channel 可选 ${supportedChannels().join(" / ")}（默认 ${DEFAULT_CHANNEL}）`,
+        说明: `用 url 参数配置（webhook/openclaw 限回环地址，openclaw 路径限 /hooks/<name>），webhook secret 在 PROFILE_ROUTE_SECRETS_JSON，openclaw 用 profile secret（缺省才回退 master 的 OPENCLAW_HOOK_TOKEN）；channel 可选 ${supportedChannels().join(" / ")}（默认 ${DEFAULT_CHANNEL}）`,
       });
     return okJson({
       推送路由: {
@@ -508,7 +550,7 @@ registerModule({
     {
       name: "notify",
       description:
-        "通知管理：action=pull 拉取未读通知（会话开始时调用一次，作为主动推送失败的兜底，会标记已读并取消待投递）；history 查看通知历史（limit/offset 分页，可按 kind 精确过滤、unread=true 只看未读；**不改变已读状态**，每条带最近一条投递的状态/尝试次数/最后错误，用于回答「哪条没发出去、为什么」）；retry 手动重试投递（notification_id 一条通知的全部投递 / delivery_id 单条投递 / all=true 批量重试该 Profile 所有 failed+fallback；重新入队后立即触发一轮投递）；quiet_hours 设置/查看/清除静默时段（HH:MM，支持跨午夜）；route 配置/查看主动推送通道（channel=webhook 默认，HMAC V2 回环 webhook、secret 在 env；channel=openclaw OpenClaw Gateway 回环 hook、token 在 OPENCLAW_HOOK_TOKEN；channel=log 本地日志通道，不需要 URL/secret）；prefs 查看/设置按类型的推送偏好（不带 kind 返回已保存+内置默认+最终生效值；带 kind+push 或 kind+channels 写入，push=false 表示不主动推送但通知仍入库、可用 pull 取回；bookkeeping.entry 默认不推，由每日摘要取代）；test 发一条测试通知验证通道（返回是否建立投递与所用通道，无路由时仅入库）；cancel 取消某条通知的待投递。",
+        "通知管理：action=pull 拉取未读通知（会话开始时调用一次，作为主动推送失败的兜底，会标记已读并取消待投递）；history 查看通知历史（limit/offset 分页，可按 kind 精确过滤、unread=true 只看未读；**不改变已读状态**，每条带最近一条投递的状态/尝试次数/最后错误，用于回答「哪条没发出去、为什么」）；retry 手动重试投递（notification_id 一条通知的全部投递 / delivery_id 单条投递 / all=true 批量重试该 Profile 所有 failed+fallback；重新入队后立即触发一轮投递）；quiet_hours 设置/查看/清除静默时段（HH:MM，支持跨午夜）；route 配置/查看主动推送通道（channel=webhook 默认，HMAC V2 回环 webhook、secret 在 env；channel=openclaw OpenClaw Gateway 回环 hook（路径限 /hooks/<name>），凭据优先用该 profile 的 secret、缺省才回退 master 的 OPENCLAW_HOOK_TOKEN；channel=log 本地日志通道，不需要 URL/secret）；prefs 查看/设置按类型的推送偏好（不带 kind 返回已保存+内置默认+最终生效值；带 kind+push 或 kind+channels 写入，push=false 表示不主动推送但通知仍入库、可用 pull 取回；bookkeeping.entry 默认不推，由每日摘要取代）；test 发一条测试通知验证通道（返回是否建立投递与所用通道，无路由时仅入库）；cancel 取消某条通知的待投递。",
       inputSchema: {
         action: z.enum([
           "pull",
@@ -544,12 +586,14 @@ registerModule({
         url: z
           .string()
           .optional()
-          .describe("推送通道 URL（webhook/openclaw 仅允许 127.0.0.1/localhost/[::1] 回环地址）"),
+          .describe(
+            "推送通道 URL（webhook/openclaw 仅允许 127.0.0.1/localhost/[::1] 回环地址；openclaw 路径限 /hooks/<name>）",
+          ),
         channel: z
           .enum(CHANNEL_NAMES)
           .optional()
           .describe(
-            "推送通道：webhook（默认，回环 HMAC V2）、openclaw（OpenClaw 回环 hook，token 在 OPENCLAW_HOOK_TOKEN）或 log（本地日志，不需要 URL/secret）",
+            "推送通道：webhook（默认，回环 HMAC V2）、openclaw（OpenClaw 回环 hook，路径限 /hooks/<name>；有独立 Profile token 的身份必须自带 route secret，否则只能用 master 的 OPENCLAW_HOOK_TOKEN）或 log（本地日志，不需要 URL/secret）",
           ),
         platform: z.string().optional().describe("目标平台标识（如 wechat），仅记录"),
         name: z.string().max(80).optional().describe("路由名，默认 life-assistant-<profile>"),
