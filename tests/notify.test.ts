@@ -15,8 +15,8 @@ import {
   setPushRouteEnabled,
   waitForDrain,
 } from "../src/core/notify.js";
-import { notifyTool } from "../src/modules/notify/index.js";
 import { setSetting } from "../src/core/settings.js";
+import { notifyTool } from "../src/modules/notify/index.js";
 import { nowIso } from "../src/time.js";
 import { cleanupTestEnv, makeTestEnv, SECRET, type TestEnv } from "./helpers.js";
 
@@ -541,9 +541,12 @@ describe("outbox 投递", () => {
     }
   });
 
-  it("recoverStaleSending：超幂等窗口进 fallback，未超的复位 queued", () => {
+  it("recoverStaleSending（webhook 幂等通道）：超幂等窗口进 fallback，未超的复位 queued", () => {
+    // P2-10 之后通道语义分叉：只有幂等通道（webhook，Hermes 按 X-Request-ID 去重）才允许
+    // 「未超窗复位重投」；非幂等通道见 tests/notify-recover-uncertain.test.ts。
     const env = makeTestEnv();
     try {
+      setPushRoute(env.db, "default", { url: "http://127.0.0.1:9/hook" });
       const old = new Date(Date.now() - 56 * 60 * 1000).toISOString();
       const recent = new Date(Date.now() - 1000).toISOString();
       const insert = env.db.prepare(
@@ -565,7 +568,13 @@ describe("outbox 投递", () => {
       recoverStaleSending(env.db);
       const rows = new Map(deliveryRows(env.db).map((r) => [r.id as string, r]));
       assert.equal(rows.get("d1")?.status, "fallback");
+      assert.equal(
+        rows.get("d1")?.last_error,
+        "uncertain delivery exceeded webhook idempotency window",
+      );
       assert.equal(rows.get("d2")?.status, "queued");
+      assert.equal(rows.get("d2")?.request_started_at, null, "复位重投要清空在途标记");
+      assert.equal(rows.get("d2")?.request_id, "req-2", "复用同一 request_id，对端才能去重");
     } finally {
       cleanupTestEnv(env);
     }

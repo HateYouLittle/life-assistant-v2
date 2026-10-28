@@ -5,7 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { acquireDaemonLock, daemonLockPath, inspectDaemonLock } from "../src/core/lock.js";
+import {
+  acquireDaemonLock,
+  daemonLockPath,
+  inspectDaemonLock,
+  type ProcessStartTimeReader,
+  readProcessStartTime,
+} from "../src/core/lock.js";
 
 /**
  * 单实例锁：正常获取、重复获取拒绝、stale（死 pid / 损坏文件）接管、
@@ -25,13 +31,31 @@ function deadPid(): number {
   return result.pid;
 }
 
-function readLock(path: string): { pid: number; startedAt: string; hostname: string } {
+function readLock(path: string): {
+  pid: number;
+  startedAt: string;
+  processStart?: string | null;
+  processStartSource?: string;
+  token?: string;
+  hostname: string;
+} {
   return JSON.parse(readFileSync(path, "utf8")) as {
     pid: number;
     startedAt: string;
+    processStart?: string | null;
+    processStartSource?: string;
+    token?: string;
     hostname: string;
   };
 }
+
+/** 固定的「假的」进程启动时间读取器：所有 pid 都报同一个值（模拟 ps 可用） */
+function fixedStartTime(value: string): ProcessStartTimeReader {
+  return () => ({ value, source: "ps" });
+}
+
+/** 模拟本机读不到任何进程启动时间（ps 被沙箱拦住 / 权限不足） */
+const unavailableStartTime: ProcessStartTimeReader = () => ({ source: "unavailable" });
 
 /** 锁模块源码的 file URL：子进程用 tsx 直接加载仓库里的 TS 源码，无需构建 */
 const LOCK_SOURCE_HREF = pathToFileURL(
@@ -357,6 +381,188 @@ describe("daemon 单实例锁", () => {
       lock.release();
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("pid 被复用：pid 存活但启动时间不一致 → 判定 stale 并成功接管（不要求人工删锁）", () => {
+    // 场景：机器重启后残留 daemon.lock，旧 pid 被一个无关进程复用。只看 pid 存活会误判
+    // 「实例在跑」并拒绝启动 —— 本用例钉的就是「启动时间不一致必须判 stale」。
+    const dir = tempDir();
+    const reader = fixedStartTime("2026-10-28T01:00:00.000Z");
+    try {
+      writeFileSync(
+        daemonLockPath(dir),
+        JSON.stringify({
+          pid: process.pid, // 存活（就是本进程），但锁记录的是重启前那个进程的启动时间
+          startedAt: "2026-01-01T00:00:00.000Z",
+          processStart: "2020-01-01T00:00:00.000Z",
+          processStartSource: "ps",
+          token: "stale-token",
+          hostname: "old-host",
+        }),
+      );
+      assert.deepEqual(
+        inspectDaemonLock(dir, { readProcessStartTime: reader }),
+        { state: "stale", pid: process.pid },
+        "pid 存活但启动时间不一致 = pid 复用，必须是 stale（否则 daemon 永远起不来）",
+      );
+
+      const lock = acquireDaemonLock(dir, { readProcessStartTime: reader });
+      const content = readLock(lock.path);
+      assert.equal(content.pid, process.pid, "接管后锁必须属于当前进程");
+      assert.equal(content.processStart, "2026-10-28T01:00:00.000Z", "新锁必须记录自己的启动时间");
+      assert.equal(content.processStartSource, "ps");
+      assert.notEqual(content.token, "stale-token", "每次获取都要换新 token");
+      lock.release();
+      assert.equal(existsSync(lock.path), false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("真持有者仍在：pid + 启动时间 + token 全一致 → 拒绝接管（且不是「疑似复用」措辞）", () => {
+    const dir = tempDir();
+    const reader = fixedStartTime("2026-10-28T01:00:00.000Z");
+    try {
+      const lock = acquireDaemonLock(dir, { readProcessStartTime: reader });
+      const before = readFileSync(lock.path, "utf8");
+      assert.deepEqual(inspectDaemonLock(dir, { readProcessStartTime: reader }), {
+        state: "locked",
+        pid: process.pid,
+      });
+      assert.throws(
+        () => acquireDaemonLock(dir, { readProcessStartTime: reader }),
+        (e: unknown) =>
+          e instanceof Error &&
+          /另一个 daemon 已在运行/.test(e.message) &&
+          !/疑似 pid 复用/.test(e.message),
+        "能核实是真持有者时，不该给出「疑似 pid 复用、删锁」的误导性指引",
+      );
+      assert.equal(readFileSync(lock.path, "utf8"), before, "拒绝接管时锁文件必须原样保留");
+      const leftovers = readdirSync(dir).filter((name) => name.includes(".stale-"));
+      assert.deepEqual(leftovers, [], "误拿活锁必须放回原位、不留接管副本");
+      lock.release();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("release 用 token 兜底：pid 相同但 token 不是自己写的锁不删除", () => {
+    const dir = tempDir();
+    try {
+      const lock = acquireDaemonLock(dir);
+      const content = readLock(lock.path);
+      assert.equal(typeof content.token, "string", "锁文件必须带随机 token");
+      writeFileSync(lock.path, JSON.stringify({ ...content, token: "someone-else" }));
+      lock.release();
+      assert.equal(existsSync(lock.path), true, "token 不匹配时绝不能删除锁文件");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("取不到启动时间：保守判 locked、拒绝接管并给出「疑似 pid 复用，确认后删锁」指引", () => {
+    const dir = tempDir();
+    try {
+      // (a) 锁里记着启动时间，但本机读不到 → 无法核实 → 保守当活
+      writeFileSync(
+        daemonLockPath(dir),
+        JSON.stringify({
+          pid: process.pid,
+          startedAt: "2026-01-01T00:00:00.000Z",
+          processStart: "2026-10-28T01:00:00.000Z",
+          processStartSource: "ps",
+          token: "t1",
+          hostname: "h",
+        }),
+      );
+      assert.deepEqual(
+        inspectDaemonLock(dir, { readProcessStartTime: unavailableStartTime }),
+        { state: "locked", pid: process.pid },
+        "无法核实启动时间时只能保守判「可能有实例在跑」",
+      );
+      assert.throws(
+        () => acquireDaemonLock(dir, { readProcessStartTime: unavailableStartTime }),
+        (e: unknown) =>
+          e instanceof Error &&
+          /疑似 pid 复用/.test(e.message) &&
+          e.message.includes("ps -p") &&
+          e.message.includes(daemonLockPath(dir)),
+        "拒绝启动必须给出可执行的自救指引（确认 pid 后删锁）",
+      );
+
+      // (b) 旧版本锁根本没有 processStart 字段：同样保守当活
+      writeFileSync(
+        daemonLockPath(dir),
+        JSON.stringify({ pid: process.pid, startedAt: "2026-01-01T00:00:00.000Z", hostname: "h" }),
+      );
+      assert.deepEqual(inspectDaemonLock(dir, { readProcessStartTime: unavailableStartTime }), {
+        state: "locked",
+        pid: process.pid,
+      });
+      assert.throws(
+        () => acquireDaemonLock(dir, { readProcessStartTime: unavailableStartTime }),
+        /疑似 pid 复用/,
+      );
+
+      // (c) 降级只影响「pid 存活」这一支：pid 已退出仍是确定性的 stale，必须能接管
+      const stalePid = deadPid();
+      writeFileSync(
+        daemonLockPath(dir),
+        JSON.stringify({
+          pid: stalePid,
+          startedAt: "2026-01-01T00:00:00.000Z",
+          processStart: "2026-10-28T01:00:00.000Z",
+          processStartSource: "ps",
+          token: "t2",
+          hostname: "h",
+        }),
+      );
+      const lock = acquireDaemonLock(dir, { readProcessStartTime: unavailableStartTime });
+      assert.equal(readLock(lock.path).pid, process.pid);
+      assert.equal(readLock(lock.path).processStart, null, "读不到启动时间时记 null");
+      assert.equal(readLock(lock.path).processStartSource, "unavailable", "降级依据要落进锁文件");
+      lock.release();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("真实启动时间读取：锁文件记录与 readProcessStartTime 一致，且能识别伪造的启动时间", () => {
+    // 这条走生产实现（macOS 用 ps、Linux 用 /proc）。本机 ps 被沙箱拦住时 readProcessStartTime
+    // 返回 unavailable —— 此时断言「锁记 null + 判 locked（保守）」，两个分支都显式断言，
+    // 不做静默跳过。
+    const dir = tempDir();
+    try {
+      const reading = readProcessStartTime(process.pid);
+      const lock = acquireDaemonLock(dir);
+      const content = readLock(lock.path);
+      if (reading.value === undefined) {
+        assert.equal(content.processStart, null);
+        assert.equal(content.processStartSource, "unavailable");
+        assert.deepEqual(inspectDaemonLock(dir), { state: "locked", pid: process.pid });
+      } else {
+        assert.equal(content.processStart, reading.value, "锁记录的必须是 OS 口径的启动时间");
+        assert.equal(content.processStartSource, reading.source);
+        assert.deepEqual(inspectDaemonLock(dir), { state: "locked", pid: process.pid });
+        lock.release();
+        // 真读取器下也能识别 pid 复用：同一个存活 pid + 伪造的启动时间 → stale
+        writeFileSync(
+          daemonLockPath(dir),
+          JSON.stringify({
+            pid: process.pid,
+            startedAt: "2026-01-01T00:00:00.000Z",
+            processStart: "2020-01-01T00:00:00.000Z",
+            processStartSource: "ps",
+            token: "forged",
+            hostname: "h",
+          }),
+        );
+        assert.deepEqual(inspectDaemonLock(dir), { state: "stale", pid: process.pid });
+      }
+      lock.release();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });
