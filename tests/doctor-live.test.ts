@@ -167,6 +167,52 @@ function seedCorruptBackup(dir: string): void {
 }
 
 /**
+ * 种一批日程（N-1 用例）。库不存在时先经 openDatabase 建到当前 schema（含 profiles 外键），
+ * 再补 profile 行；`recurrence` 传 JSON 字符串表示循环日程，null 表示一次性。
+ */
+function seedSchedules(
+  doctorEnv: DoctorEnv,
+  rows: {
+    id: string;
+    profileId: string;
+    title: string;
+    startDate: string;
+    status: string;
+    recurrence: string | null;
+    calendar?: string;
+  }[],
+): void {
+  const config = loadConfig(doctorEnv.env);
+  const db = openDatabase(config.dbPath);
+  try {
+    const stamp = new Date().toISOString();
+    for (const row of rows) {
+      db.prepare("INSERT OR IGNORE INTO profiles (id, created_at) VALUES (?, ?)").run(
+        row.profileId,
+        stamp,
+      );
+      db.prepare(
+        `INSERT INTO schedules (id, profile_id, title, calendar, start_date, time, all_day,
+           recurrence_json, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, '09:00', 1, ?, ?, ?, ?)`,
+      ).run(
+        row.id,
+        row.profileId,
+        row.title,
+        row.calendar ?? "solar",
+        row.startDate,
+        row.recurrence,
+        row.status,
+        stamp,
+        stamp,
+      );
+    }
+  } finally {
+    db.close();
+  }
+}
+
+/**
  * 造一份「旁车仍可信、但库中间页已损坏」的备份：真实 backup + 可信旁车，然后覆盖中间
  * 一个 4KB 页并把旁车里的 mtime 同步成新值（首尾 4KB 指纹不变）。
  * 这是零开库口径无法识破、只有 doctor 的 deep 开库校验能抓到的形态。
@@ -461,6 +507,126 @@ describe("doctor --live", () => {
       );
       assert.match(detailOf(report.checks, "备份新鲜度"), /旁车/);
       assert.match(detailOf(report.checks, "备份新鲜度"), /以开库结果为准/);
+    } finally {
+      await stub.close();
+      doctorEnv.cleanup();
+    }
+  });
+
+  it("存量死行：活跃的已过期一次性日程报 warn 并列出 id/profile/title，且不 fail（N-1）", async () => {
+    const stub = await startStub({
+      "/healthz": { body: { ok: true, version: "2.0.0", uptime_s: 60 } },
+      "/api/status": { body: { ok: true } },
+      "/api/jobs": { body: { items: FRESH_JOBS } },
+    });
+    const doctorEnv = makeDoctorEnv(stub.port);
+    try {
+      seedBackup(doctorEnv.dir, { ageHours: 1 });
+      // 真实库里的形态：bestie 的「代购下单」，2026-10-19 的一次性日程仍停在 active
+      seedSchedules(doctorEnv, [
+        {
+          id: "162b6e6a",
+          profileId: "bestie",
+          title: "代购下单",
+          startDate: "2026-10-19",
+          status: "active",
+          recurrence: null,
+        },
+      ]);
+
+      const report = await runDoctor(doctorEnv.env, { live: true });
+      assert.equal(
+        levelOf(report.checks, "过期一次性日程"),
+        "warn",
+        `存量死行必须报 warn：${detailOf(report.checks, "过期一次性日程")}`,
+      );
+      const detail = detailOf(report.checks, "过期一次性日程");
+      assert.match(detail, /162b6e6a/, "必须列出可操作的 id");
+      assert.match(detail, /bestie/);
+      assert.match(detail, /代购下单/);
+      assert.match(detail, /complete/, "文案要指导用户怎么收尾");
+      assert.equal(report.failed, 0, "存量死行只 warn，不能让自检退出码变红");
+    } finally {
+      await stub.close();
+      doctorEnv.cleanup();
+    }
+  });
+
+  it("存量死行不误报：循环日程 / 已完成 / 已取消 / 今天或未来 / 农历 都不算（N-1）", async () => {
+    const stub = await startStub({
+      "/healthz": { body: { ok: true, version: "2.0.0", uptime_s: 60 } },
+      "/api/status": { body: { ok: true } },
+      "/api/jobs": { body: { items: FRESH_JOBS } },
+    });
+    const doctorEnv = makeDoctorEnv(stub.port);
+    try {
+      seedBackup(doctorEnv.dir, { ageHours: 1 });
+      const yesterday = new Date(Date.now() - 24 * 3600 * 1000).toISOString().slice(0, 10);
+      const tomorrow = new Date(Date.now() + 24 * 3600 * 1000).toISOString().slice(0, 10);
+      seedSchedules(doctorEnv, [
+        // 循环日程：start_date 在过去是正常的（下次提醒照常）
+        {
+          id: "s-recurring",
+          profileId: "default",
+          title: "每天喝水",
+          startDate: yesterday,
+          status: "active",
+          recurrence: JSON.stringify({ freq: "daily", interval: 1 }),
+        },
+        // 已收尾/已取消：不再需要提醒，不是「死行」
+        {
+          id: "s-done",
+          profileId: "default",
+          title: "已完成",
+          startDate: yesterday,
+          status: "done",
+          recurrence: null,
+        },
+        {
+          id: "s-cancelled",
+          profileId: "default",
+          title: "已取消",
+          startDate: yesterday,
+          status: "cancelled",
+          recurrence: null,
+        },
+        // 今天/未来：还没到点
+        {
+          id: "s-today",
+          profileId: "default",
+          title: "今天",
+          startDate: new Date().toISOString().slice(0, 10),
+          status: "active",
+          recurrence: null,
+        },
+        {
+          id: "s-future",
+          profileId: "default",
+          title: "明天",
+          startDate: tomorrow,
+          status: "active",
+          recurrence: null,
+        },
+        // 农历一次性：不走公历 start_date 判定
+        {
+          id: "s-lunar",
+          profileId: "default",
+          title: "农历生日",
+          startDate: yesterday,
+          status: "active",
+          recurrence: null,
+          calendar: "lunar",
+        },
+      ]);
+
+      const report = await runDoctor(doctorEnv.env, { live: true });
+      assert.equal(
+        levelOf(report.checks, "过期一次性日程"),
+        "ok",
+        `正常行不得误报：${detailOf(report.checks, "过期一次性日程")}`,
+      );
+      assert.match(detailOf(report.checks, "过期一次性日程"), /没有活跃的已过期一次性日程/);
+      assert.equal(report.failed, 0);
     } finally {
       await stub.close();
       doctorEnv.cleanup();

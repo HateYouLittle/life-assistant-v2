@@ -17,7 +17,7 @@ import { fetchJson } from "./core/http.js";
 import { CATCHUP_POLICY, previousFireTime } from "./core/jobs.js";
 import { loadEd25519PrivateKey } from "./core/qweather-jwt.js";
 import { applySecureUmask } from "./core/security.js";
-import { now } from "./time.js";
+import { now, todayIso } from "./time.js";
 
 /**
  * `npm run doctor`：把「启动能过、第一次用到才炸」的配置问题提前暴露出来。
@@ -432,8 +432,60 @@ function checkLiveBackup(config: ResolvedConfig): CheckResult[] {
 }
 
 /**
+ * 存量「活跃的已过期一次性日程」（N-1）。
+ *
+ * 起因：P2-3 只拦**新写入**（`expiredOneOff`），历史库里已有的行没人管 —— 真实库里就留着
+ * 一条（bestie 的「代购下单」，start_date 早于今天、recurrence 为空、status 仍 active）。
+ * 这类行不会再产生任何提醒（引擎对一次性日程只在 start > 游标时产出候选日期），却一直显示
+ * active，用户以为「还没到时候」。自检的职责是把它指出来，**不自动改数据、不让退出码变红**：
+ * 收尾方式（complete all=true / delete / 改日期）必须由用户决定。
+ *
+ * 用独立的只读连接查（与 checkSchemaFingerprint 同口径）：不经过 openDatabase，避免自检
+ * 顺带升级/写入；daemon 在跑时只读连接也可能先撞 BUSY，给 2 秒窗口，失败按「无法检查」warn。
+ */
+function checkStaleActiveOneOffs(config: ResolvedConfig): CheckResult {
+  const name = "过期一次性日程";
+  if (!existsSync(config.dbPath)) {
+    return warn(name, `${config.dbPath} 还不存在（首次启动会创建）`);
+  }
+  let db: DatabaseSync | undefined;
+  try {
+    db = new DatabaseSync(config.dbPath, { readOnly: true });
+    db.exec("PRAGMA busy_timeout = 2000");
+    // 与 modules/schedule 的 expiredOneOff 同口径：公历 + 无循环规则 + 开始日早于今天，
+    // 这里再叠加 status='active'（写入侧不需要，存量排查需要）。
+    const rows = db
+      .prepare(
+        `SELECT id, profile_id, title FROM schedules
+         WHERE recurrence_json IS NULL AND calendar = 'solar' AND start_date < ? AND status = 'active'
+         ORDER BY start_date, id`,
+      )
+      .all(todayIso()) as { id: string; profile_id: string; title: string }[];
+    if (rows.length === 0) return ok(name, "没有活跃的已过期一次性日程");
+    const shown = rows
+      .slice(0, 5)
+      .map((row) => `${row.id}（${row.profile_id}「${row.title}」）`)
+      .join("、");
+    return warn(
+      name,
+      `${rows.length} 条活跃的已过期一次性日程：${shown}${rows.length > 5 ? " 等" : ""}。` +
+        "它们不会再触发任何提醒（开始日早于今天的一次性日程不会产出候选日期），" +
+        '但状态仍是 active：用 schedule {action:"complete", all:true} 或 delete 收尾，' +
+        "或把日期改到今天/以后。自检不自动改数据。",
+    );
+  } catch (e) {
+    return warn(
+      name,
+      `无法检查（库被占用或不可读）：${e instanceof Error ? e.message : String(e)}`,
+    );
+  } finally {
+    if (db?.isOpen) db.close();
+  }
+}
+
+/**
  * `doctor --live`：检查运行中的 daemon。默认关闭，避免未启动/内网环境下自检卡住
- * （与 `--network` 同一取舍）。三项检查各自独立：daemon 不可达时仍会检查备份目录。
+ * （与 `--network` 同一取舍）。各项检查各自独立：daemon 不可达时仍会检查备份目录。
  */
 async function checkLive(config: ResolvedConfig): Promise<CheckResult[]> {
   const results: CheckResult[] = [];
@@ -496,6 +548,8 @@ async function checkLive(config: ResolvedConfig): Promise<CheckResult[]> {
 
   // 备份检查直接读备份目录，不依赖 daemon：daemon 挂了更要知道备份还新不新
   results.push(...checkLiveBackup(config));
+  // 存量死行检查只读库，不依赖 daemon：daemon 没起来时同样要能查出这些「永远不会触发」的日程
+  results.push(checkStaleActiveOneOffs(config));
   return results;
 }
 
