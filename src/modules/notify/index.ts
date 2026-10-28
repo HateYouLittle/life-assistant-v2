@@ -101,6 +101,23 @@ function retryNote(retried: number, skipped: number): string {
   );
 }
 
+/**
+ * P2-21：inputSchema 由所有 action 共享，agent 看得见全部字段 —— 与当前 action 无关的字段
+ * 过去被静默忽略（如 pull 传 offset），agent 会以为「传了就生效」。这里按 action 列白名单，
+ * 表外字段显式失败。白名单必须与各分支真正读取的字段一一对应，不得顺手扩大既有契约。
+ * 文案与 bookkeeping 侧统一：`未知字段: <名>（action=<action> 不接受）`。
+ */
+const ACTION_FIELDS: Record<string, readonly string[]> = {
+  pull: ["limit"],
+  history: ["limit", "offset", "unread", "kind"],
+  retry: ["notification_id", "delivery_id", "all"],
+  quiet_hours: ["start", "end", "clear"],
+  route: ["url", "channel", "enabled", "platform", "name"],
+  prefs: ["kind", "push", "channels"],
+  test: [],
+  cancel: ["id"],
+};
+
 export function notifyTool(args: Record<string, unknown>, ctx: ToolContext) {
   try {
     return notifyToolInner(args, ctx);
@@ -113,6 +130,17 @@ function notifyToolInner(args: Record<string, unknown>, ctx: ToolContext) {
   const action = args.action as string;
   const db = ctx.db;
   const profileId = ctx.profileId;
+
+  // 未知 action 交给文件末尾统一报错；已知 action 才做字段白名单校验。
+  const allowedFields = ACTION_FIELDS[action];
+  if (allowedFields !== undefined) {
+    for (const key of Object.keys(args)) {
+      if (key === "action" || args[key] === undefined) continue;
+      if (!allowedFields.includes(key)) {
+        return fail(`未知字段: ${key}（action=${action} 不接受）`);
+      }
+    }
+  }
 
   if (action === "pull") {
     const limit = Math.min((args.limit as number) ?? 20, 100);

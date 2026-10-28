@@ -210,6 +210,37 @@ describe("notify 工具", () => {
     }
   });
 
+  it("与当前 action 无关的字段显式拒绝（P2-21）", () => {
+    const env = makeTestEnv({ PROFILE_ROUTE_SECRETS_JSON: JSON.stringify({ default: SECRET }) });
+    try {
+      // pull 不读 offset：过去被静默忽略，agent 以为分页生效了
+      const pullOffset = tool(env, { action: "pull", offset: 20 });
+      assert.equal(pullOffset.isError, true);
+      assert.ok(
+        text(pullOffset).endsWith("未知字段: offset（action=pull 不接受）"),
+        `文案必须与 bookkeeping 侧一致: ${text(pullOffset)}`,
+      );
+
+      // cancel 只认 id；kind 属于 history/prefs
+      const cancelKind = tool(env, { action: "cancel", id: "n1", kind: "k" });
+      assert.equal(cancelKind.isError, true);
+      assert.ok(
+        text(cancelKind).endsWith("未知字段: kind（action=cancel 不接受）"),
+        `文案必须与 bookkeeping 侧一致: ${text(cancelKind)}`,
+      );
+
+      // 反向：本 action 真正读取的字段不得被误伤（否则白名单过宽 = 又一种静默破坏）
+      const history = tool(env, { action: "history", limit: 5, offset: 0, unread: true });
+      assert.ok(!history.isError, `history 的 offset/unread 必须可用: ${text(history)}`);
+      const route = tool(env, { action: "route", channel: "log", name: "r1" }, "p9");
+      assert.ok(!route.isError, `route 的 channel/name 必须可用: ${text(route)}`);
+      const retry = tool(env, { action: "retry", all: true });
+      assert.ok(!retry.isError, `retry 的 all 必须可用: ${text(retry)}`);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("route 的 channel 描述由 supportedChannels() 生成，含全部通道（P2-22）", () => {
     const def = allTools().find((t) => t.def.name === "notify")?.def;
     assert.ok(def !== undefined, "notify 工具应已注册");
