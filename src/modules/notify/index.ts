@@ -530,9 +530,34 @@ function notifyToolInner(args: Record<string, unknown>, ctx: ToolContext) {
       .prepare("SELECT id, title FROM notifications WHERE id = ? AND profile_id = ?")
       .get(id, profileId) as { id: string; title: string } | undefined;
     if (row === undefined) return fail(`通知不存在: ${id}`);
-    cancelPendingDeliveries(db, profileId, [id]);
+    const { cancelled, sending } = cancelPendingDeliveries(db, profileId, [id]);
     db.prepare("UPDATE notifications SET read = 1 WHERE id = ?").run(id);
-    return ok(`已取消通知《${row.title}》的待投递并标记已读`);
+    // P2-26：旧回执对「已发出 / 没有投递 / 拦不住的在途行 / 重复 cancel」一律回
+    // 「已取消…待投递」，agent 会照抄成「已取消推送」，而用户可能已经收到。这里按实际
+    // 条数分档回执：取消了 n 条、有没有发出过、有没有拦不住的 sending。
+    const counts = db
+      .prepare(
+        `SELECT COUNT(*) AS total,
+                SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) AS sent
+         FROM deliveries WHERE notification_id = ?`,
+      )
+      .get(id) as { total: number; sent: number | null };
+    const sent = counts.sent ?? 0;
+    const detail =
+      cancelled > 0
+        ? `已取消投递 ${cancelled} 条`
+        : counts.total === 0
+          ? "没有投递记录（未配置推送路由，或该类型已关闭主动推送）"
+          : sent > 0
+            ? `没有待投递可取消（该通知的投递已发出 ${sent} 条）`
+            : "没有待投递可取消";
+    return ok(
+      `通知《${row.title}》：${detail}；已标记为已读` +
+        (sent > 0 && cancelled > 0 ? `；另有已发出的投递 ${sent} 条，撤回不了` : "") +
+        (sending > 0
+          ? `；仍有 ${sending} 条正在发送中，撤回不了（在途请求拦不住），是否已送达请以实际收到为准`
+          : ""),
+    );
   }
 
   return fail(`未知 action: ${String(action)}`);

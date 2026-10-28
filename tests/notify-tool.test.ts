@@ -149,4 +149,63 @@ describe("notify 工具", () => {
       cleanupTestEnv(env);
     }
   });
+
+  it("cancel：回执按实际投递状态分档，不把「已发出/在途/无投递」说成已取消（P2-26）", () => {
+    const env = makeTestEnv({ PROFILE_ROUTE_SECRETS_JSON: JSON.stringify({ default: SECRET }) });
+    try {
+      setPushRoute(env.db, "default", { url: "http://127.0.0.1:9/hook" });
+      /** 造一条通知，并把它的投递行改成指定状态（null = 删掉投递行，模拟无路由） */
+      const seed = (title: string, status: string | null): string => {
+        const pub = publishProfile(env.db, env.config, "default", {
+          kind: "k",
+          title,
+          blocks: {},
+        });
+        if (status === null) {
+          env.db.prepare("DELETE FROM deliveries WHERE notification_id = ?").run(pub.id);
+        } else {
+          env.db
+            .prepare("UPDATE deliveries SET status = ? WHERE notification_id = ?")
+            .run(status, pub.id);
+        }
+        return pub.id;
+      };
+
+      // ① 投递已发出：回执必须点明「没有待投递可取消」，绝不能再说「已取消…待投递」
+      const sentReceipt = text(tool(env, { action: "cancel", id: seed("已发出", "sent") }));
+      assert.match(sentReceipt, /没有待投递可取消/);
+      assert.match(sentReceipt, /已发出 1 条/);
+      assert.doesNotMatch(sentReceipt, /已取消投递/);
+
+      // ② 投递处于 sending：拦不住，回执必须报条数并说明（与「pull 拦不住在途」同口径）
+      const sendingId = seed("在途", "sending");
+      const sendingReceipt = text(tool(env, { action: "cancel", id: sendingId }));
+      assert.match(sendingReceipt, /仍有 1 条正在发送中/);
+      assert.match(sendingReceipt, /撤回不了/);
+      assert.equal(
+        (
+          env.db.prepare("SELECT status FROM deliveries WHERE notification_id = ?").get(sendingId) as {
+            status: string;
+          }
+        ).status,
+        "sending",
+        "sending 行不能被 cancel 改写",
+      );
+
+      // ③ 压根没有投递记录（未配置路由 / 该类型关闭推送）
+      assert.match(
+        text(tool(env, { action: "cancel", id: seed("无投递", null) })),
+        /没有投递记录/,
+      );
+
+      // ④ 真的取消了：回执报条数；重复 cancel 不得再回「已取消投递 1 条」
+      const queuedId = seed("待投递", "queued");
+      assert.match(text(tool(env, { action: "cancel", id: queuedId })), /已取消投递 1 条/);
+      const again = text(tool(env, { action: "cancel", id: queuedId }));
+      assert.match(again, /没有待投递可取消/);
+      assert.doesNotMatch(again, /已取消投递/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
 });

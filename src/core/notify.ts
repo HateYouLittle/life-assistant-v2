@@ -294,20 +294,40 @@ export async function publishGlobal(
   return { materialized };
 }
 
+export interface CancelPendingResult {
+  /** 真正被取消（queued/failed → cancelled）的条数 */
+  cancelled: number;
+  /** 仍处于 sending 的条数：请求已经发出，取消拦不住（P2-26） */
+  sending: number;
+}
+
 /** 用户 pull 后，取消这些通知的待处理投递 */
 export function cancelPendingDeliveries(
   db: DatabaseSync,
   profileId: string,
   notificationIds: string[],
-): void {
-  if (notificationIds.length === 0) return;
+): CancelPendingResult {
+  if (notificationIds.length === 0) return { cancelled: 0, sending: 0 };
   const placeholders = notificationIds.map(() => "?").join(",");
-  db.prepare(
-    `UPDATE deliveries SET status = 'cancelled', updated_at = ?
+  const cancelled = db
+    .prepare(
+      `UPDATE deliveries SET status = 'cancelled', updated_at = ?
      WHERE status IN ('queued','failed')
        AND notification_id IN (${placeholders})
        AND notification_id IN (SELECT id FROM notifications WHERE profile_id = ?)`,
-  ).run(nowIso(), ...notificationIds, profileId);
+    )
+    .run(nowIso(), ...notificationIds, profileId).changes;
+  // sending 行已经发出请求：pull/cancel 拦不住（与 README/AGENTS.md 的「拦不住在途」同一口径）。
+  // 回执若不报这个数，agent 会把「已取消」转述成「没收到推送」，而用户其实可能已经收到。
+  const sending = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM deliveries
+     WHERE status = 'sending'
+       AND notification_id IN (${placeholders})
+       AND notification_id IN (SELECT id FROM notifications WHERE profile_id = ?)`,
+    )
+    .get(...notificationIds, profileId) as { n: number };
+  return { cancelled: Number(cancelled), sending: sending.n };
 }
 
 /**
