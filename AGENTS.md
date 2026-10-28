@@ -57,7 +57,10 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   「原定触发时刻」传给 handler，供早报/晚报/摘要/周报/调休提醒按该时刻取业务日期）；daemon 在 listen
   之后非阻塞调用，停机时与 onStart 一起收敛。
   `src/core/lock.ts`：`daemon.lock` 单实例锁（写完整临时文件后 `link` 原子创建、
-  失效锁 rename 原子接管并校验 inode/pid、PID 存活探测）。
+  失效锁 rename 原子接管并校验 inode/pid/内容身份；锁内容 = pid + 进程启动时间
+  （macOS `ps -o lstart=` / Linux `/proc/<pid>/stat`+`btime`，读不到记 `unavailable`）+ 随机 token；
+  接管前三重交叉校验，pid 存活但启动时间不符判为 pid 复用并按失效锁接管并 warn，
+  读不到启动时间时保守拒绝启动并给「确认后删锁」指引；release 要求 pid+token 双一致）。
   `src/core/security.ts`：`applySecureUmask`/`hardenDataDir`/`applyCliSecurityBaseline`/
   `createRequestGuard`（umask 077 与目录/库/备份收紧对 daemon 与 `db:backup`/`db:restore`/
   `db:cleanup:preview`/`db:fingerprint` 同口径：库不存在时只设 umask、不 chmod 可能写错的目录；
@@ -180,10 +183,24 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
 - `verifyDatabaseFile(path, { thorough: true })` 额外跑 `integrity_check` + `foreign_key_check`：
   只用于低频且「错了会毁数据」的路径（`db:restore` 选目标/恢复后复验、`doctor --live` 的 deep）；
   每日备份自校验仍只用 `quick_check`（成本）。
-- `daemon.lock` 存在表示同机已有实例；stale 锁（pid 已死/内容损坏）启动时会原子接管。`db:restore`
+- `daemon.lock` 存在表示同机已有实例；stale 锁（pid 已死 / 启动时间不符 / 内容损坏）启动时会原子接管。
+  启动时间读不到（`unavailable`）或旧锁没有该字段时按「无法确认已停」处理：拒绝启动并提示
+  「疑似 pid 复用，确认后删除锁文件」。`db:restore`
   在锁内 pid 仍存活时拒绝执行；锁文件存在但内容损坏/不可读时无法确认 daemon 已停，同样拒绝
   （dead-pid 残留仍放行），需先确认停服再手工删锁。别绕过它直接覆盖库文件。
 - `notify.pull` 只能取消 `queued`/`failed` 的投递，无法拦住已处于 `sending` 的那一次。
+- **重启时的「不确定投递」按通道幂等性分叉**（P2-10）：`recoverStaleSending` 只对 `webhook`
+  （对端按 `X-Request-ID` 去重）复位重发；bark/ntfy/telegram/smtp/openclaw 及「通道未知」一律判
+  `fallback` 终态、保留 `request_started_at`（`requeueRoute` 只捞 `IS NULL`，不会自动重投），
+  重发只能人工走 `notify.retry`/`retryDeliveries`。通道名按该 Profile **当前生效路由**反查
+  （`deliveries` 无 channel 列），换过通道的极少数场景按更保守一侧处理。
+- **openclaw 通道的凭据边界**（P2-17）：Bearer token 优先取 `PROFILE_ROUTE_SECRETS_JSON[profile]`；
+  只有「部署自身 profile（`HERMES_PROFILE`，缺省 `default`，见 `config.deploymentProfile`）」与
+  「未登记独立 Profile token 的 profile」才回退全局 `OPENCLAW_HOOK_TOKEN`。登记了独立 token 的
+  隔离用户配置/重新启用 openclaw 路由必须自带 secret，否则明确 fail；`validateRoute` 把路径收紧到
+  `/hooks/<name>`（保留 `/hooks/agent?channel=&to=` 直连形态）。判定内核只有 `config.ts` 一份
+  （`openclawCanUseGlobalToken`），工具层与投递层不得各写一套。收紧前已落库的隔离路由仍会投递，
+  投递侧按 profile 打一条一次性 warn（不擅自拒绝，见 README 已知取舍 #33）。
 - `npm run db:cleanup:preview` 是**零业务删除**预演（打开旧库时仍可能执行附加式 schema
   升级，因此不保证零写入）：occurrence 清理 job（每日 04:30）与保留策略
   （通知/已取消日程，每日 04:50）会删掉哪些行——改清理规则前先用它。
