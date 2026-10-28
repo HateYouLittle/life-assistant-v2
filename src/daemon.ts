@@ -12,8 +12,8 @@ import { bindHost, loadConfig, parseProfileId, type ResolvedConfig, urlHost } fr
 import { bearerToken, resolveIdentity, tokenFingerprint } from "./core/auth.js";
 import { openDatabase } from "./core/database.js";
 import { createInFlightTracker, type InFlightTracker } from "./core/inflight.js";
-import { createJobRunner } from "./core/job-runner.js";
-import { markInterruptedJobRuns, runStartupCatchups } from "./core/jobs.js";
+import { createJobRunner, type JobRunner } from "./core/job-runner.js";
+import { CATCHUP_POLICY, markInterruptedJobRuns, runStartupCatchups } from "./core/jobs.js";
 import { acquireDaemonLock } from "./core/lock.js";
 import { logger, maskSensitiveUrl, sanitizeLogText, setLogLevel } from "./core/logger.js";
 import { incCounter } from "./core/metrics.js";
@@ -392,6 +392,123 @@ export interface DaemonHandle {
   stop(): Promise<void>;
 }
 
+/**
+ * 是否对该 job 开启 node-cron 的「错过触发回放」（`recoverMissedExecutions`）。
+ *
+ * 背景（P2-14）：node-cron 是 1s 轮询 + 秒级匹配，进程内出现 >60s 的同步阻塞
+ * （大导入 / VACUUM / GC 长停顿）时，被跨过的那一分钟在 `recoverMissedExecutions: false`
+ * （3.0.3 默认）下被**静默丢弃**：既没有 job_runs 行也没有日志，进程内不补发。
+ *
+ * 为什么只对 `CATCHUP_POLICY` 白名单开放：白名单里的 job 本来就是「允许迟到的补发」的
+ * （启动补发已按同一份表判定，且都有 dedupeKey / 幂等实现）。开启回放后 node-cron 会把
+ * 阻塞期间**每一个匹配到的秒**都回放一次（见 scheduler.js 的 i 循环），因此：
+ * - 同一 job 名的回放不会重叠执行：`createJobRunner` 的 `busy` 是同步 check-and-set，
+ *   同一轮里第 2..n 次触发直接记 `skipped`（有 job_runs 行，可查）；
+ * - 通知类 job 的重复推送由 outbox 的 dedupeKey 兜住；清理/备份类本身幂等；
+ * - 非白名单 job（含每分钟的 `tick`）保持默认 false —— 它们的语义不允许「迟到的补跑」，
+ *   而且 tick 回放会在一次事件循环里堆出多次「补扫」。
+ */
+export function recoverMissedExecutionsFor(jobKey: string): boolean {
+  return Object.hasOwn(CATCHUP_POLICY, jobKey);
+}
+
+/**
+ * 把 node-cron 回调参数解析成「这次触发对应的原定时刻」：
+ * - 返回 `null`：正常到点触发（匹配到的就是当前这一分钟）；
+ * - 返回 DateTime（TZ 时区）：**回放的错过触发**，值是被跨过的那一分钟。
+ *
+ * node-cron 的 `TimeMatcher.apply()` 把瞬间按 `timezone` 格式化成墙钟字符串、再用
+ * `new Date(...)` 按**系统本地时区**解析后交给回调，因此回调参数的「年月日时分」
+ * 恰好是 TZ 墙钟 —— 用它们按 TZ 重新组装，才能与 `now()`（luxon，TZ）比较，
+ * 不受进程 TZ 是否等于 TZ 常量影响（服务器跑 UTC 时直接比 epoch 会整体错 8 小时）。
+ *
+ * 5 段表达式的秒字段被 node-cron 补成 `0`，所以「匹配到的分钟 < 当前分钟」等价于
+ * 「这次是补跑过去某一分钟」，不会把「同一分钟内晚 1 秒的检测」误判成补跑。
+ */
+export function matchedFireSlot(matched: unknown, firedAt: DateTime): DateTime | null {
+  if (!(matched instanceof Date) || Number.isNaN(matched.getTime())) return null;
+  const wall = DateTime.fromObject(
+    {
+      year: matched.getFullYear(),
+      month: matched.getMonth() + 1,
+      day: matched.getDate(),
+      hour: matched.getHours(),
+      minute: matched.getMinutes(),
+    },
+    { zone: TZ },
+  );
+  if (!wall.isValid) return null;
+  return wall < firedAt.startOf("minute") ? wall : null;
+}
+
+/**
+ * 注册一个 job 的 cron 任务。
+ *
+ * 抽成导出函数有两个目的：① 让 `startDaemon` 的循环只剩一行；② 测试可以直接驱动回调
+ * （`task.now(<伪造的匹配时刻>)`）与断言注册选项，不必真的等到整分钟。
+ * `opts.scheduled=false` 只注册不启动调度器，测试里不留定时器。
+ */
+export function scheduleJobCron(
+  module: string,
+  def: JobDef,
+  expr: string,
+  jobRunner: JobRunner,
+  opts: { scheduled?: boolean } = {},
+): cron.ScheduledTask {
+  const recover = recoverMissedExecutionsFor(`${module}.${def.name}`);
+  /**
+   * 已处理过的触发时刻（分钟粒度，毫秒）。
+   *
+   * node-cron 3.0.3 在开启回放后会把 `lastExecution` 归零到秒（`date_tmp.setMilliseconds(0)`），
+   * 于是**同一个匹配秒**会在相邻两次轮询里各发一次（第 2 次走 i=1 的回放分支）——
+   * 对 5 段表达式就是「同一分钟的触发跑两遍」，且两次相隔约 1s（同名互斥挡不住已经跑完的
+   * 快任务）。这个守卫保证「同一个触发时刻最多执行一次」，是本项敢开回放的前提。
+   */
+  let lastSlotMs: number | null = null;
+  return cron.schedule(
+    expr,
+    (matched?: unknown) => {
+      const firedAt = now();
+      // 回放时才判「补跑」：非白名单 job 即便收到一个过去时刻的匹配（理论上不会发生），
+      // 也按普通触发处理，语义与开启本特性前完全一致。
+      const slot = recover ? matchedFireSlot(matched, firedAt) : null;
+      // 补跑把**原定时刻**交给 handler 与 job_runs，与启动补发（runStartupCatchups）同口径：
+      // 早报/晚报/摘要/周报/调休都按这个时刻取业务日期，晚了 2 分钟不该换成另一天的数据。
+      const at = slot ?? firedAt;
+      const slotKey = at.startOf("minute").toMillis();
+      if (lastSlotMs !== null && slotKey === lastSlotMs) {
+        logger.debug(
+          `定时任务 ${module}.${def.name} 忽略重复触发：同一分钟（${at.toFormat("yyyy-LL-dd HH:mm")}）已处理`,
+        );
+        return;
+      }
+      lastSlotMs = slotKey;
+      if (slot !== null) {
+        logger.info(
+          `定时任务 ${module}.${def.name} 补跑错过的触发：原定 ${slot.toFormat("yyyy-LL-dd HH:mm")}，实际 ${firedAt.toFormat("HH:mm:ss")}`,
+        );
+      }
+      void jobRunner.run(`job:${def.name}`, () => def.handler(at), {
+        module,
+        jobName: def.name,
+        // job_runs.trigger 的 CHECK 只允许 cron/startup/catchup/manual（schema v5）：
+        // 新增枚举值要重建表 + 升 schema 版本，超出本项范围，因此补跑复用 `catchup`
+        // （语义就是「补上错过的触发」）。与普通触发靠 trigger 区分，与启动补发靠
+        // scheduled_for（原定时刻）与 started_at 的间隔区分。
+        trigger: slot === null ? "cron" : "catchup",
+        // job_runs 的时间口径是 UTC ISO（字符串比较即时间比较）：本地 +08:00 偏移串
+        // 与 Z 串做字典序会得出错误结论，必须显式转 UTC。
+        scheduledFor: at.toUTC().toISO() ?? "",
+      });
+    },
+    {
+      timezone: TZ,
+      recoverMissedExecutions: recover,
+      ...(opts.scheduled === undefined ? {} : { scheduled: opts.scheduled }),
+    },
+  );
+}
+
 export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise<DaemonHandle> {
   const config = loadConfig(env);
   setLogLevel(config.logLevel);
@@ -500,23 +617,13 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
 
   const tasks: cron.ScheduledTask[] = [];
   for (const { module, def, expr } of jobSpecs) {
-    const task = cron.schedule(
-      expr,
-      () => {
-        const at = now();
-        void jobRunner.run(`job:${def.name}`, () => def.handler(at), {
-          module,
-          jobName: def.name,
-          trigger: "cron",
-          // job_runs 的时间口径是 UTC ISO（字符串比较即时间比较）：本地 +08:00 偏移串
-          // 与 Z 串做字典序会得出错误结论，必须显式转 UTC。
-          scheduledFor: at.toUTC().toISO() ?? "",
-        });
-      },
-      { timezone: TZ },
-    );
+    const task = scheduleJobCron(module, def, expr, jobRunner);
     tasks.push(watchCronTask(task, `${module}.${def.name}`));
-    logger.info(`注册定时任务 ${module}.${def.name}: "${expr}" (${TZ})`);
+    logger.info(
+      `注册定时任务 ${module}.${def.name}: "${expr}" (${TZ})${
+        recoverMissedExecutionsFor(`${module}.${def.name}`) ? "（开启错过触发回放）" : ""
+      }`,
+    );
   }
   tasks.push(
     watchCronTask(
