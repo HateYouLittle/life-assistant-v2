@@ -6,6 +6,7 @@ import {
   ensureYears,
   holidayDayName,
   holidayPeriods,
+  holidayYearsNeedingData,
   holidayYearsReady,
   nextHolidayPeriod,
   requiredYears,
@@ -129,91 +130,150 @@ export async function runWorkdayWatch(at?: DateTime): Promise<void> {
   }
 }
 
+/** 分发参数（P2-20②）：`action` 是规范名，`view` 是兼容别名（SKILL.md 与既有调用方仍写 view）。 */
+const HOLIDAY_ACTIONS = ["next", "month", "is_workday"] as const;
+
+/**
+ * 必填参数表（P2-20③）：集中校验「哪个分支需要哪些参数」，不再在每个分支各写一遍。
+ * 这里只判「缺失/纯空白」，格式校验仍留在各分支 —— 既有报错文案逐字不变。
+ */
+const ACTION_REQUIRES: Record<string, readonly { field: string; message: string }[]> = {
+  month: [{ field: "month", message: "month 需为 YYYY-MM 格式" }],
+  is_workday: [{ field: "date", message: "date 需为 YYYY-MM-DD 格式" }],
+};
+
+/**
+ * 解析分发参数：action 与 view 同时给出且不同时明确报错（绝不静默取其一）；
+ * 未知取值统一按规范名报 `未知 action: …`（与其余工具一致，见 P2-25）。
+ */
+function resolveHolidayAction(args: Record<string, unknown>): string | { error: string } {
+  const action = typeof args.action === "string" ? args.action : undefined;
+  const view = typeof args.view === "string" ? args.view : undefined;
+  const known = (value: string): boolean => (HOLIDAY_ACTIONS as readonly string[]).includes(value);
+  if (action !== undefined && !known(action)) return { error: `未知 action: ${action}` };
+  // view 只是别名：未知取值同样按规范名报错，各工具的未知分支文案保持一致
+  if (view !== undefined && !known(view)) return { error: `未知 action: ${view}` };
+  if (action !== undefined && view !== undefined && action !== view) {
+    return { error: `action 与 view 冲突: action=${action}, view=${view}` };
+  }
+  if (action !== undefined) return action;
+  if (view !== undefined) return view;
+  return { error: "缺少 action（或兼容别名 view）" };
+}
+
+/** 按 ACTION_REQUIRES 表校验必填参数；缺失/纯空白时返回报错文案（空串等同缺失） */
+function missingRequiredArg(key: string, args: Record<string, unknown>): string | null {
+  for (const rule of ACTION_REQUIRES[key] ?? []) {
+    const value = args[rule.field];
+    if (value === undefined || (typeof value === "string" && value.trim() === "")) {
+      return rule.message;
+    }
+  }
+  return null;
+}
+
 export async function holidayTool(
   args: Record<string, unknown>,
   ctx: ToolContext,
 ): Promise<ToolResult> {
-  const view = args.view as string;
+  const resolved = resolveHolidayAction(args);
+  if (typeof resolved !== "string") return fail(resolved.error);
+  const action = resolved;
+  const missing = missingRequiredArg(action, args);
+  if (missing !== null) return fail(missing);
   const db = ctx.db;
-  if (view === "next") {
-    const period = nextHolidayPeriod(db);
-    if (period === null) {
-      const years = holidayYearsReady(db);
-      if (years.length === 0) {
-        return ok("节假日数据尚未导入，暂无法查询（导入后每天 02:00 自动刷新）");
+  switch (action) {
+    case "next": {
+      const period = nextHolidayPeriod(db);
+      if (period === null) {
+        const years = holidayYearsReady(db);
+        if (years.length === 0) {
+          return ok("节假日数据尚未导入，暂无法查询（导入后每天 02:00 自动刷新）");
+        }
+        // 覆盖到当年但查不到更晚的假期，通常是下一年数据还没导入，而不是「没有假期」。
+        const currentYear = Number(todayIso().slice(0, 4));
+        if (Math.max(...years) <= currentYear) {
+          return ok(
+            `覆盖年份内没有更晚的假期了；下一年（${currentYear + 1} 年）数据尚未导入（通常 11 月后发布）`,
+          );
+        }
+        return ok("覆盖年份内没有更晚的假期了");
       }
-      // 覆盖到当年但查不到更晚的假期，通常是下一年数据还没导入，而不是「没有假期」。
-      const currentYear = Number(todayIso().slice(0, 4));
-      if (Math.max(...years) <= currentYear) {
-        return ok(
-          `覆盖年份内没有更晚的假期了；下一年（${currentYear + 1} 年）数据尚未导入（通常 11 月后发布）`,
-        );
+      return okJson({
+        下一假期: `${period.name}`,
+        开始: period.start,
+        结束: period.end,
+        天数: period.days,
+        进行中: period.inProgress,
+        数据覆盖年份: holidayYearsReady(db),
+      });
+    }
+    case "month": {
+      const month = typeof args.month === "string" ? args.month : "";
+      if (!/^\d{4}-\d{2}$/.test(month)) return fail("month 需为 YYYY-MM 格式");
+      // 格式合法不等于月份合法：`2026-13` 会被 LIKE '2026-13-%' 静默查成「无安排」。
+      const monthNumber = Number(month.slice(5, 7));
+      if (monthNumber < 1 || monthNumber > 12) {
+        return fail(`月份不合法: ${month}（需为 01-12）`);
       }
-      return ok("覆盖年份内没有更晚的假期了");
-    }
-    return okJson({
-      下一假期: `${period.name}`,
-      开始: period.start,
-      结束: period.end,
-      天数: period.days,
-      进行中: period.inProgress,
-      数据覆盖年份: holidayYearsReady(db),
-    });
-  }
-  if (view === "month") {
-    const month = typeof args.month === "string" ? args.month : "";
-    if (!/^\d{4}-\d{2}$/.test(month)) return fail("month 需为 YYYY-MM 格式");
-    // 格式合法不等于月份合法：`2026-13` 会被 LIKE '2026-13-%' 静默查成「无安排」。
-    const monthNumber = Number(month.slice(5, 7));
-    if (monthNumber < 1 || monthNumber > 12) {
-      return fail(`月份不合法: ${month}（需为 01-12）`);
-    }
-    // 先按行查，再看年份元数据 —— 与 dayType 的「行命中优先」口径一致：
-    // 跨年日期（如 2027 年度文件里的 2026-12-31）会让「日期所属年份」未就绪但行已存在，
-    // 此时 is_workday 给出确定答案，month 也必须照常展示，不能反过来报「未知」。
-    // 只有「该月没有任何行」且年份未 ready 时才是真正未知。
-    const year = Number(month.slice(0, 4));
-    const rows = db
-      .prepare("SELECT date, day_type, name FROM cn_holiday_days WHERE date LIKE ? ORDER BY date")
-      .all(`${month}-%`) as { date: string; day_type: string; name: string }[];
-    if (rows.length === 0) {
-      const meta = db.prepare("SELECT status FROM cn_holiday_years WHERE year = ?").get(year) as
-        | { status: string }
-        | undefined;
-      if (meta?.status !== "ready") {
-        return okJson({
-          月份: month,
-          安排: `未知（${year} 年节假日数据未就绪，不猜测）`,
-          数据覆盖年份: holidayYearsReady(db),
-        });
+      // 先按行查，再看年份元数据 —— 与 dayType 的「行命中优先」口径一致：
+      // 跨年日期（如 2027 年度文件里的 2026-12-31）会让「日期所属年份」未就绪但行已存在，
+      // 此时 is_workday 给出确定答案，month 也必须照常展示，不能反过来报「未知」。
+      // 只有「该月没有任何行」且年份未 ready 时才是真正未知。
+      const year = Number(month.slice(0, 4));
+      const rows = db
+        .prepare("SELECT date, day_type, name FROM cn_holiday_days WHERE date LIKE ? ORDER BY date")
+        .all(`${month}-%`) as { date: string; day_type: string; name: string }[];
+      if (rows.length === 0) {
+        const meta = db.prepare("SELECT status FROM cn_holiday_years WHERE year = ?").get(year) as
+          | { status: string }
+          | undefined;
+        if (meta?.status !== "ready") {
+          return okJson({
+            月份: month,
+            安排: `未知（${year} 年节假日数据未就绪，不猜测）`,
+            数据覆盖年份: holidayYearsReady(db),
+          });
+        }
       }
+      const table = rows.map((r) => [r.date, r.day_type === "holiday" ? "休息" : "上班", r.name]);
+      return okJson({
+        月份: month,
+        安排:
+          table.length > 0
+            ? { columns: ["日期", "类型", "名称"], rows: table }
+            : "当月无法定节假日/调休安排",
+        数据覆盖年份: holidayYearsReady(db),
+      });
     }
-    const table = rows.map((r) => [r.date, r.day_type === "holiday" ? "休息" : "上班", r.name]);
-    return okJson({
-      月份: month,
-      安排:
-        table.length > 0
-          ? { columns: ["日期", "类型", "名称"], rows: table }
-          : "当月无法定节假日/调休安排",
-      数据覆盖年份: holidayYearsReady(db),
-    });
+    case "is_workday": {
+      const date = typeof args.date === "string" ? args.date : "";
+      if (!DATE_RE.test(date)) return fail("date 需为 YYYY-MM-DD 格式");
+      // DATE_RE 只校验格式：2026-02-30 会因 weekday 为 NaN 被误判成「上班日（工作日）」
+      if (!isDate(date)) return fail(`date 不是真实存在的日期: ${date}`);
+      const cls = dayType(db, date);
+      if (cls === "holiday") {
+        const name = db.prepare("SELECT name FROM cn_holiday_days WHERE date = ?").get(date) as {
+          name: string;
+        };
+        return ok(`${date}：休息日（法定节假日：${name.name}）`);
+      }
+      if (cls === "workday") return ok(`${date}：上班日（调休补班）`);
+      if (cls === "weekend") return ok(`${date}：休息日（周末）`);
+      if (cls === "weekday") return ok(`${date}：上班日（工作日）`);
+      // 未知时点名**真正缺失的年度**（P2-5 的 holidayYearsNeedingData 是单一来源）：
+      // 跨年区间（12-25~12-31）的权威分类来自下一年度文件，此时日期所属年份往往已 ready，
+      // 按 `date.slice(0,4)` 报年份会指向一个并不缺失的项，用户/agent 无从判断该补哪一年。
+      const missingYears = holidayYearsNeedingData(db, date);
+      if (missingYears.length === 0) {
+        return ok(`${date}：未知（${date.slice(0, 4)} 年节假日数据未就绪，不猜测）`);
+      }
+      return ok(`${date}：未知（${missingYears.join("/")} 年节假日数据未就绪，不猜测）`);
+    }
+    // 显式兜底（P2-25）：未知分支绝不落入 is_workday，文案前缀与其它工具一致
+    default:
+      return fail(`未知 action: ${String(action)}`);
   }
-  // is_workday
-  const date = typeof args.date === "string" ? args.date : "";
-  if (!DATE_RE.test(date)) return fail("date 需为 YYYY-MM-DD 格式");
-  // DATE_RE 只校验格式：2026-02-30 会因 weekday 为 NaN 被误判成「上班日（工作日）」
-  if (!isDate(date)) return fail(`date 不是真实存在的日期: ${date}`);
-  const cls = dayType(db, date);
-  if (cls === "holiday") {
-    const name = db.prepare("SELECT name FROM cn_holiday_days WHERE date = ?").get(date) as {
-      name: string;
-    };
-    return ok(`${date}：休息日（法定节假日：${name.name}）`);
-  }
-  if (cls === "workday") return ok(`${date}：上班日（调休补班）`);
-  if (cls === "weekend") return ok(`${date}：休息日（周末）`);
-  if (cls === "weekday") return ok(`${date}：上班日（工作日）`);
-  return ok(`${date}：未知（${date.slice(0, 4)} 年节假日数据未就绪，不猜测）`);
 }
 
 registerModule({
@@ -222,19 +282,26 @@ registerModule({
     {
       name: "holiday",
       description:
-        "中国大陆法定节假日/调休查询。view=next 查下一假期；view=month+month(YYYY-MM) 查某月安排；view=is_workday+date(YYYY-MM-DD) 判断某日是否上班。数据未覆盖时明确返回未知，绝不按星期猜测。",
+        "中国大陆法定节假日/调休查询。action=next 查下一假期；action=month+month(YYYY-MM) 查某月安排；action=is_workday+date(YYYY-MM-DD) 判断某日是否上班。action 为规范名，view 为兼容别名（两者等价；同时传且不同会报错）。数据未覆盖时明确返回未知，绝不按星期猜测。",
       inputSchema: {
-        view: z.enum(["next", "month", "is_workday"]).describe("查询类型"),
+        action: z
+          .enum(HOLIDAY_ACTIONS)
+          .optional()
+          .describe("查询类型（规范名）：next 查下一假期 / month 查某月 / is_workday 判断某日"),
+        view: z
+          .enum(HOLIDAY_ACTIONS)
+          .optional()
+          .describe("兼容别名，等价于 action；同时传且冲突会明确报错"),
         month: z
           .string()
           .regex(/^\d{4}-\d{2}$/)
           .optional()
-          .describe("view=month 时必填，如 2026-10"),
+          .describe("action=month 时必填，如 2026-10"),
         date: z
           .string()
           .regex(DATE_RE)
           .optional()
-          .describe("view=is_workday 时必填，如 2026-10-01"),
+          .describe("action=is_workday 时必填，如 2026-10-01"),
       },
       handler: holidayTool,
     },
