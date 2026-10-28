@@ -322,6 +322,11 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
         clientToken: requestId,
       });
       const entry = result.entry;
+      // 幂等命中（P2-4）：返回的行来自**首次写入**，回显字段必须全部取自原记录。
+      // 本次调用解析出的 ledger 可能与之不同（重试时显式换了 ledger_id，或默认账本被改），
+      // 用它回显会让「账本」与金额/分类/日期（都来自 entry）自相矛盾，误导人工对账，
+      // 也会把错误的账本写进 quick 的 audit_log.detail。
+      const entryLedger = result.reused ? (getLedger(db, entry.ledger_id) ?? ledger) : ledger;
       // 幂等命中：行是首次写入的那一条，本次不再发回执/预算提醒（否则重试会重复打扰用户）
       if (result.reused) {
         logger.debug(
@@ -359,7 +364,7 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
       return okJson({
         已记账: {
           id: entry.id,
-          账本: ledger.name,
+          账本: entryLedger.name,
           金额: `¥${centsToYuan(entry.amount_cents)}`,
           分类: entry.category,
           日期: entry.spent_on,

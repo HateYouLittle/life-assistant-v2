@@ -330,6 +330,58 @@ describe("/api/quick/expenses", () => {
     }
   });
 
+  // P2-4：手机入口的响应与 audit_log.detail 都由工具层回执派生，命中幂等时账本必须取自原记录，
+  // 否则「重试时换了账本」会在留痕里写成错的账本，事后回溯对不上账。
+  it("带 request_id 重试但换了账本：响应与审计留痕都按原记录回显（P2-4）", async () => {
+    const env = buildEnv();
+    try {
+      seedLedgers(env);
+      const app = appFor(env);
+      const payload = (ledgerId: string) =>
+        JSON.stringify({
+          amount: 9.9,
+          ledger_id: ledgerId,
+          category: "零食",
+          request_id: "quick-ledger-drift",
+        });
+
+      const first = await app.request("/api/quick/expenses", {
+        method: "POST",
+        headers: bearer(BESTIE),
+        body: payload("l-family"),
+      });
+      assert.equal(first.status, 201);
+      const firstBody = await body(first);
+      assert.equal(firstBody.ledger_name, "家庭账本");
+
+      // 同一次请求重试，但这次换成 bestie 自己的个人账本
+      const retry = await app.request("/api/quick/expenses", {
+        method: "POST",
+        headers: bearer(BESTIE),
+        body: payload("l-bestie"),
+      });
+      assert.equal(retry.status, 201);
+      const retryBody = await body(retry);
+      assert.equal(retryBody.已存在, true);
+      assert.equal(retryBody.id, firstBody.id);
+      assert.equal(retryBody.ledger_name, "家庭账本", "幂等命中时响应账本名取自原记录");
+
+      const audit = env.db
+        .prepare(
+          "SELECT detail_json FROM audit_log WHERE action = 'quick.expense.add' AND target_id = ?",
+        )
+        .get(String(firstBody.id)) as { detail_json: string } | undefined;
+      assert.ok(audit !== undefined, "手机写路径必须留审计");
+      assert.equal(
+        (JSON.parse(audit.detail_json) as { 账本?: string }).账本,
+        "家庭账本",
+        "审计留痕的账本必须与响应同源",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("非法金额 / 缺金额都是 400 + 中文错误，且不落库", async () => {
     const env = buildEnv();
     try {
