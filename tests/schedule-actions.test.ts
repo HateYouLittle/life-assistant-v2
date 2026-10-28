@@ -417,11 +417,7 @@ describe("schedule complete：循环日程必须显式指定单次或结束系�
         "active",
         "裸调 complete 的既有行为不变（收尾需显式 all=true 或 skip/delete）",
       );
-      assert.equal(
-        occurrenceStatus(env, created.id, `${D}T18:00#0`),
-        "done",
-        "该次发生仍应被完成",
-      );
+      assert.equal(occurrenceStatus(env, created.id, `${D}T18:00#0`), "done", "该次发生仍应被完成");
     } finally {
       cleanupTestEnv(env);
     }
