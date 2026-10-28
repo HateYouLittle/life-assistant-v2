@@ -327,6 +327,13 @@ function scheduleToolInner(args: Record<string, unknown>, ctx: ToolContext) {
           标题: result.row.title,
           occurrence_key: result.occurrenceKey,
           剩余未完成: result.remaining,
+          // 回执必须与真实状态一致：一次性待办 skip 后整条日程已收尾（done），
+          // 只写「已跳过」会让调用方以为系列还在（P2-2 / C-03）。
+          状态: result.row.status,
+          已结束该待办: result.ended,
+          ...(result.ended
+            ? { 说明: "已跳过并结束该待办（一次性待办没有后续发生，日程已置为 done）" }
+            : {}),
           版本: result.row.version,
         },
       });
@@ -377,7 +384,7 @@ registerModule({
         "action=add 创建（calendar=lunar 时需 lunar_month/lunar_day 且按年循环；生日/纪念日默认按年循环；可选 request_id 幂等键，重试不会重复创建）；" +
         "list 查询（每行「待办发生」给出可用的 occurrence_key）；update 修改（escalation 传 [] 清除阶梯）；" +
         "complete 完成：一次性日程直接完成；循环日程必须带 occurrence_key 只完成该次，结束整个系列请显式传 all=true；" +
-        "snooze 推迟单次提醒（minutes 或 until）；skip 跳过单次发生（系列继续）；delete 删除；upcoming 查即将提醒。",
+        "snooze 推迟单次提醒（minutes 或 until）；skip 跳过单次发生（循环系列继续；一次性待办则跳过并结束该待办，回执的「状态」为 done）；delete 删除；upcoming 查即将提醒。",
       inputSchema: {
         action: z.enum([
           "add",

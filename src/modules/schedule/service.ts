@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { DateTime } from "luxon";
 import type { DatabaseSync } from "node:sqlite";
-import { now, nowIso, localToInstant, instantToLocalDate, TZ } from "../../time.js";
+import { now, nowIso, todayIso, localToInstant, instantToLocalDate, TZ } from "../../time.js";
 import { dayType, ensureYears } from "../../core/holiday.js";
 import {
   collapseLunarInterval,
@@ -330,6 +330,39 @@ export function validateScheduleInput(input: ScheduleInput): void {
   }
 }
 
+/**
+ * 一次性（recurrence 为空）公历日程的「过期」判定。
+ *
+ * 根因：引擎对一次性日程只在 `start > afterDay` 时产出候选日期（core/recurrence.ts 的
+ * iterate：`if (rec === null) { if (start > afterDay) yield start; return; }`），而
+ * materializeSchedule 的游标起点是 `now().minus({ days: 1 }).startOf("day")`。
+ * start_date ≤ 昨天时，起点与之后的所有物化都严格晚于它 → 永远产不出日期 → 0 occurrence、
+ * next_run_at=null、日程永久停在 active、永不提醒，而创建/更新却报成功 —— 纯静默失败。
+ *
+ * 判定集中在这里（create 与 update 共用），避免两处各写一份后口径漂移。
+ * 返回 null 表示不适用（非公历 / 有循环规则 / 缺日期：缺日期已由 validateScheduleInput 拒掉）。
+ */
+export function expiredOneOff(input: {
+  calendar: "solar" | "lunar";
+  recurrence: Recurrence | null;
+  startDate?: string | null;
+}): { startDate: string; today: string } | null {
+  if (input.calendar !== "solar") return null;
+  if (input.recurrence !== null) return null;
+  const startDate = input.startDate ?? null;
+  if (startDate === null) return null;
+  const today = todayIso();
+  return startDate < today ? { startDate, today } : null;
+}
+
+/** 一次性日程过期的可操作报错文案：必须说清「不会触发」以及怎么改，不能只说「日期不合法」 */
+function expiredOneOffError(expired: { startDate: string; today: string }): Error {
+  return new Error(
+    `一次性日程的开始日期 ${expired.startDate} 已过期（早于今天 ${expired.today}）：该日期不会再产生任何提醒，` +
+      `日程会一直停在 active 且下次提醒为空。请把日期改为今天或之后，或改为循环日程（recurrence）后重试。`,
+  );
+}
+
 /** 提醒偏移的项数上限（与 MCP schema 一致） */
 export const MAX_REMIND_OFFSETS = 5;
 /** 单个提醒偏移的绝对值上限（分钟，30 天；与 MCP schema 一致） */
@@ -633,6 +666,11 @@ export function createSchedule(
   validateScheduleInput(input);
   // 服务层再收口一道 remind_offsets 边界（MCP 有 zod，quick 直接走工具层绕过了它）。
   validateRemindOffsets(input.remindOffsets);
+  // P2-3：一次性日程的开始日期早于今天时，物化永远产不出 occurrence（游标从昨天起、
+  // 引擎只产出严格晚于游标的日期）。此前这种写入会「成功」但 0 提醒、永久 active ——
+  // 纯静默失败；现在明确 fail，并给出可操作的改法（改日期 / 改循环）。
+  const expired = expiredOneOff(input);
+  if (expired !== null) throw expiredOneOffError(expired);
   ensureProfile(db, profileId);
   let lastError: unknown = null;
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -803,6 +841,16 @@ export function updateSchedule(
     patch.recurrence !== undefined ||
     (patch.workdayFilter !== undefined && merged.workdayFilter !== row.workday_filter) ||
     (patch.status !== undefined && status !== row.status);
+  // P2-3：update 不得走成第二条静默路径。本次写入会删 pending 行（materializationAffected）
+  // 而新日期又是「一次性 + 已过期」时，删掉的正是这条日程**唯一的待发提醒**，且重物化永远
+  // 产不出替代行 —— 静默丢失。此时明确 fail，并给出可操作的改法。
+  // 无关 patch（只改标题/备注等不动物化的字段）不在此列：既有 pending 提醒原样保留，不做
+  // 无谓阻断；把日期改回今天或之后、改成循环、或显式置 done/cancelled 收尾，也都不受影响
+  // （前两者合并后不再是「过期一次性」，后者 status 已不是 active）。
+  if (status === "active" && materializationAffected) {
+    const expired = expiredOneOff(merged);
+    if (expired !== null) throw expiredOneOffError(expired);
+  }
   const ts = nowIso();
   withTransaction(db, () => {
     // 必须在 DELETE 之前取锚点：删除 pending 行后「最近一个 notified 事件还有 pending
@@ -1144,12 +1192,25 @@ export interface SkipOutcome {
   occurrenceKey: string;
   /** 跳过这次发生之后，该日程剩余未完成的发生次数（按事件去重） */
   remaining: number;
+  /**
+   * 本次 skip 是否同时把整条日程收尾（status → done）。仅一次性待办为 true：
+   * 它没有「下一次」，跳过这一次就是整条待办结束，回执必须如实说明（见 skipSchedule）。
+   */
+  ended: boolean;
 }
 
 /**
  * 跳过单次发生：把该事件的提醒行（含同事件的兄弟偏移与派生行）置为 cancelled。
- * 只动 occurrence 行、不改 schedules.status —— 系列继续，下一次仍会照常物化/提醒。
+ *
+ * 重复系列只动 occurrence 行、不改 schedules.status —— 系列继续，下一次仍会照常物化/提醒。
  * cancelled 是终态：materialize 的 INSERT OR IGNORE 不会复活它，catchupSweep 只碰 pending。
+ *
+ * 一次性待办（recurrence_json 为空）例外：它没有「下一次」，跳过这一次就是整条待办结束，
+ * 因此同时把 schedules.status 置为 done —— 与 complete 对同形态日程的终态完全一致
+ * （completeSchedule 对 recurrence_json=null 的 todo 同样置 done，不引入第三种半终态）。
+ * 此前只置 occurrence=cancelled 而日程仍 active：物化撞上 cancelled 行永不重建、next_run_at
+ * 变 NULL，该待办永留 active 列表、不再提醒，complete 又报「已结束」，只剩 all=true/delete
+ * 能收尾 —— 而回执只写「已跳过」，与真实状态不符。
  */
 export function skipSchedule(
   db: DatabaseSync,
@@ -1167,6 +1228,9 @@ export function skipSchedule(
     );
   }
   const eventPrefix = eventPrefixOf(target.occurrence_key);
+  // 与 completeSchedule 的终态判定逐字对齐（recurrence_json === null && kind === 'todo'）：
+  // 两条路径必须得出同一个终态，否则「跳过」和「完成」会对同一条待办给出不同收尾。
+  const ended = row.recurrence_json === null && row.kind === "todo";
   let remaining = 0;
   withTransaction(db, () => {
     if (eventPrefix === null) {
@@ -1183,6 +1247,9 @@ export function skipSchedule(
       ).run(id, eventPrefix.length + 1, `${eventPrefix}#`);
     }
     touchSchedule(db, id);
+    if (ended) {
+      db.prepare("UPDATE schedules SET status = 'done' WHERE id = ?").run(id);
+    }
     updateNextRunAt(db, id);
     remaining = countUnfinishedEvents(db, id);
   });
@@ -1190,6 +1257,7 @@ export function skipSchedule(
     row: getSchedule(db, profileId, id) as ScheduleRow,
     occurrenceKey: target.occurrence_key,
     remaining,
+    ended,
   };
 }
 
