@@ -9,7 +9,7 @@
 | 天气 | QWeather 实时 / 7 日预报 / 官方预警；出行模式（行程期间自动切到目的地） |
 | 空气质量 | QWeather 国标 AQI（cn-mee）、PM2.5/PM10 |
 | 每日简报 | 每日 07:00（可配）确定性组装，无 LLM；含今日日程/逾期未完成与下个假期倒计时；21:00 晚报（可配）给明日天气、明日日程与今日未完成 |
-| 日程 | 待办/生日/纪念日，公历+农历（闰月策略、腊月三十顺延）、按法定工作日/节假日重复；`snooze`/`skip` 处置单次，`complete` 对循环默认只完成当前一次（`all: true` 才结束系列） |
+| 日程 | 待办/生日/纪念日，公历+农历（闰月策略、腊月三十顺延）、按法定工作日/节假日重复；`snooze`/`skip` 处置单次（`skip` 对一次性待办即收尾，见下），`complete` 对循环默认只完成当前一次（`all: true` 才结束系列） |
 | 节假日 | 大陆法定节假日/调休日历，每日 02:00 自动抓取校验（数据源 `NateScarlet/holiday-cn` 的 jsDelivr / GitHub raw；无外网时 `workday/holiday` 过滤的日程会暂停并在状态页 `holidays.failed` 显示原因；次年数据未发布记 `pending` 而不是失败） |
 | 记账 | 家庭/个人多账本、只记支出（可编辑已记支出，编辑不触发回执/预算提醒）、CSV 导出（已做公式注入防护），账本/分类月度预算与 80%/100% 跨阈值提醒（按支出所属月份判定）、月度账单与周报推送、状态页预算看板（进度条 + 可执行建议）、分类字典/别名（「吃饭」自动归到「餐饮」）；默认账本/常用分类降低摩擦 |
 | 通知 | SQLite outbox + 可扩展投递通道（webhook / log / bark / ntfy / telegram / smtp / openclaw，细节见已知取舍 #17）、静默时段、`notify.pull` 兜底 |
@@ -398,7 +398,7 @@ npm run db:cleanup:preview   # 零业务删除预演：occurrence 与保留策�
 - **「本月」的口径**：状态页看板、预算对照、月报的「本月」= **自然月全月**（月初→月末，**含月内尚未到来的日期**）—— `spent_on` 是已录入的记账事实，指定了未来日期就不该因为日历没到那天就从本月数字里消失（否则同一个「本月」会随日期推移忽增忽减，对不上账）。工具侧 `expense summary` 不传区间时的默认区间是「月初 → 今天」，那是「本月至今」的查询默认。`expense` 的 `month` 与 `from`/`to` 互斥（同时传直接报错，`from > to` 也报错）：两者都表达区间，混着传会让 `list` 与 `summary` 得出相反结论。
 - **物化窗口**：occurrence 只物化到 `now + 62 天`。若某日程此刻一条 `pending` 都没有（远期生日、远期一次性待办），额外豁免**恰好 1 条**越过窗口的 occurrence，保证「下一条」在 `list`/`upcoming`/状态页始终可见（豁免的那条最远可达 400 天，因此远期生日会显示成明年的日期）；豁免资格取自入库状态，补上第一条即失效，因此不会随时间累积增长。
 - **截止型日程（逾期升级）**：给 `todo` 设置 `escalation`（严格升序分钟偏移数组，1-5 项、最大 43200 即 30 天，**首元素必须为 0** 表示截止时刻本身，如 `[0,60,360,1440]`）即可 —— 仅 `kind=todo` 可设，到达截止时刻后按阶梯依次重发升级提醒（第 0 步即截止时刻的提醒，第 1..n 步是逾期加压的 `<event>#N#esc:M`；锚点默认是 `#0`，晚录入/停机导致 `#0` 被 `catchupSweep` 取消时落在保留下来的那条偏移行上），直到 `complete` 才停；设置 `escalation` 时 `resend_minutes` 被忽略。每步各生成一条 occurrence，靠 `INSERT OR IGNORE` + `notified` 状态保证只推一次；改了 `time`/`escalation` 或父事件被删/重排后，残留行在触发前按当前排期校验并作废。`complete` 带 `occurrence_key` 时按**事件前缀**收敛：同一事件的各条提醒偏移（`#0..#4`）与它们的派生行（`:resend`、`#esc:N`）一并终结，因此用哪一条提醒去完成都不会再有同事件的后续推送。`update` 传 `escalation: []` 清除阶梯（空数组在 MCP schema 层合法：长度下限与首元素/升序等语义规则在 service 层判定，否则经真实 MCP 的 `[]` 会在进入 handler 前被拒）。工具/状态页把这类日程的类型显示为「截止」（不新增 `kind` 枚举值，语义由字段表达）。
-- **单次处置**：`schedule {action:"snooze"}` 顺延某一次发生的提醒（`minutes` 或 `until`），`skip` 跳过某一次但不结束系列，两者都按 `occurrence_key` 精确定位；`schedule list` 每行附 `待办发生`（最多 5 条 occurrence_key），就是这两个 action 要传的值。`complete` 对循环日程**必须**带 `occurrence_key`（只完成当前一次；同一事件的各条提醒偏移与派生行一并收敛），裸调会被拒绝并提示改用 `all: true` 结束整个系列；一次性日程语义不变。手工 snooze 过的 occurrence 在提醒里显示顺延后的 `due_at`，`dedupeKey` 含该时刻，因此二次提醒不会被 outbox 的幂等窗口吞掉。
+- **单次处置**：`schedule {action:"snooze"}` 顺延某一次发生的提醒（`minutes` 或 `until`），`skip` 跳过某一次（循环系列继续；**一次性待办则跳过即结束该待办** —— `status` 转 `done`，回执的 `状态` 与 `已结束该待办` 如实反映，与 `complete` 对同形态日程的终态一致），两者都按 `occurrence_key` 精确定位；`schedule list` 每行附 `待办发生`（最多 5 条 occurrence_key），就是这两个 action 要传的值。`complete` 对循环日程**必须**带 `occurrence_key`（只完成当前一次；同一事件的各条提醒偏移与派生行一并收敛），裸调会被拒绝并提示改用 `all: true` 结束整个系列；一次性日程语义不变。`add`/`update` 对**公历一次性**日程在 `start_date` 早于今天时明确报错（该日期不会再产生任何提醒，日程只会一直停在 active 且下次提醒为空），报错给出「改日期到今天或之后 / 改成循环日程」两条改法；`update` 同样拦截「会删掉唯一待发 pending 行却重物化不出替代行」的改法（P2-3）。手工 snooze 过的 occurrence 在提醒里显示顺延后的 `due_at`，`dedupeKey` 含该时刻，因此二次提醒不会被 outbox 的幂等窗口吞掉。
 - **历史回收**：`schedule.occurrence_cleanup`（每日 04:30）只清理 90 天前的 `notified`/`done`/`cancelled` 行 —— `pending` 永不删；使用 `recurrence.count` 的日程整条豁免（发生次数上限依赖历史行数，删历史会让已达上限的循环复活；漏触发被 `catchupSweep` 收敛为 `cancelled` 的事件同样计入上限——否则漏一次就会补出新事件，上限永远达不到）。上线或调参前用 `npm run db:cleanup:preview` 零业务删除预演将删除的行数与涉及日程（与 job 共用同一份判定；打开旧库时仍可能做附加式 schema 升级）。
 
 ### 已知取舍与后续优化
@@ -458,4 +458,8 @@ npm run db:cleanup:preview   # 零业务删除预演：occurrence 与保留策�
 
 32. **`audit_log` 目前只增不清**：每次 `/api/quick/*` 写入一行，个人规模量级可忽略；保留策略尚未接管（后续按天数清理或归档）。`/api/audit` 的 master 能看到所有 Profile 的审计 detail（含账本名/标题，但不含备注全文与 token）；Profile 只能看自己的。结构指纹是「上次启动结构 vs 当前结构」的对账，无法发现从未经过本程序的结构（首次启动/恢复旧快照后基线即当前结构）；回滚到 `pre-v4` 快照会丢掉升级后的 `audit_log` 行与指纹状态，属预期。
 
-33. **收紧前已落库的隔离用户 openclaw 路由仍用全局 token（P2-17 已知残留）**：配置/重新启用入口已拦住隔离用户（登记了独立 Profile token 且不是部署自身 profile 的人），但**收紧之前**就已写入且 `enabled=true` 的路由不会被改写——投递侧拿不到「这条路由是谁配的」，只能按 profile 打一条一次性 warn（提示补 `PROFILE_ROUTE_SECRETS_JSON` 或改通道），不擅自拒绝投递（否则会打断该用户正在工作的推送）。彻底关闭需要把请求身份（master / 某个 Profile）透传到投递层，属后续工作；已授权或可信的部署可直接为该 profile 补一条 route secret 收口。另：重启恢复的「通道是否幂等」按该 Profile **当前生效路由**反查（`deliveries` 没有 channel 列），崩溃前后若用户换过通道（如 `bark` → `webhook`），可能把非幂等行误判成幂等——概率极低，精确化需给 `deliveries` 加列（P2-10 已知近似）。
+33. **收紧前已落库的隔离用户 openclaw 路由仍用全局 token（P2-17 已知残留）**：配置/重新启用入口已拦住隔离用户（登记了独立 Profile token 且不是部署自身 profile 的人），但**收紧之前**就已写入且 `enabled=true` 的路由不会被改写——投递侧拿不到「这条路由是谁配的」，只能按 profile 打一条一次性 warn（提示补 `PROFILE_ROUTE_SECRETS_JSON` 或改通道），不擅自拒绝投递（否则会打断该用户正在工作的推送）。彻底关闭需要把请求身份（master / 某个 Profile）透传到投递层，属后续工作；已授权或可信的部署可直接为该 profile 补一条 route secret 收口。另：重启恢复的「通道是否幂等」按该 Profile **当前生效路由**反查（`deliveries` 没有 channel 列），崩溃前后若用户换过通道（如 `bark` → `webhook`），可能把非幂等行误判成幂等——概率极低，精确化需给 `deliveries` 加列（P2-10 已知近似）。顺带：隔离用户的存量 openclaw 路由**可以停用、但不能重新启用**（启用会 requeue，等于把全局 token 再送一次）；要恢复推送请先补该 profile 的 route secret，或改用其它通道。
+
+34. **P2-3 只拦新写入，不改存量死行**：`add`/`update` 现在会明确拒绝「公历一次性 + `start_date` 早于今天」，但**此前已写入**的同类行保持原样（`status='active'`、`next_run_at=null`、永不提醒），本次不做自动收尾、也不告警。自查 SQL（把 `date('now','+8 hours')` 换成当天即可）：
+    `SELECT id, profile_id, title, start_date FROM schedules WHERE recurrence_json IS NULL AND calendar='solar' AND start_date < date('now','+8 hours') AND status='active';`
+    这类行按语义应显式收尾（`complete all=true` 或 `delete`）或改日期。后续可加进 `doctor --live` 检查或一次性清扫。
