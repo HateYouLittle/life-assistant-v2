@@ -979,6 +979,17 @@ export function completeSchedule(
       );
     }
   }
+  // P2-1 / C-02：all=true 是「结束整个系列」的唯一显式入口，必须对**任意 kind** 真的置终态。
+  // 旧实现只在 kind==='todo' 时置 done，于是生日/纪念日 all=true 后回执写「已完成」而
+  // status 仍是 active —— 下一轮 tick 继续物化下一年（实测 birthday yearly 会重建 2027 那次），
+  // 与工具描述「结束整个系列请显式传 all=true」直接矛盾。终态口径与 P2-2 逐字一致：只有 done。
+  // 裸调 complete（无 key、无 all）不在改动范围：一次性待办的收尾仍走上面 kind==='todo' 的分支。
+  if (opts.all === true) {
+    db.prepare("UPDATE schedules SET status = 'done', updated_at = ? WHERE id = ?").run(
+      nowIso(),
+      id,
+    );
+  }
   updateNextRunAt(db, id);
   return getSchedule(db, profileId, id) as ScheduleRow;
 }
