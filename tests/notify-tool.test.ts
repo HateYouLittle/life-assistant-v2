@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { supportedChannels } from "../src/core/channels.js";
 import { publishProfile, setPushRoute } from "../src/core/notify.js";
+import { allTools } from "../src/core/registry.js";
 import { notifyTool } from "../src/modules/notify/index.js";
 import { cleanupTestEnv, makeTestEnv, SECRET, type TestEnv } from "./helpers.js";
 
@@ -147,6 +149,112 @@ describe("notify 工具", () => {
       );
     } finally {
       cleanupTestEnv(env);
+    }
+  });
+
+  it("cancel：回执按实际投递状态分档，不把「已发出/在途/无投递」说成已取消（P2-26）", () => {
+    const env = makeTestEnv({ PROFILE_ROUTE_SECRETS_JSON: JSON.stringify({ default: SECRET }) });
+    try {
+      setPushRoute(env.db, "default", { url: "http://127.0.0.1:9/hook" });
+      /** 造一条通知，并把它的投递行改成指定状态（null = 删掉投递行，模拟无路由） */
+      const seed = (title: string, status: string | null): string => {
+        const pub = publishProfile(env.db, env.config, "default", {
+          kind: "k",
+          title,
+          blocks: {},
+        });
+        if (status === null) {
+          env.db.prepare("DELETE FROM deliveries WHERE notification_id = ?").run(pub.id);
+        } else {
+          env.db
+            .prepare("UPDATE deliveries SET status = ? WHERE notification_id = ?")
+            .run(status, pub.id);
+        }
+        return pub.id;
+      };
+
+      // ① 投递已发出：回执必须点明「没有待投递可取消」，绝不能再说「已取消…待投递」
+      const sentReceipt = text(tool(env, { action: "cancel", id: seed("已发出", "sent") }));
+      assert.match(sentReceipt, /没有待投递可取消/);
+      assert.match(sentReceipt, /已发出 1 条/);
+      assert.doesNotMatch(sentReceipt, /已取消投递/);
+
+      // ② 投递处于 sending：拦不住，回执必须报条数并说明（与「pull 拦不住在途」同口径）
+      const sendingId = seed("在途", "sending");
+      const sendingReceipt = text(tool(env, { action: "cancel", id: sendingId }));
+      assert.match(sendingReceipt, /仍有 1 条正在发送中/);
+      assert.match(sendingReceipt, /撤回不了/);
+      assert.equal(
+        (
+          env.db
+            .prepare("SELECT status FROM deliveries WHERE notification_id = ?")
+            .get(sendingId) as {
+            status: string;
+          }
+        ).status,
+        "sending",
+        "sending 行不能被 cancel 改写",
+      );
+
+      // ③ 压根没有投递记录（未配置路由 / 该类型关闭推送）
+      assert.match(text(tool(env, { action: "cancel", id: seed("无投递", null) })), /没有投递记录/);
+
+      // ④ 真的取消了：回执报条数；重复 cancel 不得再回「已取消投递 1 条」
+      const queuedId = seed("待投递", "queued");
+      assert.match(text(tool(env, { action: "cancel", id: queuedId })), /已取消投递 1 条/);
+      const again = text(tool(env, { action: "cancel", id: queuedId }));
+      assert.match(again, /没有待投递可取消/);
+      assert.doesNotMatch(again, /已取消投递/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("与当前 action 无关的字段显式拒绝（P2-21）", () => {
+    const env = makeTestEnv({ PROFILE_ROUTE_SECRETS_JSON: JSON.stringify({ default: SECRET }) });
+    try {
+      // pull 不读 offset：过去被静默忽略，agent 以为分页生效了
+      const pullOffset = tool(env, { action: "pull", offset: 20 });
+      assert.equal(pullOffset.isError, true);
+      assert.ok(
+        text(pullOffset).endsWith("未知字段: offset（action=pull 不接受）"),
+        `文案必须与 bookkeeping 侧一致: ${text(pullOffset)}`,
+      );
+
+      // cancel 只认 id；kind 属于 history/prefs
+      const cancelKind = tool(env, { action: "cancel", id: "n1", kind: "k" });
+      assert.equal(cancelKind.isError, true);
+      assert.ok(
+        text(cancelKind).endsWith("未知字段: kind（action=cancel 不接受）"),
+        `文案必须与 bookkeeping 侧一致: ${text(cancelKind)}`,
+      );
+
+      // 反向：本 action 真正读取的字段不得被误伤（否则白名单过宽 = 又一种静默破坏）
+      const history = tool(env, { action: "history", limit: 5, offset: 0, unread: true });
+      assert.ok(!history.isError, `history 的 offset/unread 必须可用: ${text(history)}`);
+      const route = tool(env, { action: "route", channel: "log", name: "r1" }, "p9");
+      assert.ok(!route.isError, `route 的 channel/name 必须可用: ${text(route)}`);
+      const retry = tool(env, { action: "retry", all: true });
+      assert.ok(!retry.isError, `retry 的 all 必须可用: ${text(retry)}`);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("route 的 channel 描述由 supportedChannels() 生成，含全部通道（P2-22）", () => {
+    const def = allTools().find((t) => t.def.name === "notify")?.def;
+    assert.ok(def !== undefined, "notify 工具应已注册");
+    const channels = supportedChannels();
+    assert.ok(channels.length > 3, `通道数应多于 3，否则这条回归无意义: ${channels.join(",")}`);
+    const shape = def.inputSchema as Record<string, { description?: string } | undefined>;
+    const fieldDescription = shape.channel?.description ?? "";
+    assert.notEqual(fieldDescription, "", "channel 字段必须有 describe（agent 只看得见 schema）");
+    for (const name of channels) {
+      assert.ok(
+        fieldDescription.includes(name),
+        `channel 字段描述缺少通道 ${name}：${fieldDescription}`,
+      );
+      assert.ok(def.description.includes(name), `工具总描述缺少通道 ${name}`);
     }
   });
 });
