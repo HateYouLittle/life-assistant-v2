@@ -6,7 +6,7 @@ import {
   openclawChannel,
   resetOpenclawGlobalTokenWarnings,
 } from "../src/core/channels.js";
-import { drainDue, getPushRoute, publishProfile } from "../src/core/notify.js";
+import { cancelPendingDrain, drainDue, getPushRoute, publishProfile } from "../src/core/notify.js";
 import { ensureProfile, setSetting } from "../src/core/settings.js";
 import { notifyTool } from "../src/modules/notify/index.js";
 import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
@@ -19,8 +19,10 @@ import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
  * 的隔离用户只要改自己的推送路由，就能把运维者的 hooks token 引到自己的本地服务上。
  *
  * 修复后的契约（组合方案：per-profile secret 优先 + 三档准入 + /hooks/ 路径收紧）：
- * 1. 隔离用户（登记在 PROFILE_TOKENS_JSON **且不是部署自身 profile**）配置 openclaw 路由时
- *    必须提供自己的 route secret；没有就**明确失败**，绝不回退全局 token；
+ * 1. 隔离用户（登记在 PROFILE_TOKENS_JSON **且不是部署自身 profile**）**配置/换 URL** 时必须
+ *    提供自己的 route secret；没有就**明确失败**，绝不回退全局 token；
+ * 1b.（N-2）收紧前已落库的存量隔离路由**可以重新启用**（投递层本来就照投），但走与投递层
+ *    同口径的一次性 warn —— 旧实现是「可停用、不可重新启用」的单向门，误点一次就开不回来；
  * 2. 提供了独立 secret 时，投递的 Authorization 必须用该 secret（而不是全局 token）；
  * 3. 部署自身 profile（HERMES_PROFILE，缺省 default）即使也登记了 Profile token，仍按运维者
  *    本人处理，可以继续用全局 OPENCLAW_HOOK_TOKEN（本部署 default|push_route 就属于这种）；
@@ -30,7 +32,8 @@ import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
  * 「有牙齿」：断言的是真实 HTTP 请求收到的 Authorization 头，而不是函数返回值。
  * - 删掉 notify/index.ts 的准入门槛 → 用例 ② 在「配置必须失败」与「不得有请求」两处失败；
  * - 把 channels.ts 的凭据优先级改成「先全局后 profile」→ 用例 ③ 失败；
- * - 把「部署自身 profile」判断去掉（回到「登记即隔离」）→ 用例 ①/④ 变红。
+ * - 把「部署自身 profile」判断去掉（回到「登记即隔离」）→ 用例 ①/④ 变红；
+ * - 把「重新启用」改回 fail（单向门）→ 用例 ⑨ 变红。
  */
 
 /** master 的 WEB_API_TOKEN（运维者身份，与各 Profile token 不同） */
@@ -375,23 +378,90 @@ describe("OpenClaw 通道凭据边界（P2-17）", () => {
     });
   });
 
-  it("⑨ 收紧前遗留的隔离用户 openclaw 路由：不允许被重新启用（不 requeue 全局 token）", async () => {
+  it("⑨ 收紧前遗留的隔离用户 openclaw 路由：可重新启用 + 同口径一次性 warn + requeue（N-2）", async () => {
     await withOpenclawToken(GLOBAL_HOOK_TOKEN, async () => {
       const env = deploymentEnv();
       try {
+        resetOpenclawGlobalTokenWarnings();
         ensureProfile(env.db, "bestie");
-        // 模拟 P2-17 之前落库的路由：openclaw + 无 profile secret，当前是停用状态
+        // 模拟 P2-17 之前落库的路由：openclaw + 无 profile secret。先在启用状态下发一条通知，
+        // 这样才有「停用期间落 fallback 的待投递行」可以验证 requeue。
         setSetting(env.db, "bestie", "push_route", {
           name: "life-assistant-bestie",
           url: "http://127.0.0.1:9/hooks/legacy",
           platform: null,
-          enabled: false,
+          enabled: true,
           channel: "openclaw",
         });
-        const enabled = tool(env, { action: "route", enabled: true }, "bestie");
-        assert.equal(enabled.isError, true, "隔离用户不得重新启用使用全局 token 的路由");
-        assert.match(text(enabled), /仅部署自身 profile|独立 secret/);
-        assert.equal(getPushRoute(env.db, "bestie")?.enabled, false, "路由必须保持停用");
+        const pub = publishProfile(env.db, env.config, "bestie", {
+          kind: "test.kind",
+          title: "存量路由通知",
+          blocks: {},
+        });
+        // publishProfile 会排一次去抖 drain；测试用显式 drainDue，避免它把行投掉
+        cancelPendingDrain();
+        const row = (): Record<string, unknown> | undefined =>
+          deliveryRows(env).find((r) => r.notification_id === pub.id);
+        assert.equal(row()?.status, "queued");
+
+        // 用户误点「停用」→ drain 把这批待投递打成 fallback
+        const disabled = tool(env, { action: "route", enabled: false }, "bestie");
+        assert.ok(!disabled.isError, text(disabled));
+        env.db.exec("UPDATE deliveries SET next_attempt_at = '2000-01-01T00:00:00.000Z'");
+        await drainDue(env.db, env.config);
+        assert.equal(row()?.status, "fallback", "停用期间的待投递应落 fallback");
+
+        // 重新启用：必须是成功（不再是单向门），且打 1 条与投递层同口径的 warn
+        const lines: string[] = [];
+        const originalError = console.error;
+        console.error = (...args: unknown[]) => {
+          lines.push(args.map((a) => String(a)).join(" "));
+        };
+        let enabledResult: { isError?: boolean; content: { text: string }[] };
+        try {
+          enabledResult = tool(env, { action: "route", enabled: true }, "bestie");
+        } finally {
+          console.error = originalError;
+        }
+        assert.ok(!enabledResult.isError, `存量路由必须能重新启用: ${text(enabledResult)}`);
+        assert.equal(getPushRoute(env.db, "bestie")?.enabled, true, "路由必须真的被启用");
+        assert.equal(row()?.status, "queued", "重新启用必须 requeue 停用期间的 fallback 行");
+        assert.equal(row()?.generation, 1, "重新入队应递增 generation");
+        const warnings = lines.filter(
+          (line) => line.includes('"bestie"') && line.includes("OPENCLAW_HOOK_TOKEN"),
+        );
+        assert.equal(
+          warnings.length,
+          1,
+          `应恰好 1 条一次性 warn，实际 ${warnings.length} 条：${lines.join(" | ")}`,
+        );
+        assert.match(warnings[0] ?? "", /PROFILE_ROUTE_SECRETS_JSON/);
+
+        // 一次性：同一 profile 再启用一次不得重复告警
+        const again: string[] = [];
+        console.error = (...args: unknown[]) => {
+          again.push(args.map((a) => String(a)).join(" "));
+        };
+        try {
+          tool(env, { action: "route", enabled: true }, "bestie");
+        } finally {
+          console.error = originalError;
+        }
+        assert.equal(
+          again.filter((line) => line.includes('"bestie"') && line.includes("OPENCLAW_HOOK_TOKEN"))
+            .length,
+          0,
+          `一次性 warn 不得重复：${again.join(" | ")}`,
+        );
+
+        // 准入门槛仍在：隔离用户「配置新 openclaw 路由」（换 URL）依旧必须自带 secret
+        const reconfigure = tool(
+          env,
+          { action: "route", channel: "openclaw", url: "http://127.0.0.1:9/hooks/other" },
+          "bestie",
+        );
+        assert.equal(reconfigure.isError, true, "新配置仍必须自带 secret");
+        assert.match(text(reconfigure), /仅部署自身 profile|独立 secret/);
       } finally {
         cleanupTestEnv(env);
       }

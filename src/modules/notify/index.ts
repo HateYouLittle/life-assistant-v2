@@ -7,6 +7,7 @@ import {
   findChannel,
   getChannel,
   supportedChannels,
+  warnOpenclawGlobalTokenFallback,
 } from "../../core/channels.js";
 import { pruneJobRuns } from "../../core/jobs.js";
 import { logger } from "../../core/logger.js";
@@ -249,8 +250,11 @@ function notifyToolInner(args: Record<string, unknown>, ctx: ToolContext) {
       });
     }
     if (enabled !== undefined) {
-      // 已经存在的 openclaw 路由（可能是收紧前由隔离用户配置的）不允许被隔离用户重新启用：
-      // 启用会 requeue 停用期间的投递，等于把全局 token 又送出去一次。
+      // N-2：存量隔离用户的 openclaw 路由（收紧前落库、没有自己的 secret）过去在工具层
+      // 一律拒绝重新启用，投递层却照投（只 warn）—— 契约不一致，用户误点一次「停用」
+      // 就再也开不回来。这里与投递层对齐：允许启用，但用**同一个** warn 函数（同文案、
+      // 同去重表）提示它仍走全局 token，建议补 secret 或改通道。
+      // 配置/换 URL 的准入门槛不变（上面 url/channel 分支仍要求新配置自带 secret）。
       const current = getPushRoute(db, profileId);
       if (
         enabled &&
@@ -258,10 +262,7 @@ function notifyToolInner(args: Record<string, unknown>, ctx: ToolContext) {
         routeSecret(ctx.config, profileId) === undefined &&
         !canUseGlobalOpenclawToken(ctx.config, profileId)
       ) {
-        return fail(
-          `profile "${profileId}" 的 openclaw 路由使用 daemon 全局 OPENCLAW_HOOK_TOKEN（仅部署自身 profile ${ctx.config.deploymentProfile} 可用），不能由隔离用户重新启用：` +
-            `请先在 PROFILE_ROUTE_SECRETS_JSON 里为它配置独立 secret，或改用其它通道`,
-        );
+        warnOpenclawGlobalTokenFallback(profileId, process.env.OPENCLAW_HOOK_TOKEN?.trim());
       }
       // 必须走 core 的 setPushRouteEnabled：它在启用时会调 requeueRoute，
       // 把路由停用期间落入 fallback 的投递重新入队。直接 setSetting 会让

@@ -91,6 +91,26 @@ export function resetOpenclawGlobalTokenWarnings(): void {
   warnedGlobalTokenFallback.clear();
 }
 
+/**
+ * 「隔离用户没有自己的 route secret、只能回退 daemon 全局 OPENCLAW_HOOK_TOKEN」的一次性告警。
+ * 投递层（真正投递时）与工具层（notify route 重新启用存量路由时）共用同一份文案与同一张
+ * 去重表 —— 两处各写一份，口径迟早漂移，N-2（工具层拒绝启用、投递层却照投）就是这么来的。
+ * @returns 是否真的打出了告警（已告警过、或没有全局 token 可回退时为 false）
+ */
+export function warnOpenclawGlobalTokenFallback(
+  profileId: string,
+  globalToken: string | undefined,
+): boolean {
+  if (globalToken === undefined || globalToken === "") return false;
+  if (warnedGlobalTokenFallback.has(profileId)) return false;
+  warnedGlobalTokenFallback.add(profileId);
+  logger.warn(
+    `openclaw 投递回退 daemon 全局 OPENCLAW_HOOK_TOKEN：profile "${profileId}" 是隔离用户且没有自己的 route secret` +
+      "（该路由多半早于 P2-17 收紧前配置）——建议在 PROFILE_ROUTE_SECRETS_JSON 里为它补 secret，或改用其它通道",
+  );
+  return true;
+}
+
 /** 内置 webhook 通道：投递协议与 v1 完全兼容（对照旧仓库 src/core/notify-delivery.ts 核对） */
 export const webhookChannel: NotificationChannel = {
   name: "webhook",
@@ -419,18 +439,13 @@ export const openclawChannel: NotificationChannel = {
     }
     // 隔离用户（登记了 Profile token 且非部署自身 profile）没有自己的 secret、实际回退了
     // 全局 token：这通常是收紧前落库的路由。只告警一次（每个 profile），**不**拒绝投递 ——
-    // 拒绝会打断既有推送，需人工确认后再补 secret 或改通道。
+    // 拒绝会打断既有推送，需人工确认后再补 secret 或改通道。工具层「重新启用」走同一个函数。
     if (
       !hasProfileSecret &&
       globalToken !== undefined &&
-      !canUseGlobalOpenclawTokenFromEnv(input.profileId) &&
-      !warnedGlobalTokenFallback.has(input.profileId)
+      !canUseGlobalOpenclawTokenFromEnv(input.profileId)
     ) {
-      warnedGlobalTokenFallback.add(input.profileId);
-      logger.warn(
-        `openclaw 投递回退 daemon 全局 OPENCLAW_HOOK_TOKEN：profile "${input.profileId}" 是隔离用户且没有自己的 route secret` +
-          "（该路由多半早于 P2-17 收紧前配置）——建议在 PROFILE_ROUTE_SECRETS_JSON 里为它补 secret，或改用其它通道",
-      );
+      warnOpenclawGlobalTokenFallback(input.profileId, globalToken);
     }
 
     const headers = {
