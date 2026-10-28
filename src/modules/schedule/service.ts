@@ -1192,12 +1192,25 @@ export interface SkipOutcome {
   occurrenceKey: string;
   /** 跳过这次发生之后，该日程剩余未完成的发生次数（按事件去重） */
   remaining: number;
+  /**
+   * 本次 skip 是否同时把整条日程收尾（status → done）。仅一次性待办为 true：
+   * 它没有「下一次」，跳过这一次就是整条待办结束，回执必须如实说明（见 skipSchedule）。
+   */
+  ended: boolean;
 }
 
 /**
  * 跳过单次发生：把该事件的提醒行（含同事件的兄弟偏移与派生行）置为 cancelled。
- * 只动 occurrence 行、不改 schedules.status —— 系列继续，下一次仍会照常物化/提醒。
+ *
+ * 重复系列只动 occurrence 行、不改 schedules.status —— 系列继续，下一次仍会照常物化/提醒。
  * cancelled 是终态：materialize 的 INSERT OR IGNORE 不会复活它，catchupSweep 只碰 pending。
+ *
+ * 一次性待办（recurrence_json 为空）例外：它没有「下一次」，跳过这一次就是整条待办结束，
+ * 因此同时把 schedules.status 置为 done —— 与 complete 对同形态日程的终态完全一致
+ * （completeSchedule 对 recurrence_json=null 的 todo 同样置 done，不引入第三种半终态）。
+ * 此前只置 occurrence=cancelled 而日程仍 active：物化撞上 cancelled 行永不重建、next_run_at
+ * 变 NULL，该待办永留 active 列表、不再提醒，complete 又报「已结束」，只剩 all=true/delete
+ * 能收尾 —— 而回执只写「已跳过」，与真实状态不符。
  */
 export function skipSchedule(
   db: DatabaseSync,
@@ -1215,6 +1228,9 @@ export function skipSchedule(
     );
   }
   const eventPrefix = eventPrefixOf(target.occurrence_key);
+  // 与 completeSchedule 的终态判定逐字对齐（recurrence_json === null && kind === 'todo'）：
+  // 两条路径必须得出同一个终态，否则「跳过」和「完成」会对同一条待办给出不同收尾。
+  const ended = row.recurrence_json === null && row.kind === "todo";
   let remaining = 0;
   withTransaction(db, () => {
     if (eventPrefix === null) {
@@ -1231,6 +1247,9 @@ export function skipSchedule(
       ).run(id, eventPrefix.length + 1, `${eventPrefix}#`);
     }
     touchSchedule(db, id);
+    if (ended) {
+      db.prepare("UPDATE schedules SET status = 'done' WHERE id = ?").run(id);
+    }
     updateNextRunAt(db, id);
     remaining = countUnfinishedEvents(db, id);
   });
@@ -1238,6 +1257,7 @@ export function skipSchedule(
     row: getSchedule(db, profileId, id) as ScheduleRow,
     occurrenceKey: target.occurrence_key,
     remaining,
+    ended,
   };
 }
 

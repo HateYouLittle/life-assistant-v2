@@ -598,21 +598,34 @@ describe("schedule skip：跳过单次发生，系列继续", () => {
     }
   });
 
-  it("skip 最后一次后日程仍 active；tick/物化不复活该次", async (t) => {
+  it("一次性待办 skip 后即收尾（done）；回执与真实状态一致，tick/物化不复活该次", async (t) => {
     freeze(t, `${D}T17:00:00+08:00`);
     const env = makeTestEnv();
     try {
       const id = addOnce(env, { time: "18:00" });
       const key = `${D}T18:00#0`;
-      const skipped = payload<{ 已跳过: { 剩余未完成: number } }>(
-        tool(env, { action: "skip", id, occurrence_key: key }),
-      );
+      const skipped = payload<{
+        已跳过: { 剩余未完成: number; 状态: string; 已结束该待办: boolean };
+      }>(tool(env, { action: "skip", id, occurrence_key: key }));
       assert.equal(skipped.已跳过.剩余未完成, 0);
-      assert.equal(scheduleStatus(env, id), "active", "一次性日程 skip 后也不得自动结束");
+      // P2-2 新契约：一次性待办没有「下一次」，skip 跳过这一次即整条待办结束（与 complete 的
+      // 终态一致：都是 done，不存在「active 但永不提醒」的半终态）。
+      assert.equal(
+        scheduleStatus(env, id),
+        "done",
+        "一次性待办 skip 后必须收尾，不能永留 active 且不再提醒",
+      );
+      assert.equal(skipped.已跳过.状态, "done", "回执必须如实反映终态");
+      assert.equal(skipped.已跳过.已结束该待办, true);
 
       await tickSchedules(T(`${D}T18:00:05+08:00`), envServices(env), env.db);
       assert.equal(occurrenceStatus(env, id, key), "cancelled", "物化不得复活已跳过的一次");
       assert.equal(reminders(env).length, 0);
+      // 已收尾后 complete 必须明确拒绝，而不是又报一次「已完成」（避免二次收尾的混淆回执）
+      const again = tool(env, { action: "complete", id, occurrence_key: key }) as {
+        isError?: boolean;
+      };
+      assert.equal(again.isError, true, "已收尾的待办再次 complete 必须明确报错");
     } finally {
       cleanupTestEnv(env);
     }
