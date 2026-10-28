@@ -1319,7 +1319,10 @@ describe("schedule update：rewind 只作用于进行中的最近事件", () => 
     }
   });
 
-  it("已全部提醒的事件：新增偏移不会为过去的事件补发", () => {
+  it("已全部提醒的事件：新增偏移不会为过去的事件补发", (t) => {
+    // 冻结在固定时刻：`now().minus({hours:2})` 在 00:00-02:00 之间会落到昨天，
+    // 而新契约下「一次性 + start_date < 今天」是明确报错（P2-3），用例会变成时段相关的偶发失败。
+    t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-22T09:00:00+08:00") });
     const env = makeTestEnv();
     try {
       const past = now().minus({ hours: 2 });
