@@ -1,4 +1,5 @@
 import { createHmac } from "node:crypto";
+import { canUseGlobalOpenclawTokenFromEnv } from "../config.js";
 import { logger } from "./logger.js";
 import { parseSmtpRouteUrl, type SmtpRoute, sendSmtpMail } from "./smtp.js";
 
@@ -14,6 +15,12 @@ import { parseSmtpRouteUrl, type SmtpRoute, sendSmtpMail } from "./smtp.js";
  * telegram（Bot API，token+chat_id 在 URL 里）、smtp（邮件，协议实现在 core/smtp.ts）。
  * webhook 与 openclaw 限制回环地址；log 只写本地日志；其余通道投递到外部服务，
  * 因此**不**做 webhook 那样的回环限制 —— 它们不带 secret，URL 本身就是凭据。
+ *
+ * 凭据边界：webhook 与 openclaw 都会把凭据发到「用户自己填的回环 URL」，因此都不允许
+ * 借用别人的凭据 —— webhook 只认 PROFILE_ROUTE_SECRETS_JSON[profile]（requiresSecret），
+ * openclaw 优先用同一个 profile secret，只有**部署自身 profile（HERMES_PROFILE）**配置的路由
+ * 才回退 daemon 全局 OPENCLAW_HOOK_TOKEN（回退准入由 config.ts 的
+ * canUseGlobalOpenclawToken 三档口径判定），且路径收紧到 Gateway 的 /hooks/ 前缀。
  */
 
 export const EVENT_TYPE = "life_assistant.reminder";
@@ -40,7 +47,10 @@ export interface ChannelDeliveryInput {
   requestId: string;
   generation: number;
   route: ChannelRoute;
-  /** 仅 requiresSecret 的通道会有值 */
+  /**
+   * webhook 必需（HMAC V2 签名密钥）；openclaw 可选 —— 有值时作为 Bearer token 优先于
+   * daemon 全局 OPENCLAW_HOOK_TOKEN 使用（非 master profile 的 openclaw 路由必须走这条）。
+   */
   secret?: string;
 }
 
@@ -69,6 +79,17 @@ export interface NotificationChannel {
 }
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
+
+/**
+ * 已就「隔离用户回退全局 openclaw token」告警过的 profile：投递会随退避阶梯重试，
+ * 每轮都告警会把日志刷爆，故每个 profile 只打一次（进程内）。
+ */
+const warnedGlobalTokenFallback = new Set<string>();
+
+/** 测试用：清空一次性告警去重表（模块级状态，跨用例会互相影响） */
+export function resetOpenclawGlobalTokenWarnings(): void {
+  warnedGlobalTokenFallback.clear();
+}
 
 /** 内置 webhook 通道：投递协议与 v1 完全兼容（对照旧仓库 src/core/notify-delivery.ts 核对） */
 export const webhookChannel: NotificationChannel = {
@@ -289,9 +310,18 @@ async function postDelivery(
 }
 
 /**
- * OpenClaw Gateway hooks 通道：route.url 是本机 Gateway 的 hook 地址。
- * hooks.token 不进入路由或数据库，每次投递从 daemon 环境读取；缺失时只终结本次投递，
- * 不影响 daemon 启动，也不改变 webhook 的 HMAC V2 协议。
+ * OpenClaw Gateway hooks 通道：route.url 是本机 Gateway 的 hook 地址，路径限定在
+ * `/hooks/<name>`（回环地址上还有大量别的本地服务，允许任意路径等于把 hooks token
+ * 交给任意本地服务的配置面）。
+ *
+ * 凭据优先级（P2-17 的凭据边界）：
+ * 1. profile 自己的 `PROFILE_ROUTE_SECRETS_JSON[profile]`（有值时用它）；
+ * 2. 缺省才回退 daemon 环境里的全局 `OPENCLAW_HOOK_TOKEN` —— 该 token 属于运维者，
+ *    只有部署自身 profile（HERMES_PROFILE）或未登记独立 token 的 profile 能回退；
+ *    隔离用户（登记了 Profile token 且非部署自身 profile）的配置入口会要求它先提供
+ *    独立 secret，不会把全局 token 投到它自己填的回环地址。
+ * token 不进入路由或数据库，每次投递时读取；缺失时只终结本次投递，不影响 daemon 启动，
+ * 也不改变 webhook 的 HMAC V2 协议。
  */
 /**
  * 直连 /hooks/agent 的目标：agent/channel/to/accountId 写在路由 URL 的 query 上。
@@ -332,6 +362,9 @@ function openclawDirectMessage(input: ChannelDeliveryInput): string {
 
 export const openclawChannel: NotificationChannel = {
   name: "openclaw",
+  // 凭据可以来自 profile secret，也可以来自 master 的全局 OPENCLAW_HOOK_TOKEN：
+  // 后者在核心层（core/notify.ts 只检查 requiresSecret）看不见，所以「缺凭据不入队」
+  // 不能交给核心层判定，改由 notify route 的 master 口径在配置时把关（P2-17）。
   requiresSecret: false,
   requiresUrl: true,
 
@@ -355,19 +388,49 @@ export const openclawChannel: NotificationChannel = {
         `openclaw URL 仅接受 127.0.0.1 / localhost / [::1] 主机名，收到: ${hostname}`,
       );
     }
+    // 路径收紧：只接受 Gateway 的 hook 前缀。去掉尾部斜杠后必须以 /hooks/<name> 开头，
+    // 裸 `/hooks` 或 `/hooks/`（没有 hook 名）同样拒绝 —— 它们只会得到 Gateway 的 404，
+    // 却会让用户以为「已配置」。
+    const path = parsed.pathname.replace(/\/+$/, "");
+    if (!path.startsWith("/hooks/")) {
+      throw new Error(
+        `openclaw URL 路径必须是 /hooks/<name>（如 http://127.0.0.1:18789/hooks/life-default 或 /hooks/agent?channel=&to=），收到: ${parsed.pathname}`,
+      );
+    }
     const serialized = parsed.toString();
     // 与 bark/ntfy 一样只在无 query/hash 时去尾斜杠，避免改动 query/hash 的内容。
     return parsed.search === "" && parsed.hash === "" ? serialized.replace(/\/+$/, "") : serialized;
   },
 
   async deliver(input: ChannelDeliveryInput): Promise<ChannelOutcome> {
-    const token = process.env.OPENCLAW_HOOK_TOKEN?.trim();
+    // 凭据来源：profile 自己的 secret 优先（非 master 路由必须走这条，绝不回退全局 token），
+    // 只有 master 配置的路由（没有 profile secret）才用 daemon 的全局 OPENCLAW_HOOK_TOKEN。
+    const profileSecret = input.secret?.trim();
+    const hasProfileSecret = profileSecret !== undefined && profileSecret !== "";
+    const globalToken = process.env.OPENCLAW_HOOK_TOKEN?.trim();
+    const token = hasProfileSecret ? profileSecret : globalToken;
     if (!token) {
       return {
         status: "terminal_failure",
         error:
-          "openclaw 通道缺少 OPENCLAW_HOOK_TOKEN（在 daemon 的 .env 里配置 OpenClaw hooks.token）",
+          `openclaw 通道缺少凭据：PROFILE_ROUTE_SECRETS_JSON 中没有 profile "${input.profileId}" 的 secret，` +
+          "daemon 也未配置 OPENCLAW_HOOK_TOKEN（部署自身 profile 的路由在 daemon 的 .env 里配置 OpenClaw hooks.token）",
       };
+    }
+    // 隔离用户（登记了 Profile token 且非部署自身 profile）没有自己的 secret、实际回退了
+    // 全局 token：这通常是收紧前落库的路由。只告警一次（每个 profile），**不**拒绝投递 ——
+    // 拒绝会打断既有推送，需人工确认后再补 secret 或改通道。
+    if (
+      !hasProfileSecret &&
+      globalToken !== undefined &&
+      !canUseGlobalOpenclawTokenFromEnv(input.profileId) &&
+      !warnedGlobalTokenFallback.has(input.profileId)
+    ) {
+      warnedGlobalTokenFallback.add(input.profileId);
+      logger.warn(
+        `openclaw 投递回退 daemon 全局 OPENCLAW_HOOK_TOKEN：profile "${input.profileId}" 是隔离用户且没有自己的 route secret` +
+          "（该路由多半早于 P2-17 收紧前配置）——建议在 PROFILE_ROUTE_SECRETS_JSON 里为它补 secret，或改用其它通道",
+      );
     }
 
     const headers = {

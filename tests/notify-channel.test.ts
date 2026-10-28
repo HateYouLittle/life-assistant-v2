@@ -36,6 +36,8 @@ interface Captured {
 function withHookServer(
   respond: (req: IncomingMessage, res: ServerResponse, body: string) => void,
   fn: (url: string, captured: Captured[], server: Server) => Promise<void>,
+  // openclaw 的路由路径被收紧到 /hooks/<name>（P2-17）；webhook 用例继续用缺省 /hook
+  path = "/hook",
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const captured: Captured[] = [];
@@ -52,7 +54,7 @@ function withHookServer(
     server.listen(0, "127.0.0.1", () => {
       const addr = server.address();
       assert.ok(addr !== null && typeof addr === "object");
-      const url = `http://127.0.0.1:${addr.port}/hook`;
+      const url = `http://127.0.0.1:${addr.port}${path}`;
       fn(url, captured, server)
         .then(() => server.close(() => resolve()))
         .catch((e) => server.close(() => reject(e)));
@@ -442,6 +444,27 @@ describe("OpenClaw 通道", () => {
     ]) {
       assert.throws(() => openclawChannel.validateRoute({ url }), /openclaw/);
     }
+    // P2-17：路径收紧到 Gateway 的 /hooks/<name>，任意回环路径不再接受
+    for (const url of [
+      "http://127.0.0.1:18789/hook",
+      "http://127.0.0.1:18789/",
+      "http://127.0.0.1:18789/hooks",
+      "http://127.0.0.1:18789/hooks/",
+      "http://127.0.0.1:18789/hooksx/life-default",
+    ]) {
+      assert.throws(
+        () => openclawChannel.validateRoute({ url }),
+        /\/hooks\//,
+        `非 /hooks/<name> 路径必须拒绝: ${url}`,
+      );
+    }
+    assert.equal(
+      openclawChannel.validateRoute({
+        url: "http://127.0.0.1:18789/hooks/agent?channel=qqbot&to=qqbot%3Ac2c%3Ax",
+      }),
+      "http://127.0.0.1:18789/hooks/agent?channel=qqbot&to=qqbot%3Ac2c%3Ax",
+      "直连 /hooks/agent 形态必须保留（多账号通道）",
+    );
   });
 
   it("deliver 发送 Bearer token、幂等头与通知 JSON", async () => {
@@ -486,6 +509,7 @@ describe("OpenClaw 通道", () => {
             createdAt: "2026-10-24T00:00:00.000Z",
           });
         },
+        "/hooks/life-default",
       );
     });
   });
@@ -507,12 +531,13 @@ describe("OpenClaw 通道", () => {
             assert.equal(outcome.status, expected, `HTTP ${status}`);
             if (outcome.status !== "sent") assert.match(outcome.error, /^openclaw 返回 HTTP/);
           },
+          "/hooks/life-default",
         );
       }
 
       const port = await unusedPort();
       const outcome = await openclawChannel.deliver(
-        openclawDeliveryInput(`http://127.0.0.1:${port}/hook`),
+        openclawDeliveryInput(`http://127.0.0.1:${port}/hooks/life-default`),
       );
       assert.equal(outcome.status, "transport_failure");
       if (outcome.status === "transport_failure") {
@@ -521,21 +546,25 @@ describe("OpenClaw 通道", () => {
     });
   });
 
-  it("缺少 OPENCLAW_HOOK_TOKEN 时终结本次投递并给出中文配置提示", async () => {
+  it("缺少 profile secret 与 OPENCLAW_HOOK_TOKEN 时终结本次投递并给出中文配置提示", async () => {
     await withOpenclawToken(undefined, async () => {
       const outcome = await openclawChannel.deliver(
-        openclawDeliveryInput("http://127.0.0.1:1/hook"),
+        openclawDeliveryInput("http://127.0.0.1:1/hooks/life-default"),
       );
+      // P2-17：消息必须点明两个凭据来源（profile secret 与部署自身 profile 的全局 token），
+      // 不能只说「缺 OPENCLAW_HOOK_TOKEN」—— 否则隔离用户不知道该配哪一个
       assert.deepEqual(outcome, {
         status: "terminal_failure",
         error:
-          "openclaw 通道缺少 OPENCLAW_HOOK_TOKEN（在 daemon 的 .env 里配置 OpenClaw hooks.token）",
+          'openclaw 通道缺少凭据：PROFILE_ROUTE_SECRETS_JSON 中没有 profile "default" 的 secret，' +
+          "daemon 也未配置 OPENCLAW_HOOK_TOKEN（部署自身 profile 的路由在 daemon 的 .env 里配置 OpenClaw hooks.token）",
       });
     });
   });
 
-  it("notify route 接受 openclaw，outbox 无 profile secret 也能按 Profile 投递", async () => {
+  it("notify route 接受 openclaw（未登记独立 token 的 profile），outbox 无 profile secret 也能按 Profile 投递", async () => {
     await withOpenclawToken("openclaw-test-token", async () => {
+      // 没有 PROFILE_TOKENS_JSON = 回环零配置：没有独立用户身份，所有 profile 按 master 代表
       const env = makeTestEnv();
       try {
         await withHookServer(
@@ -545,7 +574,10 @@ describe("OpenClaw 通道", () => {
           },
           async (url, captured) => {
             const configured = tool(env, { action: "route", channel: "openclaw", url });
-            assert.ok(!configured.isError, "openclaw 不应要求 PROFILE_ROUTE_SECRETS_JSON");
+            assert.ok(
+              !configured.isError,
+              "master 配置 openclaw 不应要求 PROFILE_ROUTE_SECRETS_JSON",
+            );
             const pub = publishProfile(env.db, env.config, "default", {
               kind: "test.kind",
               title: "OpenClaw outbox",
@@ -559,7 +591,10 @@ describe("OpenClaw 通道", () => {
             assert.ok(row !== undefined);
             assert.equal(row.status, "sent", row.last_error ?? "");
             assert.equal(captured.length, 1);
+            // master 路由仍用全局 OPENCLAW_HOOK_TOKEN（既有行为不回归）
+            assert.equal(captured[0]?.headers.authorization, "Bearer openclaw-test-token");
           },
+          "/hooks/life-default",
         );
       } finally {
         cleanupTestEnv(env);

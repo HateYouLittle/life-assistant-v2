@@ -65,6 +65,12 @@ export interface ResolvedConfig {
   qweatherAuth?: QweatherAuth;
   defaultCity: string;
   profileRouteSecrets: Record<string, string>;
+  /**
+   * 部署自身 profile（HERMES_PROFILE，缺省 "default"）：daemon 自己代表的那个 Profile。
+   * 它由运维者持有，即使同时登记在 PROFILE_TOKENS_JSON 里也仍按 master 代表处理 ——
+   * openclaw 通道的全局 token 准入（P2-17）靠它区分「运维者本人」与「隔离用户」。
+   */
+  deploymentProfile: string;
   /** OpenClaw Gateway hooks token（OPENCLAW_HOOK_TOKEN）；仅 openclaw 通道投递时使用。 */
   openclawHookToken?: string;
   dailyBriefCron: string;
@@ -400,6 +406,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
       "PROFILE_TOKENS_JSON 已配置但没有 WEB_API_TOKEN：仅回环部署可用，看板/运维接口将无 master 凭据",
     );
   }
+  // 部署自身 profile：缺省 default（未设置时不能拒绝启动，否则既有零配置部署会挂）。
+  // 非空但非法的值仍走 parseProfileId 的严格校验，与 HERMES_PROFILE 其它用途同口径。
+  const deploymentProfile = parseProfileId(
+    env.HERMES_PROFILE?.trim() || DEFAULT_DEPLOYMENT_PROFILE,
+    "HERMES_PROFILE",
+  );
 
   // 每身份每分钟请求上限：默认 120 次；0 表示关闭（本地调试用）。
   const rateLimitRaw = env.RATE_LIMIT_PER_MINUTE?.trim() || "120";
@@ -535,6 +547,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
     qweatherAuth,
     defaultCity: env.DEFAULT_CITY?.trim() || "北京",
     profileRouteSecrets: parseSecrets(env.PROFILE_ROUTE_SECRETS_JSON),
+    deploymentProfile,
     openclawHookToken: env.OPENCLAW_HOOK_TOKEN?.trim() || undefined,
     dailyBriefCron,
     alertWatchCron,
@@ -574,4 +587,72 @@ export function bindHost(host: string): string {
 export function urlHost(host: string): string {
   if (host === "" || host.startsWith("[")) return host;
   return host.includes(":") ? `[${host}]` : host;
+}
+
+/** 部署自身 profile 的缺省名（HERMES_PROFILE 未设置时） */
+export const DEFAULT_DEPLOYMENT_PROFILE = "default";
+
+/**
+ * openclaw 全局 hooks token 的准入口径（P2-17 的三档判定）：
+ * 1. `profileId` 是**部署自身 profile**（HERMES_PROFILE）→ 可用（运维者本人，master 代表）；
+ * 2. 其它**登记在 PROFILE_TOKENS_JSON** 的 profile → 不可用（真正的隔离用户，必须提供自己的
+ *    route secret，否则不得借用 master 的全局 token）；
+ * 3. **未登记独立 token** 的 profile → 可用（PROFILE_TOKENS_JSON 为空或未含该 profile：
+ *    回环零配置 / 仅 master 部署没有独立用户身份，保持既有行为）。
+ *
+ * 判定内核只有这一份：ownProfile / profileHasOwnToken 由调用方从配置或环境快照取出，
+ * 避免「配置层」与「投递层」各写一套口径而漂移。
+ */
+export function openclawCanUseGlobalToken(
+  profileId: string,
+  ownProfile: string,
+  profileHasOwnToken: boolean,
+): boolean {
+  return profileId === ownProfile || !profileHasOwnToken;
+}
+
+/** ResolvedConfig 版本：notify 工具层的 openclaw 准入门槛用这个 */
+export function canUseGlobalOpenclawToken(config: ResolvedConfig, profileId: string): boolean {
+  return openclawCanUseGlobalToken(
+    profileId,
+    config.deploymentProfile,
+    // Object.hasOwn：profile 名允许 "constructor" 这类原型键，直接取值会命中 Object.prototype
+    Object.hasOwn(config.profileTokens, profileId),
+  );
+}
+
+/** HERMES_PROFILE 缺省/空白 → 部署自身 profile 缺省名；其余原样（非法值在启动时已拒绝） */
+function deploymentProfileFromEnv(env: NodeJS.ProcessEnv): string {
+  const raw = env.HERMES_PROFILE?.trim();
+  return raw === undefined || raw === "" ? DEFAULT_DEPLOYMENT_PROFILE : raw;
+}
+
+/** 环境快照里的 PROFILE_TOKENS_JSON 是否登记了该 profile（解析失败按「未登记」处理） */
+function profileHasOwnTokenInEnv(profileId: string, env: NodeJS.ProcessEnv): boolean {
+  const raw = env.PROFILE_TOKENS_JSON;
+  if (raw === undefined || raw.trim() === "") return false;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    return Object.hasOwn(parsed as Record<string, unknown>, profileId);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 环境快照版本：`src/core/channels.ts` 的投递路径拿不到 ResolvedConfig（ChannelDeliveryInput
+ * 只有 profileId/secret/route），只能按 daemon 进程环境判定 —— 仅用于「隔离用户回退全局
+ * token」的一次性告警，准入拦截仍以 canUseGlobalOpenclawToken(config, …) 为准。
+ * 解析失败/缺失一律按「可用全局 token」处理：宁可少告警，也不把 master 的投递误报成越权。
+ */
+export function canUseGlobalOpenclawTokenFromEnv(
+  profileId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return openclawCanUseGlobalToken(
+    profileId,
+    deploymentProfileFromEnv(env),
+    profileHasOwnTokenInEnv(profileId, env),
+  );
 }
