@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { DateTime } from "luxon";
 import type { DatabaseSync } from "node:sqlite";
 import { now, nowIso, todayIso, localToInstant, instantToLocalDate, TZ } from "../../time.js";
-import { dayType, ensureYears } from "../../core/holiday.js";
+import { dayType, ensureYears, holidayYearsNeedingData, type DayType } from "../../core/holiday.js";
 import {
   collapseLunarInterval,
   describeRecurrence,
@@ -102,6 +102,122 @@ export function takeYearsNeedingBackfill(): number[] {
   const years = [...yearsNeedingBackfill].sort((a, b) => a - b);
   yearsNeedingBackfill.clear();
   return years;
+}
+
+/**
+ * workday/holiday 过滤是否命中该 dayType。**单一判定**：物化与跨年复核共用，
+ * 避免两处各写一份 isWork/isOff 后漂移（只改一处就会出现「复核放过、物化拒绝」的矛盾）。
+ */
+function workdayFilterMatches(filter: WorkdayFilter, cls: DayType): boolean {
+  const isWork = cls === "workday" || cls === "weekday";
+  const isOff = cls === "holiday" || cls === "weekend";
+  return filter === "workday" ? isWork : isOff;
+}
+
+/**
+ * 已复核过的「下一年度」集合（进程内）。跨年复核每进程每个年度只跑一次：
+ * 数据就绪后已物化行不会自动重判，但复核本身要遍历 pending 行，不能每分钟跑。
+ */
+const crossYearRechecked = new Set<number>();
+
+/**
+ * 清空跨年复核的触发闸。仅供测试：同一进程内多个用例各自独立验证复核行为，
+ * 否则先跑过的用例会把「下一年度」占住，后面的用例看不到复核（与
+ * takeYearsNeedingBackfill 同类的测试可见出口）。
+ */
+export function resetCrossYearRecheck(): void {
+  crossYearRechecked.clear();
+}
+
+/**
+ * P2-5 / C-06 ②：跨年区间（12-25~12-31）的权威分类来自下一年度文件。该文件到达**前**
+ * 已按星期兜底物化的 pending 行不会自动重判（「仅工作日」漏提醒 / 「仅节假日」误提醒），
+ * 这里在数据就绪后按新 dayType 复核一次：
+ *
+ * - 新分类不再匹配过滤条件 → 置 cancelled（不复活；已 notified 的行无法撤回，不动它）；
+ * - 新分类匹配但该日期缺失（旧兜底把它跳过、游标已推过它）→ 回退重物化补回。
+ *
+ * 只动 `workday_filter != 'any'` 的 active 日程，只碰 pending 行；重物化走 INSERT OR IGNORE，
+ * 不会产生重复提醒。锚点取**今天**：过去的日期不补（避免生成一条早已过期的提醒），
+ * 未来的日期照常补。返回实际复核过的日程数。
+ */
+export function recheckCrossYearOccurrences(db: DatabaseSync, updatedYears: number[]): number {
+  const windows = updatedYears
+    .filter((year) => Number.isInteger(year))
+    .map((year) => ({ from: `${year - 1}-12-25`, to: `${year - 1}-12-31` }));
+  if (windows.length === 0) return 0;
+  const rows = db
+    .prepare("SELECT * FROM schedules WHERE status = 'active' AND workday_filter != 'any'")
+    .all() as unknown as ScheduleRow[];
+  const today = todayIso();
+  let touched = 0;
+  for (const row of rows) {
+    try {
+      const pending = db
+        .prepare(
+          "SELECT occurrence_key, event_at FROM occurrences WHERE schedule_id = ? AND status = 'pending'",
+        )
+        .all(row.id) as { occurrence_key: string; event_at: string }[];
+      let cancelled = 0;
+      let missing = false;
+      for (const win of windows) {
+        const from = DateTime.fromISO(win.from, { zone: TZ });
+        const toExclusive = DateTime.fromISO(win.to, { zone: TZ }).plus({ days: 1 });
+        for (const occ of pending) {
+          if (!isNormalReminderKey(occ.occurrence_key)) continue; // 派生行的有效性由 fireDue 复核
+          const at = DateTime.fromISO(occ.event_at, { zone: TZ });
+          if (!at.isValid || at < from || at >= toExclusive) continue;
+          const dateISO = instantToLocalDate(occ.event_at);
+          const cls = dayType(db, dateISO);
+          if (cls === "unknown") continue; // 仍不权威：留着，下次数据齐了再复核
+          if (!workdayFilterMatches(row.workday_filter, cls)) {
+            db.prepare(
+              "UPDATE occurrences SET status = 'cancelled' WHERE schedule_id = ? AND occurrence_key = ? AND status = 'pending'",
+            ).run(row.id, occ.occurrence_key);
+            cancelled += 1;
+          }
+        }
+        // 现在应当匹配、却没有任何 occurrence 的日期：旧兜底误判把它跳过了，
+        // 而物化游标已经推过它（回退重物化是唯一的补回方式）。
+        for (let d = from; d <= DateTime.fromISO(win.to, { zone: TZ }); d = d.plus({ days: 1 })) {
+          const dateISO = d.toISODate();
+          if (dateISO === null || dateISO < today) continue; // 过去不补（不生成过期提醒）
+          const cls = dayType(db, dateISO);
+          if (cls === "unknown" || !workdayFilterMatches(row.workday_filter, cls)) continue;
+          const existingRow = db
+            .prepare("SELECT 1 FROM occurrences WHERE schedule_id = ? AND occurrence_key = ?")
+            .get(row.id, `${dateISO}T${row.time}#0`);
+          if (existingRow === undefined) missing = true;
+        }
+      }
+      if (cancelled === 0 && !missing) continue;
+      materializeSchedule(db, row, { rewind: true, rewindFrom: today });
+      updateNextRunAt(db, row.id);
+      touched += 1;
+      logger.info(
+        `跨年节假日数据就绪后复核日程「${row.title}」(${row.id})：作废 ${cancelled} 条误判提醒${missing ? "，并回退重物化补回被跳过的日期" : ""}`,
+      );
+    } catch (e) {
+      // 逐行隔离：一条脏数据不能带走整批复核（与 tickSchedules 的物化循环同口径）
+      logger.warn(`跨年节假日复核失败（跳过该日程）: ${row.id}: ${errorMessage(e)}`);
+    }
+  }
+  return touched;
+}
+
+/**
+ * 跨年复核的进程内触发闸：每个「下一年度」只跑一次，且必须等它 status='ready'
+ * （数据没到就留到下次 tick，不空转）。返回本次复核的日程数。
+ */
+function recheckCrossYearOnce(db: DatabaseSync): number {
+  const nextYear = now().year + 1;
+  if (crossYearRechecked.has(nextYear)) return 0;
+  const meta = db.prepare("SELECT status FROM cn_holiday_years WHERE year = ?").get(nextYear) as
+    | { status: string }
+    | undefined;
+  if (meta?.status !== "ready") return 0;
+  crossYearRechecked.add(nextYear);
+  return recheckCrossYearOccurrences(db, [nextYear]);
 }
 
 export function newShortId(): string {
@@ -604,24 +720,21 @@ export function materializeSchedule(
     if (row.workday_filter !== "any") {
       const cls = dayType(db, dateISO);
       if (cls === "unknown") {
-        // 保守暂停语义保留，但必须留痕且不能每分钟刷屏；同时登记该年份待补齐
-        yearsNeedingBackfill.add(Number(dateISO.slice(0, 4)));
+        // 保守暂停语义保留，但必须留痕且不能每分钟刷屏；同时登记**权威所需**的年份待补齐
+        // （跨年区间 12-25~12-31 需要下一年度文件，只登记日期所属年份会去补一个已 ready 的
+        // 年份，次年数据永远抓不回来 → 该日程被永久暂停，与 P2-3 同类的静默失败）。
+        const needed = holidayYearsNeedingData(db, dateISO);
+        for (const y of needed) yearsNeedingBackfill.add(y);
         if (pausedWarned.get(row.id) !== dateISO) {
           pausedWarned.set(row.id, dateISO);
           logger.warn(
-            `日程「${row.title}」的 ${row.workday_filter} 过滤因 ${dateISO.slice(0, 4)} 年节假日数据未就绪而暂停`,
+            `日程「${row.title}」的 ${row.workday_filter} 过滤因 ${needed.join("/")} 年节假日数据未就绪而暂停`,
           );
         }
         break;
       }
       pausedWarned.delete(row.id);
-      const isWork = cls === "workday" || cls === "weekday";
-      const isOff = cls === "holiday" || cls === "weekend";
-      if (row.workday_filter === "workday" && !isWork) {
-        after = date;
-        continue;
-      }
-      if (row.workday_filter === "holiday" && !isOff) {
+      if (!workdayFilterMatches(row.workday_filter, cls)) {
         after = date;
         continue;
       }
@@ -1971,13 +2084,22 @@ export async function tickSchedules(
   // 物化撞到的未就绪年份：收尾时尝试补齐。ensureYears 自带 6h 冷却
   // （cn_holiday_years.status='failed' + last_attempt_at），失败不会每分钟重试。
   const years = takeYearsNeedingBackfill();
-  if (years.length === 0) return;
-  try {
-    const result = await ensureYears(db, years, fetchYear);
-    if (result.failed.length > 0) {
-      logger.warn(`日程物化补齐节假日数据失败: ${result.failed.join("; ")}`);
+  if (years.length > 0) {
+    try {
+      const result = await ensureYears(db, years, fetchYear);
+      if (result.failed.length > 0) {
+        logger.warn(`日程物化补齐节假日数据失败: ${result.failed.join("; ")}`);
+      }
+    } catch (e) {
+      logger.warn(`日程物化补齐节假日数据异常: ${errorMessage(e)}`);
     }
+  }
+  // P2-5 / C-06 ②：跨年区间（12-25~12-31）的权威分类来自下一年度文件。数据就绪后，
+  // 把此前按星期兜底物化的 pending 行按新 dayType 复核一次（每进程每个年度一次）。
+  // 放在 ensureYears 之后：本轮刚抓回来的数据必须参与复核，否则要等下一分钟。
+  try {
+    recheckCrossYearOnce(db);
   } catch (e) {
-    logger.warn(`日程物化补齐节假日数据异常: ${errorMessage(e)}`);
+    logger.warn(`跨年节假日复核异常: ${errorMessage(e)}`);
   }
 }
