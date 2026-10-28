@@ -6,6 +6,7 @@ import {
   ensureYears,
   holidayDayName,
   holidayPeriods,
+  holidayYearsNeedingData,
   holidayYearsReady,
   nextHolidayPeriod,
   requiredYears,
@@ -260,7 +261,14 @@ export async function holidayTool(
       if (cls === "workday") return ok(`${date}：上班日（调休补班）`);
       if (cls === "weekend") return ok(`${date}：休息日（周末）`);
       if (cls === "weekday") return ok(`${date}：上班日（工作日）`);
-      return ok(`${date}：未知（${date.slice(0, 4)} 年节假日数据未就绪，不猜测）`);
+      // 未知时点名**真正缺失的年度**（P2-5 的 holidayYearsNeedingData 是单一来源）：
+      // 跨年区间（12-25~12-31）的权威分类来自下一年度文件，此时日期所属年份往往已 ready，
+      // 按 `date.slice(0,4)` 报年份会指向一个并不缺失的项，用户/agent 无从判断该补哪一年。
+      const missingYears = holidayYearsNeedingData(db, date);
+      if (missingYears.length === 0) {
+        return ok(`${date}：未知（${date.slice(0, 4)} 年节假日数据未就绪，不猜测）`);
+      }
+      return ok(`${date}：未知（${missingYears.join("/")} 年节假日数据未就绪，不猜测）`);
     }
     // 显式兜底（P2-25）：未知分支绝不落入 is_workday，文案前缀与其它工具一致
     default:

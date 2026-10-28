@@ -2,12 +2,16 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { importYear } from "../src/core/holiday.js";
 import { holidayTool } from "../src/modules/holiday/index.js";
+import { todayIso } from "../src/time.js";
 import { cleanupTestEnv, makeTestEnv } from "./helpers.js";
 
 /**
  * P2-20② + P2-25 回归：holiday 的 action 规范名 / view 兼容别名，
  * 以及**未知分支的显式兜底**（此前没有 default，未知 view 会落入 is_workday，
  * 报出「date 需为 YYYY-MM-DD 格式」这种把未知分发误报成参数错误的信息）。
+ *
+ * 另含 P2-25 跨模块文案补充：未知时点名的年度必须是**真正缺失**的年度（P2-5 的
+ * 跨年区间规则下，12-25~12-31 的权威数据在下一年度文件里，日期所属年份往往已 ready）。
  */
 
 function ctxOf(env: ReturnType<typeof makeTestEnv>) {
@@ -158,6 +162,45 @@ describe("P2-20② holiday action/view 兼容", () => {
       assert.match(textOf(month), /2026-01-01/);
       const workday = await holidayTool({ view: "is_workday", date: "2026-01-01" }, ctxOf(env));
       assert.match(textOf(workday), /休息日（法定节假日：元旦）/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
+describe("P2-25 补充：未知文案点名真正缺失的年度", () => {
+  it("当年 ready、下一年度未 ready：12-30 的未知文案点名下一年度", async () => {
+    const env = makeTestEnv();
+    try {
+      // 只导入「日期所属年份」，下一年度（跨年区间的权威来源）未导入
+      const year = Number(todayIso().slice(0, 4));
+      importYear(
+        env.db,
+        { year, days: [{ name: "元旦", date: `${year}-01-01`, isOffDay: true }] },
+        "test",
+      );
+      const date = `${year}-12-30`; // 跨年归档区间（12-25~12-31）
+      const result = await holidayTool({ action: "is_workday", date }, ctxOf(env));
+      assert.equal(isErrorOf(result), false, textOf(result));
+      // 真正缺的是下一年度：文案必须点名它，而不是已经 ready 的当年
+      assert.match(textOf(result), new RegExp(`未知（${year + 1} 年节假日数据未就绪`));
+      assert.doesNotMatch(textOf(result), new RegExp(`未知（${year} 年`));
+      // 既有 view 别名走同一条路径
+      const viaView = await holidayTool({ view: "is_workday", date }, ctxOf(env));
+      assert.equal(textOf(viaView), textOf(result));
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("两年都缺时点名两个年度（单一来源，不重复也不遗漏）", async () => {
+    const env = makeTestEnv();
+    try {
+      const year = Number(todayIso().slice(0, 4));
+      // 当年与下一年度都未 ready：跨年区间的所需年度是 [year, year+1]
+      const result = await holidayTool({ action: "is_workday", date: `${year}-12-30` }, ctxOf(env));
+      assert.equal(isErrorOf(result), false, textOf(result));
+      assert.match(textOf(result), new RegExp(`未知（${year}/${year + 1} 年节假日数据未就绪`));
     } finally {
       cleanupTestEnv(env);
     }
