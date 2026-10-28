@@ -1,3 +1,8 @@
+// 副作用 import：模块注册入口（不是模块内部实现）。写接口经 registry 的 invokeTool 调工具，
+// 因此本文件所在的进程必须先注册模块 —— daemon 也 import 同一入口（并调 registerAllModules()，
+// 注册本身由该入口的 import 副作用完成）。这里显式 import 是为了让 createQuickApp 单独使用时
+// （测试/嵌入式）也自洽，不再依赖「碰巧 import 了某个模块 index」这种隐式前提。
+import "../modules/index.js";
 import { randomBytes } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { Context } from "hono";
@@ -10,9 +15,8 @@ import { type Identity, resolveIdentity } from "../core/auth.js";
 import { logger, sanitizeLogText } from "../core/logger.js";
 import { incCounter } from "../core/metrics.js";
 import { envClientAddress } from "../core/ratelimit.js";
-import { runtime, type ToolContext, type ToolResult } from "../core/registry.js";
+import { invokeTool, runtime, type ToolContext, type ToolResult } from "../core/registry.js";
 import { ensureProfile } from "../core/settings.js";
-import { bookkeepingExpenseTool } from "../modules/bookkeeping/index.js";
 import {
   monthRange,
   recentCategories,
@@ -20,7 +24,6 @@ import {
   summarizeExpenses,
   writableLedgers,
 } from "../modules/bookkeeping/service.js";
-import { scheduleTool } from "../modules/schedule/index.js";
 import { getSchedule, type ScheduleRow } from "../modules/schedule/service.js";
 import { TZ, todayIso } from "../time.js";
 import { resolveToken } from "./page.js";
@@ -31,7 +34,8 @@ import { resolveToken } from "./page.js";
  * 设计要点：
  * - 身份只来自凭据：Profile token → 该 Profile；master → `?profile=` / body.profile（缺省
  *   default）。**绝不读 X-Hermes-Profile** —— 公网入口下自报身份等于没有鉴权。
- * - 写路径直接复用 MCP 工具层（`expense add` / `schedule add`），因此幂等键、通知回执、
+ * - 写路径经 registry 的 `invokeTool` 复用 MCP 工具层（`expense add` / `schedule add`）：
+ *   不 import 模块 handler，参数由模块自己的 zod raw shape 校验，因此幂等键、通知回执、
  *   预算提醒、occurrence 物化这些副作用只有一份实现；这里只做 HTTP 形状的校验与包装。
  * - 页面与状态页同款 nonce CSP、token 引导（localStorage + 抹地址栏），不引入任何外链。
  */
@@ -272,7 +276,8 @@ export function createQuickApp(config: ResolvedConfig, db: DatabaseSync): Hono {
     // 手机入口没有 MCP 会话的 ensureProfile：先登记 Profile，个人账本归属与审计外键都依赖它
     // （审计表 profile_id 有外键，未登记的 Profile 会让审计静默失败）。
     ensureProfile(db, who.profileId);
-    // 走工具层：默认账本解析、可见性判定、client_token 幂等、回执与预算提醒都在那里
+    // 经 registry 调工具层：默认账本解析、可见性判定、client_token 幂等、回执与预算提醒都在那里。
+    // 参数还会被模块自己的 zod raw shape 再校验一次（与 MCP 同一份 schema，不再是手写副本）。
     const args: Record<string, unknown> = { action: "add", amount };
     if (ledgerId.value !== undefined) args.ledger_id = ledgerId.value;
     if (category.value !== undefined) args.category = category.value;
@@ -280,7 +285,7 @@ export function createQuickApp(config: ResolvedConfig, db: DatabaseSync): Hono {
     if (spentOn.value !== undefined) args.date = spentOn.value;
     if (requestId.value !== undefined) args.request_id = requestId.value;
 
-    const result = bookkeepingExpenseTool(args, toolContext(db, config, who.profileId));
+    const result = await invokeTool("expense", args, toolContext(db, config, who.profileId));
     if (result.isError === true) return fail(c, 400, toolErrorText(result));
     const data = JSON.parse(toolText(result)) as {
       已记账?: { id?: string; 账本?: string; 分类?: string };
@@ -355,7 +360,7 @@ export function createQuickApp(config: ResolvedConfig, db: DatabaseSync): Hono {
     if (offsets.value !== undefined) args.remind_offsets = offsets.value;
     if (requestId.value !== undefined) args.request_id = requestId.value;
 
-    const result = scheduleTool(args, toolContext(db, config, who.profileId));
+    const result = await invokeTool("schedule", args, toolContext(db, config, who.profileId));
     if (result.isError === true) return fail(c, 400, toolErrorText(result));
     const data = JSON.parse(toolText(result)) as {
       已创建?: { id?: string };

@@ -11,8 +11,9 @@ import {
 import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
 
 /**
- * A6 回归：`/api/quick/schedules` 直接调用工具层，绕过了 MCP 的 zod schema，
- * 因此 `remind_offsets` 的边界（1-5 项、整数、±43200 分钟）必须在服务层收口；
+ * A6 回归：`/api/quick/schedules` 的 `remind_offsets` 边界（1-5 项、整数、±43200 分钟）。
+ * P2-24 之后 quick 不再 import 模块 handler，而是经 registry 用模块的 zod raw shape 校验
+ * （越界在 HTTP 边界就被拒），但服务层收口仍是最后一道 —— 内部调用方可能绕过 schema；
  * 同时**不能**卡住历史脏数据的无关编辑（改标题等 patch 不传 remind_offsets 时沿用原值）。
  */
 
