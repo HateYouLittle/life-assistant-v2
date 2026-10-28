@@ -17,6 +17,7 @@ import { loadConfig } from "../src/config.js";
 import { runBackup } from "../src/core/backup.js";
 import { openDatabase, SCHEMA_VERSION } from "../src/core/database.js";
 import { type CheckResult, runDoctor } from "../src/doctor.js";
+import { now, todayIso } from "../src/time.js";
 
 /**
  * `doctor --live` 的端到端测试：用本地 http server 桩代替真实 daemon
@@ -561,8 +562,8 @@ describe("doctor --live", () => {
     const doctorEnv = makeDoctorEnv(stub.port);
     try {
       seedBackup(doctorEnv.dir, { ageHours: 1 });
-      const yesterday = new Date(Date.now() - 24 * 3600 * 1000).toISOString().slice(0, 10);
-      const tomorrow = new Date(Date.now() + 24 * 3600 * 1000).toISOString().slice(0, 10);
+      const yesterday = now().minus({ days: 1 }).toISODate() ?? "";
+      const tomorrow = now().plus({ days: 1 }).toISODate() ?? "";
       seedSchedules(doctorEnv, [
         // 循环日程：start_date 在过去是正常的（下次提醒照常）
         {
@@ -595,7 +596,7 @@ describe("doctor --live", () => {
           id: "s-today",
           profileId: "default",
           title: "今天",
-          startDate: new Date().toISOString().slice(0, 10),
+          startDate: todayIso(),
           status: "active",
           recurrence: null,
         },
