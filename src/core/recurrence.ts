@@ -300,6 +300,29 @@ export function lunarMonthDayProblem(
   return null;
 }
 
+/**
+ * 循环规则是否已「耗尽」—— 到 `until` 当天为止再无任何候选日期。**终态判定的唯一来源**。
+ *
+ * 不能拿「物化得到空结果」当耗尽：nextDate 的 horizon 截断同样返回 null
+ * （年度日程的下一条只是落在物化前瞻之外），据此置终态会把还有未来的日程误判为 done。
+ * 因此这里显式问「到 until 为止还有没有候选」。count 的上限由调用方按已物化事件数判定
+ * （引擎不管历史，见 Recurrence.count 注释）。
+ *
+ * 脏 until（不可解析）与规则不可满足（迭代预算耗尽等）都保守返回 false：宁可留在 active
+ * 让人看见，也不误收尾。
+ */
+export function recurrenceExhausted(source: OccurrenceSource, after: DateTime): boolean {
+  const until = source.recurrence?.until;
+  if (until === undefined) return false;
+  const untilDay = DateTime.fromISO(until, { zone: TZ });
+  if (!untilDay.isValid) return false;
+  try {
+    return nextDate(source, after, untilDay.endOf("day")) === null;
+  } catch {
+    return false;
+  }
+}
+
 /** 供通知/列表展示的循环规则人话描述 */
 export function describeRecurrence(
   source: Pick<
@@ -309,6 +332,15 @@ export function describeRecurrence(
   startDate: string | null,
 ): string {
   const rec = source.recurrence;
+  // P2-6 / C-07：until/count 是用户配置的一部分，回显必须带上 —— 只写「每天」会让用户
+  // 看不出「为什么停了 / 还剩几次」（until 过后物化返回 null、next_run_at 变空，而回显不变）。
+  // 单个限制追加为「（共 3 次）」/「（至 2026-11-05）」，两者都有时合并成一个括号。
+  const withLimits = (base: string): string => {
+    const limits: string[] = [];
+    if (rec?.count !== undefined) limits.push(`共 ${rec.count} 次`);
+    if (rec?.until !== undefined) limits.push(`至 ${rec.until}`);
+    return limits.length === 0 ? base : `${base}（${limits.join("，")}）`;
+  };
   if (source.calendar === "lunar") {
     // 判定与文案集中在 lunarMonthDayProblem，避免与 rowToPublic 的「日历」栏口径漂移（N15）
     const problem = lunarMonthDayProblem(source.calendar, source.lunarMonth, source.lunarDay);
@@ -331,15 +363,17 @@ export function describeRecurrence(
     // 那正是「设了 interval 被静默忽略」的回显。validateScheduleInput 已拒掉新的写入，
     // 这里对存量行显式说明 interval 被忽略，不误导使用者。
     if (rec.interval !== 1) {
-      return `每年${name}${clamp}（interval=${rec.interval} 不生效：农历只支持按年循环）`;
+      return withLimits(
+        `每年${name}${clamp}（interval=${rec.interval} 不生效：农历只支持按年循环）`,
+      );
     }
-    return `每年${name}${clamp}`;
+    return withLimits(`每年${name}${clamp}`);
   }
   if (rec === null) return `一次：${startDate ?? ""}`;
   const n = rec.interval;
   switch (rec.freq) {
     case "daily":
-      return n === 1 ? "每天" : `每 ${n} 天`;
+      return withLimits(n === 1 ? "每天" : `每 ${n} 天`);
     case "weekly": {
       const names = ["一", "二", "三", "四", "五", "六", "日"];
       const days = uniqSorted(rec.byweekday ?? [])
@@ -348,22 +382,26 @@ export function describeRecurrence(
       const week = n === 1 ? "每周" : `每 ${n} 周 `;
       // 星期列表为空（脏数据兜底路径；工具入口与 validateScheduleInput 都会拦截空数组）
       // 时不留尾随空格，避免描述拼成「每 2 周 」
-      return days === "" ? week.trimEnd() : `${week}${days}`;
+      return withLimits(days === "" ? week.trimEnd() : `${week}${days}`);
     }
     case "monthly": {
-      if (n !== 1) return `每 ${n} 个月`; // 不带日号，夹取无从体现
+      if (n !== 1) return withLimits(`每 ${n} 个月`); // 不带日号，夹取无从体现
       const day = startDate?.slice(8, 10) ?? "";
       const text = `每月${day}日`;
-      return day !== "" && willClamp(ALL_MONTHS, Number(day)) ? `${text}${CLAMP_NOTE}` : text;
+      return withLimits(
+        day !== "" && willClamp(ALL_MONTHS, Number(day)) ? `${text}${CLAMP_NOTE}` : text,
+      );
     }
     case "yearly": {
-      if (n !== 1) return `每 ${n} 年`;
+      if (n !== 1) return withLimits(`每 ${n} 年`);
       const month = startDate?.slice(5, 7) ?? "";
       const day = startDate?.slice(8, 10) ?? "";
       const text = `每年${month}月${day}日`;
-      return month !== "" && day !== "" && willClamp([Number(month)], Number(day))
-        ? `${text}${CLAMP_NOTE}`
-        : text;
+      return withLimits(
+        month !== "" && day !== "" && willClamp([Number(month)], Number(day))
+          ? `${text}${CLAMP_NOTE}`
+          : text,
+      );
     }
   }
 }

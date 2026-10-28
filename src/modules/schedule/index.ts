@@ -284,7 +284,14 @@ function scheduleToolInner(args: Record<string, unknown>, ctx: ToolContext) {
       const row = completeSchedule(db, ctx.profileId, id, occurrenceKey, {
         all: args.all === true,
       });
-      return okJson({ 已完成: rowToPublic(row) });
+      // P2-1：all=true 现在对任意 kind（含生日/纪念日）都置终态 done，回执必须说清「系列已结束」，
+      // 不能只给一个「已完成」让调用方以为系列还在。状态字段仍与库内真实值同源（rowToPublic）。
+      return okJson({
+        已完成: rowToPublic(row),
+        ...(args.all === true
+          ? { 说明: "已结束整个系列（状态置 done），不会再物化或提醒后续发生" }
+          : {}),
+      });
     }
     case "snooze": {
       const id = args.id as string;

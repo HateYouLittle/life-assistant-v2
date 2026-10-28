@@ -196,10 +196,11 @@ describe("P2-2 一次性待办 skip：跳过即收尾，回执与真实状态一
     }
   });
 
-  it("边界：kind≠todo 的一次性日程不在本次收尾范围（与 complete 的现状一致，不留半终态）", () => {
+  it("边界：kind≠todo 的一次性日程 skip 不收尾；收尾只能靠 all=true（P2-1 口径）", () => {
     const env = makeTestEnv();
     try {
-      // 与 completeSchedule 的判定逐字对齐：只有 recurrence_json===null && kind==='todo' 收尾。
+      // skip 的收尾判定与 complete 的**一次性待办**分支逐字对齐：只有
+      // recurrence_json===null && kind==='todo' 由 skip 收尾（P2-2）。
       const created = createSchedule(
         env.db,
         "default",
@@ -213,9 +214,13 @@ describe("P2-2 一次性待办 skip：跳过即收尾，回执与真实状态一
       const outcome = skipSchedule(env.db, "default", created.id, key);
       assert.equal(outcome.ended, false);
       assert.equal(statusOf(env, created.id), "active");
-      // 与 complete 现状一致：同形态日程带 key complete 也不改 status
+      // 裸调 complete（无 key、无 all）保持现状：完成这次但不改 status
+      completeSchedule(env.db, "default", created.id, null);
+      assert.equal(statusOf(env, created.id), "active", "裸调 complete 对 kind≠todo 的现状未变");
+      // P2-1：all=true 是「结束整个系列」的显式入口，对任意 kind（含纪念日）置终态 done，
+      // 终态只有一种（与 P2-2 的 done 口径一致）。
       completeSchedule(env.db, "default", created.id, null, { all: true });
-      assert.equal(statusOf(env, created.id), "active", "complete 对 kind≠todo 的现状未变");
+      assert.equal(statusOf(env, created.id), "done", "all=true 必须对 kind≠todo 也置终态");
     } finally {
       cleanupTestEnv(env);
     }

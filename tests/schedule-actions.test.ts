@@ -3,6 +3,7 @@ import { describe, it, type TestContext } from "node:test";
 import { DateTime } from "luxon";
 import { TZ } from "../src/time.js";
 import {
+  createSchedule,
   fireDue,
   getSchedule,
   materializeSchedule,
@@ -333,6 +334,93 @@ describe("schedule complete：循环日程必须显式指定单次或结束系�
       assert.ok(
         occurrenceKeys(env, id).every((key) => occurrenceStatus(env, id, key) === "done"),
         "整系列完成后所有 occurrence 应为 done",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("生日 all=true：系列真的结束（status=done），下一轮 tick 不再重建下一年（P2-1）", async (t) => {
+    freeze(t, `${D}T17:00:00+08:00`);
+    const env = makeTestEnv();
+    try {
+      // 生日默认按年循环（工具层 add 的 kind!=='todo' 缺省 recurrence=yearly）
+      const id = addOnce(env, { title: "妈妈生日", kind: "birthday", date: D });
+      const yearKeys = normalKeys(env, id);
+      assert.deepEqual(yearKeys, [`${D}T18:00#0`], "生日应物化本年度那一次");
+      const result = tool(env, { action: "complete", id, all: true }) as {
+        isError?: boolean;
+        content: { text: string }[];
+      };
+      assert.notEqual(result.isError, true, text(result));
+      assert.equal(
+        scheduleStatus(env, id),
+        "done",
+        "all=true 必须对生日也置终态（旧行为留在 active，回执说「已完成」而系列未结束）",
+      );
+      const receipt = payload<{ 已完成: { 状态: string }; 说明?: string }>(result);
+      assert.equal(receipt.已完成.状态, "done", "回执状态必须与库内真实状态一致");
+      assert.match(receipt.说明 ?? "", /结束整个系列/, "回执必须说清系列已结束");
+
+      // 关键牙齿：把时钟推进到下一次发生落在物化前瞻内，若 status 仍是 active，
+      // 物化会把 2027 那次重新造出来（旧实现正是如此）——终态日程必须一条都不补。
+      advance(t, "2027-09-30T17:00:00+08:00");
+      await tickSchedules(T("2027-09-30T17:00:00+08:00"), envServices(env), env.db);
+      assert.deepEqual(
+        normalKeys(env, id),
+        yearKeys,
+        "已结束的系列不得因下一轮物化重建下一年 occurrence",
+      );
+      assert.equal(scheduleStatus(env, id), "done", "终态不得被物化翻回 active");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("纪念日 all=true：同样收敛到 done（终态只有一种，与 P2-2 口径一致）", (t) => {
+    freeze(t, `${D}T17:00:00+08:00`);
+    const env = makeTestEnv();
+    try {
+      const id = addOnce(env, { title: "结婚纪念日", kind: "anniversary", date: D });
+      const result = tool(env, { action: "complete", id, all: true }) as { isError?: boolean };
+      assert.notEqual(result.isError, true);
+      assert.equal(scheduleStatus(env, id), "done");
+      assert.ok(occurrenceKeys(env, id).every((key) => occurrenceStatus(env, id, key) === "done"));
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("裸调 complete（无 key、无 all）对一次性纪念日不置终态：保持既有语义（P2-1 边界）", (t) => {
+    freeze(t, `${D}T17:00:00+08:00`);
+    const env = makeTestEnv();
+    try {
+      // 工具层的 recurrence schema 不接受 null，这里走服务层造「一次性非 todo」存量形态：
+      // 裸调 complete 的既有语义是「完成这次、系列不动」，本批只统一 all=true 的终态，
+      // 不扩大裸调的收敛范围。
+      const created = createSchedule(env.db, "default", {
+        title: "一次性纪念",
+        kind: "anniversary",
+        calendar: "solar",
+        startDate: D,
+        time: "18:00",
+        allDay: false,
+        recurrence: null,
+        remindOffsets: [0],
+        resendMinutes: 0,
+        workdayFilter: "any",
+      });
+      const done = tool(env, { action: "complete", id: created.id }) as { isError?: boolean };
+      assert.notEqual(done.isError, true);
+      assert.equal(
+        scheduleStatus(env, created.id),
+        "active",
+        "裸调 complete 的既有行为不变（收尾需显式 all=true 或 skip/delete）",
+      );
+      assert.equal(
+        occurrenceStatus(env, created.id, `${D}T18:00#0`),
+        "done",
+        "该次发生仍应被完成",
       );
     } finally {
       cleanupTestEnv(env);

@@ -36,21 +36,67 @@ export function holidaySourceUrls(year: number): string[] {
 }
 
 /**
+ * 跨年归档区间：12-25 ~ 12-31。上游 holiday-cn 按**假期**归档，元旦假期（含 12-31 起的
+ * 调休/补班）落在**下一年度**文件里（实测 2019.json 含 2018-12-29「元旦」补班
+ * isOffDay=false）。因此这段日期的权威分类必须等**下一年度**文件到位。
+ */
+const CROSS_YEAR_MONTH = 12;
+const CROSS_YEAR_FROM_DAY = 25;
+
+/**
+ * 判定某公历日期的分类需要哪些年度的数据才权威。**单一来源**：dayType 用它决定是否
+ * 可以按星期兜底，日程物化用它决定「未就绪时该登记哪一年去补齐」——两处各写一份的话，
+ * 跨年区间会去补一个已经 ready 的年份，次年数据永远抓不回来（日程被永久暂停）。
+ */
+export function holidayLookupYears(date: string): number[] {
+  const year = Number(date.slice(0, 4));
+  const month = Number(date.slice(5, 7));
+  const day = Number(date.slice(8, 10));
+  return month === CROSS_YEAR_MONTH && day >= CROSS_YEAR_FROM_DAY ? [year, year + 1] : [year];
+}
+
+/** 该日期是否落在跨年归档区间（12-25~12-31）—— 权威数据在下一年度文件里 */
+export function inCrossYearWindow(date: string): boolean {
+  return holidayLookupYears(date).length > 1;
+}
+
+/**
+ * 该日期「还缺哪些年度的数据」：holidayLookupYears 中 status != 'ready' 的年份。
+ * 日程物化据此登记待补齐 —— 只登记真正缺失的年份，否则 tick 会去补一个已就绪的年份，
+ * 而真正缺的下一年度永远不抓（日程被永久暂停）。
+ */
+export function holidayYearsNeedingData(db: DatabaseSync, date: string): number[] {
+  return holidayLookupYears(date).filter((year) => {
+    const meta = db.prepare("SELECT status FROM cn_holiday_years WHERE year = ?").get(year) as
+      | { status: string }
+      | undefined;
+    return meta?.status !== "ready";
+  });
+}
+
+/**
  * 日期分类。规则：
  * 1. 命中 cn_holiday_days → holiday / workday（权威数据）
- * 2. 未命中但该年份 status='ready' → 按星期兜底：周六日=weekend，其余=weekday
- * 3. 未命中且该年份数据未就绪 → unknown（调用方必须暂停，不得猜测）
+ * 2. 未命中但该日期**权威所需的每个年度**都 status='ready' → 按星期兜底：周六日=weekend，其余=weekday
+ * 3. 未命中且所需年度数据未就绪 → unknown（调用方必须暂停，不得猜测）
+ *
+ * 规则 2 的「每个年度」是 P2-5 / C-06 的修正点：跨年区间（12-25~12-31）的权威分类来自
+ * **下一年度**文件。旧实现只看「该日期所属年份 ready」，于是 10 月下旬起（物化前瞻 62 天
+ * 已覆盖 12 月下旬）就把 2018-12-29 这类元旦调休补班按星期六兜底成 weekend ——
+ * 「仅工作日」漏提醒 / 「仅节假日」误提醒；而次年文件到达后已物化行不会重判，错就一直留着。
+ * 现在次年数据未就绪时返回 unknown（暂停，宁可晚提醒也不猜）。
  */
 export function dayType(db: DatabaseSync, date: string): DayType | "unknown" {
   const row = db.prepare("SELECT day_type FROM cn_holiday_days WHERE date = ?").get(date) as
     | { day_type: string }
     | undefined;
   if (row !== undefined) return row.day_type as DayType;
-  const year = Number(date.slice(0, 4));
-  const meta = db.prepare("SELECT status FROM cn_holiday_years WHERE year = ?").get(year) as
-    | { status: string }
-    | undefined;
-  if (meta?.status !== "ready") return "unknown";
+  for (const year of holidayLookupYears(date)) {
+    const meta = db.prepare("SELECT status FROM cn_holiday_years WHERE year = ?").get(year) as
+      | { status: string }
+      | undefined;
+    if (meta?.status !== "ready") return "unknown";
+  }
   const weekday = DateTime.fromISO(date, { zone: TZ }).weekday; // 6=周六 7=周日
   return weekday >= 6 ? "weekend" : "weekday";
 }
