@@ -8,6 +8,7 @@ import {
   registerModule,
   runtime,
   type ToolContext,
+  type ToolResult,
 } from "../../core/registry.js";
 import { ensureProfile } from "../../core/settings.js";
 import { DATE_RE, todayIso } from "../../time.js";
@@ -57,6 +58,60 @@ import {
   updateExpenseChecked,
 } from "./service.js";
 
+/**
+ * 按 action 维护「允许字段」白名单（P2-21 / M-05）：工具的 inputSchema 是全 action 共享的，
+ * handler 只读其中一部分，未列出的字段此前被**静默忽略** —— `export` 带 by/limit 会被当成
+ * 「导出当月全部」、非 budget 的 amount 被直接丢弃，都属于「成功返回但语义错误」，
+ * 比报错更难发现（M-05）。这里统一显式拒绝，文案与 notify 侧完全一致。
+ *
+ * 值为 undefined 的键不算「传了字段」：MCP/quick 可能显式带上未使用的可选键。
+ * `from/to`（export）与 `ledger_id`（update）仍由各自分支给出更具体、可操作的报错
+ * （既有用例钉住这两条文案），故列入白名单让它走到那条分支，而不是被通用文案抢先。
+ */
+const LEDGER_ALLOWED_FIELDS: Record<string, readonly string[]> = {
+  create: ["name", "personal"],
+  list: ["include_archived"],
+  rename: ["id", "name"],
+  archive: ["id", "unarchive"],
+  transfer: ["id", "profile"],
+  budget: ["ledger_id", "amount", "category", "clear"],
+};
+
+const EXPENSE_ALLOWED_FIELDS: Record<string, readonly string[]> = {
+  add: ["ledger_id", "amount", "category", "note", "date", "request_id"],
+  list: ["ledger_id", "month", "from", "to", "by", "limit", "offset"],
+  // summary 也支持 by（按记账人过滤），与 list 同口径
+  summary: ["ledger_id", "month", "from", "to", "by"],
+  update: ["id", "amount", "category", "note", "date", "ledger_id"],
+  delete: ["id"],
+  export: ["ledger_id", "month", "from", "to"],
+  // ledger 是 set_default_ledger 的既有简写参数（等价 ledger_id），不得误伤
+  set_default_ledger: ["ledger_id", "ledger"],
+  categories: [],
+  category_alias: ["category", "alias", "remove"],
+};
+
+/** 返回第一个不在白名单内的字段名；全部合法（或值为 undefined）时返回 null */
+function unknownFieldOf(args: Record<string, unknown>, allowed: readonly string[]): string | null {
+  for (const key of Object.keys(args)) {
+    // action 是分发参数本身，不属于任何 action 的「字段」；undefined 视为未传
+    if (key === "action" || args[key] === undefined) continue;
+    if (!allowed.includes(key)) return key;
+  }
+  return null;
+}
+
+/** 未知字段统一拒绝：文案与 notify 侧完全一致（`未知字段: <名>（action=<action> 不接受）`） */
+function rejectUnknownField(
+  args: Record<string, unknown>,
+  allowed: readonly string[],
+  action: string,
+): ToolResult | null {
+  const unknown = unknownFieldOf(args, allowed);
+  if (unknown === null) return null;
+  return fail(`未知字段: ${unknown}（action=${action} 不接受）`);
+}
+
 /** 账本的工具视图：家庭账本标注「家庭」，个人账本标注「个人 + 归属人」 */
 function ledgerView(row: LedgerRow) {
   return {
@@ -86,6 +141,11 @@ export function bookkeepingLedgerTool(args: Record<string, unknown>, ctx: ToolCo
   try {
     const action = args.action as string;
     const db = ctx.db;
+    const allowed = LEDGER_ALLOWED_FIELDS[action];
+    if (allowed !== undefined) {
+      const rejected = rejectUnknownField(args, allowed, action);
+      if (rejected !== null) return rejected;
+    }
     if (action === "create") {
       const name = args.name as string | undefined;
       if (name === undefined) return fail("create 需要 name");
@@ -290,6 +350,11 @@ export function bookkeepingExpenseTool(args: Record<string, unknown>, ctx: ToolC
   try {
     const action = args.action as string;
     const db = ctx.db;
+    const allowed = EXPENSE_ALLOWED_FIELDS[action];
+    if (allowed !== undefined) {
+      const rejected = rejectUnknownField(args, allowed, action);
+      if (rejected !== null) return rejected;
+    }
     if (action === "add") {
       const ledgerIdArg = args.ledger_id;
       const amount = args.amount as number | undefined;
@@ -628,7 +693,7 @@ registerModule({
     {
       name: "ledger",
       description:
-        "账本管理：create 创建（personal=true 建个人账本，仅归属人可见可写；缺省建家庭账本，所有 Profile 共享）、list 列出当前 Profile 可见的账本（家庭账本 + 自己的个人账本；含归档需 include_archived）、rename 重命名、archive 归档/恢复（unarchive=true）、transfer 转移个人账本归属（带 profile 转给该 Profile，缺省转回家庭且不可逆；仅当前归属人可操作）、budget 月度预算（传 ledger_id 查看全部预算与本月对照；带 amount 设置/覆盖，单位元，带 category 为分类预算、缺省为账本总额；clear=true 删除该范围）。家庭账本逐笔回执只发记账人（不再全局推送，其他人改由每晚 21:30 的每日摘要汇总），预算提醒仍全局推送（跨越 80%/100% 时，同一预算一笔只推跨过的最高阈值那一条）；个人账本不回执、不推送预算提醒，月报只发给归属人。",
+        "账本管理：create 创建（personal=true 建个人账本，仅归属人可见可写；缺省建家庭账本，所有 Profile 共享）、list 列出当前 Profile 可见的账本（家庭账本 + 自己的个人账本；含归档需 include_archived）、rename 重命名、archive 归档/恢复（unarchive=true）、transfer 转移个人账本归属（带 profile 转给该 Profile，缺省转回家庭且不可逆；仅当前归属人可操作）、budget 月度预算（传 ledger_id 查看全部预算与本月对照；带 amount 设置/覆盖，单位元，带 category 为分类预算、缺省为账本总额；clear=true 删除该范围）。家庭账本逐笔回执只发记账人（不再全局推送，其他人改由每晚 21:30 的每日摘要汇总），预算提醒仍全局推送（跨越 80%/100% 时，同一预算一笔只推跨过的最高阈值那一条）；个人账本不回执、不推送预算提醒，月报只发给归属人。各 action 只接受自己的参数：传其它 action 的字段（如 create 传 amount）会明确报错，不静默忽略。",
       inputSchema: {
         action: z.enum(["create", "list", "rename", "archive", "transfer", "budget"]),
         name: z.string().min(1).max(40).optional(),
@@ -661,7 +726,7 @@ registerModule({
     {
       name: "expense",
       description:
-        "支出记账：add 记一笔（amount 元必填；ledger_id 可选，缺省按「默认账本 → 唯一可写账本」解析；可选 category/note/date/request_id；家庭账本逐笔回执只发记账人（想恢复逐笔推送可用 notify prefs 打开 bookkeeping.entry），个人账本不回执不提醒；未显式传 category 时回执附「常用分类」）；list 明细（可按 month/from/to/by 过滤）；summary 汇总（按分类与记账人）；update 更正一笔（id + amount/category/note/date 至少一个，只改显式传入的字段，不触发回执与预算提醒）；delete 删除记错的一笔（id 从 list 获取）；export 导出 CSV（ledger_id + 可选 month，默认当月；表头「日期,账本,分类,金额(元),备注,记账人」，UTF-8 BOM；单次上限 2000 行，超出时 已截断=true 并给出总行数）；set_default_ledger 设置/查看默认账本（传 ledger_id 设置，不传则返回当前默认账本）；categories 列出分类字典（标准名+别名+近 90 天笔数/金额，字典为空时即近 90 天实际用过的分类）；category_alias 维护别名（category + alias 添加，remove=true 删除；别名命中后 add/update 会自动归一成标准名，未知分类仍按自由文本保存）。list 支持 offset 分页（回执带 已返回/偏移/匹配总数/还有更多）。仅能操作当前 Profile 可见的账本（家庭账本或自己的个人账本）。幂等：add 传 request_id 后，同一人用同一个 request_id 重试不会重复记账，返回原记录并附「已存在: true」（不重复发通知）。CSV 导出对以 = + - @ 或制表符/回车开头的文本单元格做公式注入中和。month 与 from/to 互斥（同时传会报错）；from/to 只给一边就是半边区间（只给 from = [from, 将来)，只给 to = (过去, to]），两个 action 口径一致；默认区间只在 month/from/to **都不传**时生效（summary 默认「月初→今天」，list 不传时不限区间）。金额只支持支出，单位为元。",
+        "支出记账：add 记一笔（amount 元必填；ledger_id 可选，缺省按「默认账本 → 唯一可写账本」解析；可选 category/note/date/request_id；家庭账本逐笔回执只发记账人（想恢复逐笔推送可用 notify prefs 打开 bookkeeping.entry），个人账本不回执不提醒；未显式传 category 时回执附「常用分类」）；list 明细（可按 month/from/to/by 过滤）；summary 汇总（按分类与记账人）；update 更正一笔（id + amount/category/note/date 至少一个，只改显式传入的字段，不触发回执与预算提醒）；delete 删除记错的一笔（id 从 list 获取）；export 导出 CSV（ledger_id + 可选 month，默认当月；表头「日期,账本,分类,金额(元),备注,记账人」，UTF-8 BOM；单次上限 2000 行，超出时 已截断=true 并给出总行数）；set_default_ledger 设置/查看默认账本（传 ledger_id 设置，不传则返回当前默认账本）；categories 列出分类字典（标准名+别名+近 90 天笔数/金额，字典为空时即近 90 天实际用过的分类）；category_alias 维护别名（category + alias 添加，remove=true 删除；别名命中后 add/update 会自动归一成标准名，未知分类仍按自由文本保存）。list 支持 offset 分页（回执带 已返回/偏移/匹配总数/还有更多）。仅能操作当前 Profile 可见的账本（家庭账本或自己的个人账本）。幂等：add 传 request_id 后，同一人用同一个 request_id 重试不会重复记账，返回原记录并附「已存在: true」（不重复发通知）。CSV 导出对以 = + - @ 或制表符/回车开头的文本单元格做公式注入中和。month 与 from/to 互斥（同时传会报错）；from/to 只给一边就是半边区间（只给 from = [from, 将来)，只给 to = (过去, to]），两个 action 口径一致；默认区间只在 month/from/to **都不传**时生效（summary 默认「月初→今天」，list 不传时不限区间）。金额只支持支出，单位为元。各 action 只接受自己的参数：传其它 action 的字段（如 export 传 by/limit、add 传 ledger 简写）会明确报错，不静默忽略。",
       inputSchema: {
         action: z.enum([
           "add",
