@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   closeSync,
@@ -30,18 +31,177 @@ import { logger } from "./logger.js";
  * `open(path,"wx")` 后 write：那会留下「文件已存在但内容还没写进去」的窗口，并发的接管者
  * 会把它当成损坏锁 rename 走，随后双方各持一把锁（Round1 审查 C2 实测复现）。
  *
- * 接管：锁文件已存在且 pid 已死/内容损坏时走**原子接管**（见 takeOverStaleLock）。
- * 崩溃残留的锁文件靠 PID 存活检测判定为 stale 并接管；release 只在 pid 仍是自己时才删除，
- * 避免误删别人刚接管的锁。
+ * 接管：锁文件已存在且判定为失效/损坏时走**原子接管**（见 takeOverStaleLock）。
+ * release 只在 pid + token 仍是自己时才删除，避免误删别人刚接管的锁。
+ *
+ * **为什么不能只看 pid 存活**：机器重启（或容器重调度）后残留的 daemon.lock 里的 pid
+ * 会被系统重新分配给一个完全无关的进程，`process.kill(pid, 0)` 于是返回「存活」，
+ * daemon 拒绝启动、必须人工删锁 —— 而真正在跑的服务其实一个都没有。
+ * 因此锁文件除 pid 外还记录：① 持有者进程的**启动时间**（OS 口径：macOS/BSD 用
+ * `ps -o lstart=`，Linux 用 `/proc/<pid>/stat` + `btime`）；② 每次获取都重新生成的随机
+ * **token**。判定「持有者还在不在」时交叉校验三者：
+ * - pid 已退出 → stale（确定）；
+ * - pid 存活 + 启动时间一致 → 真持有者仍在（locked，拒绝启动）；
+ * - pid 存活 + 启动时间不一致 → **pid 被复用**，按 stale 接管并 warn；
+ * - pid 存活但启动时间读不到（旧锁没这字段 / ps 不可用 / 权限不足）→ **保守当活**
+ *   （宁可拒绝启动并给出「疑似 pid 复用，确认后删锁」的指引，也不能赌一把接管一个
+ *   可能正在跑的实例，那是双写 SQLite 的入口）。降级依据会写进锁文件的
+ *   `processStartSource`（`proc`/`ps`/`unavailable`），排障时能区分「旧锁没这字段」与
+ *   「本机读不到」。
  */
 
 export const DAEMON_LOCK_FILENAME = "daemon.lock";
 
-/** 锁文件内容；hostname 只是排障线索（NFS/容器共享数据目录时能看出是哪个主机占的锁） */
+/**
+ * 锁文件内容。
+ *
+ * - `hostname`：排障线索（NFS/容器共享数据目录时能看出是哪个主机占的锁）；
+ * - `processStart`：持有者进程的启动时间（OS 口径字符串，只用于「同机同 pid 前后两次读
+ *   是否一致」的比较，不做日期运算）；取不到时为 null；
+ * - `processStartSource`：`processStart` 的取值来源（`proc`/`ps`/`unavailable`），
+ *   让接管者能区分「旧版本锁没这字段」与「本机根本读不到启动时间」；
+ * - `token`：每次 acquire 重新生成的随机串，用于「读到的锁」与「rename 走的锁」是不是
+ *   同一把的内容身份校验，release 也要求 token 一致。旧版本写的锁没有这些字段，
+ *   解析时按「未知」处理（保守判定），不影响读取。
+ */
 interface LockFileContent {
   pid: number;
   startedAt: string;
+  processStart?: string | null;
+  processStartSource?: string;
+  token?: string;
   hostname: string;
+}
+
+/** 进程启动时间的一次读取结果：`value` 缺失表示读不到（降级），`source` 记录依据 */
+export interface ProcessStartTimeReading {
+  value?: string;
+  source: "proc" | "ps" | "unavailable";
+}
+
+/** 进程启动时间读取器；可注入（测试模拟 ps 不可用 / pid 复用），生产用 readProcessStartTime */
+export type ProcessStartTimeReader = (pid: number) => ProcessStartTimeReading;
+
+/** acquireDaemonLock / inspectDaemonLock 的可选参数（目前只有测试注入点） */
+export interface DaemonLockOptions {
+  /** 覆盖进程启动时间读取器：仅测试用（模拟 ps 不可用、pid 被复用） */
+  readProcessStartTime?: ProcessStartTimeReader;
+}
+
+/** 归一化启动时间字符串：折叠空白，保证「同一进程前后两次读」逐字可比 */
+function normalizeStartTime(raw: string): string | undefined {
+  const trimmed = raw.trim().replace(/\s+/g, " ");
+  return trimmed === "" ? undefined : trimmed;
+}
+
+/**
+ * Linux：`/proc/<pid>/stat` 第 22 字段 starttime（自开机起的 clock tick，通常 HZ=100）
+ * 加上 `/proc/stat` 的 btime，换算成 ISO 瞬间。两次读用同一套换算，因此逐字可比。
+ */
+function readProcStartTime(pid: number): string | undefined {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    // comm 字段可能含空格与右括号：从最后一个 ")" 之后开始切字段
+    const rparen = stat.lastIndexOf(")");
+    if (rparen < 0) return undefined;
+    const fields = stat.slice(rparen + 2).split(" ");
+    const startTicks = Number(fields[19]);
+    if (!Number.isFinite(startTicks) || startTicks < 0) return undefined;
+    const procStat = readFileSync("/proc/stat", "utf8");
+    const btimeLine = procStat.split("\n").find((line) => line.startsWith("btime "));
+    if (btimeLine === undefined) return undefined;
+    const btime = Number(btimeLine.slice("btime ".length).trim());
+    if (!Number.isFinite(btime)) return undefined;
+    const seconds = Math.round(btime + startTicks / 100);
+    return new Date(seconds * 1000).toISOString();
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * macOS/BSD：`ps -o lstart= -p <pid>`。
+ * `LC_ALL=C` 固定输出格式（locale 变化会让同一进程读出不同字符串），`TZ=UTC` 固定时区
+ * （否则不同进程的 TZ 环境不同会把同一时刻解析成不同字符串，误判成 pid 复用 → 接管活锁）。
+ * 解析失败时退回原始字符串：只要两次读的归一化结果一致即可，不依赖绝对时间。
+ */
+function readPsStartTime(pid: number): string | undefined {
+  const result = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+    encoding: "utf8",
+    timeout: 2000,
+    env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
+  });
+  if (result.error !== undefined) return undefined;
+  if (result.status !== 0 || typeof result.stdout !== "string") return undefined;
+  return normalizeStartTime(result.stdout);
+}
+
+/**
+ * 读任意 pid 的进程启动时间（生产实现）。取不到时返回 `{ source: "unavailable" }`，
+ * **绝不抛错**：锁判定必须能在 ps 被沙箱/权限拦住的环境里降级运行（见文件头注释）。
+ */
+export function readProcessStartTime(pid: number): ProcessStartTimeReading {
+  if (!Number.isInteger(pid) || pid <= 0) return { source: "unavailable" };
+  if (process.platform === "linux") {
+    const fromProc = readProcStartTime(pid);
+    if (fromProc !== undefined) return { value: fromProc, source: "proc" };
+  }
+  const fromPs = readPsStartTime(pid);
+  return fromPs === undefined ? { source: "unavailable" } : { value: fromPs, source: "ps" };
+}
+
+/**
+ * 锁持有者存活判定结果：
+ * - `alive: true, unverified: false`：pid 存活且启动时间一致（真持有者）；
+ * - `alive: true, unverified: true`：pid 存活但无法核实启动时间 —— 保守当活，拒绝接管；
+ * - `alive: false, reused: true`：pid 存活但启动时间不一致 —— pid 被复用，可安全接管；
+ * - `alive: false, reused: false`：pid 已退出 —— 崩溃残留，可安全接管。
+ * `detail` 是判定依据，用于 warn 日志与启动失败指引。
+ */
+export interface HolderAssessment {
+  alive: boolean;
+  reused: boolean;
+  unverified: boolean;
+  detail: string;
+}
+
+/** 判定锁里的持有者是否仍在运行（交叉校验 pid 存活 + 启动时间一致） */
+function assessHolder(value: LockFileContent, readStart: ProcessStartTimeReader): HolderAssessment {
+  if (!isProcessAlive(value.pid)) {
+    return { alive: false, reused: false, unverified: false, detail: `pid ${value.pid} 已不存在` };
+  }
+  const recorded = value.processStart;
+  if (recorded === undefined || recorded === null || recorded === "") {
+    return {
+      alive: true,
+      reused: false,
+      unverified: true,
+      detail: `锁文件未记录 pid ${value.pid} 的启动时间（旧版本写入或写入时读取失败）`,
+    };
+  }
+  const reading = readStart(value.pid);
+  if (reading.value === undefined) {
+    return {
+      alive: true,
+      reused: false,
+      unverified: true,
+      detail: `本机无法读取 pid ${value.pid} 的启动时间（来源 ${reading.source}）`,
+    };
+  }
+  if (reading.value !== recorded) {
+    return {
+      alive: false,
+      reused: true,
+      unverified: false,
+      detail: `pid ${value.pid} 存活但启动时间为 ${reading.value}，锁记录为 ${recorded}（疑似机器重启后 pid 被复用）`,
+    };
+  }
+  return {
+    alive: true,
+    reused: false,
+    unverified: false,
+    detail: `pid ${value.pid} 存活且启动时间一致（${recorded}）`,
+  };
 }
 
 /**
@@ -57,8 +217,10 @@ type LockFileSnapshot =
 /**
  * daemon 锁的当前状态（供恢复 CLI / doctor 等只读判定用）：
  * - `unlocked`：没有锁文件；
- * - `locked`：锁文件里的 pid 仍存活（同机确实有实例在跑）；
- * - `stale`：锁文件合法但 pid 已退出（崩溃残留，可安全接管/恢复）；
+ * - `locked`：锁文件里的 pid 仍存活**且能确认是同一个进程**（启动时间一致，或无法核实
+ *   时保守当活）—— 同机确实有实例在跑；
+ * - `stale`：锁文件合法但 pid 已退出，**或 pid 存活而启动时间不一致（pid 被复用）**
+ *   —— 两种情况都可安全接管/恢复；
  * - `corrupt`：锁文件存在但读不到或不合法 —— **无法判断**有没有实例在跑。
  */
 export type DaemonLockState =
@@ -152,7 +314,16 @@ function parseLockContent(raw: string): LockFileContent | undefined {
   if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return undefined;
   if (typeof startedAt !== "string" || startedAt === "") return undefined;
   if (typeof host !== "string") return undefined;
-  return { pid, startedAt, hostname: host };
+  // 新增字段一律按「可选 + 类型不对就当未知」解析：旧版本锁没有它们（保守判定），
+  // 手工改坏的字段也不能让整把锁变成 corrupt —— 那会拒绝掉一个其实还在跑的实例。
+  const processStart =
+    typeof record.processStart === "string" && record.processStart !== ""
+      ? record.processStart
+      : undefined;
+  const processStartSource =
+    typeof record.processStartSource === "string" ? record.processStartSource : undefined;
+  const token = typeof record.token === "string" && record.token !== "" ? record.token : undefined;
+  return { pid, startedAt, processStart, processStartSource, token, hostname: host };
 }
 
 /**
@@ -268,10 +439,26 @@ function restoreMovedLockFile(stalePath: string, path: string): void {
   }
 }
 
-function duplicateDaemonError(existing: LockFileContent, path: string): Error {
-  return new Error(
-    `另一个 daemon 已在运行（pid=${existing.pid}，启动于 ${existing.startedAt}，锁文件 ${path}）`,
-  );
+/**
+ * 「已有实例在跑」的启动失败错误。
+ *
+ * 无法核实持有者启动时间时（旧锁没这字段 / 本机读不到），必须额外给出「疑似 pid 复用，
+ * 确认后删锁」的指引：这种情形下拒绝启动是**保守选择**（不能赌一把接管可能正在跑的实例），
+ * 但用户得知道怎么自救，而不是只看到一句「另一个 daemon 已在运行」。
+ */
+function duplicateDaemonError(
+  existing: LockFileContent,
+  path: string,
+  assessment?: HolderAssessment,
+): Error {
+  const base = `另一个 daemon 已在运行（pid=${existing.pid}，启动于 ${existing.startedAt}，锁文件 ${path}）`;
+  if (assessment?.unverified === true) {
+    return new Error(
+      `${base}；${assessment.detail}。疑似 pid 复用（机器重启后 pid 被无关进程占用）：` +
+        `请先确认该 pid 不是本服务的 daemon（如 ps -p ${existing.pid}），确认后可删除锁文件 ${path} 再启动`,
+    );
+  }
+  return new Error(base);
 }
 
 /**
@@ -283,13 +470,21 @@ function duplicateDaemonError(existing: LockFileContent, path: string): Error {
  *
  * 实现要点：`renameSync(path, stalePath)` 同一时刻只能有一个成功者（旧锁文件被移走），
  * 之后的竞争者 rename 会得到 ENOENT；但 rename 本身不校验「移走的是不是我刚检查过的那把锁」，
- * 所以必须再校验两步：
+ * 所以必须再校验三步：
  * 1. inode 身份：`before`（rename 前 stat）与 `after`（rename 后 stat stalePath）的 dev/ino
  *    必须一致 —— 否则说明 read 与 rename 之间锁被别的进程换掉了；
- * 2. 内容身份：移走的锁若仍指向**存活**进程，说明我们误拿了别人刚建好的活锁，必须放回原位，
- *    绝不能当成 stale 继续抢。
+ * 2. 内容身份（token）：移走的锁内容必须与判定时读到的锁是同一把（pid + token 一致）——
+ *    挡住「同 inode 复用 / 刚被别人重写」的窗口，token 是每次 acquire 新生成的随机串；
+ * 3. 存活身份：移走的锁若仍指向**活着的持有者**（pid 存活 + 启动时间一致，或无法核实），
+ *    说明我们误拿了别人刚建好的活锁，必须放回原位，绝不能当成 stale 继续抢。
+ *
+ * `assessment` 仅在「移走的锁指向存活持有者」时返回，供调用方报 duplicate 错误。
  */
-function takeOverStaleLock(path: string): { acquired: boolean; moved?: LockFileContent } {
+function takeOverStaleLock(
+  path: string,
+  expected: LockFileSnapshot,
+  readStart: ProcessStartTimeReader,
+): { acquired: boolean; moved?: LockFileContent; assessment?: HolderAssessment } {
   const stalePath = `${path}${STALE_LOCK_SUFFIX}${process.pid}-${randomUUID()}`;
   const before = statSync(path, { throwIfNoEntry: false });
   try {
@@ -309,10 +504,26 @@ function takeOverStaleLock(path: string): { acquired: boolean; moved?: LockFileC
     before.dev === after.dev;
   const movedSnapshot = readLockFileSnapshot(stalePath);
   const moved = movedSnapshot.kind === "ok" ? movedSnapshot.value : undefined;
-  if (!sameFile || (moved !== undefined && isProcessAlive(moved.pid))) {
-    // 拿到的不是刚才判断为 stale 的那把锁（可能是别的进程刚建好的活锁）：放回原位并重试/报错
+  // 内容身份：判定时读到的是 ok，移走的就必须是同一把（pid+token 一致）。token 缺失
+  // （旧版本锁/损坏锁）时只能比 pid，此时以 inode 校验为准。
+  const sameContent =
+    expected.kind === "ok"
+      ? moved !== undefined &&
+        moved.pid === expected.value.pid &&
+        moved.token === expected.value.token
+      : true;
+  if (!sameFile || !sameContent) {
+    // 拿到的不是刚才判断为 stale 的那把锁（可能是别的进程刚建好的活锁）：放回原位并重试
     restoreMovedLockFile(stalePath, path);
-    return { acquired: false, moved };
+    return { acquired: false };
+  }
+  if (moved !== undefined) {
+    const assessment = assessHolder(moved, readStart);
+    if (assessment.alive) {
+      // 移走的锁仍指向活着的持有者：放回原位，由调用方按「已有实例」报错
+      restoreMovedLockFile(stalePath, path);
+      return { acquired: false, moved, assessment };
+    }
   }
   // 确认接管的就是失效锁：清理旧副本，把创建新锁的机会留给调用方（可能被第三者抢先）
   removeFileQuietly(stalePath, "清理旧锁副本");
@@ -324,31 +535,45 @@ function takeOverStaleLock(path: string): { acquired: boolean; moved?: LockFileC
  * pid/启动时间/锁路径，用户据此能直接 `kill`/`systemctl stop`）。
  *
  * 快速路径 O_CREAT|O_EXCL 原子创建；已存在时：
- * - 活 pid → 明确 duplicate 错误；
- * - 死 pid / 内容损坏 / 读取失败 → 原子接管（rename 抢占 + 身份/内容校验），抢到后创建新锁；
- *   创建失败的窗口（旧锁刚移走、别人抢先创建）重读后再决定 duplicate 或继续重试。
+ * - 持有者仍在（pid 存活 + 启动时间一致，或启动时间无法核实时的保守判定）→ 明确 duplicate 错误；
+ * - pid 已退出 / pid 被复用（启动时间不一致）/ 内容损坏 / 读取失败 → 原子接管
+ *   （rename 抢占 + inode/token/存活三重校验），抢到后创建新锁；创建失败的窗口
+ *   （旧锁刚移走、别人抢先创建）重读后再决定 duplicate 或继续重试。
  */
-export function acquireDaemonLock(dataDir: string): DaemonLock {
+export function acquireDaemonLock(dataDir: string, options: DaemonLockOptions = {}): DaemonLock {
   // daemon 正常路径会先建 dataDir；这里再兜一次，避免「目录还没建」被表现成锁获取失败
   mkdirSync(dataDir, { recursive: true });
   const path = daemonLockPath(dataDir);
+  const readStart = options.readProcessStartTime ?? readProcessStartTime;
   // 上次进程在「写完暂存文件/link 之前」或「rename 接管后清理之前」崩溃留下的垃圾：
   // 顺手清理（只删已死 pid 的）。
   cleanupLockResidues(path);
+  const token = randomUUID();
+  const selfReading = readStart(process.pid);
   const self: LockFileContent = {
     pid: process.pid,
     startedAt: new Date().toISOString(),
+    processStart: selfReading.value ?? null,
+    processStartSource: selfReading.source,
+    token,
     hostname: hostname(),
   };
   /** 已接管的失效锁信息，仅用于成功后的 warn 文案 */
   let takeoverFrom: LockFileContent | undefined;
+  let takeoverAssessment: HolderAssessment | undefined;
   let takeoverFromCorrupt = false;
 
   const logTakeover = (): void => {
     if (takeoverFrom !== undefined) {
-      logger.warn(
-        `接管已失效的 daemon 锁：pid=${takeoverFrom.pid}（启动于 ${takeoverFrom.startedAt}）已不存在，锁文件 ${path}`,
-      );
+      if (takeoverAssessment?.reused === true) {
+        logger.warn(
+          `接管 daemon 锁：${takeoverAssessment.detail}，按 stale 处理并重写锁文件 ${path}`,
+        );
+      } else {
+        logger.warn(
+          `接管已失效的 daemon 锁：pid=${takeoverFrom.pid}（启动于 ${takeoverFrom.startedAt}）已不存在，锁文件 ${path}`,
+        );
+      }
     } else if (takeoverFromCorrupt) {
       logger.warn(`daemon 锁文件内容缺失或损坏，接管并重写: ${path}`);
     }
@@ -357,32 +582,38 @@ export function acquireDaemonLock(dataDir: string): DaemonLock {
   for (let attempt = 0; attempt < MAX_TAKEOVER_ATTEMPTS; attempt += 1) {
     if (tryCreateLockFile(path, self)) {
       logTakeover();
-      return { path, release: () => releaseDaemonLock(path) };
+      return { path, release: () => releaseDaemonLock(path, token) };
     }
 
     const snapshot = readLockFileSnapshot(path);
-    if (snapshot.kind === "ok" && isProcessAlive(snapshot.value.pid)) {
-      throw duplicateDaemonError(snapshot.value, path);
+    if (snapshot.kind === "ok") {
+      const assessment = assessHolder(snapshot.value, readStart);
+      if (assessment.alive) throw duplicateDaemonError(snapshot.value, path, assessment);
     }
 
-    // 死 pid / 损坏 / 读不了：尝试原子接管
-    const takeover = takeOverStaleLock(path);
-    if (takeover.moved !== undefined && isProcessAlive(takeover.moved.pid)) {
+    // 死 pid / pid 被复用 / 损坏 / 读不了：尝试原子接管
+    const takeover = takeOverStaleLock(path, snapshot, readStart);
+    if (takeover.assessment?.alive === true && takeover.moved !== undefined) {
       // 误拿了别的进程刚建好的活锁：已尽力放回原位，按「已有实例」报错
-      throw duplicateDaemonError(takeover.moved, path);
+      throw duplicateDaemonError(takeover.moved, path, takeover.assessment);
     }
     if (!takeover.acquired) continue;
-    if (takeover.moved !== undefined) takeoverFrom = takeover.moved;
-    else takeoverFromCorrupt = true;
+    if (takeover.moved !== undefined) {
+      takeoverFrom = takeover.moved;
+      takeoverAssessment = takeover.assessment;
+    } else {
+      takeoverFromCorrupt = true;
+    }
 
     if (tryCreateLockFile(path, self)) {
       logTakeover();
-      return { path, release: () => releaseDaemonLock(path) };
+      return { path, release: () => releaseDaemonLock(path, token) };
     }
     // 旧锁移走与创建之间有别的进程抢先创建了新锁：读它决定 duplicate / 继续
     const raced = readLockFileSnapshot(path);
-    if (raced.kind === "ok" && isProcessAlive(raced.value.pid)) {
-      throw duplicateDaemonError(raced.value, path);
+    if (raced.kind === "ok") {
+      const racedAssessment = assessHolder(raced.value, readStart);
+      if (racedAssessment.alive) throw duplicateDaemonError(raced.value, path, racedAssessment);
     }
     // raced 也是失效/损坏（极端并发）：继续下一轮，有界循环兜底
   }
@@ -394,12 +625,15 @@ export function acquireDaemonLock(dataDir: string): DaemonLock {
 /**
  * 释放锁。只在自己仍持有锁时删除：接管/被接管后旧进程退出时不能把新 daemon 的锁删掉，
  * 否则第二个实例又能起来（这正是双实例的入口）。
+ *
+ * 判据是 pid + token 双一致：pid 相同但 token 不是自己写的那把锁（同 pid 重建 / 手工改库 /
+ * 被外部替换）一律不删 —— 宁可留下一个 stale 锁让下次启动接管，也不误删别人的活锁。
  */
-function releaseDaemonLock(path: string): void {
+function releaseDaemonLock(path: string, token: string): void {
   const existing = readLockFile(path);
   if (existing === undefined) return;
-  if (existing.pid !== process.pid) {
-    logger.debug(`锁文件 pid=${existing.pid} 不是当前进程，跳过释放: ${path}`);
+  if (existing.pid !== process.pid || (existing.token !== undefined && existing.token !== token)) {
+    logger.debug(`锁文件不是当前进程持有的那一把（pid=${existing.pid}），跳过释放: ${path}`);
     return;
   }
   try {
@@ -412,11 +646,18 @@ function releaseDaemonLock(path: string): void {
 }
 
 /**
- * 锁文件状态（只读、不修改任何文件）。区分 `stale`（pid 已退出，可安全接管/恢复）与
- * `corrupt`（存在但读不懂，无法判断是否有实例在跑）—— 需要安全默认值相反的调用方
- * （如 `db:restore` 覆盖数据库前）必须用这个，而不是只看 `locked`。
+ * 锁文件状态（只读、不修改任何文件）。区分 `stale`（pid 已退出**或 pid 被复用**，
+ * 可安全接管/恢复）与 `corrupt`（存在但读不懂，无法判断是否有实例在跑）—— 需要安全默认值
+ * 相反的调用方（如 `db:restore` 覆盖数据库前）必须用这个，而不是只看 `locked`。
+ *
+ * 启动时间无法核实时保守判为 `locked`（存在误判为「有实例在跑」的可能，但绝不会出现
+ * 两个实例同时写同一个库）。
  */
-export function inspectDaemonLock(dataDir: string): DaemonLockState {
+export function inspectDaemonLock(
+  dataDir: string,
+  options: DaemonLockOptions = {},
+): DaemonLockState {
+  const readStart = options.readProcessStartTime ?? readProcessStartTime;
   const snapshot = readLockFileSnapshot(daemonLockPath(dataDir));
   switch (snapshot.kind) {
     case "missing":
@@ -425,7 +666,7 @@ export function inspectDaemonLock(dataDir: string): DaemonLockState {
     case "invalid":
       return { state: "corrupt" };
     case "ok":
-      return isProcessAlive(snapshot.value.pid)
+      return assessHolder(snapshot.value, readStart).alive
         ? { state: "locked", pid: snapshot.value.pid }
         : { state: "stale", pid: snapshot.value.pid };
   }
