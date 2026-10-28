@@ -551,20 +551,20 @@ describe("OpenClaw 通道", () => {
       const outcome = await openclawChannel.deliver(
         openclawDeliveryInput("http://127.0.0.1:1/hooks/life-default"),
       );
-      // P2-17：消息必须点明两个凭据来源（profile secret 与 master 的全局 token），
-      // 不能只说「缺 OPENCLAW_HOOK_TOKEN」—— 否则非 master 用户不知道该配哪一个
+      // P2-17：消息必须点明两个凭据来源（profile secret 与部署自身 profile 的全局 token），
+      // 不能只说「缺 OPENCLAW_HOOK_TOKEN」—— 否则隔离用户不知道该配哪一个
       assert.deepEqual(outcome, {
         status: "terminal_failure",
         error:
           'openclaw 通道缺少凭据：PROFILE_ROUTE_SECRETS_JSON 中没有 profile "default" 的 secret，' +
-          "daemon 也未配置 OPENCLAW_HOOK_TOKEN（master 路由在 daemon 的 .env 里配置 OpenClaw hooks.token）",
+          "daemon 也未配置 OPENCLAW_HOOK_TOKEN（部署自身 profile 的路由在 daemon 的 .env 里配置 OpenClaw hooks.token）",
       });
     });
   });
 
-  it("notify route 接受 openclaw（master 口径），outbox 无 profile secret 也能按 Profile 投递", async () => {
+  it("notify route 接受 openclaw（未登记独立 token 的 profile），outbox 无 profile secret 也能按 Profile 投递", async () => {
     await withOpenclawToken("openclaw-test-token", async () => {
-      // 没有 PROFILE_TOKENS_JSON = 回环零配置/仅 master 部署：所有 profile 都由 master 代表
+      // 没有 PROFILE_TOKENS_JSON = 回环零配置：没有独立用户身份，所有 profile 按 master 代表
       const env = makeTestEnv();
       try {
         await withHookServer(
