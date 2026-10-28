@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { describe, it } from "node:test";
-import { bindHost, loadConfig, parseProfileId, urlHost } from "../src/config.js";
+import {
+  bindHost,
+  canUseGlobalOpenclawToken,
+  canUseGlobalOpenclawTokenFromEnv,
+  loadConfig,
+  parseProfileId,
+  urlHost,
+} from "../src/config.js";
 import { SECRET } from "./helpers.js";
 
 const BASE = { DATA_DIR: "/tmp/la-test", HERMES_PROFILE: "default" };
@@ -290,5 +297,66 @@ describe("config", () => {
     assert.throws(() => parseProfileId(undefined), /HERMES_PROFILE/);
     assert.throws(() => parseProfileId("大写"), /HERMES_PROFILE/);
     assert.throws(() => parseProfileId("-leading"), /HERMES_PROFILE/);
+  });
+
+  it("部署自身 profile：HERMES_PROFILE 解析，缺省 default，非法值拒绝启动", () => {
+    assert.equal(loadConfig(BASE).deploymentProfile, "default");
+    assert.equal(
+      loadConfig({ ...BASE, HERMES_PROFILE: "bestie" }).deploymentProfile,
+      "bestie",
+      "HERMES_PROFILE 就是部署自身 profile",
+    );
+    // 未设置（既有零配置部署）与空白值都落到缺省 default，不能因此拒绝启动
+    assert.equal(loadConfig({ DATA_DIR: "/tmp/la-test" }).deploymentProfile, "default");
+    assert.equal(
+      loadConfig({ ...BASE, HERMES_PROFILE: "   " }).deploymentProfile,
+      "default",
+      "空白 HERMES_PROFILE 按未设置处理",
+    );
+    assert.throws(() => loadConfig({ ...BASE, HERMES_PROFILE: "大写" }), /HERMES_PROFILE/);
+  });
+
+  it("openclaw 全局 token 三档口径：部署自身 / 隔离用户 / 未登记", () => {
+    const owner = "o".repeat(32);
+    const bestie = "b".repeat(32);
+    const config = loadConfig({
+      ...BASE,
+      WEB_API_TOKEN: SECRET,
+      PROFILE_TOKENS_JSON: JSON.stringify({ default: owner, bestie }),
+    });
+    // ① 部署自身 profile（default）即使登记了 Profile token，也仍可用全局 token
+    assert.equal(canUseGlobalOpenclawToken(config, "default"), true);
+    // ② 其它登记了独立 token 的 profile = 隔离用户，必须自带 route secret
+    assert.equal(canUseGlobalOpenclawToken(config, "bestie"), false);
+    // ③ 未登记独立 token 的 profile 仍按 master 代表处理
+    assert.equal(canUseGlobalOpenclawToken(config, "guest"), true);
+    // 口径是配置驱动：把 HERMES_PROFILE 换成 bestie，两者互换
+    const swapped = loadConfig({
+      ...BASE,
+      HERMES_PROFILE: "bestie",
+      WEB_API_TOKEN: SECRET,
+      PROFILE_TOKENS_JSON: JSON.stringify({ default: owner, bestie }),
+    });
+    assert.equal(canUseGlobalOpenclawToken(swapped, "bestie"), true);
+    assert.equal(canUseGlobalOpenclawToken(swapped, "default"), false);
+    // PROFILE_TOKENS_JSON 为空：所有 profile 都按 master 代表（既有行为）
+    const zeroConfig = loadConfig({ ...BASE, WEB_API_TOKEN: SECRET });
+    assert.equal(canUseGlobalOpenclawToken(zeroConfig, "default"), true);
+    assert.equal(canUseGlobalOpenclawToken(zeroConfig, "bestie"), true);
+    // 环境快照版本（投递层告警用）与配置版本同口径
+    assert.equal(
+      canUseGlobalOpenclawTokenFromEnv("bestie", {
+        HERMES_PROFILE: "default",
+        PROFILE_TOKENS_JSON: JSON.stringify({ default: owner, bestie }),
+      }),
+      false,
+    );
+    assert.equal(canUseGlobalOpenclawTokenFromEnv("bestie", { HERMES_PROFILE: "bestie" }), true);
+    // 解析失败/缺失一律按「可用全局 token」处理（fail-safe：少告警，不误告警）
+    assert.equal(
+      canUseGlobalOpenclawTokenFromEnv("bestie", { PROFILE_TOKENS_JSON: "{坏 JSON" }),
+      true,
+    );
+    assert.equal(canUseGlobalOpenclawTokenFromEnv("bestie", {}), true);
   });
 });
