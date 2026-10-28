@@ -8,6 +8,7 @@ import {
   getExpense,
   listExpenses,
   setBudget,
+  setDefaultLedgerId,
 } from "../src/modules/bookkeeping/service.js";
 import { cleanupTestEnv, makeTestEnv, type Published, type TestEnv } from "./helpers.js";
 
@@ -302,6 +303,81 @@ describe("bookkeeping 幂等：request_id → client_token", () => {
         request_id: "past-month",
       });
       assert.equal(env.published.length, 0, "幂等重试不得再次告警");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  // P2-4：命中幂等时回执必须整体取自原记录。此前「账本」取自本次调用解析出的 ledger，
+  // 于是同一 request_id 换账本重试（或默认账本被改）会得到「金额/分类是原记录、账本却是本次参数」
+  // 的自相矛盾回执，quick 的 audit_log.detail 也一并被污染。
+  it("幂等命中时回执的账本取自原记录，不随本次参数漂移（P2-4）", () => {
+    const env = makeTestEnv();
+    const t = tools(env);
+    try {
+      const ledgerA = createLedger(env.db, "漂移A");
+      const ledgerB = createLedger(env.db, "漂移B");
+      const first = JSON.parse(
+        text(
+          t.expense({
+            action: "add",
+            ledger_id: ledgerA.id,
+            amount: 8,
+            category: "交通",
+            request_id: "req-ledger-drift",
+          }),
+        ),
+      ) as AddReceipt;
+      assert.equal(first.已记账.账本, "漂移A");
+      assert.equal(first.已存在, undefined);
+
+      // 同一次请求重试，但这次显式换了账本：返回的仍是首次那一行
+      const retry = JSON.parse(
+        text(
+          t.expense({
+            action: "add",
+            ledger_id: ledgerB.id,
+            amount: 8,
+            category: "交通",
+            request_id: "req-ledger-drift",
+          }),
+        ),
+      ) as AddReceipt;
+      assert.equal(retry.已存在, true);
+      assert.equal(retry.已记账.id, first.已记账.id);
+      assert.equal(
+        retry.已记账.账本,
+        "漂移A",
+        "幂等命中时账本必须按原记录回显（回执不能一半来自原记录、一半来自本次参数）",
+      );
+      assert.deepEqual(retry.已记账, first.已记账, "命中回执应与首次成功完全一致");
+      assert.equal(rowCount(env), 1, "换账本重试不得落第二行");
+      assert.equal(getExpense(env.db, first.已记账.id)?.ledger_id, ledgerA.id, "原记录归属不变");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("默认账本被改后重试（不带 ledger_id）：账本仍取自原记录（P2-4）", () => {
+    const env = makeTestEnv();
+    const t = tools(env);
+    try {
+      const ledgerA = createLedger(env.db, "默认A");
+      const ledgerB = createLedger(env.db, "默认B");
+      setDefaultLedgerId(env.db, "default", ledgerA.id);
+      const first = JSON.parse(
+        text(t.expense({ action: "add", amount: 30, request_id: "req-default-drift" })),
+      ) as AddReceipt;
+      assert.equal(first.已记账.账本, "默认A");
+
+      // 默认账本改成 B 后再重试：本次解析出的是 B，但命中的行仍是首次那一条
+      setDefaultLedgerId(env.db, "default", ledgerB.id);
+      const retry = JSON.parse(
+        text(t.expense({ action: "add", amount: 30, request_id: "req-default-drift" })),
+      ) as AddReceipt;
+      assert.equal(retry.已存在, true);
+      assert.equal(retry.已记账.账本, "默认A", "默认账本变化不得改写幂等命中的回显");
+      assert.equal(rowCount(env), 1);
     } finally {
       cleanupTestEnv(env);
     }
