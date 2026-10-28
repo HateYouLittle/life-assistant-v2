@@ -814,6 +814,38 @@ describe("看板明细「加载更多」", () => {
   });
 });
 
+/**
+ * 抽屉入口冒烟（P2-23）：七个 openXxx() 各自是一次独立的渲染路径，
+ * 任何一个在加载时引用未定义符号/写坏模板拼接，都只会让那一个抽屉白屏。
+ * 这里对每个入口都跑一遍真实脚本 + 真实 /api，断言「点了没抛异常且抽屉确实打开」。
+ */
+describe("看板抽屉入口冒烟（每个 openXxx 都不得抛异常）", () => {
+  it("七个抽屉入口都能打开", () => {
+    const env = makeTestEnv();
+    try {
+      for (const kind of [
+        "expenses",
+        "schedules",
+        "holidays",
+        "budget",
+        "deliveries",
+        "jobs",
+        "system",
+      ]) {
+        const run = runPageScript(env, "");
+        assert.doesNotThrow(() => run.clickDrawer(kind), `${kind} 抽屉入口抛异常`);
+        assert.notEqual(
+          run.elements.get("drawer-title")?.textContent ?? "",
+          "",
+          `${kind} 抽屉没有打开（openDrawer 未被调用）`,
+        );
+      }
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
 describe("看板身份 chip", () => {
   it("master / 无 token：显示「家庭看板」", async () => {
     const env = makeTestEnv();

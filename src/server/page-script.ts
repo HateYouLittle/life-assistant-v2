@@ -1,0 +1,1013 @@
+import { UNSET_BUDGET_SUGGESTION } from "./budget.js";
+
+/**
+ * 状态看板页面的内联 CSS/JS（从 page.ts 逐字搬出，字符串内容零改动）。
+ *
+ * 这些内容最终以内联 `<style>`/`<script>` 注入浏览器，tsc/biome 看不见字符串内部：
+ * 拆成独立模块后，tests/status-page-script-syntax.test.ts 用 `node --check` 校验语法。
+ *
+ * `resolveToken` 放在本文件而不是 page.ts：SCRIPT 用 `resolveToken.toString()` 内联它的
+ * 函数体文本，同文件可避免 page.ts ↔ page-script.ts 的循环 import（函数体仍是逐字内联）。
+ * SCRIPT 里还内联了 `UNSET_BUDGET_SUGGESTION`（JSON 序列化），因此这里 import budget.ts。
+ */
+
+export const STYLE = `
+  :root {
+    --bg: #0a0c11;
+    --card: rgba(255,255,255,.028);
+    --card-hi: rgba(255,255,255,.055);
+    --line: rgba(255,255,255,.075);
+    --line-soft: rgba(255,255,255,.045);
+    --fg: #e9eef6;
+    --dim: #8e99a8;
+    --mute: #5b6575;
+    --teal: #5eead4;
+    --sky: #7dd3fc;
+    --green: #4ade80;
+    --amber: #fbbf24;
+    --red: #f87171;
+    --r: 16px;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 30px 20px 64px; min-height: 100vh;
+    background:
+      radial-gradient(820px 460px at 8% -12%, rgba(94,234,212,.075), transparent 62%),
+      radial-gradient(680px 380px at 100% -6%, rgba(125,211,252,.055), transparent 58%),
+      var(--bg);
+    color: var(--fg);
+    font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB",
+      "Microsoft YaHei", system-ui, sans-serif;
+    font-variant-numeric: tabular-nums;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+
+  /* ── header ── */
+  .head { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }
+  .brand { display: flex; align-items: center; gap: 13px; }
+  .mark {
+    width: 40px; height: 40px; border-radius: 12px; flex: none; display: grid; place-items: center;
+    font-size: 15px; font-weight: 700; color: #04231f;
+    background: linear-gradient(140deg, #5eead4, #38bdf8);
+    box-shadow: 0 6px 20px -8px rgba(94,234,212,.55);
+  }
+  h1 { margin: 0; font-size: 17px; font-weight: 600; letter-spacing: -.01em; }
+  h1 .ver { color: var(--mute); font-weight: 500; font-size: 13px; margin-left: 4px; }
+  .date { color: var(--dim); font-size: 12.5px; margin-top: 2px; }
+  .head-right { display: flex; align-items: center; gap: 12px; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 7px; padding: 6px 12px; border-radius: 999px;
+    font-size: 12.5px; background: rgba(74,222,128,.08); border: 1px solid rgba(74,222,128,.22); color: #86efac;
+  }
+  .pill.warn { background: rgba(251,191,36,.08); border-color: rgba(251,191,36,.25); color: #fcd34d; }
+  .pill.bad { background: rgba(248,113,113,.1); border-color: rgba(248,113,113,.28); color: #fca5a5; }
+  .pill.info { background: rgba(125,211,252,.08); border-color: rgba(125,211,252,.25); color: #7dd3fc; }
+  /* 身份 chip 在首屏数据回来前是空的：不占位避免先闪一个空胶囊（拿到 /api/status 后再显示） */
+  #identity-chip:empty { display: none; }
+  .pill i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; box-shadow: 0 0 0 3px rgba(255,255,255,.06); }
+  .stamp { color: var(--mute); font-size: 12px; }
+
+  /* ── cards ── */
+  .card {
+    position: relative; background: var(--card); border: 1px solid var(--line);
+    border-radius: var(--r); padding: 20px 22px; transition: border-color .16s, background .16s, transform .16s;
+  }
+  .clickable { cursor: pointer; }
+  .clickable:hover { border-color: rgba(255,255,255,.16); background: var(--card-hi); }
+  .clickable:active { transform: translateY(1px); }
+  .clickable:focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; }
+  .chev { margin-left: auto; color: var(--mute); font-size: 11.5px; letter-spacing: .02em; }
+  .clickable:hover .chev { color: var(--teal); }
+  .card-k { color: var(--dim); font-size: 12.5px; display: flex; align-items: center; gap: 8px; }
+  .tag { color: var(--mute); font-size: 11px; border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; }
+
+  .hero-group { display: grid; grid-template-columns: 1.32fr 1fr; gap: 14px; margin-bottom: 14px; }
+  .side { display: grid; grid-template-rows: 1fr 1fr; gap: 14px; }
+  .side .card { display: flex; flex-direction: column; justify-content: center; }
+
+  .amount { font-size: clamp(36px, 5.2vw, 48px); font-weight: 600; letter-spacing: -.025em; line-height: 1.1; margin: 14px 0 6px; }
+  .amount .dec { font-size: .55em; color: var(--dim); font-weight: 500; letter-spacing: 0; }
+  .delta { font-size: 12.5px; color: var(--dim); }
+  .delta b { color: var(--amber); font-weight: 600; }
+  .delta .down { color: var(--green); }
+  .bar { display: flex; height: 8px; border-radius: 99px; overflow: hidden; margin: 18px 0 14px; background: rgba(255,255,255,.05); gap: 2px; }
+  .bar span { height: 100%; display: block; }
+  .legend { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 18px; font-size: 12.5px; }
+  .legend div { display: flex; align-items: center; gap: 8px; color: var(--dim); min-width: 0; }
+  .legend i { width: 7px; height: 7px; border-radius: 2px; flex: none; }
+  .legend b { margin-left: auto; color: var(--fg); font-weight: 500; }
+
+  .big { font-size: 28px; font-weight: 600; letter-spacing: -.02em; margin: 10px 0 4px; line-height: 1.15; }
+  .big small { font-size: 13px; color: var(--dim); font-weight: 500; margin-left: 6px; letter-spacing: 0; }
+  .tiny { font-size: 12.5px; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mini { list-style: none; margin: 10px 0 0; padding: 0; font-size: 12.5px; }
+  .mini li { display: flex; align-items: center; gap: 8px; padding: 5px 0; border-top: 1px solid var(--line-soft); }
+  .mini li:first-child { border-top: 0; }
+  .mini .t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mini .w { color: var(--dim); flex: none; }
+  .mini .d { color: var(--teal); flex: none; font-size: 12px; }
+  .mini li.more { color: var(--mute); font-size: 12px; }
+
+  .card.trend, .card.jobs { margin-bottom: 14px; }
+  .card.jobs .tiny { margin-top: 10px; }
+  .trend-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; flex-wrap: wrap; }
+  .stats { display: flex; gap: 26px; margin-top: 12px; }
+  .stat .n { font-size: 22px; font-weight: 600; letter-spacing: -.02em; line-height: 1.2; }
+  .stat .l { font-size: 12px; color: var(--mute); margin-top: 2px; }
+  .spark { width: 100%; height: 62px; }
+  .sparkwrap { flex: 1 1 240px; max-width: 360px; min-width: 190px; }
+  .spark-cap { display: flex; justify-content: space-between; align-items: baseline; font-size: 11.5px; color: var(--mute); margin-bottom: 8px; }
+  .spark-axis { display: flex; justify-content: space-between; font-size: 10.5px; color: var(--mute); margin-top: 5px; }
+  .hero-stats { display: flex; gap: 26px; margin-top: 16px; padding-top: 13px; border-top: 1px solid var(--line-soft); }
+  .ok { color: var(--green); }
+  .warn { color: var(--amber); }
+  .bad { color: var(--red); }
+
+  .ops { padding: 6px 0; margin-top: 14px; }
+  .ops-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 22px; border-top: 1px solid var(--line-soft); }
+  .ops-row:first-child { border-top: 0; }
+  .ops-row .l { color: var(--dim); font-size: 12.5px; }
+  .ops-row .v { font-size: 13px; }
+  .muted { color: var(--mute); }
+
+  /* ── 预算 ── */
+  .card.budget { margin-bottom: 14px; }
+  .bud-item { padding: 12px 0; border-top: 1px solid var(--line-soft); }
+  .bud-item:first-child { border-top: 0; padding-top: 4px; }
+  .bud-item:last-child { padding-bottom: 2px; }
+  .bud-head { display: flex; align-items: baseline; gap: 10px; }
+  .bud-head .t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+  .bud-head .amt { flex: none; color: var(--dim); font-size: 12.5px; }
+  .prog { height: 6px; border-radius: 99px; background: rgba(255,255,255,.06); overflow: hidden; margin: 8px 0 6px; }
+  .prog span { display: block; height: 100%; border-radius: 99px; background: linear-gradient(90deg, rgba(94,234,212,.9), rgba(56,189,248,.7)); }
+  .prog.warn span { background: linear-gradient(90deg, rgba(251,191,36,.9), rgba(251,191,36,.5)); }
+  .prog.over span { background: linear-gradient(90deg, rgba(248,113,113,.95), rgba(248,113,113,.55)); }
+  .bud-tip { font-size: 12px; color: var(--dim); margin-top: 5px; }
+  .bud-tip.warn { color: var(--amber); }
+  .bud-tip.bad { color: var(--red); }
+  .bud-cats { list-style: none; margin: 9px 0 0; padding: 0; font-size: 12px; }
+  .bud-cats li { display: flex; align-items: center; gap: 8px; padding: 4px 0; color: var(--dim); }
+  .bud-cats .c { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bud-cats .c em { font-style: normal; font-size: 11px; margin-left: 6px; }
+  .bud-cats .p { flex: none; width: 84px; }
+  .bud-cats .p span { display: block; height: 4px; border-radius: 99px; background: rgba(255,255,255,.07); overflow: hidden; }
+  .bud-cats .p i { display: block; height: 100%; border-radius: 99px; background: var(--teal); }
+  .bud-cats .p i.warn { background: var(--amber); }
+  .bud-cats .p i.over { background: var(--red); }
+  .bud-cats .a { flex: none; color: var(--mute); font-size: 11.5px; }
+  .bud-cats li.more { color: var(--mute); font-size: 11.5px; }
+
+  /* ── drawer ── */
+  .scrim {
+    position: fixed; inset: 0; background: rgba(4,6,10,.62); opacity: 0; pointer-events: none;
+    transition: opacity .2s; backdrop-filter: blur(2px); z-index: 40;
+  }
+  .scrim.on { opacity: 1; pointer-events: auto; }
+  .drawer {
+    position: fixed; top: 0; right: 0; height: 100%; width: min(460px, 92vw);
+    background: #0d1017; border-left: 1px solid var(--line); z-index: 50;
+    transform: translateX(102%); transition: transform .24s cubic-bezier(.22,.61,.36,1);
+    display: flex; flex-direction: column; box-shadow: -24px 0 60px -30px rgba(0,0,0,.8);
+  }
+  .drawer.on { transform: none; }
+  .drawer-head {
+    display: flex; align-items: center; gap: 12px; padding: 18px 20px 14px;
+    border-bottom: 1px solid var(--line-soft); flex: none;
+  }
+  .drawer-head h2 { margin: 0; font-size: 15px; font-weight: 600; }
+  .drawer-head .sub { color: var(--mute); font-size: 12px; margin-left: auto; }
+  .close {
+    flex: none; width: 30px; height: 30px; border-radius: 9px; border: 1px solid var(--line);
+    background: transparent; color: var(--dim); font-size: 17px; line-height: 1; cursor: pointer;
+  }
+  .close:hover { color: var(--fg); border-color: rgba(255,255,255,.2); }
+  .drawer-body { padding: 18px 20px calc(40px + env(safe-area-inset-bottom, 0px)); overflow-y: auto; }
+
+  .sect { margin-bottom: 22px; }
+  .sect h3 { margin: 0 0 10px; font-size: 12px; font-weight: 600; color: var(--dim); letter-spacing: .04em; text-transform: uppercase; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th { text-align: left; color: var(--mute); font-weight: 500; font-size: 11.5px; padding: 0 0 6px; border-bottom: 1px solid var(--line); }
+  td { padding: 7px 0; border-bottom: 1px solid var(--line-soft); vertical-align: top; }
+  td.num, th.num { text-align: right; white-space: nowrap; }
+  tr:last-child td { border-bottom: 0; }
+  .rowlist { list-style: none; margin: 0; padding: 0; }
+  .rowlist li { padding: 9px 0; border-bottom: 1px solid var(--line-soft); font-size: 12.5px; }
+  .rowlist li:last-child { border-bottom: 0; }
+  .rowlist .top { display: flex; align-items: baseline; gap: 8px; }
+  .rowlist .top .t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rowlist .meta { color: var(--mute); font-size: 11.5px; margin-top: 3px; display: flex; gap: 10px; flex-wrap: wrap; }
+  .chip { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 99px; border: 1px solid var(--line); color: var(--dim); }
+  .chip.teal { border-color: rgba(94,234,212,.28); color: var(--teal); }
+  .chip.amber { border-color: rgba(251,191,36,.3); color: var(--amber); }
+  .chip.red { border-color: rgba(248,113,113,.3); color: var(--red); }
+  .chip.green { border-color: rgba(74,222,128,.28); color: var(--green); }
+  .empty { color: var(--mute); font-size: 12.5px; padding: 10px 0; }
+  .bars { display: flex; align-items: flex-end; gap: 6px; height: 72px; margin: 6px 0 4px; }
+  .bars div { flex: 1; background: linear-gradient(180deg, rgba(94,234,212,.85), rgba(94,234,212,.15)); border-radius: 4px 4px 2px 2px; min-height: 3px; position: relative; }
+  .bars div span { position: absolute; bottom: -18px; left: 0; right: 0; text-align: center; color: var(--mute); font-size: 10px; }
+  /* flex-wrap：导出按钮让月份导航多一项，窄屏（抽屉 92vw）下不能横向溢出 */
+  .monthnav { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
+  .monthnav button {
+    background: transparent; border: 1px solid var(--line); color: var(--dim); border-radius: 8px;
+    padding: 4px 10px; font-size: 12px; cursor: pointer;
+  }
+  .monthnav button:hover { color: var(--fg); border-color: rgba(255,255,255,.2); }
+  .monthnav .cur { font-weight: 600; }
+  .sel { background: transparent; border: 1px solid var(--line); color: var(--fg); border-radius: 8px; padding: 4px 8px; font-size: 12px; }
+  /* 「加载更多」：横贯抽屉底部的一行按钮；已全部加载时保持占位（不跳版） */
+  .morebtn {
+    display: block; width: 100%; margin-top: 10px; padding: 8px 10px; border-radius: 9px;
+    background: transparent; border: 1px solid var(--line); color: var(--dim);
+    font-size: 12.5px; cursor: pointer;
+  }
+  .morebtn:hover:not(:disabled) { color: var(--fg); border-color: rgba(255,255,255,.2); }
+  .morebtn:disabled { color: var(--mute); cursor: default; opacity: .7; }
+  .spin { color: var(--mute); font-size: 12.5px; padding: 8px 0; }
+
+  @media (max-width: 820px) {
+    .hero-group { grid-template-columns: 1fr; }
+    .side { grid-template-rows: none; grid-template-columns: 1fr 1fr; }
+    .legend { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 620px) {
+    body { padding: 20px 14px 48px; }
+    .side { grid-template-columns: 1fr; }
+    .stats { gap: 18px; }
+    .spark { width: 100%; }
+    .drawer {
+      top: auto; bottom: 0; right: 0; left: 0; width: auto; height: 84vh;
+      border-left: 0; border-top: 1px solid var(--line); border-radius: 18px 18px 0 0;
+      transform: translateY(102%);
+    }
+    .drawer.on { transform: none; }
+  }
+`;
+
+/**
+ * 页面凭据引导：`?token=` 取到的 token 落 localStorage 后复用，后续 fetch 只走
+ * Authorization 头（凭据不再出现在每次请求的 URL 里）。
+ *
+ * 该函数会被 toString 内联进浏览器脚本，因此必须保持纯 JS 语法、不引用任何外部符号；
+ * 单独导出是为了能直接单测 —— 字符串层面的「页面里有没有这行代码」断言证明不了行为。
+ */
+export function resolveToken(
+  search: string,
+  store: { getItem(key: string): string | null; setItem(key: string, value: string): void },
+): string | null {
+  const fromUrl = new URLSearchParams(search).get("token");
+  if (fromUrl !== null && fromUrl !== "") {
+    try {
+      store.setItem("web_api_token", fromUrl);
+    } catch {
+      // 隐私模式下 storage 可能不可写；本次仍用 URL 里的凭据，不影响使用
+    }
+    return fromUrl;
+  }
+  try {
+    return store.getItem("web_api_token");
+  } catch {
+    return null;
+  }
+}
+
+export const SCRIPT = `
+  var COLORS = ['#5eead4','#38bdf8','#818cf8','#c084fc','#f472b6'];
+  var REST_COLOR = '#475569';
+  var token = (${resolveToken.toString()})(location.search, localStorage);
+  if (location.search.indexOf('token=') >= 0 && typeof history !== 'undefined' && history.replaceState) {
+    // 凭据已落到 localStorage，立刻从地址栏抹掉：否则会留在浏览器历史、Referer 与截图里
+    history.replaceState(null, '', location.pathname);
+  }
+  var drawer = document.getElementById('drawer');
+  var scrim = document.getElementById('scrim');
+  var drawerBody = document.getElementById('drawer-body');
+  var drawerTitle = document.getElementById('drawer-title');
+  var drawerSub = document.getElementById('drawer-sub');
+  var expMonth = null;
+  /* 分页累积状态：expEntries/delItems 是「已加载」的行，expTotal/delTotal 是服务端总数 */
+  var expEntries = [];
+  var expTotal = 0;
+  var delItems = [];
+  var delTotal = 0;
+  var holYear = null;
+  var drawerOpen = false;
+  var drawerRender = null;
+  var current = null;
+  /* 未设预算的提示文案与 src/server/budget.ts 同源（服务端拼进脚本，避免两处漂移） */
+  var BUDGET_UNSET_TIP = ${JSON.stringify(UNSET_BUDGET_SUGGESTION)};
+
+  function api(path) {
+    return fetch(path, token ? { headers: { Authorization: 'Bearer ' + token } } : {}).then(function (r) {
+      if (!r.ok) throw new Error(r.status === 401 ? '未授权：在地址栏给本页加上 ?token=<WEB_API_TOKEN> 刷新一次（本页会记住）' : 'HTTP ' + r.status);
+      return r.json();
+    });
+  }
+  function el(id) { return document.getElementById(id); }
+  function yuan(cents) {
+    return '¥' + (cents / 100).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+  function esc(text) {
+    return String(text === null || text === undefined ? '' : text).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function mins(sec) {
+    var m = Math.floor(sec / 60);
+    if (m < 90) return m + ' 分钟';
+    var h = Math.floor(m / 60);
+    if (h < 36) return h + ' 小时';
+    return Math.floor(h / 24) + ' 天';
+  }
+  function icon(kind) {
+    return kind === 'birthday' ? '生日' : kind === 'anniversary' ? '纪念' : '待办';
+  }
+
+  /* ── 首屏 ── */
+  function render(s) {
+    current = s;
+    el('date-line').className = 'date';
+    el('date-line').textContent = s.today.label + ' · 已运行 ' + mins(s.uptime_s);
+    var alerts = s.notifications.failed + s.notifications.fallback;
+    var health = el('health');
+    health.className = 'pill' + (alerts > 0 ? ' bad' : s.notifications.queued > 0 ? ' warn' : '');
+    health.innerHTML = '<i></i>' + (alerts > 0 ? alerts + ' 项投递异常' : s.notifications.queued > 0 ? s.notifications.queued + ' 项待投递' : '运行正常');
+    el('stamp').textContent = s.today.time + ' 更新 · 30s 自动刷新';
+
+    // 身份 chip：master = 家庭看板（全部 Profile），profile = 个人视图（只有自己的数据）。
+    // 身份来自受鉴权保护的 /api/status，静态页 / 本身不含任何身份信息。
+    var ident = s.identity || { kind: 'master' };
+    var identityChip = el('identity-chip');
+    if (identityChip) {
+      identityChip.className = 'pill' + (ident.kind === 'profile' ? ' info' : '');
+      identityChip.textContent = ident.kind === 'profile' ? '个人视图 · ' + ident.profile_id : '家庭看板';
+      identityChip.title = ident.kind === 'profile'
+        ? '只显示该 Profile 的日程/通知，以及家庭 + 自己个人账本的支出'
+        : '家庭看板：所有 Profile 的日程/通知 + 家庭账本支出';
+    }
+
+    var exp = s.expenses;
+    var whole = Math.floor(exp.month_cents / 100).toLocaleString('zh-CN');
+    var dec = String(Math.round(exp.month_cents % 100)).padStart(2, '0');
+    el('exp-amount').innerHTML = '¥' + whole + '<span class="dec">.' + dec + '</span>';
+    var diff = exp.month_cents - exp.prev_month_cents;
+    var prevLabel = exp.prev_month.slice(5).replace(/^0/, '');
+    el('exp-delta').innerHTML = '上月（' + prevLabel + ' 月）全月 ' + yuan(exp.prev_month_cents) + ' · ' +
+      (diff >= 0
+        ? '本月已多出 <b>' + yuan(diff) + '</b>'
+        : '比上月少 <b class="down">' + yuan(-diff) + '</b>') +
+      ' · 共 ' + exp.count + ' 笔';
+
+    var cats = exp.categories || [];
+    // 堆叠条只画 Top5 + 其余合并，图例与之严格一一对应（否则条与图例对不上）
+    var segs = cats.slice(0, 5).map(function (c, i) {
+      return { label: c.category, cents: c.cents, color: COLORS[i] };
+    });
+    var restCents = cats.slice(5).reduce(function (a, c) { return a + c.cents; }, 0);
+    if (restCents > 0) {
+      segs.push({ label: '其他 ' + (cats.length - 5) + ' 类', cents: restCents, color: REST_COLOR });
+    }
+    var monthCents = exp.month_cents || 1;
+    el('exp-bar').innerHTML = segs.length
+      ? segs.map(function (s) {
+          return '<span style="width:' + ((s.cents / monthCents) * 100).toFixed(2) + '%;background:' + s.color + '"></span>';
+        }).join('')
+      : '<span style="width:100%;background:rgba(255,255,255,.06)"></span>';
+    el('exp-legend').innerHTML = segs.map(function (s) {
+      return '<div><i style="background:' + s.color + '"></i>' + esc(s.label) + '<b>' + yuan(s.cents) + '</b></div>';
+    }).join('') || '<div class="muted">本月还没有记账</div>';
+
+    var day = Number(s.today.date.slice(8, 10));
+    var dim = new Date(Number(s.today.date.slice(0, 4)), Number(s.today.date.slice(5, 7)), 0).getDate();
+    // 「日均（至今）」必须只除到今天：本月合计按自然月全月含未来记账，
+    // 直接用 month_cents / 日号会把提前录入的月末支出摊进「至今」。
+    var spentToDate = (exp.daily || []).reduce(function (a, d) {
+      return d.date <= s.today.date ? a + d.cents : a;
+    }, 0);
+    el('exp-stats').innerHTML =
+      '<div class="stat"><div class="n">' + yuan(Math.round(spentToDate / Math.max(1, day))) + '</div><div class="l">日均（至今）</div></div>' +
+      '<div class="stat"><div class="n">' + (exp.daily || []).length + '</div><div class="l">记账天数</div></div>' +
+      '<div class="stat"><div class="n">' + Math.max(0, dim - day) + '</div><div class="l">本月剩余天</div></div>';
+
+    // 预算：ratio/pace/建议都由服务端算好（budgetPayload），前端只做展示，避免浏览器重算口径
+    renderBudget(s.budget);
+
+    var next = s.schedules.next || [];
+    el('sch-count').innerHTML = s.schedules.active + ' <small>项</small>';
+    var shown = next.slice(0, 4);
+    el('sch-next').innerHTML = shown.length
+      ? shown.map(function (n) {
+          return '<li><span class="t" title="' + esc(n.title) + '">' + esc(n.title) + '</span>' +
+            '<span class="w">' + esc(shortWhen(n.next_local)) + '</span></li>';
+        }).join('') +
+        (s.schedules.active > shown.length
+          ? '<li class="more">还有 ' + (s.schedules.active - shown.length) + ' 项 · 点开看全部 ›</li>'
+          : '')
+      : '<li class="muted">暂无待触发日程</li>';
+
+    var hol = s.holidays.next;
+    el('hol-main').innerHTML = hol ? esc(hol.name) + ' <small>' + hol.days + ' 天</small>' : '暂无数据 <small>—</small>';
+    el('hol-sub').textContent = hol
+      ? hol.in_progress
+        ? '进行中 · ' + hol.date + '–' + hol.end + '，共 ' + hol.days + ' 天'
+        : hol.date + ' 起' + (hol.days_until === 0 ? ' · 就是今天' : ' · 还有 ' + hol.days_until + ' 天')
+      : '节假日数据未导入';
+
+    el('trend-stats').innerHTML =
+      '<div class="stat"><div class="n ' + (s.notifications.queued > 0 ? 'warn' : 'ok') + '">' + s.notifications.queued + '</div><div class="l">待投递</div></div>' +
+      '<div class="stat"><div class="n ' + (alerts > 0 ? 'bad' : 'ok') + '">' + alerts + '</div><div class="l">失败 / 兜底</div></div>' +
+      '<div class="stat"><div class="n">' + s.notifications.sent_24h + '</div><div class="l">近 24 小时</div></div>';
+    el('spark').innerHTML = sparkline(s.notifications.daily || []);
+    var daily = s.notifications.daily || [];
+    var peak = daily.reduce(function (a, d) { return Math.max(a, d.sent); }, 0);
+    el('spark-cap').innerHTML = '<span>近 7 天投递</span><span>峰值 ' + peak + ' 条</span>';
+    el('spark-from').textContent = daily.length ? daily[0].label : '';
+    el('spark-to').textContent = daily.length ? daily[daily.length - 1].label + ' 今天' : '';
+
+    // 定时任务：概览只回答「有没有任务在失败、最近一次跑在什么时候」，
+    // 逐个任务的最近运行放进抽屉（点开才拉 /api/jobs）。
+    var jobInfo = s.jobs || { total: 0, failed_24h: 0, runs: [] };
+    var jobRuns = jobInfo.runs || [];
+    el('job-stats').innerHTML =
+      '<div class="stat"><div class="n">' + jobInfo.total + '</div><div class="l">定时任务</div></div>' +
+      '<div class="stat"><div class="n ' + (jobInfo.failed_24h > 0 ? 'bad' : 'ok') + '">' + jobInfo.failed_24h +
+      '</div><div class="l">24 小时失败</div></div>';
+    var latestJob = null;
+    jobRuns.forEach(function (j) {
+      if (j.last_run && (latestJob === null || j.last_run.started_at > latestJob.started_at)) latestJob = j.last_run;
+    });
+    el('job-last').innerHTML = latestJob
+      ? '最近运行 ' + jobChip(latestJob.status) + ' · ' + esc(stampShort(latestJob.started_at)) +
+        (latestJob.error ? ' · <span class="bad">' + esc(String(latestJob.error).slice(0, 80)) + '</span>' : '')
+      : '<span class="muted">还没有运行记录</span>';
+
+    el('ops').innerHTML =
+      row('Profile', esc(s.profiles.join(' · ') || '暂无')) +
+      row('账本', s.ledgers.total + ' 个活跃' + (s.ledgers.archived ? ' · ' + s.ledgers.archived + ' 个归档' : ' · 无归档')) +
+      row('定时简报', '<span class="muted">' + esc(cronLabel(s.daily_brief_cron)) + '</span>') +
+      row('天气数据源', s.qweather_configured ? '<span class="ok">QWeather 已配置</span>' : '<span class="warn">QWeather 未配置</span>') +
+      (s.qweather_usage
+        ? row('今日天气请求', s.qweather_usage.requests + ' 次 <span class="muted">（' + esc(s.qweather_usage.day) + '，含重试）</span>')
+        : '') +
+      (s.holidays.failed.length
+        ? row('节假日抓取失败', '<span class="bad">' + s.holidays.failed.map(function (f) {
+            return f.year + ' 年（' + esc(String(f.error || '未知原因').slice(0, 80)) + '）';
+          }).join('、') + '</span>')
+        : '');
+  }
+  function shortWhen(stamp) {
+    return stamp ? stamp.slice(5) : '—';
+  }
+  function row(label, value) {
+    return '<div class="ops-row"><span class="l">' + label + '</span><span class="v">' + value + '</span></div>';
+  }
+  /* job_runs 的时间戳是 UTC 瞬间（不是业务日历日）：按浏览器本地时区显示成 MM-dd HH:mm，
+     与 /api/* 里服务端本地化好的业务日期区分开；解析失败就原样截断，不猜。 */
+  function stampShort(iso) {
+    if (!iso) return '—';
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return String(iso).slice(0, 16).replace('T', ' ');
+    return ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2) + ' ' +
+      ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2);
+  }
+  function jobStatusLabel(status) {
+    return status === 'ok' ? '成功'
+      : status === 'failed' ? '失败'
+      : status === 'skipped' ? '跳过'
+      : status === 'running' ? '执行中'
+      : String(status);
+  }
+  function jobChip(status) {
+    var cls = status === 'ok' ? ' green' : status === 'failed' ? ' red' : status === 'skipped' ? ' amber' : '';
+    return '<span class="chip' + cls + '">' + esc(jobStatusLabel(status)) + '</span>';
+  }
+
+  /* ── 预算（服务端已算好 ratio/pace/suggestion；这里只决定颜色与排版） ── */
+  function budLevel(line) {
+    if (!line) return '';
+    if (line.ratio >= 1) return ' over';
+    if (line.pace > 1.1) return ' warn';
+    return '';
+  }
+  function budBar(line) {
+    var pct = Math.max(0, Math.min(100, (line.ratio || 0) * 100));
+    return '<div class="prog' + budLevel(line) + '"><span style="width:' + pct.toFixed(1) + '%"></span></div>';
+  }
+  function budTip(line) {
+    var cls = line.ratio >= 1 ? ' bad' : line.pace > 1.1 ? ' warn' : '';
+    return '<div class="bud-tip' + cls + '">' + esc(line.suggestion) + '</div>';
+  }
+  function budCatLevel(cat) {
+    return cat.ratio >= 1 ? 'over' : cat.pace > 1.1 ? 'warn' : '';
+  }
+  function renderBudget(budget) {
+    var body = el('budget-body');
+    if (!body) return;
+    var ledgers = (budget && budget.ledgers) || [];
+    if (!ledgers.length) {
+      body.innerHTML = '<div class="empty">还没有家庭账本</div>';
+      return;
+    }
+    body.innerHTML = ledgers.map(function (l) {
+      var html = '<div class="bud-item">';
+      if (l.total) {
+        html += '<div class="bud-head"><span class="t">' + esc(l.ledger_name) + '</span>' +
+          '<span class="amt">' + yuan(l.total.spent_cents) + ' / ' + yuan(l.total.budget_cents) + '</span></div>' +
+          budBar(l.total) + budTip(l.total);
+      } else {
+        html += '<div class="bud-head"><span class="t">' + esc(l.ledger_name) + '</span>' +
+          '<span class="chip">' + (l.has_budget ? '仅分类预算' : '未设预算') + '</span></div>' +
+          (l.has_budget ? '' : '<div class="bud-tip">' + esc(BUDGET_UNSET_TIP) + '</div>');
+      }
+      var cats = l.categories || [];
+      if (cats.length) {
+        html += '<ul class="bud-cats">' + cats.slice(0, 6).map(function (c) {
+          var pct = Math.max(0, Math.min(100, (c.ratio || 0) * 100));
+          // 只有「超支 / 花速过快」才把整句建议塞进卡片；正常行保持简洁（完整建议在抽屉里）
+          var advice = c.ratio >= 1 || c.pace > 1.1
+            ? '<em class="' + (c.ratio >= 1 ? 'bad' : 'warn') + '">' + esc(c.suggestion) + '</em>'
+            : '';
+          return '<li><span class="c">' + esc(c.category) + advice + '</span>' +
+            '<span class="p"><span><i class="' + budCatLevel(c) + '" style="width:' + pct.toFixed(1) + '%"></i></span></span>' +
+            '<span class="a">' + yuan(c.spent_cents) + ' / ' + yuan(c.budget_cents) + '</span></li>';
+        }).join('') + (cats.length > 6 ? '<li class="more">+' + (cats.length - 6) + ' 项</li>' : '') + '</ul>';
+      }
+      return html + '</div>';
+    }).join('');
+  }
+  function remainingText(cents) {
+    return cents < 0 ? '超支 ' + yuan(-cents) : yuan(cents);
+  }
+  /* cron 只渲染「分 时」都写死的常见形式（0 7 * * * → 07:00）；其余原样显示，不猜 */
+  function cronTime(expr) {
+    var raw = String(expr === null || expr === undefined ? '' : expr);
+    var parts = raw.trim().split(/\\s+/);
+    if (parts.length < 2 || !/^\\d+$/.test(parts[0]) || !/^\\d+$/.test(parts[1])) return raw;
+    return ('0' + parts[1]).slice(-2) + ':' + ('0' + parts[0]).slice(-2);
+  }
+  function isDailyCron(expr) {
+    var parts = String(expr === null || expr === undefined ? '' : expr).trim().split(/\\s+/);
+    return parts.length === 5 && parts[2] === '*' && parts[3] === '*' && parts[4] === '*';
+  }
+  function cronLabel(expr) {
+    var raw = String(expr === null || expr === undefined ? '' : expr);
+    if (!isDailyCron(raw)) return raw;
+    var time = cronTime(raw);
+    return time === raw ? raw : '每天 ' + time;
+  }
+  function sparkline(daily) {
+    if (!daily.length) return '';
+    var max = Math.max.apply(null, daily.map(function (d) { return d.sent; }).concat([1]));
+    var w = 300, h = 58, pad = 6;
+    var step = daily.length > 1 ? (w - pad * 2) / (daily.length - 1) : 0;
+    var pts = daily.map(function (d, i) {
+      return [pad + i * step, h - 5 - (d.sent / max) * (h - 16)];
+    });
+    var line = pts.map(function (p) { return p[0].toFixed(1) + ',' + p[1].toFixed(1); }).join(' ');
+    var area = '0,' + h + ' ' + line + ' ' + w + ',' + h;
+    var last = pts[pts.length - 1];
+    return '<svg viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none" style="width:100%;height:100%">' +
+      '<defs><linearGradient id="sf" x1="0" y1="0" x2="0" y2="1">' +
+      '<stop offset="0%" stop-color="#5eead4" stop-opacity=".38"/><stop offset="100%" stop-color="#5eead4" stop-opacity="0"/>' +
+      '</linearGradient></defs>' +
+      '<polygon points="' + area + '" fill="url(#sf)"/>' +
+      '<polyline points="' + line + '" fill="none" stroke="#5eead4" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>' +
+      '<circle cx="' + last[0].toFixed(1) + '" cy="' + last[1].toFixed(1) + '" r="3.5" fill="#0a0c11" stroke="#5eead4" stroke-width="2"/>' +
+      '</svg>';
+  }
+
+  function refresh() {
+    return api('/api/status').then(render).catch(function (e) {
+      el('date-line').textContent = e.message;
+      el('date-line').className = 'date bad';
+    });
+  }
+
+  /* ── 抽屉 ── */
+  function openDrawer(kind, title, renderFn) {
+    drawerTitle.textContent = title;
+    drawerSub.textContent = '';
+    drawerBody.innerHTML = '<div class="spin">加载中…</div>';
+    drawer.classList.add('on');
+    scrim.classList.add('on');
+    drawer.setAttribute('aria-hidden', 'false');
+    drawer.dataset.kind = kind;
+    drawerOpen = true;
+    drawerRender = renderFn;
+    renderFn();
+  }
+  function closeDrawer() {
+    drawer.classList.remove('on');
+    scrim.classList.remove('on');
+    drawer.setAttribute('aria-hidden', 'true');
+    drawer.dataset.kind = '';
+    drawerOpen = false;
+    drawerRender = null;
+  }
+  function fail(e) {
+    drawerBody.innerHTML = '<div class="empty bad">' + esc(e.message) + '</div>';
+  }
+
+  /* ── 分页（加载更多） ──
+     逐笔/投递行渲染在首屏与续页共用，避免两处转义或字段漂移；
+     分页状态（has_more/next_offset）全部来自服务端，前端不自己算「还有没有下一页」。 */
+  function expenseRow(e) {
+    return '<li><div class="top"><span class="t">' + esc(e.note || e.category) + '</span>' +
+      '<span style="flex:none">' + yuan(e.amount_cents) + '</span></div>' +
+      '<div class="meta"><span>' + esc(e.spent_on.slice(5)) + '</span><span class="chip">' + esc(e.category) + '</span>' +
+      '<span>' + esc(e.ledger_name) + '</span><span>' + esc(e.created_by_profile) + '</span></div></li>';
+  }
+  function deliveryRow(i) {
+    var cls = i.status === 'sent' ? 'green' : i.status === 'failed' ? 'red' : i.status === 'fallback' ? 'amber' : '';
+    return '<li><div class="top"><span class="t">' + esc(i.title) + '</span>' +
+      '<span class="chip ' + cls + '">' + esc(i.status) + '</span></div>' +
+      '<div class="meta"><span>' + esc(i.sent_local || i.created_local) + '</span>' +
+      '<span class="chip">' + esc(i.route_name) + '</span>' +
+      '<span>' + esc(i.profile_id) + '</span>' +
+      (i.attempts ? '<span>尝试 ' + i.attempts + ' 次</span>' : '') +
+      '</div>' + (i.last_error ? '<div class="meta bad">' + esc(i.last_error.slice(0, 160)) + '</div>' : '') + '</li>';
+  }
+  function pagedTitle(label, loaded, total) {
+    return label + (total > loaded ? '（已显示 ' + loaded + '/' + total + '）' : '');
+  }
+  function moreButton(id, kind, payload, loaded, total) {
+    if (payload.has_more === true && payload.next_offset !== null && payload.next_offset !== undefined) {
+      return '<button type="button" class="morebtn" id="' + id + '" data-load-more="' + kind +
+        '" data-next-offset="' + payload.next_offset + '">加载更多（已显示 ' + loaded + '/' + total + '）</button>';
+    }
+    // 没有下一页（含首屏就装得下）：文案明确说「已全部加载」，按钮禁用避免无意义点击
+    return '<button type="button" class="morebtn" id="' + id + '" data-load-more="' + kind +
+      '" disabled="disabled">已全部加载</button>';
+  }
+  function setMoreState(btn, hasMore, nextOffset, loaded, total) {
+    if (hasMore === true && nextOffset !== null && nextOffset !== undefined) {
+      btn.setAttribute('data-next-offset', String(nextOffset));
+      btn.textContent = '加载更多（已显示 ' + loaded + '/' + total + '）';
+      btn.disabled = false;
+    } else {
+      btn.textContent = '已全部加载';
+      btn.disabled = true;
+      btn.setAttribute('disabled', 'disabled');
+    }
+  }
+  function bindLoadMore() {
+    Array.prototype.forEach.call(drawerBody.querySelectorAll('[data-load-more]'), function (btn) {
+      btn.addEventListener('click', function () { loadMore(btn); });
+    });
+  }
+  function loadMore(btn) {
+    var kind = btn.getAttribute('data-load-more');
+    var raw = btn.getAttribute('data-next-offset');
+    if (raw === null) return; // 「已全部加载」：没有下一页
+    var offset = Number(raw);
+    if (!isFinite(offset) || offset <= 0) return;
+    // 续页参数由服务端的 next_offset 提供；limit 与首屏一致，否则页边界会错位
+    var path = kind === 'expenses'
+      ? '/api/expenses?month=' + encodeURIComponent(expMonth || '') + '&limit=50&offset=' + offset
+      : '/api/deliveries?limit=60&offset=' + offset;
+    btn.disabled = true;
+    btn.textContent = '加载中…';
+    api(path).then(function (d) {
+      if (kind === 'expenses') {
+        var fresh = d.entries || [];
+        expEntries = expEntries.concat(fresh);
+        expTotal = d.entries_total;
+        var list = el('exp-entries');
+        if (list) list.innerHTML += fresh.map(expenseRow).join('');
+        var title = el('exp-entries-title');
+        if (title) title.textContent = pagedTitle('逐笔', expEntries.length, expTotal);
+        setMoreState(btn, d.has_more, d.next_offset, expEntries.length, expTotal);
+      } else {
+        var freshItems = d.items || [];
+        delItems = delItems.concat(freshItems);
+        delTotal = d.items_total;
+        var itemList = el('del-entries');
+        if (itemList) itemList.innerHTML += freshItems.map(deliveryRow).join('');
+        var itemTitle = el('del-entries-title');
+        if (itemTitle) itemTitle.textContent = pagedTitle('记录', delItems.length, delTotal);
+        setMoreState(btn, d.has_more, d.next_offset, delItems.length, delTotal);
+      }
+    }).catch(function (e) {
+      // 失败时保留当前页并恢复按钮：不能让一次网络抖动把已加载内容清空
+      btn.disabled = false;
+      if (kind === 'expenses') setMoreState(btn, true, Number(raw), expEntries.length, expTotal);
+      else setMoreState(btn, true, Number(raw), delItems.length, delTotal);
+      drawerSub.textContent = '加载更多失败：' + e.message;
+    });
+  }
+
+  function openExpenses(month) {
+    openDrawer('expenses', '支出明细', function () {
+      var query = '/api/expenses?limit=50' + (month ? '&month=' + encodeURIComponent(month) : '');
+      api(query).then(renderExpenses).catch(fail);
+    });
+  }
+  function renderExpenses(d) {
+    expMonth = d.month;
+    expEntries = d.entries || [];
+    expTotal = d.entries_total;
+    drawerSub.textContent = d.count + ' 笔';
+    var html = '<div class="monthnav">' +
+      '<button type="button" data-month="' + shiftMonth(expMonth, -1) + '">‹ 上月</button>' +
+      '<span class="cur">' + expMonth + '</span>' +
+      '<button type="button" data-month="' + shiftMonth(expMonth, 1) + '">下月 ›</button>' +
+      '<button type="button" data-export="' + expMonth + '">导出 CSV</button>' +
+      '<span class="muted" style="margin-left:auto">' + yuan(d.total_cents) + '</span></div>';
+
+    html += '<div class="sect"><h3>分类</h3>' +
+      (d.categories.length
+        ? '<table><tbody>' + d.categories.map(function (c, i) {
+            return '<tr><td><i style="display:inline-block;width:7px;height:7px;border-radius:2px;margin-right:8px;background:' +
+              COLORS[i % COLORS.length] + '"></i>' + esc(c.category) + '</td>' +
+              '<td class="num muted">' + c.count + ' 笔</td>' +
+              '<td class="num">' + yuan(c.cents) + '</td>' +
+              '<td class="num muted">' + (c.share * 100).toFixed(1) + '%</td></tr>';
+          }).join('') + '</tbody></table>'
+        : '<div class="empty">本月没有记账</div>') + '</div>';
+
+    if (d.daily.length) {
+      var dmax = Math.max.apply(null, d.daily.map(function (x) { return x.cents; }));
+      html += '<div class="sect"><h3>按天</h3><div class="bars">' +
+        d.daily.map(function (x) {
+          return '<div style="height:' + Math.max(4, (x.cents / dmax) * 100) + '%" title="' + esc(x.date) + ' ' + yuan(x.cents) + '"></div>';
+        }).join('') + '</div>' +
+        '<div class="spark-axis"><span>' + esc(d.daily[0].date.slice(5)) + '</span><span>' +
+        esc(d.daily[d.daily.length - 1].date.slice(5)) + '</span></div>' +
+        '<div class="muted" style="font-size:11.5px;margin-top:10px">柱高为该日金额 · ' + d.daily.length + ' 天有记账</div></div>';
+    }
+
+    if (d.ledgers.length > 1) {
+      html += '<div class="sect"><h3>账本</h3><table><tbody>' + d.ledgers.map(function (l) {
+        return '<tr><td>' + esc(l.ledger_name) + '</td><td class="num muted">' + l.count + ' 笔</td><td class="num">' +
+          yuan(l.cents) + '</td></tr>';
+      }).join('') + '</tbody></table></div>';
+    }
+
+    // 逐笔行先渲染到独立容器：续页只追加这个 <ul>，不必整抽屉重绘（保留滚动位置）
+    html += '<div class="sect"><h3 id="exp-entries-title">' + pagedTitle('逐笔', expEntries.length, expTotal) + '</h3>' +
+      '<ul class="rowlist" id="exp-entries"></ul>' +
+      (expTotal === 0 ? '<div class="empty">没有记录</div>' : '') +
+      moreButton('exp-more', 'expenses', d, expEntries.length, expTotal) + '</div>';
+
+    drawerBody.innerHTML = html;
+    var list = el('exp-entries');
+    if (list) list.innerHTML = expEntries.map(expenseRow).join('');
+    Array.prototype.forEach.call(drawerBody.querySelectorAll('[data-month]'), function (b) {
+      b.addEventListener('click', function () { openExpenses(b.getAttribute('data-month')); });
+    });
+    Array.prototype.forEach.call(drawerBody.querySelectorAll('[data-export]'), function (b) {
+      b.addEventListener('click', function () { downloadCsv(b.getAttribute('data-export')); });
+    });
+    bindLoadMore();
+  }
+  /* 导出当月 CSV：凭据只走 Authorization 头（绝不进 URL）；Blob + a[download] 触发下载，
+     revoke 延后一秒，避免部分浏览器在下载真正开始前就把 objectURL 失效。 */
+  function downloadCsv(month) {
+    fetch('/api/expenses.csv?month=' + encodeURIComponent(month), token ? { headers: { Authorization: 'Bearer ' + token } } : {})
+      .then(function (r) {
+        if (!r.ok) throw new Error(r.status === 401 ? '未授权：在地址栏给本页加上 ?token=<WEB_API_TOKEN> 刷新一次（本页会记住）' : 'HTTP ' + r.status);
+        return r.blob();
+      })
+      .then(function (blob) {
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = 'expenses-' + month + '.csv';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+      })
+      .catch(function (e) {
+        drawerSub.textContent = '导出失败：' + e.message;
+      });
+  }
+  function shiftMonth(ym, delta) {
+    var y = Number(ym.slice(0, 4)), m = Number(ym.slice(5, 7)) + delta;
+    if (m < 1) { m = 12; y -= 1; }
+    if (m > 12) { m = 1; y += 1; }
+    return y + '-' + String(m).padStart(2, '0');
+  }
+
+  function openSchedules() {
+    openDrawer('schedules', '日程明细', function () {
+      api('/api/schedules').then(function (d) {
+        drawerSub.textContent = d.items.length + ' 项';
+        if (!d.items.length) { drawerBody.innerHTML = '<div class="empty">没有活跃日程</div>'; return; }
+        drawerBody.innerHTML = '<ul class="rowlist">' + d.items.map(function (s) {
+          var soon = s.days_until !== null && s.days_until <= 1;
+          return '<li><div class="top"><span class="t">' + esc(s.title) + '</span>' +
+            '<span class="chip' + (soon ? ' teal' : '') + '">' + icon(s.kind) + '</span></div>' +
+            '<div class="meta"><span>' + esc(s.next_local || '未排期') + '</span>' +
+            (s.remind_local ? '<span>提醒 ' + esc(s.remind_local) + '</span>' : '') +
+            (s.calendar === 'lunar' ? '<span class="chip">农历</span>' : '') +
+            (s.all_day ? '<span>全天</span>' : '<span>' + esc(s.time) + '</span>') +
+            (s.workday_filter === 'workday' ? '<span>仅工作日</span>' : s.workday_filter === 'holiday' ? '<span>仅节假日</span>' : '') +
+            (s.is_deadline ? '<span class="chip">截止</span>' : '') +
+            '<span>' + esc(s.profile_id) + '</span></div>' +
+            (s.note ? '<div class="meta"><span>' + esc(s.note) + '</span></div>' : '') + '</li>';
+        }).join('') + '</ul>';
+      }).catch(fail);
+    });
+  }
+
+  function openDeliveries() {
+    openDrawer('deliveries', '投递明细', function () {
+      api('/api/deliveries?limit=60').then(renderDeliveries).catch(fail);
+    });
+  }
+  function renderDeliveries(d) {
+    delItems = d.items || [];
+    delTotal = d.items_total;
+    var c = d.counts;
+    drawerSub.textContent = c.sent_24h + ' 条 / 24h';
+    var max = Math.max.apply(null, d.daily.map(function (x) { return x.sent; }).concat([1]));
+    var html = '<div class="sect"><h3>近 7 天</h3><div class="bars">' +
+      d.daily.map(function (x) {
+        return '<div style="height:' + Math.max(4, (x.sent / max) * 100) + '%" title="' + esc(x.date) + ' ' + x.sent + ' 条">' +
+          '<span>' + esc(x.label) + '</span></div>';
+      }).join('') + '</div><div style="height:16px"></div>' +
+      '<table><tbody>' +
+      '<tr><td>待投递</td><td class="num ' + (c.queued ? 'warn' : '') + '">' + c.queued + '</td></tr>' +
+      '<tr><td>失败</td><td class="num ' + (c.failed ? 'bad' : '') + '">' + c.failed + '</td></tr>' +
+      '<tr><td>兜底</td><td class="num ' + (c.fallback ? 'bad' : '') + '">' + c.fallback + '</td></tr>' +
+      '</tbody></table></div>';
+
+    html += '<div class="sect"><h3 id="del-entries-title">' + pagedTitle('记录', delItems.length, delTotal) + '</h3>' +
+      '<ul class="rowlist" id="del-entries"></ul>' +
+      (delTotal === 0 ? '<div class="empty">没有投递记录</div>' : '') +
+      moreButton('del-more', 'deliveries', d, delItems.length, delTotal) + '</div>';
+    drawerBody.innerHTML = html;
+    var list = el('del-entries');
+    if (list) list.innerHTML = delItems.map(deliveryRow).join('');
+    bindLoadMore();
+  }
+
+  function openHolidays() {
+    openDrawer('holidays', '节假日明细', function () {
+      api('/api/holidays').then(function (d) {
+        var render = function (year) {
+          holYear = year;
+          api('/api/holidays?year=' + year).then(function (h) {
+            drawerSub.textContent = h.year + ' 年';
+            var html = '<div class="monthnav">' +
+              '<select class="sel" id="hol-year">' + h.years.map(function (y) {
+                return '<option' + (y === h.year ? ' selected' : '') + '>' + esc(y) + '</option>';
+              }).join('') + '</select>' +
+              '<span class="muted">' + h.days.filter(function (x) { return x.day_type === 'holiday'; }).length + ' 天假期 · ' +
+              h.days.filter(function (x) { return x.day_type === 'workday'; }).length + ' 天调休</span></div>';
+            if (h.upcoming.length) {
+              html += '<div class="sect"><h3>接下来的假期</h3><table><tbody>' + h.upcoming.map(function (u) {
+                return '<tr><td>' + esc(u.name) + '</td><td class="muted">' + esc(u.date) + '</td>' +
+                  '<td class="num">' + (u.in_progress ? '<span class="chip teal">进行中</span>' : u.days_until === 0 ? '<span class="chip teal">今天</span>' : u.days_until + ' 天后') + '</td></tr>';
+              }).join('') + '</tbody></table></div>';
+            }
+            html += '<div class="sect"><h3>' + h.year + ' 年安排</h3>' + (h.days.length
+              ? '<table><thead><tr><th>日期</th><th>星期</th><th>名称</th><th class="num">类型</th></tr></thead><tbody>' +
+                h.days.map(function (x) {
+                  return '<tr><td>' + esc(x.date.slice(5)) + '</td><td class="muted">' + esc(x.weekday) + '</td><td>' + esc(x.name) + '</td>' +
+                    '<td class="num">' + (x.day_type === 'holiday' ? '<span class="chip green">休</span>' : '<span class="chip amber">班</span>') + '</td></tr>';
+                }).join('') + '</tbody></table>'
+              : '<div class="empty">该年份暂无数据</div>') + '</div>';
+            drawerBody.innerHTML = html;
+            var sel = el('hol-year');
+            if (sel) sel.addEventListener('change', function () { render(sel.value); });
+          }).catch(fail);
+        };
+        render(holYear || d.year);
+      }).catch(fail);
+    });
+  }
+
+  function openJobs() {
+    openDrawer('jobs', '定时任务', function () {
+      api('/api/jobs').then(function (d) {
+        var items = d.items || [];
+        drawerSub.textContent = items.length + ' 个任务';
+        if (!items.length) { drawerBody.innerHTML = '<div class="empty">没有注册定时任务</div>'; return; }
+        drawerBody.innerHTML = '<div class="sect"><h3>任务与最近运行</h3><ul class="rowlist">' +
+          items.map(function (j) {
+            var r = j.last_run;
+            // 每个 job 展开最近 3 次运行：只看「最近一次」分不清「偶发失败」还是「一直失败」
+            var recent = (j.recent_runs || []).slice(0, 3).map(function (x) {
+              return jobChip(x.status) + ' ' + esc(stampShort(x.started_at));
+            });
+            return '<li><div class="top"><span class="t">' + esc(j.module + '.' + j.name) + '</span>' +
+              (r ? jobChip(r.status) : '<span class="chip">未运行</span>') + '</div>' +
+              '<div class="meta"><span>' + esc(j.cron) + '</span>' +
+              (j.next_run_hint ? '<span>' + esc(j.next_run_hint) + '</span>' : '') +
+              '<span>最近成功 ' + (j.last_ok_at ? esc(stampShort(j.last_ok_at)) : '从未') + '</span>' +
+              (j.failed_24h > 0 ? '<span class="bad">24h 失败 ' + j.failed_24h + ' 次</span>' : '') + '</div>' +
+              (recent.length ? '<div class="meta">' + recent.join(' · ') + '</div>' : '') +
+              (r && r.error ? '<div class="meta bad">' + esc(String(r.error).slice(0, 160)) + '</div>' : '') + '</li>';
+          }).join('') + '</ul></div>';
+      }).catch(fail);
+    });
+  }
+
+  function openBudget() {
+    openDrawer('budget', '预算明细', function () {
+      api('/api/budget').then(function (d) {
+        var ledgers = d.ledgers || [];
+        drawerSub.textContent = d.month;
+        if (!ledgers.length) { drawerBody.innerHTML = '<div class="empty">还没有家庭账本</div>'; return; }
+        drawerBody.innerHTML = ledgers.map(function (l) {
+          var html = '<div class="sect"><h3>' + esc(l.ledger_name) + '</h3>';
+          if (l.total) {
+            html += '<div class="bud-head"><span class="t">总额</span><span class="amt">' +
+              yuan(l.total.spent_cents) + ' / ' + yuan(l.total.budget_cents) + '</span></div>' +
+              budBar(l.total) + budTip(l.total);
+          } else {
+            html += '<div class="bud-tip">' + (l.has_budget ? '未设总额预算（仅有分类预算）' : esc(BUDGET_UNSET_TIP)) + '</div>';
+          }
+          var cats = l.categories || [];
+          if (cats.length) {
+            html += '<table><thead><tr><th>分类</th><th class="num">已用 / 预算</th><th class="num">剩余</th></tr></thead><tbody>' +
+              cats.map(function (c) {
+                var cls = c.ratio >= 1 ? 'bad' : c.pace > 1.1 ? 'warn' : 'muted';
+                return '<tr><td>' + esc(c.category) + '</td>' +
+                  '<td class="num">' + yuan(c.spent_cents) + ' / ' + yuan(c.budget_cents) + '</td>' +
+                  '<td class="num ' + (c.remaining_cents < 0 ? 'bad' : '') + '">' + remainingText(c.remaining_cents) + '</td></tr>' +
+                  '<tr><td colspan="3" class="' + cls + '" style="padding-top:0">' + esc(c.suggestion) + '</td></tr>';
+              }).join('') + '</tbody></table>';
+          }
+          return html + '</div>';
+        }).join('');
+      }).catch(fail);
+    });
+  }
+
+  function openSystem() {
+    openDrawer('system', '系统信息', function () {
+      api('/api/status').then(function (s) {
+        drawerBody.innerHTML = '<div class="sect"><table><tbody>' +
+          '<tr><td>名称</td><td class="num">' + esc(s.name) + ' v' + esc(s.version) + '</td></tr>' +
+          '<tr><td>运行时长</td><td class="num">' + mins(s.uptime_s) + '</td></tr>' +
+          '<tr><td>Profile</td><td class="num">' + esc(s.profiles.join(' · ')) + '</td></tr>' +
+          '<tr><td>活跃日程</td><td class="num">' + s.schedules.active + '</td></tr>' +
+          '<tr><td>账本</td><td class="num">' + s.ledgers.total + ' 活跃 / ' + s.ledgers.archived + ' 归档</td></tr>' +
+          '<tr><td>定时简报</td><td class="num">' + esc(s.daily_brief_cron) + '</td></tr>' +
+          '<tr><td>天气数据源</td><td class="num">' + (s.qweather_configured ? '已配置' : '未配置') + '</td></tr>' +
+          '<tr><td>节假日年份</td><td class="num">' + (s.holidays.years.join('、') || '无') + '</td></tr>' +
+          '</tbody></table></div>' +
+          '<div class="sect"><h3>原始状态</h3><div class="muted" style="font-size:11.5px">' +
+          'GET <a href="#" data-api="/api/status" style="color:inherit">/api/status</a> · ' +
+          'GET <a href="#" data-api="/api/expenses" style="color:inherit">/api/expenses</a> · ' +
+          'GET <a href="#" data-api="/api/budget" style="color:inherit">/api/budget</a> · ' +
+          'GET <a href="#" data-api="/api/schedules" style="color:inherit">/api/schedules</a> · ' +
+          'GET <a href="#" data-api="/api/deliveries" style="color:inherit">/api/deliveries</a> · ' +
+          'GET <a href="#" data-api="/api/holidays" style="color:inherit">/api/holidays</a> · ' +
+          'GET <a href="#" data-api="/api/jobs" style="color:inherit">/api/jobs</a></div></div>';
+      }).catch(fail);
+    });
+  }
+
+  var HANDLERS = {
+    expenses: function () { openExpenses(null); },
+    schedules: openSchedules,
+    deliveries: openDeliveries,
+    holidays: openHolidays,
+    jobs: openJobs,
+    budget: openBudget,
+    system: openSystem
+  };
+  var TITLES = { expenses: '支出明细', schedules: '日程明细', deliveries: '投递明细', holidays: '节假日明细', jobs: '定时任务', budget: '预算明细', system: '系统信息' };
+
+  document.addEventListener('click', function (ev) {
+    // 原始状态链接不能直接用 href：普通导航不会带 Authorization 头，配了 token
+    // 必然 401。改为走页面已有的 api()（带 Bearer）并把 JSON 渲染在抽屉里。
+    var raw = ev.target.closest('[data-api]');
+    if (raw) {
+      if (typeof ev.preventDefault === 'function') ev.preventDefault();
+      var path = raw.getAttribute('data-api');
+      drawerSub.textContent = path;
+      drawerBody.innerHTML = '<div class="spin">加载中…</div>';
+      api(path).then(function (d) {
+        drawerBody.innerHTML = '<pre style="white-space:pre-wrap;word-break:break-word;font-size:11.5px;margin:0">' +
+          esc(JSON.stringify(d, null, 2)) + '</pre>';
+      }).catch(fail);
+      return;
+    }
+    var target = ev.target.closest('[data-drawer]');
+    if (target) {
+      var kind = target.getAttribute('data-drawer');
+      if (HANDLERS[kind]) { HANDLERS[kind](); }
+      return;
+    }
+    if (ev.target === scrim || ev.target.closest('#drawer-close')) closeDrawer();
+  });
+  document.addEventListener('keydown', function (ev) {
+    if (ev.key === 'Escape') closeDrawer();
+  });
+
+  refresh();
+  setInterval(function () {
+    refresh();
+    // 只刷新「开着的那张抽屉」：关着时不重跑渲染函数（会白拉一次接口）。
+    // 必须走已保存的渲染函数，而不是 HANDLERS[kind]——后者会重走 openDrawer，
+    // 把 body 打回「加载中…」、丢掉列表滚动位置（所选的月/年由 expMonth/holYear 保留）。
+    if (!drawerOpen || drawerRender === null) return;
+    drawerRender();
+  }, 30000);
+`;
