@@ -310,17 +310,87 @@ export function cancelPendingDeliveries(
   ).run(nowIso(), ...notificationIds, profileId);
 }
 
-/** 启动/每轮：超过幂等窗口的不确定投递进入 fallback；其余 sending 复位为 queued */
+/**
+ * 幂等通道：请求带唯一 request_id，对端按 id 去重，重发不会让用户收到第二条推送。
+ * 目前只有 webhook（回环 Hermes 网关按 X-Request-ID 去重）。
+ *
+ * openclaw 虽然也带 `idempotencyKey`，但网关侧是否真的按它去重无法在本仓库核实 ——
+ * 按**非幂等**保守处理：宁可让用户手工重发（`notify.retry`），也不冒「用户收到两条」的风险。
+ * 将来若确认对端去重语义，把它加进这个集合即可。
+ */
+const IDEMPOTENT_CHANNELS = new Set<string>(["webhook"]);
+
+/**
+ * 非幂等通道上「结果不确定」的 sending 行判为终态时的原因（需要人工确认后重发）。
+ * 导出给测试断言用：这是用户能在 `notify.history` 里看到的可观察契约。
+ */
+export const UNCERTAIN_NON_IDEMPOTENT_ERROR =
+  "uncertain delivery on non-idempotent channel: not auto-retried after restart (may already have been delivered); confirm and retry manually";
+
+/** 幂等通道超出对端去重窗口后的终态原因（沿用既有措辞，排障口径不变） */
+export const UNCERTAIN_EXCEEDED_WINDOW_ERROR =
+  "uncertain delivery exceeded webhook idempotency window";
+
+/**
+ * 启动/每轮 drain：收拾上次进程留下的 `sending` 行（「请求已发出、结果未知」）。
+ *
+ * 关键取舍（P2-10）：**幂等通道与非幂等通道必须分开处理**。
+ * - 幂等通道（webhook，Hermes 按 X-Request-ID 去重）：未超窗 → 复位 `queued`，重发时复用
+ *   原 request_id，对端去重、用户不会收到第二条；超窗（>55min，对端可能已清掉去重记录）
+ *   → 终态 `fallback`，不盲重发。
+ * - 非幂等通道（bark/ntfy/telegram/smtp/openclaw）：重启发生在「请求已发出、未落库」之间时，
+ *   那条推送**可能已经真的送达**，重发就是给用户多发一条。因此无论是否超窗一律判终态
+ *   `fallback`，由用户 `notify.retry` 确认后手工重发。
+ *
+ * 通道名按「该 Profile 当前生效路由」反查（`deliveries` 行没有 channel 列，且本项不允许改
+ * schema）；路由已删除/通道未知时一律按**非幂等**保守处理 —— 这条路径上「漏发等人工确认」
+ * 的代价远小于「重复推送」。
+ *
+ * `request_started_at` 刻意**不清空**：`requeueRoute`（路由变更/重新启用时的自动重新入队）
+ * 只捞 `request_started_at IS NULL` 的行，保留它才能保证「结果不确定的非幂等投递」不会被
+ * 自动重投；人工重发走 `retryDeliveries`（它显式清空该列并按需复用 request_id）。
+ *
+ * 指标沿用既有口径、不新增导出：这些行落 `fallback`，由 `/metrics` 的
+ * `life_assistant_deliveries{status="fallback"}` 计数（与 `outbox_failed_retrying` 区分：
+ * 那是 `failed` 行，本函数不产生 `failed`）。
+ */
 export function recoverStaleSending(db: DatabaseSync): void {
-  const cutoff = new Date(Date.now() - IDEMPOTENCY_WINDOW_MS).toISOString();
-  db.prepare(
-    `UPDATE deliveries SET status = 'fallback', last_error = 'uncertain delivery exceeded webhook idempotency window', updated_at = ?
-     WHERE status = 'sending' AND request_started_at IS NOT NULL AND request_started_at < ?`,
-  ).run(nowIso(), cutoff);
-  db.prepare(
-    `UPDATE deliveries SET status = 'queued', request_started_at = NULL, updated_at = ?
-     WHERE status = 'sending'`,
-  ).run(nowIso());
+  const cutoffMs = Date.now() - IDEMPOTENCY_WINDOW_MS;
+  const rows = db
+    .prepare(
+      `SELECT d.id, d.request_started_at, n.profile_id
+       FROM deliveries d JOIN notifications n ON n.id = d.notification_id
+       WHERE d.status = 'sending'`,
+    )
+    .all() as { id: string; request_started_at: string | null; profile_id: string }[];
+
+  const now = nowIso();
+  const toFallback = db.prepare(
+    "UPDATE deliveries SET status = 'fallback', last_error = ?, updated_at = ? WHERE id = ? AND status = 'sending'",
+  );
+  const toQueued = db.prepare(
+    "UPDATE deliveries SET status = 'queued', request_started_at = NULL, updated_at = ? WHERE id = ? AND status = 'sending'",
+  );
+
+  for (const row of rows) {
+    const route = getPushRoute(db, row.profile_id);
+    // 路由缺失（用户删了路由）时通道未知 → 非幂等保守处理，不能默认成 webhook
+    const channelName = route === null ? undefined : findChannel(route.channel)?.name;
+    const idempotent = channelName !== undefined && IDEMPOTENT_CHANNELS.has(channelName);
+    if (!idempotent) {
+      toFallback.run(UNCERTAIN_NON_IDEMPOTENT_ERROR, now, row.id);
+      continue;
+    }
+    // 按时间值比较（历史行可能存 +08:00 偏移，字典序会错判）；解析失败视为「未超窗」，
+    // 与旧实现的字符串比较结论一致 —— 幂等通道下重发有对端去重兜底。
+    const startedMs =
+      row.request_started_at === null ? Number.NaN : Date.parse(row.request_started_at);
+    if (Number.isFinite(startedMs) && startedMs < cutoffMs) {
+      toFallback.run(UNCERTAIN_EXCEEDED_WINDOW_ERROR, now, row.id);
+    } else {
+      toQueued.run(now, row.id);
+    }
+  }
 }
 
 /**
