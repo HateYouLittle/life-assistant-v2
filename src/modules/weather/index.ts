@@ -255,11 +255,104 @@ function airTable(air: AirQuality): { columns: string[]; rows: string[][] } {
   return { columns: ["项目", "内容"], rows };
 }
 
-/** view=travel：出行计划的 set/clear/show（只写该 Profile 的 settings.travel_plan，不新增表） */
-async function travelView(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
-  const action = args.action;
+/**
+ * 分发参数（P2-20②）：`action` 是**规范名**，`view` 是兼容别名（SKILL.md 与既有调用方
+ * 仍写 view，必须继续可用）。兼容语义：`action=set/clear/show` 仍是出行模式的子操作
+ * （隐含 view=travel），所以 `{view:"travel", action:"set"}` 的既有写法逐字不变。
+ */
+const WEATHER_VIEWS = ["current", "forecast", "alert", "air", "locate", "travel"] as const;
+const TRAVEL_OPS = ["set", "clear", "show"] as const;
+/** action 的全部合法取值：6 个视图名 + 3 个出行子操作 */
+const WEATHER_ACTIONS = [...WEATHER_VIEWS, ...TRAVEL_OPS] as const;
+
+/**
+ * 必填参数表（P2-20③）：集中校验「哪个分发分支需要哪些参数」，不再在每个分支各写一遍。
+ * 键是规范名（出行的 set 用 `travel:set`）；这里只判「缺失/纯空白」，格式校验仍留在
+ * 各分支 —— 报错文案与既有实现逐字一致，集中校验不改变任何既有报错。
+ */
+const ACTION_REQUIRES: Record<string, readonly { field: string; message: string }[]> = {
+  locate: [{ field: "city", message: "locate 需要 city 参数" }],
+  "travel:set": [
+    { field: "city", message: "设置出行计划需要 city 参数" },
+    { field: "start", message: "设置出行计划需要合法的 start/end 日期（YYYY-MM-DD）" },
+    { field: "end", message: "设置出行计划需要合法的 start/end 日期（YYYY-MM-DD）" },
+  ],
+};
+
+interface WeatherDispatch {
+  view: string;
+  /** 出行子操作（仅 view=travel 有意义）；未给时由 travelView 明确报错 */
+  travelOp: string | undefined;
+}
+
+/**
+ * 解析分发参数：action 与 view 同时给出且指向**不同**分支时明确报错（绝不静默取其一）。
+ * 未知取值统一按规范名报 `未知 action: …`（与其余工具的未知分支前缀一致，见 P2-25）。
+ */
+function resolveWeatherDispatch(
+  args: Record<string, unknown>,
+): WeatherDispatch | { error: string } {
+  const action = typeof args.action === "string" ? args.action : undefined;
+  const view = typeof args.view === "string" ? args.view : undefined;
+  const isView = (value: string): boolean => (WEATHER_VIEWS as readonly string[]).includes(value);
+  const isTravelOp = (value: string): boolean => (TRAVEL_OPS as readonly string[]).includes(value);
+  if (action !== undefined && !isView(action) && !isTravelOp(action)) {
+    return { error: `未知 action: ${action}` };
+  }
+  // view 只是别名：未知取值同样按规范名报错，各工具的未知分支文案保持一致
+  if (view !== undefined && !isView(view)) return { error: `未知 action: ${view}` };
+  const fromAction = action === undefined ? undefined : isView(action) ? action : "travel";
+  if (fromAction !== undefined && view !== undefined && fromAction !== view) {
+    return { error: `action 与 view 冲突: action=${action}（${fromAction}）, view=${view}` };
+  }
+  const resolvedView = fromAction ?? view;
+  if (resolvedView === undefined) return { error: "缺少 action（或兼容别名 view）" };
+  return {
+    view: resolvedView,
+    travelOp: action !== undefined && isTravelOp(action) ? action : undefined,
+  };
+}
+
+/** 按 ACTION_REQUIRES 表校验必填参数；缺失/纯空白时返回报错文案（空串等同缺失） */
+function missingRequiredArg(key: string, args: Record<string, unknown>): string | null {
+  for (const rule of ACTION_REQUIRES[key] ?? []) {
+    const value = args[rule.field];
+    if (value === undefined || (typeof value === "string" && value.trim() === "")) {
+      return rule.message;
+    }
+  }
+  return null;
+}
+
+/**
+ * 空气质量视图：`weather {action|view:"air"}` 与独立工具 `air_quality` 共用**同一份**实现
+ * （P2-20①）。两条入口此前是并行代码（同样的 place 解析 + requireQweather + airQuality +
+ * airTable + 出行模式字段拼装），改口径要同步两处、极易漂移；现在「输出逐字一致」由
+ * 「同一个函数」保证，而不是靠人工对齐。
+ */
+async function airView(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+  try {
+    const place = await resolveToolPlace(ctx, args.city as string | undefined);
+    const { host, key } = requireQweather(ctx);
+    const air = await airQuality(ctx.db, host, key, place.loc);
+    return okJson({
+      城市: place.loc.city,
+      ...(place.travel === null ? {} : { 出行模式: travelModeField(place.travel) }),
+      空气质量: airTable(air),
+    });
+  } catch (e) {
+    return fail(errorMessage(e));
+  }
+}
+
+/** travel：出行计划的 set/clear/show（只写该 Profile 的 settings.travel_plan，不新增表） */
+async function travelView(
+  travelOp: string | undefined,
+  args: Record<string, unknown>,
+  ctx: ToolContext,
+): Promise<ToolResult> {
   const today = todayIso();
-  if (action === "show") {
+  if (travelOp === "show") {
     const state = readTravelPlan(ctx.db, ctx.profileId);
     if (state.kind === "corrupt") {
       return okJson({
@@ -282,11 +375,11 @@ async function travelView(args: Record<string, unknown>, ctx: ToolContext): Prom
       今天: today,
     });
   }
-  if (action === "clear") {
+  if (travelOp === "clear") {
     deleteSetting(ctx.db, ctx.profileId, TRAVEL_PLAN_KEY);
     return ok("已清除出行模式");
   }
-  if (action !== "set") return fail("travel 需要 action 参数（set/clear/show）");
+  if (travelOp !== "set") return fail("travel 需要 action 参数（set/clear/show）");
   const city = typeof args.city === "string" ? args.city.trim() : "";
   if (city === "") return fail("设置出行计划需要 city 参数");
   const start = typeof args.start === "string" ? args.start : "";
@@ -321,9 +414,13 @@ async function travelView(args: Record<string, unknown>, ctx: ToolContext): Prom
 
 export async function weatherTool(args: Record<string, unknown>, ctx: ToolContext) {
   try {
-    const view = args.view as string;
+    const dispatch = resolveWeatherDispatch(args);
+    if ("error" in dispatch) return fail(dispatch.error);
+    const { view, travelOp } = dispatch;
+    const missing = missingRequiredArg(travelOp === undefined ? view : `${view}:${travelOp}`, args);
+    if (missing !== null) return fail(missing);
     const city = args.city as string | undefined;
-    if (view === "travel") return await travelView(args, ctx);
+    if (view === "travel") return await travelView(travelOp, args, ctx);
     if (view === "locate") {
       if (city === undefined || city.trim() === "") return fail("locate 需要 city 参数");
       const place = await resolveToolPlace(ctx, city);
@@ -339,6 +436,8 @@ export async function weatherTool(args: Record<string, unknown>, ctx: ToolContex
       }
       return okJson(payload);
     }
+    // 空气质量只有 airView 一份实现：weather 的 air 分支与独立工具 air_quality 都调它
+    if (view === "air") return await airView(args, ctx);
     const place = await resolveToolPlace(ctx, city);
     const loc = place.loc;
     const travel = place.travel === null ? {} : { 出行模式: travelModeField(place.travel) };
@@ -362,12 +461,7 @@ export async function weatherTool(args: Record<string, unknown>, ctx: ToolContex
       }
       return okJson({ 城市: loc.city, ...travel, 预警: alertTable(list) });
     }
-    if (view === "air") {
-      const { host, key } = requireQweather(ctx);
-      const air = await airQuality(ctx.db, host, key, loc);
-      return okJson({ 城市: loc.city, ...travel, 空气质量: airTable(air) });
-    }
-    return fail(`未知 view: ${view}`);
+    return fail(`未知 action: ${view}`);
   } catch (e) {
     return fail(errorMessage(e));
   }
@@ -985,10 +1079,18 @@ registerModule({
     {
       name: "weather",
       description:
-        "天气查询（QWeather）：view=current 实时天气；view=forecast 七天/三天预报；view=alert 气象预警；view=locate 设置该 Profile 的默认位置（city 参数，如 '上海'）；view=air 空气质量（国标）；view=travel 出行模式（action=set 需 city/start/end，action=clear 清除，action=show 查看）。city 参数可选，缺省按「出行计划（窗口内）> 已设置位置 > DEFAULT_CITY」解析。",
+        "天气查询（QWeather）：action=current 实时天气；action=forecast 七天/三天预报；action=alert 气象预警；action=locate 设置该 Profile 的默认位置（city 参数，如 '上海'）；action=air 空气质量（国标）；action=travel 出行模式（action=set 需 city/start/end，action=clear 清除，action=show 查看）。action 为规范名，view 为兼容别名（两者等价；同时传且指向不同分支会报错）。city 参数可选，缺省按「出行计划（窗口内）> 已设置位置 > DEFAULT_CITY」解析。",
       inputSchema: {
-        view: z.enum(["current", "forecast", "alert", "air", "locate", "travel"]),
-        action: z.enum(["set", "clear", "show"]).optional().describe("view=travel 的操作"),
+        action: z
+          .enum(WEATHER_ACTIONS)
+          .optional()
+          .describe(
+            "分发（规范名）：current/forecast/alert/air/locate/travel；travel 另接受子操作 set/clear/show",
+          ),
+        view: z
+          .enum(WEATHER_VIEWS)
+          .optional()
+          .describe("兼容别名，等价于 action；同时传且冲突会明确报错"),
         city: z.string().max(64).optional().describe("城市名；locate / travel set 时必填"),
         start: z.string().max(10).optional().describe("出行开始日期 YYYY-MM-DD；travel set 必填"),
         end: z.string().max(10).optional().describe("出行结束日期 YYYY-MM-DD；travel set 必填"),
@@ -1002,24 +1104,11 @@ registerModule({
     {
       name: "air_quality",
       description:
-        "空气质量（QWeather 国标 AQI/PM2.5/PM10）。city 可选，缺省按「出行计划（窗口内）> 已设置位置 > DEFAULT_CITY」解析。",
+        '空气质量（QWeather 国标 AQI/PM2.5/PM10），等价于 weather {action:"air"}（同一份实现，输出逐字一致）。city 可选，缺省按「出行计划（窗口内）> 已设置位置 > DEFAULT_CITY」解析。',
       inputSchema: {
         city: z.string().max(64).optional(),
       },
-      handler: async (args, ctx) => {
-        try {
-          const place = await resolveToolPlace(ctx, args.city as string | undefined);
-          const { host, key } = requireQweather(ctx);
-          const air = await airQuality(ctx.db, host, key, place.loc);
-          return okJson({
-            城市: place.loc.city,
-            ...(place.travel === null ? {} : { 出行模式: travelModeField(place.travel) }),
-            空气质量: airTable(air),
-          });
-        } catch (e) {
-          return fail(errorMessage(e));
-        }
-      },
+      handler: airView,
     },
   ],
   jobs: [
