@@ -206,3 +206,85 @@ describe("P2-25 补充：未知文案点名真正缺失的年度", () => {
     }
   });
 });
+
+describe("P2-25 补充：month 视图的跨年所需年度", () => {
+  /** 造一份最小年度数据：该年元旦为休息日 */
+  function seedYear(env: ReturnType<typeof makeTestEnv>, year: number): void {
+    importYear(
+      env.db,
+      { year, days: [{ name: "元旦", date: `${year}-01-01`, isOffDay: true }] },
+      "test",
+    );
+  }
+
+  it("当年 ready + 下一年度 pending：YYYY-12 必须报未知并点名下一年度（不得错答「无安排」）", async () => {
+    const env = makeTestEnv();
+    try {
+      const year = Number(todayIso().slice(0, 4));
+      seedYear(env, year); // 只有当年 ready；下一年度（YYYY-12 的权威来源）未导入
+      const result = await holidayTool({ action: "month", month: `${year}-12` }, ctxOf(env));
+      assert.equal(isErrorOf(result), false, textOf(result));
+      const payload = JSON.parse(textOf(result)) as { 月份: string; 安排: unknown };
+      // 关键：不能是「当月无法定节假日/调休安排」这种肯定式错答（verifier 在真实库复现的正是它）
+      assert.equal(typeof payload.安排, "string", "数据未就绪时不应返回表格");
+      assert.match(String(payload.安排), new RegExp(`^未知（${year + 1} 年节假日数据未就绪`));
+      assert.doesNotMatch(String(payload.安排), /无法定节假日/);
+      assert.doesNotMatch(String(payload.安排), new RegExp(`${year} 年节假日数据未就绪`));
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("两年都 ready：跨年月正常出表，无行月份仍给肯定答案（不回归）", async () => {
+    const env = makeTestEnv();
+    try {
+      const year = Number(todayIso().slice(0, 4));
+      seedYear(env, year);
+      // 真实归档形态：跨年行（次年元旦假期首日 YYYY-12-31）在**下一年度**文件里
+      importYear(
+        env.db,
+        { year: year + 1, days: [{ name: "元旦", date: `${year}-12-31`, isOffDay: true }] },
+        "test",
+      );
+      const december = JSON.parse(
+        textOf(await holidayTool({ action: "month", month: `${year}-12` }, ctxOf(env))),
+      ) as { 安排: { rows: string[][] } };
+      assert.ok(Array.isArray(december.安排.rows), "两年都 ready 时应出表");
+      assert.deepEqual(december.安排.rows[0]?.slice(0, 2), [`${year}-12-31`, "休息"]);
+
+      const november = JSON.parse(
+        textOf(await holidayTool({ action: "month", month: `${year}-11` }, ctxOf(env))),
+      ) as { 安排: string };
+      assert.equal(november.安排, "当月无法定节假日/调休安排", "数据齐备时仍给肯定答案");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("行命中优先不回归：月内已有跨年行时即使所需年度未 ready 也照常出表", async () => {
+    const env = makeTestEnv();
+    try {
+      const year = Number(todayIso().slice(0, 4));
+      // 与 tests/holiday.test.ts 的 M4 用例同口径：次年文件带一条跨年行、当年元数据未 ready。
+      // 该行是权威数据（is_workday 对 YYYY-12-31 给出确定答案），month 不能反过来报未知。
+      importYear(
+        env.db,
+        { year: year + 1, days: [{ name: "元旦", date: `${year}-12-31`, isOffDay: true }] },
+        "test",
+      );
+      const december = JSON.parse(
+        textOf(await holidayTool({ action: "month", month: `${year}-12` }, ctxOf(env))),
+      ) as { 安排: { rows: string[][] } };
+      assert.ok(Array.isArray(december.安排.rows), "有行的月份必须出表");
+      assert.deepEqual(december.安排.rows[0]?.slice(0, 2), [`${year}-12-31`, "休息"]);
+
+      // 同一年份里没有行的月份：仍按所需年度未就绪返回未知（点名当年）
+      const november = JSON.parse(
+        textOf(await holidayTool({ action: "month", month: `${year}-11` }, ctxOf(env))),
+      ) as { 安排: string };
+      assert.match(november.安排, new RegExp(`未知（${year} 年节假日数据未就绪`));
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});

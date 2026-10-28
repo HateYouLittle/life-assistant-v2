@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { DatabaseSync } from "node:sqlite";
 import { DateTime } from "luxon";
 import { DATE_RE, TZ, isDate, now, todayIso } from "../../time.js";
 import {
@@ -172,6 +173,28 @@ function missingRequiredArg(key: string, args: Record<string, unknown>): string 
   return null;
 }
 
+/**
+ * 该月**所需年度**的并集中未 ready 的年份（P2-5 的 holidayYearsNeedingData 是单一来源）。
+ *
+ * 为什么不能只看「月份所属年份」：上游按**假期**归档，元旦假期/调休放在下一年度文件里
+ * （实测 2023.json 含 2022-12-31），所以 2026-12 的权威数据包含 2027 年度。2026 ready、
+ * 2027 未就绪时该月没有任何行，旧判据（只看 2026）会给出肯定式错答「当月无法定节假日/
+ * 调休安排」——用户/agent 以为查到了答案，实际是数据没到。
+ *
+ * 逐日取并集而不是写死「12-25 起看下一年」：跨年窗口规则变化（提前/延后）时这里自动跟随，
+ * 不产生第二份规则（P2-5 的 holidayLookupYears 是唯一来源）。
+ */
+function monthMissingYears(db: DatabaseSync, month: string): number[] {
+  const first = DateTime.fromISO(`${month}-01`, { zone: TZ });
+  if (!first.isValid) return [];
+  const missing = new Set<number>();
+  for (let day = 1; day <= (first.daysInMonth ?? 31); day += 1) {
+    const date = `${month}-${String(day).padStart(2, "0")}`;
+    for (const year of holidayYearsNeedingData(db, date)) missing.add(year);
+  }
+  return [...missing].sort((a, b) => a - b);
+}
+
 export async function holidayTool(
   args: Record<string, unknown>,
   ctx: ToolContext,
@@ -216,22 +239,23 @@ export async function holidayTool(
       if (monthNumber < 1 || monthNumber > 12) {
         return fail(`月份不合法: ${month}（需为 01-12）`);
       }
-      // 先按行查，再看年份元数据 —— 与 dayType 的「行命中优先」口径一致：
+      // 先按行查，再看所需年度 —— 与 dayType 的「行命中优先」口径一致：
       // 跨年日期（如 2027 年度文件里的 2026-12-31）会让「日期所属年份」未就绪但行已存在，
       // 此时 is_workday 给出确定答案，month 也必须照常展示，不能反过来报「未知」。
-      // 只有「该月没有任何行」且年份未 ready 时才是真正未知。
-      const year = Number(month.slice(0, 4));
       const rows = db
         .prepare("SELECT date, day_type, name FROM cn_holiday_days WHERE date LIKE ? ORDER BY date")
         .all(`${month}-%`) as { date: string; day_type: string; name: string }[];
+      // 只有「该月没有任何行」时才是真正未知；判据是**该月所需年度的并集**（P2-5 的
+      // holidayYearsNeedingData，单一来源），而不是「月份所属年份」：跨年归档区间
+      // （12-25~12-31，元旦假期/调休）的权威数据放在下一年度文件里，2026-12 在
+      // 「2026 ready、2027 未就绪」时既没有行、也不该被当成「当月无法定节假日/调休安排」
+      // （肯定式错答），必须点名真正缺失的 2027。
       if (rows.length === 0) {
-        const meta = db.prepare("SELECT status FROM cn_holiday_years WHERE year = ?").get(year) as
-          | { status: string }
-          | undefined;
-        if (meta?.status !== "ready") {
+        const missingYears = monthMissingYears(db, month);
+        if (missingYears.length > 0) {
           return okJson({
             月份: month,
-            安排: `未知（${year} 年节假日数据未就绪，不猜测）`,
+            安排: `未知（${missingYears.join("/")} 年节假日数据未就绪，不猜测）`,
             数据覆盖年份: holidayYearsReady(db),
           });
         }
