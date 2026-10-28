@@ -262,7 +262,13 @@ function notifyToolInner(args: Record<string, unknown>, ctx: ToolContext) {
         routeSecret(ctx.config, profileId) === undefined &&
         !canUseGlobalOpenclawToken(ctx.config, profileId)
       ) {
-        warnOpenclawGlobalTokenFallback(profileId, process.env.OPENCLAW_HOOK_TOKEN?.trim());
+        // 与投递层同口径：只在真的存在可回退的全局 token 时才提示（否则告警文案会误导）。
+        // 投递层读的是 process.env.OPENCLAW_HOOK_TOKEN；config 快照在生产里与它同源，
+        // 但测试环境用固定 env 对象建 config，不会带上它 —— 所以两边都取一次。
+        warnOpenclawGlobalTokenFallback(
+          profileId,
+          ctx.config.openclawHookToken ?? process.env.OPENCLAW_HOOK_TOKEN?.trim(),
+        );
       }
       // 必须走 core 的 setPushRouteEnabled：它在启用时会调 requeueRoute，
       // 把路由停用期间落入 fallback 的投递重新入队。直接 setSetting 会让
