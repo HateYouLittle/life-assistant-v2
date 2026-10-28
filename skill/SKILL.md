@@ -21,9 +21,9 @@ read_when:
 
 | 意图 | 工具 |
 |---|---|
-| 实时天气 / 预报 / 预警 / 设置位置 / 出行模式 | `weather {view}` |
+| 实时天气 / 预报 / 预警 / 设置位置 / 出行模式 | `weather {action}`（`view` 为兼容别名） |
 | 空气质量（国标 AQI） | `air_quality` |
-| 下一假期 / 某月安排 / 某日是否上班 | `holiday {view}` |
+| 下一假期 / 某月安排 / 某日是否上班 | `holiday {action}`（`view` 为兼容别名） |
 | 待办、生日、纪念日提醒（公历+农历） | `schedule {action}` |
 | 账本管理、月度预算 | `ledger {action}` |
 | 记一笔支出 / 明细 / 汇总 / 编辑 / 删除记错的一笔 / 导出 CSV | `expense {action}` |
@@ -57,7 +57,7 @@ read_when:
 - `remind_offsets` 负数为提前提醒（如 [-30] 提前 30 分钟），**最多 5 项**；`resend_minutes` 是待办到点重发一次，取值 0-1440 分钟。
 - 截止型日程：给待办加 `escalation`（严格升序分钟偏移数组，**首元素固定为 0**＝截止时刻本身，如 `[0,60,360,1440]`，即截止/1h/6h/24h；仅 `kind=todo` 可设）—— 到达截止后按阶梯持续加压提醒，直到 `complete`；此时 `resend_minutes` 被忽略（`update` 传 `escalation: []` 可清除阶梯）。这类日程在列表/状态页显示为「截止」。
 - `workday_filter` 让日程只在法定工作日/节假日触发；节假日数据未覆盖时日程会暂停，如实告知用户。
-- 完成待办用 `complete`：循环日程**必须**带 `occurrence_key`（只完成当前一次——同一事件的各条提醒与派生行一并收敛）；裸调 `complete` 会被拒绝，要结束整个系列须显式传 `all: true`。一次性日程不传 key 即可。更新用 `update`；删除用 `delete`。
+- 完成待办用 `complete`：循环日程**必须**带 `occurrence_key`（只完成当前一次——同一事件的各条提醒与派生行一并收敛）；裸调 `complete` 会被拒绝，要结束整个系列须显式传 `all: true` —— `all: true` 对**任意类型**（含生日/纪念日）都会把整个系列置为结束（`状态=done`），回执里会写明。一次性日程不传 key 即可。更新用 `update`；删除用 `delete`。列表/新增的「重复」栏会带限制（`（共 N 次）`/`（至 YYYY-MM-DD）`）；限次或截止型日程在次数用尽/到期且没有待发提醒后会自动收尾为 `done`（不再留在 active 列表里干等）。
 - 只想推迟或跳过某一次：`schedule {action:"snooze"}`（`minutes` 或 `until`，按 `occurrence_key` 顺延该次提醒）与 `schedule {action:"skip"}`（跳过该次；循环系列继续，一次性待办则跳过并结束该待办——回执的 `状态` 为 `done`、`已结束该待办` 为 `true`）。`schedule list` 每行附 `待办发生`（最多 5 条 occurrence_key + 本地时间），就是这两个 action 的取值来源。
 - `schedule {action:"add"}` 可带可选 `request_id`（1-128 字符）：重试时带同一个值，服务端返回首次创建的日程并标 `已存在: true`，不会建出第二条、也不会重复提醒。用户说「刚才好像没成功，再建一次」时先按这个方式重试。
 - **远期日程只保留「下一条」**：occurrence 只物化到未来 62 天；若某日程此刻一条待提醒都没有（远期生日、远期一次性待办），会额外保留 1 条越过该窗口的 occurrence。因此 `upcoming` 里远期日程只出现一条，这不是数据缺失，提醒也不会漏。

@@ -70,11 +70,17 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   规范文件口径；锁文件损坏/不可读时拒绝恢复）。
 - **核心层不得 import 模块内部。** 这一点由 `tests/registry.test.ts` 的静态 import 扫描强制，
   而不仅是运行时查重。新模块在 `modules/index.ts` 注册。
-- 例外是 `src/server/details.ts`，它直接 import 了 bookkeeping/schedule 的纯函数；
-  `src/server/status.ts` 的 CSV 导出也直接 import 了 bookkeeping 的 `expenseCsv`
-  （同上，已知技术债）。模块间还有一条：`src/modules/weather` 直接 import
-  `schedule/service.ts` 的 `agendaForDate`（早报/晚报的「今日/明日日程」）。改这些签名
-  可能静默破坏状态页或简报——记得同步检查这几处。
+- **非 MCP 调用方一律经 `registry.invokeTool(name, args, ctx)` 调工具**（P2-24）：按名取
+  `allTools()` 里的 def、用模块自己的 zod raw shape 校验参数、把 handler 抛错转成工具错误结果。
+  手机快捷入口 `src/server/quick.ts` 的写路径已改为这条，**不得再 import 模块 index 里的 handler**。
+- server 层的既有例外（`tests/registry.test.ts` 扫描 core + server 两层，例外逐条白名单，白名单
+  过期即报错）：`src/server/details.ts` 与 `src/server/budget.ts` 直接 import bookkeeping/schedule
+  的**纯函数**（monthRange / KIND_LABEL / budgetStatus 等）；`src/server/status.ts` 的 CSV 导出
+  import bookkeeping 的 `expenseCsv`；`src/server/quick.ts` 保留两处**只读** service import
+  （bootstrap 首屏聚合 + 幂等命中时回读原记录的事件时间——不能从本次请求参数推算，与 P2-4 同因）；
+  以及 `import "../modules/index.js"`（模块注册入口，非模块内部实现）。模块间还有一条：
+  `src/modules/weather` 直接 import `schedule/service.ts` 的 `agendaForDate`。改这些签名可能
+  静默破坏状态页或简报——记得同步检查这几处。
 - Runtime 是进程级单例（`src/core/registry.ts` 的 `initRuntime`/`runtime`），只能初始化一次。
   测试必须用 `makeTestEnv()` + `cleanupTestEnv()`（`tests/helpers.ts`），后者会重置 runtime
   并调用 `cancelPendingDrain()`。
@@ -103,7 +109,10 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   `default`，并把 `publishProfile`/`publishGlobal` 的调用记录到 `env.published`。
   务必在 `finally` 里 `cleanupTestEnv(env)`。
 - 状态页内联 JS 在 `node:vm` + DOM 桩里做端到端测试（`tests/status-page-script.test.ts`），
-  因为纯字符串断言看不出整页渲染故障。
+  因为纯字符串断言看不出整页渲染故障。内联 `STYLE`/`SCRIPT`/`resolveToken` 已搬到
+  `src/server/page-script.ts`（`page.ts` 只留页面骨架，1108 → 114 行），并由
+  `tests/status-page-script-syntax.test.ts` 把脚本写进临时 `.mjs` 跑 `node --check` 兜住
+  字符串内的语法错误（P2-23）。仍是字符串，字符串内的未定义变量/`esc` 漏用只能靠 vm 端到端。
 - 走 `createHttpHandler` 的测试会经过 Host/Origin 守卫：用 `http.request` 指向 `127.0.0.1`
   时 Host 自动放行（回环主机名不限端口）；要测拒绝路径就直接构造 `IncomingMessage` 风格的
   `{ headers }` 调 `createRequestGuard(config)`。
@@ -144,6 +153,11 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   保守不反查。补发会把「原定触发时刻」
   传给 handler。新增「每天必须发生一次」的任务时记得加进策略表；`tests/jobs.test.ts`
   会校验键名必须对应真实注册的 `module.job`。
+  **错过触发回放**（P2-14）：同步长任务阻塞事件循环跨过整分钟时，`CATCHUP_POLICY` 白名单内的
+  job 开启 node-cron `recoverMissedExecutions`（补跑错过的触发，写 `job_runs` 且 trigger=`catchup`、
+  handler 收到**原定时刻**）；非白名单（含每分钟 `tick`）保持默认关闭。**必须配合分钟级槽位守卫**：
+  node-cron 开启该开关后即使没有任何阻塞，同一分钟也会触发两次（实测 `lastExecution` 被
+  `setMilliseconds(0)` 后下一次轮询再匹配一次），守卫保证同一触发时刻只执行一次。
 - **鉴权矩阵**：`/api/*`（看板/只读）认 master 与 Profile token —— master=家庭看板（家庭账本
   支出 + 所有 Profile 日程/通知），Profile token=个人视图（家庭+本人个人账本、仅自己的日程/
   通知/投递）；`/api/quick/*` 同上；身份由 `resolveIdentity` 反查（**绝不读 `X-Hermes-Profile`**）；
@@ -188,7 +202,10 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   「疑似 pid 复用，确认后删除锁文件」。`db:restore`
   在锁内 pid 仍存活时拒绝执行；锁文件存在但内容损坏/不可读时无法确认 daemon 已停，同样拒绝
   （dead-pid 残留仍放行），需先确认停服再手工删锁。别绕过它直接覆盖库文件。
-- `notify.pull` 只能取消 `queued`/`failed` 的投递，无法拦住已处于 `sending` 的那一次。
+- `notify.pull` 只能取消 `queued`/`failed` 的投递，无法拦住已处于 `sending` 的那一次；
+  `notify {action:"cancel"}` 的回执按真实状态分档（`cancelPendingDeliveries` 返回
+  `{cancelled, sending}`）——已 sent / 无投递 / sending 在途 都与「真取消」区分，不再一律回
+  「已取消…待投递」（P2-26）。
 - **重启时的「不确定投递」按通道幂等性分叉**（P2-10）：`recoverStaleSending` 只对 `webhook`
   （对端按 `X-Request-ID` 去重）复位重发；bark/ntfy/telegram/smtp/openclaw 及「通道未知」一律判
   `fallback` 终态、保留 `request_started_at`（`requeueRoute` 只捞 `IS NULL`，不会自动重投），
@@ -200,7 +217,28 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   隔离用户配置/重新启用 openclaw 路由必须自带 secret，否则明确 fail；`validateRoute` 把路径收紧到
   `/hooks/<name>`（保留 `/hooks/agent?channel=&to=` 直连形态）。判定内核只有 `config.ts` 一份
   （`openclawCanUseGlobalToken`），工具层与投递层不得各写一套。收紧前已落库的隔离路由仍会投递，
-  投递侧按 profile 打一条一次性 warn（不擅自拒绝，见 README 已知取舍 #33）。
+  投递侧按 profile 打一条一次性 warn（不擅自拒绝，见 README 已知取舍 #33）。**存量**隔离路由允许
+  停用后重新启用（与投递层对齐：共用 `warnOpenclawGlobalTokenFallback`，同文案同去重表，N-2）；
+  `validateRoute` 另拒绝含 `..`/`.` 段、空段（`//`）或百分号编码 `%2e`/`%2f` 的 pathname
+  （会被反代/Gateway 归一化到 `/hooks/` 之外，N-3）。
+- **日程终态只有 `done` 一种**（P2-1 / P2-6）：`complete {all:true}` 对**任意 kind**（含生日/纪念日）
+  置 `done` 并如实回执「已结束整个系列」；限次（`count`）用尽或截止（`until`）到期、且**已无待发
+  pending** 时由物化收尾置 `done`（`recurrenceExhausted()` 显式问「到 until 为止还有没有候选」，
+  不能拿「物化结果为空」当耗尽判据 —— 会把 400 天前瞻之外的合法下一次误判为结束）。判定 pending
+  的守卫不可省，否则会吞掉「until=今天但提醒还没到点」的那一条。裸调 `complete` 行为不变。
+- **跨年假日不猜**（P2-5）：12-25~12-31 的权威数据在下一年度文件里，`dayType` 对这段区间若所需年度
+  未 `ready` 一律返回 `unknown` 并**暂停物化**（`holidayYearsNeedingData` 是「所需年度」的唯一来源，
+  物化暂停时只登记**真正缺失**的年份，否则会去补已 ready 的年份导致永久暂停）；数据到达后
+  `recheckCrossYearOccurrences` 复核该窗口 pending 行（误判作废、漏掉的回退重物化，每进程每个
+  下一年度一次）。已知残留：`holiday {view:"month"}` 的未知文案仍只判「月份所属年份」，
+  12 月的跨年几天可能少列而不报未知（下轮候选）。
+- **工具参数契约**（P2-20 / P2-21）：7 个 action 参数化工具的规范参数名是 `action`，`view` 是兼容
+  别名（两者都传且冲突要明确报错）；`air_quality` 与 `weather {action:"air"}` 共用同一个 `airView()`。
+  与当前 action 无关的字段**显式拒绝**（`未知字段: X（action=Y 不接受）`，bookkeeping 与 notify
+  两侧逐字一致），不再静默忽略；两条既有更具体文案（export 的 from/to、update 的 ledger_id）保留。
+- **`doctor --live` 的「过期一次性日程」检查**（N-1）：`recurrence_json IS NULL AND calendar='solar'
+  AND start_date < 今天 AND status='active'` 的行报 warn（列 id/profile/title + 收尾指引），
+  用独立只读连接查（不升级 schema、不写库、不 fail）。
 - `npm run db:cleanup:preview` 是**零业务删除**预演（打开旧库时仍可能执行附加式 schema
   升级，因此不保证零写入）：occurrence 清理 job（每日 04:30）与保留策略
   （通知/已取消日程，每日 04:50）会删掉哪些行——改清理规则前先用它。
