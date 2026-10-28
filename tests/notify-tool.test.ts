@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { supportedChannels } from "../src/core/channels.js";
 import { publishProfile, setPushRoute } from "../src/core/notify.js";
+import { allTools } from "../src/core/registry.js";
 import { notifyTool } from "../src/modules/notify/index.js";
 import { cleanupTestEnv, makeTestEnv, SECRET, type TestEnv } from "./helpers.js";
 
@@ -184,7 +186,9 @@ describe("notify 工具", () => {
       assert.match(sendingReceipt, /撤回不了/);
       assert.equal(
         (
-          env.db.prepare("SELECT status FROM deliveries WHERE notification_id = ?").get(sendingId) as {
+          env.db
+            .prepare("SELECT status FROM deliveries WHERE notification_id = ?")
+            .get(sendingId) as {
             status: string;
           }
         ).status,
@@ -193,10 +197,7 @@ describe("notify 工具", () => {
       );
 
       // ③ 压根没有投递记录（未配置路由 / 该类型关闭推送）
-      assert.match(
-        text(tool(env, { action: "cancel", id: seed("无投递", null) })),
-        /没有投递记录/,
-      );
+      assert.match(text(tool(env, { action: "cancel", id: seed("无投递", null) })), /没有投递记录/);
 
       // ④ 真的取消了：回执报条数；重复 cancel 不得再回「已取消投递 1 条」
       const queuedId = seed("待投递", "queued");
@@ -206,6 +207,23 @@ describe("notify 工具", () => {
       assert.doesNotMatch(again, /已取消投递/);
     } finally {
       cleanupTestEnv(env);
+    }
+  });
+
+  it("route 的 channel 描述由 supportedChannels() 生成，含全部通道（P2-22）", () => {
+    const def = allTools().find((t) => t.def.name === "notify")?.def;
+    assert.ok(def !== undefined, "notify 工具应已注册");
+    const channels = supportedChannels();
+    assert.ok(channels.length > 3, `通道数应多于 3，否则这条回归无意义: ${channels.join(",")}`);
+    const shape = def.inputSchema as Record<string, { description?: string } | undefined>;
+    const fieldDescription = shape.channel?.description ?? "";
+    assert.notEqual(fieldDescription, "", "channel 字段必须有 describe（agent 只看得见 schema）");
+    for (const name of channels) {
+      assert.ok(
+        fieldDescription.includes(name),
+        `channel 字段描述缺少通道 ${name}：${fieldDescription}`,
+      );
+      assert.ok(def.description.includes(name), `工具总描述缺少通道 ${name}`);
     }
   });
 });
