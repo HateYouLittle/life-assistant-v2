@@ -1,6 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { DateTime } from "luxon";
-import type { ZodRawShape } from "zod";
+import { type ZodRawShape, z } from "zod";
 import type { ResolvedConfig } from "../config.js";
 
 /**
@@ -180,4 +180,36 @@ export function fail(message: string): ToolResult {
 export function errorMessage(e: unknown): string {
   if (e instanceof Error) return e.message;
   return String(e);
+}
+
+/**
+ * 经注册表调用工具（非 MCP 的调用方，如 HTTP 子应用 `/api/quick/*` 用）。
+ *
+ * 为什么要有它：`inputSchema` 是模块对外唯一契约（MCP 侧由 SDK 按同一份 zod raw shape
+ * 校验）。绕过 registry 直接 import 模块 handler，等于让每个调用方自己手写一套参数校验 ——
+ * 两边迟早漂移（手机端曾漏掉长度上限、只能靠 service 兜底），新增工具也不会自动在
+ * HTTP 侧可达。这里按名取 def、用同一份 schema 校验参数，再调 handler。
+ *
+ * 失败口径与 MCP 侧一致：未注册 / 参数不合法 / handler 抛错都返回 `fail(...)`
+ * （`isError: true` 的结果，不抛异常），调用方按既有的「工具错误 → 4xx」路径处理。
+ */
+export async function invokeTool(
+  name: string,
+  args: Record<string, unknown>,
+  ctx: ToolContext,
+): Promise<ToolResult> {
+  const tool = allTools().find((t) => t.def.name === name);
+  if (tool === undefined) return fail(`工具未注册: ${name}`);
+  const parsed = z.object(tool.def.inputSchema).safeParse(args);
+  if (!parsed.success) {
+    const detail = parsed.error.issues
+      .map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
+      .join("; ");
+    return fail(`参数不合法（${name}）: ${detail}`);
+  }
+  try {
+    return await tool.def.handler(parsed.data as Record<string, unknown>, ctx);
+  } catch (e) {
+    return fail(errorMessage(e));
+  }
 }

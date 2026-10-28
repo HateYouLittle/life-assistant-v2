@@ -19,6 +19,39 @@ import { cleanupTestEnv, makeTestEnv } from "./helpers.js";
 
 const noopHandler = () => ok("noop");
 
+/** 抽出源码里所有指向 src/modules/** 的 import 说明符（静态 import 与动态 import()） */
+function moduleImportSpecifiers(source: string): string[] {
+  const specifiers: string[] = [];
+  for (const matched of source.matchAll(/(?:from|import)\s*\(?\s*["']([^"']+)["']/g)) {
+    const specifier = matched[1] ?? "";
+    if (/\/modules\//.test(specifier)) specifiers.push(specifier);
+  }
+  return specifiers;
+}
+
+/**
+ * 模块注册入口：`src/modules/index.ts` 只做副作用注册，不是模块内部实现，
+ * 允许被 server 层 import（daemon 与各测试也是这么接入的）。模块**内部**文件
+ * （`modules/<name>/**`）一律不许绕过 registry 直接 import。
+ */
+const MODULE_REGISTRATION_ENTRY = "../modules/index.js";
+
+/**
+ * server 层允许的「模块内部 import」白名单：文件 → 允许的说明符，逐条显式登记。
+ *
+ * 这些是只读的纯函数/service 读取（与 details.ts、status.ts 同性质的历史技术债），
+ * 不是绕过 registry 直调 handler。新增一条必须显式登记（并同步 AGENTS.md 的例外清单），
+ * 否则下面的契约扫描会变红 —— 白名单过期（说明符已不再使用）同样变红。
+ */
+const SERVER_MODULE_IMPORT_ALLOWLIST: Record<string, string[]> = {
+  "budget.ts": ["../modules/bookkeeping/service.js"],
+  "details.ts": ["../modules/bookkeeping/service.js", "../modules/schedule/service.js"],
+  // P2-24：写路径已改为 registry.invokeTool（不再 import bookkeeping/schedule 的 handler）；
+  // 剩下的只是 bootstrap 与「创建后回读事件时间」用的只读 service 函数。
+  "quick.ts": ["../modules/bookkeeping/service.js", "../modules/schedule/service.js"],
+  "status.ts": ["../modules/bookkeeping/service.js"],
+};
+
 describe("registry 契约", () => {
   it("模块重复注册抛错", () => {
     registerModule({
@@ -166,16 +199,81 @@ describe("registry 契约", () => {
     const coreDir = fileURLToPath(new URL("../src/core/", import.meta.url));
     const files = readdirSync(coreDir).filter((f) => f.endsWith(".ts"));
     assert.ok(files.length > 0, "应当读到 src/core 下的源文件");
-    const dynamicImport = /import\(\s*["'][^"']*\/modules\//;
-    const staticImport = /from\s+["'][^"']*\/modules\//;
-    const offenders = files.filter((file) => {
-      const source = readFileSync(join(coreDir, file), "utf8");
-      return staticImport.test(source) || dynamicImport.test(source);
-    });
+    // 核心层连模块注册入口都不许 import（那是 daemon 的活）：这里不放行 index.js
+    const offenders = files.flatMap((file) =>
+      moduleImportSpecifiers(readFileSync(join(coreDir, file), "utf8")).map(
+        (specifier) => `${file} → ${specifier}`,
+      ),
+    );
     assert.deepEqual(
       offenders,
       [],
       "核心文件不得 import 模块内部；模块只经 src/modules/index.ts 注册",
+    );
+  });
+
+  it("server 层不得直接 import 模块内部（静态扫描 + 显式白名单）", () => {
+    // P2-24：quick.ts 曾直接 import bookkeeping/schedule 的 handler 与 service，绕过 registry ——
+    // 于是 inputSchema 不再是唯一契约（quick 手写一套校验）、新增工具在手机端永远不可达。
+    // 这里把 core→modules 的扫描扩到 server 层：模块内部 import 必须逐条登记在白名单里。
+    const serverDir = fileURLToPath(new URL("../src/server/", import.meta.url));
+    const files = readdirSync(serverDir).filter((f) => f.endsWith(".ts"));
+    assert.ok(files.length > 0, "应当读到 src/server 下的源文件");
+    const offenders: string[] = [];
+    for (const file of files) {
+      const allowed = new Set(SERVER_MODULE_IMPORT_ALLOWLIST[file] ?? []);
+      for (const specifier of moduleImportSpecifiers(readFileSync(join(serverDir, file), "utf8"))) {
+        if (specifier === MODULE_REGISTRATION_ENTRY) continue; // 注册入口，不是模块内部
+        if (!allowed.has(specifier)) offenders.push(`${file} → ${specifier}`);
+      }
+    }
+    assert.deepEqual(
+      offenders,
+      [],
+      "server 层不得绕过 registry 直接 import 模块内部；新例外必须显式登记白名单并同步 AGENTS.md",
+    );
+
+    // 白名单不许腐烂：登记过的文件/说明符必须真实存在且仍在使用
+    for (const [file, specifiers] of Object.entries(SERVER_MODULE_IMPORT_ALLOWLIST)) {
+      assert.ok(files.includes(file), `白名单登记了不存在的 server 文件：${file}`);
+      const used = new Set(moduleImportSpecifiers(readFileSync(join(serverDir, file), "utf8")));
+      for (const specifier of specifiers) {
+        assert.ok(used.has(specifier), `白名单过期：${file} 已不再 import ${specifier}`);
+      }
+    }
+  });
+
+  it("契约扫描能抓住「server 直接 import 模块内部」的新违规（变异自证）", () => {
+    // ① 在真实的 quick.ts 源码上插一行直调模块 index（handler 层，比 service 更深一层）：
+    //    扫描必须把它判成违规，且白名单里不得有它 —— 否则这条测试只是恒绿摆设。
+    const serverDir = fileURLToPath(new URL("../src/server/", import.meta.url));
+    const quickSource = readFileSync(join(serverDir, "quick.ts"), "utf8");
+    assert.ok(
+      !quickSource.includes("modules/schedule/index.js"),
+      "quick.ts 不应再 import 模块 handler（本任务就是要删掉它）",
+    );
+    const mutated = `${quickSource}\nimport { scheduleTool } from "../modules/schedule/index.js";\n`;
+    const found = moduleImportSpecifiers(mutated);
+    assert.ok(
+      found.includes("../modules/schedule/index.js"),
+      `变异后的直调没有被扫描抓到：${JSON.stringify(found)}`,
+    );
+    assert.ok(
+      !(SERVER_MODULE_IMPORT_ALLOWLIST["quick.ts"] ?? []).includes("../modules/schedule/index.js"),
+      "白名单不得放行模块 index（handler 层），否则违规会被静默吞掉",
+    );
+    // 同一变异若在 core 层，同样必须被 core 扫描抓到
+    assert.deepEqual(
+      moduleImportSpecifiers('import { weatherTool } from "../modules/weather/index.js";'),
+      ["../modules/weather/index.js"],
+    );
+    // ② 注册入口是唯一放行项：只有它不算违规，模块内部 service/index 都算
+    assert.deepEqual(moduleImportSpecifiers('import "../modules/index.js";'), [
+      MODULE_REGISTRATION_ENTRY,
+    ]);
+    assert.deepEqual(
+      moduleImportSpecifiers('const m = await import("../modules/weather/service.js");'),
+      ["../modules/weather/service.js"],
     );
   });
 });
