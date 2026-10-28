@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { DateTime } from "luxon";
 import { Lunar, LunarYear } from "lunar-javascript";
+import { DateTime } from "luxon";
 import {
   describeRecurrence,
   lunarToSolar,
   nextDate,
   type OccurrenceSource,
+  recurrenceExhausted,
 } from "../src/core/recurrence.js";
 import { TZ } from "../src/time.js";
 
@@ -242,6 +243,78 @@ describe("recurrence：描述", () => {
       "多周间隔要读得通，不能拼成「每周2一、三」",
     );
     assert.equal(describeRecurrence(lunarSource(5, 5), null), "每年农历5月5日");
+  });
+
+  it("until/count 必须回显：只写「每天」会让用户看不出为什么停了、还剩几次（P2-6 / C-07）", () => {
+    // 回归：describeRecurrence 曾完全丢弃 rec.until / rec.count，于是「每天直到 2026-11-05」
+    // 与「每天」在 list/add 的「重复」栏里长得一模一样；until 过后物化返回 null、
+    // next_run_at 变空，用户没有任何线索。
+    assert.equal(
+      describeRecurrence(
+        solarSource("2026-10-20", { freq: "daily", interval: 1, until: "2026-11-05" }),
+        "2026-10-20",
+      ),
+      "每天（至 2026-11-05）",
+    );
+    assert.equal(
+      describeRecurrence(
+        solarSource("2026-10-20", { freq: "daily", interval: 1, count: 3 }),
+        "2026-10-20",
+      ),
+      "每天（共 3 次）",
+    );
+    // 两个限制同时存在时合并成一个括号，顺序固定（count 在前）
+    assert.equal(
+      describeRecurrence(
+        solarSource("2026-10-20", {
+          freq: "weekly",
+          interval: 1,
+          byweekday: [0],
+          count: 2,
+          until: "2026-12-31",
+        }),
+        "2026-10-20",
+      ),
+      "每周一（共 2 次，至 2026-12-31）",
+    );
+    // 无限制时不得凭空多出括号（既有形状逐字不变）
+    assert.equal(
+      describeRecurrence(solarSource("2026-10-20", { freq: "daily", interval: 1 }), "2026-10-20"),
+      "每天",
+    );
+    // 农历分支同样回显（农历也支持 count/until，物化走同一引擎）
+    assert.equal(
+      describeRecurrence(
+        { ...lunarSource(5, 5), recurrence: { freq: "yearly", interval: 1, count: 5 } },
+        null,
+      ),
+      "每年农历5月5日（共 5 次）",
+    );
+  });
+
+  it("recurrenceExhausted 只看 until 到期，不把「下一条在物化前瞻之外」当耗尽", () => {
+    // 年度日程：after 当天之后的下一条要等一年 —— nextDate 在近端地平线内返回 null，
+    // 但规则并未耗尽（这是 P2-6 终态判定最容易踩的坑）。
+    const yearly = solarSource("2026-10-20", { freq: "yearly", interval: 1 });
+    assert.equal(
+      nextDate(yearly, at("2026-10-20"), at("2026-12-31")),
+      null,
+      "构造前提：窗口内无候选",
+    );
+    assert.equal(recurrenceExhausted(yearly, at("2026-10-20")), false, "无 until 一律不算耗尽");
+
+    const untilFuture = solarSource("2026-10-20", {
+      freq: "daily",
+      interval: 1,
+      until: "2026-11-05",
+    });
+    assert.equal(recurrenceExhausted(untilFuture, at("2026-10-20")), false, "until 未到不算耗尽");
+    assert.equal(recurrenceExhausted(untilFuture, at("2026-11-05")), true, "until 当天之后无候选");
+    assert.equal(recurrenceExhausted(untilFuture, at("2026-11-06")), true);
+
+    // 脏 until：保守不判终态（宁可留在 active 让人看见，也不误收尾）
+    const dirty = solarSource("2026-10-20", { freq: "daily", interval: 1, until: "不是日期" });
+    assert.equal(recurrenceExhausted(dirty, at("2026-10-20")), false);
   });
 
   it("会夹到月末的日号必须在文案里体现（每月31日 → 11 月只得 30 日）", () => {

@@ -8,6 +8,7 @@ import {
   describeRecurrence,
   nextDate,
   recurrenceDeclaresCount,
+  recurrenceExhausted,
   type OccurrenceSource,
   type Recurrence,
 } from "../../core/recurrence.js";
@@ -557,6 +558,7 @@ export function materializeSchedule(
   // 但仍是同一个日历日，不会新增日历日数量；因此这里不能因「已有事件数达上限」提前返回。
   if (rec?.count !== undefined && existing >= rec.count && opts.rewind !== true) {
     updateNextRunAt(db, row.id);
+    finalizeExhaustedSchedule(db, row, existing);
     return;
   }
   const source = sourceOf(row);
@@ -655,6 +657,49 @@ export function materializeSchedule(
     if (rec?.count !== undefined && existing >= rec.count) break;
   }
   updateNextRunAt(db, row.id);
+  finalizeExhaustedSchedule(db, row, existing);
+}
+
+/**
+ * P2-6 / C-07 终态收口：循环规则已耗尽（count 用尽 / until 到期）且再无 pending 提醒时，
+ * 把日程置 `done` —— 否则会留下「active 但永不提醒」的半终态（用户看不出为什么停了）。
+ *
+ * 两条硬约束（也是最容易踩的两点）：
+ * 1. **有 pending 就绝不收尾**：count 用尽时最后一次发生的提醒可能还没到点，置 done 会让
+ *    fireDue 的 `s.status = 'active'` 过滤把它永久吞掉（少提醒一次）；
+ * 2. **空结果 ≠ 耗尽**：年度日程的「下一条」只是落在物化前瞻（NEAR/FAR_HORIZON）之外，
+ *    nextDate 同样返回 null。必须由 recurrenceExhausted 显式问「到 until 为止还有没有候选」，
+ *    不能拿物化空结果当依据，否则生日/纪念日会被误判为终态。
+ *
+ * 终态只有 `done` 一种，与 P2-1（complete all=true）/ P2-2（一次性待办 skip）同口径。
+ * 一次性日程（recurrence 为 null）不在此处收尾：它们的收尾入口是 complete/skip。
+ */
+function finalizeExhaustedSchedule(db: DatabaseSync, row: ScheduleRow, existing: number): void {
+  if (row.status !== "active") return;
+  let rec: Recurrence | null;
+  try {
+    rec = parseRecurrence(row.recurrence_json);
+  } catch {
+    return; // 规则损坏：无法判定是否耗尽，保持原状（逐行隔离由调用方负责）
+  }
+  if (rec === null) return;
+  const pending = db
+    .prepare("SELECT COUNT(*) AS n FROM occurrences WHERE schedule_id = ? AND status = 'pending'")
+    .get(row.id) as { n: number };
+  if (pending.n > 0) return;
+  const countReached = rec.count !== undefined && existing >= rec.count;
+  const untilReached = recurrenceExhausted(sourceOf(row), now());
+  if (!countReached && !untilReached) return;
+  const result = db
+    .prepare(
+      "UPDATE schedules SET status = 'done', updated_at = ? WHERE id = ? AND status = 'active'",
+    )
+    .run(nowIso(), row.id);
+  if (Number(result.changes) > 0) {
+    logger.info(
+      `日程「${row.title}」(${row.id}) 的循环规则已耗尽（${countReached ? "count 已达上限" : "until 已过"}）且无待发提醒，已置为 done`,
+    );
+  }
 }
 
 export function createSchedule(
