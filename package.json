@@ -39,7 +39,7 @@
     "lunar-javascript": "^1.7.7",
     "luxon": "^3.7.2",
     "node-cron": "^3.0.3",
-    "zod": "^3.23.8"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.13",
