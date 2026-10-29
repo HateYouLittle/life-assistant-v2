@@ -30,6 +30,15 @@ function recoverOptionOf(task: ReturnType<typeof scheduleJobCron>): boolean | un
     .recoverMissedExecutions;
 }
 
+/**
+ * 模拟 node-cron 3.0.3 交给回调的 Date：它先把瞬间按 `timezone` 格式化成墙钟字符串，
+ * 再用 `new Date("...")` 按**系统本地时区**解析。因此 Date 上的年月日时分等于 TZ 墙钟，
+ * 与进程 TZ 无关；直接传 `DateTime#toJSDate()`（真实瞬间）会在 CI 的 UTC 下整体错 8 小时。
+ */
+function nodeCronDate(at: DateTime): Date {
+  return new Date(at.setZone(TZ).toFormat("yyyy-LL-dd HH:mm:ss"));
+}
+
 /** 等一轮 job 跑完（run() 返回的 promise 在 finally 里从 inFlight 摘除） */
 async function settle(runner: ReturnType<typeof createJobRunner>, name: string): Promise<void> {
   await runner.inFlight.get(name);
@@ -91,7 +100,7 @@ describe("P2-14 cron 错过触发回放", () => {
     try {
       // 伪造「事件循环被阻塞 3 分钟后，node-cron 回放 3 分钟前那一分钟」
       const missed = DateTime.now().setZone(TZ).minus({ minutes: 3 }).startOf("minute");
-      task.now(missed.toJSDate());
+      task.now(nodeCronDate(missed));
       await settle(runner, "job:daily_brief");
 
       const rows = jobRuns(env);
@@ -131,9 +140,9 @@ describe("P2-14 cron 错过触发回放", () => {
       const missed = DateTime.now().setZone(TZ).minus({ minutes: 2 }).startOf("minute");
       // node-cron 3.0.3 会把 lastExecution 归零到秒，同一个匹配秒在相邻两次轮询里各发一次：
       // 第 2 次必须被守卫吃掉，否则快任务会被执行两遍（备份会出两份文件）。
-      task.now(missed.toJSDate());
+      task.now(nodeCronDate(missed));
       await settle(runner, "job:daily_brief");
-      task.now(missed.plus({ seconds: 1 }).toJSDate());
+      task.now(nodeCronDate(missed.plus({ seconds: 1 })));
       await settle(runner, "job:daily_brief");
 
       assert.equal(calls, 1, "同一个触发时刻不得执行两次");
@@ -154,7 +163,7 @@ describe("P2-14 cron 错过触发回放", () => {
     const task = scheduleJobCron("weather", def, "*/20 * * * *", runner, { scheduled: false });
     try {
       const firedAt = now();
-      task.now(firedAt.toJSDate());
+      task.now(nodeCronDate(firedAt));
       await settle(runner, "job:daily_brief");
 
       const rows = jobRuns(env);
@@ -182,7 +191,7 @@ describe("P2-14 cron 错过触发回放", () => {
     const task = scheduleJobCron("weather", def, "* * * * *", runner, { scheduled: false });
     try {
       const firedAt = now();
-      task.now(firedAt.minus({ minutes: 5 }).toJSDate());
+      task.now(nodeCronDate(firedAt.minus({ minutes: 5 })));
       await settle(runner, "job:not_whitelisted");
 
       const rows = jobRuns(env);
@@ -201,14 +210,14 @@ describe("P2-14 cron 错过触发回放", () => {
 
   it("matchedFireSlot：同一分钟算正常触发，过去的分钟算补跑，非法参数不崩", () => {
     const at = DateTime.fromISO("2026-10-28T09:30:45", { zone: TZ });
-    assert.equal(matchedFireSlot(at.toJSDate(), at), null, "同一分钟 = 正常触发");
+    assert.equal(matchedFireSlot(nodeCronDate(at), at), null, "同一分钟 = 正常触发");
     assert.equal(
-      matchedFireSlot(at.minus({ seconds: 30 }).toJSDate(), at),
+      matchedFireSlot(nodeCronDate(at.minus({ seconds: 30 })), at),
       null,
       "同一分钟内晚 1 秒检测到 = 正常触发（不是补跑）",
     );
     assert.equal(
-      matchedFireSlot(at.minus({ minutes: 1 }).toJSDate(), at)
+      matchedFireSlot(nodeCronDate(at.minus({ minutes: 1 })), at)
         ?.toUTC()
         .toISO(),
       at.minus({ minutes: 1 }).startOf("minute").toUTC().toISO(),

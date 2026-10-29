@@ -11,7 +11,7 @@ import {
   type ToolResult,
 } from "../../core/registry.js";
 import { ensureProfile } from "../../core/settings.js";
-import { DATE_RE, todayIso } from "../../time.js";
+import { DATE_RE, TZ, todayIso } from "../../time.js";
 import {
   addExpenseChecked,
   type BudgetStatus,
@@ -824,7 +824,14 @@ registerModule({
       handler: async (at?: DateTime) => {
         const rt = runtime();
         try {
-          const pushed = await pushDailyDigests(rt.db, rt.services, at?.toISODate() ?? todayIso());
+          // 参考时刻必须先换算到业务时区再取日期：cron/启动补发给的是 TZ 时区的 DateTime，
+          // 但手动调用或测试可能传系统时区（如 UTC）的 DateTime，直接 toISODate() 会在
+          // 跨午夜时汇总成错误的一天（CI 跑 UTC 时 21:30 的摘要会落到前一天）。
+          const pushed = await pushDailyDigests(
+            rt.db,
+            rt.services,
+            at?.setZone(TZ).toISODate() ?? todayIso(),
+          );
           logger.info(`每日记账摘要：发布 ${pushed} 条`);
         } catch (e) {
           // 摘要失败不影响记账本身（账已落库），但必须让运维看得见：rethrow 交给 job_runs
