@@ -191,8 +191,10 @@ export function createJobRunner(db: DatabaseSync, opts: JobRunnerOptions = {}): 
               }
               resolve();
             }, timeoutMs);
-            // 看门狗本身不该拖住进程退出（daemon 停机不看它，只看 inFlight）
-            timer.unref?.();
+            // 看门狗必须保持 ref：它在 run() 返回前一直是**唯一**能解开等待的句柄，
+            // unref 后事件循环一空（node:test 里尤其明显）就会以「Promise 仍未 settle
+            // 但事件循环已结束」报错，node 22 上必现。正常结束走下面的 clearTimeout，
+            // 不会把进程多留 timeoutMs。
           })
         : null;
     // `.finally` 挂在**竞赛**结果上（不是挂在 handler 的 promise 上）：超时那一刻就执行一次，
