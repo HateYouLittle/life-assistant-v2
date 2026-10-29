@@ -579,8 +579,19 @@ export function acquireDaemonLock(dataDir: string, options: DaemonLockOptions = 
     }
   };
 
+  /**
+   * 创建成功后自检「锁文件里还是不是我」。
+   *
+   * 接管路径会先把旧锁 rename 走再创建新锁，这中间存在一个窗口：别的进程可能把
+   * **我刚建好的活锁**误当成 stale 移动走，并因放不回去（原位被第三者占用）而丢弃。
+   * 那一刻「创建成功」已经失效，若直接返回成功，就会和第三者双双持有单实例锁
+   * （双 daemon）。所以返回前必须回读一次：token 不是我的一律不算赢。
+   */
+  const ownsLockFile = (): boolean => readLockFile(path)?.token === token;
+
   for (let attempt = 0; attempt < MAX_TAKEOVER_ATTEMPTS; attempt += 1) {
     if (tryCreateLockFile(path, self)) {
+      if (!ownsLockFile()) continue;
       logTakeover();
       return { path, release: () => releaseDaemonLock(path, token) };
     }
@@ -606,6 +617,7 @@ export function acquireDaemonLock(dataDir: string, options: DaemonLockOptions = 
     }
 
     if (tryCreateLockFile(path, self)) {
+      if (!ownsLockFile()) continue;
       logTakeover();
       return { path, release: () => releaseDaemonLock(path, token) };
     }
