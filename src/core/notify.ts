@@ -1,5 +1,10 @@
 import type { DatabaseSync } from "node:sqlite";
-import type { ResolvedConfig } from "../config.js";
+import {
+  openclawTargetForProfile,
+  type ResolvedConfig,
+  resolveOpenclawCredentialSource,
+  resolveOpenclawGlobalToken,
+} from "../config.js";
 import { inQuietWindow, nowIso, quietResumeAt } from "../time.js";
 import { findChannel, getChannel, type NotificationChannel } from "./channels.js";
 import { withTransaction } from "./database.js";
@@ -23,6 +28,10 @@ const MAX_CONFIRMED_FAILURES = 5;
 const MAX_TRANSPORT_FAILURES = 3;
 const IDEMPOTENCY_WINDOW_MS = 55 * 60 * 1000;
 const BATCH_LIMIT = 100;
+/** openclaw 凭据缺失时，把待投行延后多久再试（保持 queued，不落终态）。 */
+const OPENCLAW_CREDENTIAL_DEFER_MS = 5 * 60 * 1000;
+/** 每个 Profile 的「凭据缺失」告警只打一次，避免每轮 drain 刷屏。 */
+const openclawCredentialWarned = new Set<string>();
 const CONCURRENCY = 5;
 const DRAIN_BUDGET_MS = 45_000;
 
@@ -205,8 +214,20 @@ export function publishProfile(
   const createdAt = nowIso();
   const routable = routableRoute(getPushRoute(db, profileId));
   const secret = routeSecret(config, profileId);
-  // 只有 requiresSecret 的通道（webhook）会因 secret 缺失而投不出去；log 通道不需要 secret
-  const secretMissing = routable?.channel.requiresSecret === true && secret === undefined;
+  const openclawTarget =
+    routable?.channel.name === "openclaw" ? openclawTargetForProfile(config, profileId) : undefined;
+  // webhook 看 route secret；openclaw 的凭据来源由目标 auth 决定（global/profile），
+  // log 等无凭据通道不受影响。缺凭据时不再落注定失败的投递行。
+  const credentialMissing =
+    routable !== null &&
+    (routable.channel.requiresSecret
+      ? secret === undefined
+      : routable.channel.name === "openclaw" &&
+        resolveOpenclawCredentialSource({
+          profileSecret: secret,
+          globalToken: resolveOpenclawGlobalToken(config),
+          target: openclawTarget,
+        }) === "missing");
   // 按 kind 的通知偏好：判定必须发生在**建 delivery 之前**。关闭推送的语义是「不打扰，但记录还在」——
   // 若改成「建了 delivery 再投失败」，通知会被投递成功路径标已读、notify.pull 也取不到，
   // 用户既没收到推送也看不到通知。通道白名单用当前路由的通道名判定（无路由时为空串，必然不匹配）。
@@ -215,10 +236,7 @@ export function publishProfile(
     input.kind,
     routable?.channel.name ?? "",
   );
-  const queueable =
-    routable !== null &&
-    (!routable.channel.requiresSecret || secret !== undefined) &&
-    decision.push;
+  const queueable = routable !== null && !credentialMissing && decision.push;
 
   // notification 与 delivery 必须同事务落库：只写进一半会让「有通知却没投递记录」永久卡住
   const { result, queued } = withTransaction(db, () => {
@@ -261,10 +279,12 @@ export function publishProfile(
     return { result: { id, deduped: false }, queued: true };
   });
 
-  // 关闭推送的 kind 不该再为「缺 secret」刷 warn：那是用户主动选择的安静，不是配置错误
-  if (secretMissing && decision.push) {
+  // 关闭推送的 kind 不该再为「缺凭据」刷 warn：那是用户主动选择的安静，不是配置错误
+  if (credentialMissing && decision.push) {
     logger.warn(
-      `Profile ${profileId} 已配置推送路由但 PROFILE_ROUTE_SECRETS_JSON 缺少对应 secret，通知仅保留可 pull`,
+      routable?.channel.name === "openclaw"
+        ? `Profile ${profileId} 的 openclaw 路由缺少可用凭据（检查 OPENCLAW_HOOK_TOKEN 或 PROFILE_ROUTE_SECRETS_JSON），通知仅保留可 pull`
+        : `Profile ${profileId} 已配置推送路由但 PROFILE_ROUTE_SECRETS_JSON 缺少对应 secret，通知仅保留可 pull`,
     );
   }
   if (!decision.push) {
@@ -659,6 +679,22 @@ export function drainDue(
             }
             continue;
           }
+          if (skip === "openclaw credentials missing") {
+            // 凭据缺失通常是配置问题（token 写错/还没加载），不是这条通知的终态：
+            // 保持 queued 并延后重试，别让用户必须手工 notify.retry。
+            const retryAt = new Date(Date.now() + OPENCLAW_CREDENTIAL_DEFER_MS).toISOString();
+            db.prepare(
+              "UPDATE deliveries SET next_attempt_at = ?, last_error = ?, updated_at = ? WHERE id = ?",
+            ).run(retryAt, skip, nowIso(), row.id);
+            if (!openclawCredentialWarned.has(row.profile_id)) {
+              openclawCredentialWarned.add(row.profile_id);
+              logger.warn(
+                `Profile ${row.profile_id} 的 openclaw 凭据缺失，待投通知暂缓 ${OPENCLAW_CREDENTIAL_DEFER_MS / 60000} 分钟（保持 queued，不落终态）`,
+              );
+            }
+            advanced = true;
+            continue;
+          }
           db.prepare(
             "UPDATE deliveries SET status = 'fallback', last_error = ?, updated_at = ? WHERE id = ?",
           ).run(skip, nowIso(), row.id);
@@ -731,8 +767,19 @@ function skipReason(db: DatabaseSync, config: ResolvedConfig, row: DeliveryRow):
   // 未知通道名按路由不可用处理（手工改库/降级回滚）：不能让 drain 每轮抛错卡住别的 Profile
   if (channel === null || (channel.requiresUrl && route.url === "")) return "route removed";
   if (route.name !== row.route_name) return "route drift";
-  if (channel.requiresSecret && routeSecret(config, row.profile_id) === undefined) {
-    return "secret missing";
+  const secret = routeSecret(config, row.profile_id);
+  if (channel.requiresSecret && secret === undefined) return "secret missing";
+  if (channel.name === "openclaw") {
+    const target = openclawTargetForProfile(config, row.profile_id);
+    if (
+      resolveOpenclawCredentialSource({
+        profileSecret: secret,
+        globalToken: resolveOpenclawGlobalToken(config),
+        target,
+      }) === "missing"
+    ) {
+      return "openclaw credentials missing";
+    }
   }
   return null;
 }
@@ -750,7 +797,19 @@ async function deliverOne(
   if (route === null || channel === null) return false;
   if (channel.requiresUrl && route.url === "") return false;
   const secret = routeSecret(config, row.profile_id);
+  const openclawTarget =
+    channel.name === "openclaw" ? openclawTargetForProfile(config, row.profile_id) : undefined;
   if (channel.requiresSecret && secret === undefined) return false;
+  if (
+    channel.name === "openclaw" &&
+    resolveOpenclawCredentialSource({
+      profileSecret: secret,
+      globalToken: resolveOpenclawGlobalToken(config),
+      target: openclawTarget,
+    }) === "missing"
+  ) {
+    return false;
+  }
 
   const claimId = newId();
   const routeName = headerSafe(row.route_name).slice(0, 80);
@@ -787,6 +846,12 @@ async function deliverOne(
     generation: row.generation,
     route: { name: route.name, url: route.url },
     secret,
+    openclawTarget,
+    openclawGlobalToken: resolveOpenclawGlobalToken(config),
+    openclawWaitForCompletion:
+      openclawTarget === undefined || openclawTarget.mode === "direct"
+        ? (openclawTarget?.waitForCompletion ?? config.openclawWaitForCompletion)
+        : false,
   });
   if (outcome.status === "sent") {
     markSent(db, row);

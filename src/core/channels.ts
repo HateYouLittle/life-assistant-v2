@@ -867,8 +867,20 @@ export const openclawChannel: NotificationChannel = {
         ...(direct.agentId === undefined ? {} : { agentId: direct.agentId }),
         ...(direct.accountId === undefined ? {} : { accountId: direct.accountId }),
         idempotencyKey: input.requestId,
+        ...(waitForCompletion
+          ? {
+              waitForCompletion: true,
+              timeoutSeconds: OPENCLAW_WAIT_AGENT_TIMEOUT_SECONDS,
+            }
+          : {}),
       });
-      return postDelivery("openclaw", input.route.url, headers, body);
+      const result = await postOpenclawDelivery(
+        input.route.url,
+        headers,
+        body,
+        waitForCompletion ? OPENCLAW_WAIT_TIMEOUT_MS : DELIVERY_TIMEOUT_MS,
+      );
+      return finishOpenclawDelivery(input, result, waitForCompletion);
     }
 
     const payload = JSON.stringify({
@@ -881,7 +893,13 @@ export const openclawChannel: NotificationChannel = {
         createdAt: input.createdAt,
       },
     });
-    return postDelivery("openclaw", input.route.url, headers, payload);
+    const result = await postOpenclawDelivery(
+      input.route.url,
+      headers,
+      payload,
+      DELIVERY_TIMEOUT_MS,
+    );
+    return result.outcome;
   },
 };
 

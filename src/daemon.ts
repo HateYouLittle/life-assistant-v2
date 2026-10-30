@@ -8,7 +8,14 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { DateTime } from "luxon";
 import cron from "node-cron";
-import { bindHost, loadConfig, parseProfileId, type ResolvedConfig, urlHost } from "./config.js";
+import {
+  bindHost,
+  loadConfig,
+  openclawWaitForCompletionEnabled,
+  parseProfileId,
+  type ResolvedConfig,
+  urlHost,
+} from "./config.js";
 import { bearerToken, resolveIdentity, tokenFingerprint } from "./core/auth.js";
 import { openDatabase } from "./core/database.js";
 import { createInFlightTracker, type InFlightTracker } from "./core/inflight.js";
@@ -762,10 +769,12 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
       // 已落库但未投出的行留着，下次启动会由 outbox 继续投递（不丢）。
       cancelPendingDrain();
       // 在途的 outbox 投递也有 10s 级网络超时：不等它收敛就会在关库后继续写。
-      // 与 onStart 一样给个上界（这里 10s），避免停机被长时间拖住。
+      // 与 onStart 一样给个上界，避免停机被长时间拖住；openclaw waitForCompletion
+      // 的单次投递最长约 30s，此时上界放宽到 35s（没有在途投递时 waitForDrain 立即返回）。
+      const drainGraceMs = openclawWaitForCompletionEnabled(config) ? 35_000 : 10_000;
       await Promise.race([
         waitForDrain(),
-        new Promise<void>((resolve) => setTimeout(resolve, 10_000).unref()),
+        new Promise<void>((resolve) => setTimeout(resolve, drainGraceMs).unref()),
       ]);
       // onStart 理论上也可能发布；关库前再清一次可能新排的 drain（未投出的行留待下次启动）。
       cancelPendingDrain();
