@@ -1,8 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { DateTime } from "luxon";
 import { z } from "zod";
-import { canUseGlobalOpenclawToken } from "../../config.js";
 import {
+  canUseGlobalOpenclawToken,
+  openclawTargetForProfile,
+  resolveOpenclawCredentialSource,
+  resolveOpenclawGlobalToken,
+} from "../../config.js";
+import {
+  assertOpenclawRouteMatchesTarget,
+  buildOpenclawRouteUrl,
   DEFAULT_CHANNEL,
   findChannel,
   getChannel,
@@ -80,12 +87,13 @@ function clampInt(value: unknown, fallback: number, min: number, max: number): n
 }
 
 /**
- * openclaw 通道的准入口径（P2-17 凭据边界）走 config.ts 的 canUseGlobalOpenclawToken 三档判定：
- * 1. 部署自身 profile（HERMES_PROFILE）→ 可用全局 token（运维者本人，即使也登记了 Profile token）；
- * 2. 其它登记在 PROFILE_TOKENS_JSON 的 profile（隔离用户）→ 必须提供自己的 route secret，
- *    投递时作为 Bearer token，不再回退全局 token；
- * 3. 未登记独立 token 的 profile → 按 master 代表处理（回环零配置/仅 master 部署的既有行为）。
- * 判定只有 config.ts 一份，工具层与投递层不得各写一套。
+ * openclaw 通道的准入口径：
+ * 1. 登记了 OPENCLAW_PROFILE_TARGETS_JSON 的 profile → 共享 token 可用，但 URL 必须与目标逐项一致
+ *    （目标 auth=profile 时改用该 profile 的 route secret）；
+ * 2. 未登记目标的旧部署 → 保留 config.ts 的 canUseGlobalOpenclawToken 三档判定：部署自身 profile
+ *    可用全局 token；登记了独立 Profile token 的隔离用户必须自带 route secret；未登记 token 的
+ *    profile 按 master 代表。
+ * 目标绑定与凭据来源判定都只有一份实现（channels.ts / config.ts），工具层与投递层不得各写一套。
  */
 
 /** retry 的人话说明：区分「没命中」「都不可重试」「已入队」三种情况 */
@@ -218,22 +226,46 @@ function notifyToolInner(args: Record<string, unknown>, ctx: ToolContext) {
           `PROFILE_ROUTE_SECRETS_JSON 中没有 profile "${profileId}" 的 secret，无法启用推送`,
         );
       }
-      // openclaw 的凭据是 daemon 全局 OPENCLAW_HOOK_TOKEN（属于 master）：隔离用户必须先
-      // 提供自己的 secret，否则拒绝配置 —— 否则 daemon 会把全局 token 投到该用户自己填的
-      // 回环地址（P2-17）。部署自身 profile（HERMES_PROFILE）不算隔离用户。明确报错，不静默降级。
-      if (
-        channel.name === "openclaw" &&
-        ownSecret === undefined &&
-        !canUseGlobalOpenclawToken(ctx.config, profileId)
-      ) {
-        return fail(
-          `openclaw 通道使用 daemon 全局 OPENCLAW_HOOK_TOKEN（仅部署自身 profile ${ctx.config.deploymentProfile} 可配置）：` +
-            `profile "${profileId}" 有独立的 Profile token，请先在 PROFILE_ROUTE_SECRETS_JSON 里为它配置独立 secret` +
-            `（投递将用它作为 Bearer token，不再回退全局 token）`,
-        );
+      const openclawTarget =
+        channel.name === "openclaw" ? openclawTargetForProfile(ctx.config, profileId) : undefined;
+      let routeUrl = url;
+      let credentialSource: "profile" | "global" | "missing" | undefined;
+      if (channel.name === "openclaw") {
+        if (openclawTarget !== undefined) {
+          // 登记了目标：共享 token 也可用，但 URL 必须与登记目标逐项一致。
+          // 不传 URL 时直接用登记目标生成，避免复制错 agent/聊天。
+          routeUrl =
+            url === undefined
+              ? buildOpenclawRouteUrl(openclawTarget, ctx.config.openclawBaseUrl)
+              : channel.validateRoute({ url });
+          assertOpenclawRouteMatchesTarget(routeUrl, openclawTarget, profileId);
+          credentialSource = resolveOpenclawCredentialSource({
+            profileSecret: ownSecret,
+            globalToken: resolveOpenclawGlobalToken(ctx.config),
+            target: openclawTarget,
+          });
+          if (credentialSource === "missing") {
+            return fail(
+              `openclaw 目标已登记，但凭据缺失：${
+                openclawTarget.auth === "profile"
+                  ? `PROFILE_ROUTE_SECRETS_JSON 中没有 profile "${profileId}" 的 secret`
+                  : "daemon 未配置 OPENCLAW_HOOK_TOKEN（必须与 Gateway 的 hooks.token 一致）"
+              }`,
+            );
+          }
+        } else if (ownSecret === undefined && !canUseGlobalOpenclawToken(ctx.config, profileId)) {
+          // 未登记目标的旧部署保留 P2-17 门槛：隔离用户必须先提供自己的 secret，
+          // 否则全局 token 会被投到该用户自己填的回环地址。
+          return fail(
+            `openclaw 通道使用 daemon 全局 OPENCLAW_HOOK_TOKEN（仅部署自身 profile ${ctx.config.deploymentProfile} 可配置）：` +
+              `profile "${profileId}" 有独立的 Profile token，请先在 PROFILE_ROUTE_SECRETS_JSON 里为它配置独立 secret，` +
+              `或在 OPENCLAW_PROFILE_TARGETS_JSON 里登记该 profile 的固定目标` +
+              `（投递将用它作为 Bearer token，不再回退全局 token）`,
+          );
+        }
       }
       const route = setPushRoute(db, profileId, {
-        url,
+        url: routeUrl,
         channel: channel.name,
         platform: args.platform as string | undefined,
         name: args.name as string | undefined,
@@ -243,7 +275,13 @@ function notifyToolInner(args: Record<string, unknown>, ctx: ToolContext) {
         推送路由: route,
         说明:
           channel.name === "openclaw"
-            ? "OpenClaw 回环通道（路径限 /hooks/<name>）：有独立 secret 时用它，否则用 daemon 的 OPENCLAW_HOOK_TOKEN（仅部署自身 profile）"
+            ? openclawTarget !== undefined
+              ? `OpenClaw 共享 Gateway（目标已绑定：${
+                  openclawTarget.mode === "direct"
+                    ? `agentId=${openclawTarget.agentId ?? "默认"} / channel=${openclawTarget.channel}`
+                    : `hook=${openclawTarget.hook}`
+                }；凭据来源 ${credentialSource}）`
+              : "OpenClaw 回环通道（路径限 /hooks/<name>）：有独立 secret 时用它，否则用 daemon 的 OPENCLAW_HOOK_TOKEN（仅部署自身 profile）；登记 OPENCLAW_PROFILE_TARGETS_JSON 可改用共享 token + 目标绑定"
             : channel.requiresSecret
               ? "URL 仅允许回环地址；secret 来自环境变量"
               : "本地日志通道：不需要 URL 与 secret，通知写入进程日志并标记为已投递",
@@ -254,21 +292,24 @@ function notifyToolInner(args: Record<string, unknown>, ctx: ToolContext) {
       // 一律拒绝重新启用，投递层却照投（只 warn）—— 契约不一致，用户误点一次「停用」
       // 就再也开不回来。这里与投递层对齐：允许启用，但用**同一个** warn 函数（同文案、
       // 同去重表）提示它仍走全局 token，建议补 secret 或改通道。
-      // 配置/换 URL 的准入门槛不变（上面 url/channel 分支仍要求新配置自带 secret）。
+      // 配置/换 URL 的准入门槛不变：未登记目标的隔离用户仍要求自带 secret；登记目标后由
+      // 目标绑定把关（共享 token 可用，URL 不能改投）。
       const current = getPushRoute(db, profileId);
+      const currentTarget =
+        current?.channel === "openclaw"
+          ? openclawTargetForProfile(ctx.config, profileId)
+          : undefined;
       if (
         enabled &&
         current?.channel === "openclaw" &&
+        currentTarget === undefined &&
         routeSecret(ctx.config, profileId) === undefined &&
         !canUseGlobalOpenclawToken(ctx.config, profileId)
       ) {
         // 与投递层同口径：只在真的存在可回退的全局 token 时才提示（否则告警文案会误导）。
         // 投递层读的是 process.env.OPENCLAW_HOOK_TOKEN；config 快照在生产里与它同源，
         // 但测试环境用固定 env 对象建 config，不会带上它 —— 所以两边都取一次。
-        warnOpenclawGlobalTokenFallback(
-          profileId,
-          ctx.config.openclawHookToken ?? process.env.OPENCLAW_HOOK_TOKEN?.trim(),
-        );
+        warnOpenclawGlobalTokenFallback(profileId, resolveOpenclawGlobalToken(ctx.config));
       }
       // 必须走 core 的 setPushRouteEnabled：它在启用时会调 requeueRoute，
       // 把路由停用期间落入 fallback 的投递重新入队。直接 setSetting 会让
@@ -285,13 +326,26 @@ function notifyToolInner(args: Record<string, unknown>, ctx: ToolContext) {
     if (current === null)
       return okJson({
         推送路由: null,
-        说明: `用 url 参数配置（webhook/openclaw 限回环地址，openclaw 路径限 /hooks/<name>），webhook secret 在 PROFILE_ROUTE_SECRETS_JSON，openclaw 用 profile secret（部署自身 profile 缺省才回退全局 OPENCLAW_HOOK_TOKEN）；channel 可选 ${supportedChannels().join(" / ")}（默认 ${DEFAULT_CHANNEL}）`,
+        说明: `用 url 参数配置（webhook/openclaw 限回环地址，openclaw 路径限 /hooks/<name>），webhook secret 在 PROFILE_ROUTE_SECRETS_JSON；openclaw 登记了 OPENCLAW_PROFILE_TARGETS_JSON 时可省略 url（按登记目标生成），凭据来源由目标 auth 决定；channel 可选 ${supportedChannels().join(" / ")}（默认 ${DEFAULT_CHANNEL}）`,
       });
+    const currentChannel = getChannel(current.channel).name;
+    const currentTarget =
+      currentChannel === "openclaw" ? openclawTargetForProfile(ctx.config, profileId) : undefined;
     return okJson({
       推送路由: {
         ...current,
-        channel: getChannel(current.channel).name,
+        channel: currentChannel,
         secretConfigured: routeSecret(ctx.config, profileId) !== undefined,
+        ...(currentChannel === "openclaw"
+          ? {
+              openclawTarget: currentTarget ?? null,
+              credentialSource: resolveOpenclawCredentialSource({
+                profileSecret: routeSecret(ctx.config, profileId),
+                globalToken: resolveOpenclawGlobalToken(ctx.config),
+                target: currentTarget,
+              }),
+            }
+          : {}),
       },
     });
   }
@@ -609,7 +663,7 @@ const CHANNEL_NAMES = supportedChannels() as [string, ...string[]];
 const CHANNEL_NOTES: Record<string, string> = {
   webhook: "默认，回环 HMAC V2，secret 在 PROFILE_ROUTE_SECRETS_JSON",
   openclaw:
-    "OpenClaw Gateway 回环 hook，路径限 /hooks/<name>；凭据优先用该 profile 的 secret，部署自身 profile 缺省才回退全局 OPENCLAW_HOOK_TOKEN；隔离用户（登记了 Profile token 且非部署自身 profile）配置/换 URL 必须自带 route secret",
+    "OpenClaw Gateway 回环 hook，路径限 /hooks/<name>；登记 OPENCLAW_PROFILE_TARGETS_JSON 后走共享 token + 目标绑定（url 可省略，但必须与登记目标一致）；未登记目标的旧部署保留 profile secret / 部署自身 profile 回退全局 token 的行为",
   log: "本地日志通道，不需要 URL/secret",
 };
 /** 工具总描述与 channel 字段描述共用一份清单，避免两处各写一份再次漂移 */
@@ -659,7 +713,7 @@ registerModule({
           .string()
           .optional()
           .describe(
-            "推送通道 URL（webhook/openclaw 仅允许 127.0.0.1/localhost/[::1] 回环地址；openclaw 路径限 /hooks/<name>）",
+            "推送通道 URL（webhook/openclaw 仅允许 127.0.0.1/localhost/[::1] 回环地址；openclaw 路径限 /hooks/<name>，登记 OPENCLAW_PROFILE_TARGETS_JSON 时可省略）",
           ),
         channel: z
           .enum(CHANNEL_NAMES)

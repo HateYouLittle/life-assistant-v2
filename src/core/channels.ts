@@ -1,5 +1,9 @@
 import { createHmac } from "node:crypto";
-import { canUseGlobalOpenclawTokenFromEnv } from "../config.js";
+import {
+  canUseGlobalOpenclawTokenFromEnv,
+  type OpenclawProfileTarget,
+  resolveOpenclawCredentialSource,
+} from "../config.js";
 import { logger } from "./logger.js";
 import { parseSmtpRouteUrl, type SmtpRoute, sendSmtpMail } from "./smtp.js";
 
@@ -16,11 +20,12 @@ import { parseSmtpRouteUrl, type SmtpRoute, sendSmtpMail } from "./smtp.js";
  * webhook 与 openclaw 限制回环地址；log 只写本地日志；其余通道投递到外部服务，
  * 因此**不**做 webhook 那样的回环限制 —— 它们不带 secret，URL 本身就是凭据。
  *
- * 凭据边界：webhook 与 openclaw 都会把凭据发到「用户自己填的回环 URL」，因此都不允许
- * 借用别人的凭据 —— webhook 只认 PROFILE_ROUTE_SECRETS_JSON[profile]（requiresSecret），
- * openclaw 优先用同一个 profile secret，只有**部署自身 profile（HERMES_PROFILE）**配置的路由
- * 才回退 daemon 全局 OPENCLAW_HOOK_TOKEN（回退准入由 config.ts 的
- * canUseGlobalOpenclawToken 三档口径判定），且路径收紧到 Gateway 的 /hooks/ 前缀。
+ * 凭据边界：webhook 与 openclaw 都会把凭据发到「用户自己填的回环 URL」。webhook 只认
+ * PROFILE_ROUTE_SECRETS_JSON[profile]（requiresSecret）。openclaw 的隔离优先靠**目标绑定**：
+ * 登记 OPENCLAW_PROFILE_TARGETS_JSON 后，token 可以共享，但 URL 必须与登记的
+ * agentId/channel/to/accountId 逐项一致，不能改投；只有目标 auth=profile 才用该 Profile 的
+ * secret。未登记目标的旧部署保留 P2-17 的 profile secret 优先 / 部署自身 profile 回退全局
+ * token 行为（由 config.ts 的 canUseGlobalOpenclawToken 判定）。路径收紧到 /hooks/ 前缀。
  */
 
 export const EVENT_TYPE = "life_assistant.reminder";
@@ -52,6 +57,12 @@ export interface ChannelDeliveryInput {
    * daemon 全局 OPENCLAW_HOOK_TOKEN 使用（非 master profile 的 openclaw 路由必须走这条）。
    */
   secret?: string;
+  /** openclaw 目标绑定（OPENCLAW_PROFILE_TARGETS_JSON；未登记时为 undefined，保留旧行为） */
+  openclawTarget?: OpenclawProfileTarget;
+  /** openclaw 全局 token（ResolvedConfig.openclawHookToken；未传时回退 process.env） */
+  openclawGlobalToken?: string;
+  /** openclaw 直连是否等待 completion.delivered（目标/环境变量决定） */
+  openclawWaitForCompletion?: boolean;
 }
 
 /**
@@ -254,17 +265,17 @@ function normalizePushUrl(label: string, hint: string, raw: string | undefined):
 }
 
 /**
- * 失败正文只读前 MAX_ERROR_LENGTH 个字符用于排障（Bark/ntfy 都会回 JSON 错误码），
+ * 只读前 maxChars 个字符的响应体（失败正文排障、OpenClaw 的 completion 解析共用）。
  * 超长正文既不进库也不留在内存里：逐块读够就断开，不等上游写完。
  */
-async function readErrorDetail(response: Response): Promise<string> {
+async function readBodyText(response: Response, maxChars: number): Promise<string> {
   const body = response.body;
   if (body === null) return "";
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let text = "";
   try {
-    while (text.length < MAX_ERROR_LENGTH) {
+    while (text.length < maxChars) {
       const { done, value } = await reader.read();
       if (done) break;
       text += decoder.decode(value, { stream: true });
@@ -274,28 +285,48 @@ async function readErrorDetail(response: Response): Promise<string> {
   } finally {
     reader.cancel().catch(() => {});
   }
-  // 冲掉分块解码残留的半截多字节字符，再折叠换行：last_error 是单行展示，
-  // 多行正文会把状态页/日志撑乱
-  return `${text}${decoder.decode()}`.trim().replace(/\s+/g, " ").slice(0, MAX_ERROR_LENGTH);
+  // 冲掉分块解码残留的半截多字节字符
+  return `${text}${decoder.decode()}`.slice(0, maxChars);
+}
+
+/**
+ * 失败正文只读前 MAX_ERROR_LENGTH 个字符用于排障（Bark/ntfy 都会回 JSON 错误码）。
+ * last_error 是单行展示，多行正文会把状态页/日志撑乱，故折叠空白。
+ */
+async function readErrorDetail(response: Response): Promise<string> {
+  const text = await readBodyText(response, MAX_ERROR_LENGTH);
+  return text.trim().replace(/\s+/g, " ").slice(0, MAX_ERROR_LENGTH);
 }
 
 /** 状态码 → 四态（webhook 的错误文案是既有契约 "HTTP <n>"，故未与它共用本函数） */
-function outcomeFromStatus(label: string, status: number, detail: string): ChannelOutcome {
+function outcomeFromStatus(
+  label: string,
+  status: number,
+  detail: string,
+  extraRetryable?: ReadonlySet<number>,
+): ChannelOutcome {
   if (status >= 200 && status <= 299) return { status: "sent" };
   const error = truncateError(`${label} 返回 HTTP ${status}${detail === "" ? "" : `：${detail}`}`);
-  // 408/429/5xx 是「服务端此刻不行」，退避后重试有意义；其余 3xx/4xx 重试也改不了结果
-  const retryable = status === 408 || status === 429 || (status >= 500 && status <= 599);
+  // 408/429/5xx 是「服务端此刻不行」，退避后重试有意义；其余 3xx/4xx 重试也改不了结果。
+  // OpenClaw 的 409（配置热更新）是例外，由调用方通过 extraRetryable 显式放行。
+  const retryable =
+    status === 408 ||
+    status === 429 ||
+    (status >= 500 && status <= 599) ||
+    extraRetryable?.has(status) === true;
   return retryable ? { status: "confirmed_failure", error } : { status: "terminal_failure", error };
 }
 
 /** 网络/超时 → 传输失败（结果不确定，由 outbox 决定重试几次） */
-function transportOutcome(label: string, e: unknown): ChannelOutcome {
+function transportOutcome(
+  label: string,
+  e: unknown,
+  timeoutMs: number = DELIVERY_TIMEOUT_MS,
+): ChannelOutcome {
   const message = e instanceof Error ? e.message : String(e);
   // AbortSignal.timeout 抛的是 TimeoutError，裸 message 是英文，换成中文更直观
   const reason =
-    e instanceof Error && e.name === "TimeoutError"
-      ? `请求超时（${DELIVERY_TIMEOUT_MS / 1000}s）`
-      : message;
+    e instanceof Error && e.name === "TimeoutError" ? `请求超时（${timeoutMs / 1000}s）` : message;
   return { status: "transport_failure", error: truncateError(`${label} 投递失败：${reason}`) };
 }
 
@@ -329,44 +360,41 @@ async function postDelivery(
   }
 }
 
-/**
- * OpenClaw Gateway hooks 通道：route.url 是本机 Gateway 的 hook 地址，路径限定在
- * `/hooks/<name>`（回环地址上还有大量别的本地服务，允许任意路径等于把 hooks token
- * 交给任意本地服务的配置面）。
- *
- * 凭据优先级（P2-17 的凭据边界）：
- * 1. profile 自己的 `PROFILE_ROUTE_SECRETS_JSON[profile]`（有值时用它）；
- * 2. 缺省才回退 daemon 环境里的全局 `OPENCLAW_HOOK_TOKEN` —— 该 token 属于运维者，
- *    只有部署自身 profile（HERMES_PROFILE）或未登记独立 token 的 profile 能回退；
- *    隔离用户（登记了 Profile token 且非部署自身 profile）的配置入口会要求它先提供
- *    独立 secret，不会把全局 token 投到它自己填的回环地址。
- * token 不进入路由或数据库，每次投递时读取；缺失时只终结本次投递，不影响 daemon 启动，
- * 也不改变 webhook 的 HMAC V2 协议。
- */
+const OPENCLAW_HOOKS_PREFIX = "/hooks";
+const OPENCLAW_DIRECT_PATH = `${OPENCLAW_HOOKS_PREFIX}/agent`;
+const OPENCLAW_DIRECT_QUERY_KEYS = new Set(["channel", "to", "agentId", "accountId"]);
+/** OpenClaw 在配置热更新时回 409 并要求 retry；不要按普通 4xx 终结。 */
+const OPENCLAW_RETRYABLE_STATUSES = new Set([409]);
+const OPENCLAW_SUCCESS_BODY_LIMIT = 64 * 1024;
+/** waitForCompletion=true 时给 agent 一轮执行留的时间（客户端比它多 5s 上界）。 */
+const OPENCLAW_WAIT_AGENT_TIMEOUT_SECONDS = 25;
+const OPENCLAW_WAIT_TIMEOUT_MS = 30_000;
+
 /**
  * 直连 /hooks/agent 的目标：agent/channel/to/accountId 写在路由 URL 的 query 上。
  * hook 映射（/hooks/<name>）不暴露 accountId，多账号通道（微信/QQ）必须走直连，
  * 否则会从默认账号发出，收件人会话不匹配时静默失败。
  */
-interface OpenclawDirectTarget {
+interface OpenclawDirectEndpoint {
   agentId?: string;
   channel: string;
   to: string;
   accountId?: string;
 }
 
-/**
- * 识别「直连 /hooks/agent」路由：路径以 /hooks/agent 结尾且带 channel/to query。
- * 非直连（如 /hooks/life-bestie 映射）返回 null，继续走映射式投递。
- */
-function parseOpenclawDirectTarget(rawUrl: string): OpenclawDirectTarget | null {
+function openclawPath(rawPath: string): string {
+  return rawPath.replace(/\/+$/, "");
+}
+
+/** 识别「直连 /hooks/agent」路由；非直连返回 null，继续走映射式投递。 */
+function parseOpenclawDirectEndpoint(rawUrl: string): OpenclawDirectEndpoint | null {
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);
   } catch {
     return null;
   }
-  if (!parsed.pathname.replace(/\/+$/, "").endsWith("/hooks/agent")) return null;
+  if (openclawPath(parsed.pathname) !== OPENCLAW_DIRECT_PATH) return null;
   const channel = parsed.searchParams.get("channel")?.trim() ?? "";
   const to = parsed.searchParams.get("to")?.trim() ?? "";
   if (channel === "" || to === "") return null;
@@ -375,16 +403,315 @@ function parseOpenclawDirectTarget(rawUrl: string): OpenclawDirectTarget | null 
   return { channel, to, ...(agentId ? { agentId } : {}), ...(accountId ? { accountId } : {}) };
 }
 
+/**
+ * 用登记目标拼出可落库的 openclaw 路由 URL。
+ * `notify route {channel:"openclaw"}` 不传 URL 时走这里，避免用户复制错目标。
+ */
+export function buildOpenclawRouteUrl(
+  target: OpenclawProfileTarget,
+  defaultBaseUrl: string,
+): string {
+  const baseUrl = target.baseUrl || defaultBaseUrl;
+  if (target.mode === "mapping") return `${baseUrl}${OPENCLAW_HOOKS_PREFIX}/${target.hook}`;
+  const url = new URL(`${baseUrl}${OPENCLAW_DIRECT_PATH}`);
+  url.searchParams.set("channel", target.channel);
+  url.searchParams.set("to", target.to);
+  if (target.agentId !== undefined) url.searchParams.set("agentId", target.agentId);
+  if (target.accountId !== undefined) url.searchParams.set("accountId", target.accountId);
+  return url.toString();
+}
+
+/**
+ * 目标绑定：URL 必须与 OPENCLAW_PROFILE_TARGETS_JSON 登记的逐项一致。
+ * 这是 shared-trust 模式下「消息进入正确地方」的核心 —— token 可以共享，目标不能改。
+ */
+/** 把回环别名归一成同一个 origin 视图，用于比较 baseUrl 与路由 URL。 */
+function loopbackOrigin(raw: string): { protocol: string; host: string; port: string } {
+  const parsed = new URL(raw);
+  const host = parsed.hostname.replace(/^\[/, "").replace(/\]$/, "").toLowerCase();
+  return {
+    protocol: parsed.protocol,
+    host: host === "localhost" || host === "::1" ? "127.0.0.1" : host,
+    port: parsed.port || (parsed.protocol === "https:" ? "443" : "80"),
+  };
+}
+
+/** query 参数重复时，不同实现可能取第一个或最后一个；目标绑定不能容忍这种歧义。 */
+function assertNoDuplicateQueryKeys(parsed: URL, label: string): void {
+  const seen = new Set<string>();
+  for (const key of parsed.searchParams.keys()) {
+    if (seen.has(key)) throw new Error(`${label} 不允许重复 query 参数: ${key}`);
+    seen.add(key);
+  }
+}
+
+export function assertOpenclawRouteMatchesTarget(
+  url: string,
+  target: OpenclawProfileTarget,
+  profileId: string,
+): void {
+  const parsed = new URL(url);
+  if (parsed.username !== "" || parsed.password !== "" || parsed.hash !== "") {
+    throw new Error(
+      `openclaw 路由目标与 OPENCLAW_PROFILE_TARGETS_JSON.${profileId} 不一致：URL 不允许用户名/密码或 # 片段`,
+    );
+  }
+  const rawHost = parsed.hostname.replace(/^\[/, "").replace(/\]$/, "").toLowerCase();
+  if (!LOOPBACK_HOSTS.has(rawHost)) {
+    throw new Error(
+      `openclaw 路由目标与 OPENCLAW_PROFILE_TARGETS_JSON.${profileId} 不一致：只接受回环地址（127.0.0.1 / localhost / [::1]），收到 ${rawHost}`,
+    );
+  }
+  const expectedOrigin = loopbackOrigin(target.baseUrl);
+  if (!LOOPBACK_HOSTS.has(expectedOrigin.host)) {
+    throw new Error(
+      `openclaw 路由目标与 OPENCLAW_PROFILE_TARGETS_JSON.${profileId} 不一致：登记的 baseUrl 必须是回环地址，收到 ${target.baseUrl}`,
+    );
+  }
+  const actualOrigin = loopbackOrigin(url);
+  if (
+    actualOrigin.protocol !== expectedOrigin.protocol ||
+    actualOrigin.host !== expectedOrigin.host ||
+    actualOrigin.port !== expectedOrigin.port
+  ) {
+    throw new Error(
+      `openclaw 路由目标与 OPENCLAW_PROFILE_TARGETS_JSON.${profileId} 不一致：origin 必须是 ` +
+        `${expectedOrigin.protocol}//${expectedOrigin.host}:${expectedOrigin.port}，收到 ` +
+        `${actualOrigin.protocol}//${actualOrigin.host}:${actualOrigin.port}（不能把共享 token 投到别的端口/主机）`,
+    );
+  }
+  assertNoDuplicateQueryKeys(
+    parsed,
+    `openclaw 路由目标与 OPENCLAW_PROFILE_TARGETS_JSON.${profileId} 不一致：`,
+  );
+  const path = openclawPath(parsed.pathname);
+  if (parsed.searchParams.has("token")) {
+    throw new Error(
+      `openclaw 路由目标与 OPENCLAW_PROFILE_TARGETS_JSON.${profileId} 不一致：不接受 ?token=，凭据必须走 Authorization 头`,
+    );
+  }
+  if (target.mode === "mapping") {
+    const expected = `${OPENCLAW_HOOKS_PREFIX}/${target.hook}`;
+    if (path !== expected) {
+      throw new Error(
+        `openclaw 路由目标与 OPENCLAW_PROFILE_TARGETS_JSON.${profileId} 不一致：路径必须是 ${expected}，收到 ${path}`,
+      );
+    }
+    return;
+  }
+  if (path !== OPENCLAW_DIRECT_PATH) {
+    throw new Error(
+      `openclaw 路由目标与 OPENCLAW_PROFILE_TARGETS_JSON.${profileId} 不一致：直连模式路径必须是 ${OPENCLAW_DIRECT_PATH}，收到 ${path}`,
+    );
+  }
+  const actual = {
+    channel: parsed.searchParams.get("channel")?.trim() ?? "",
+    to: parsed.searchParams.get("to")?.trim() ?? "",
+    agentId: parsed.searchParams.get("agentId")?.trim() || undefined,
+    accountId: parsed.searchParams.get("accountId")?.trim() || undefined,
+  };
+  const mismatched: string[] = [];
+  if (actual.channel !== target.channel) mismatched.push("channel");
+  if (actual.to !== target.to) mismatched.push("to");
+  if (actual.agentId !== target.agentId) mismatched.push("agentId");
+  if (actual.accountId !== target.accountId) mismatched.push("accountId");
+  for (const key of parsed.searchParams.keys()) {
+    if (!OPENCLAW_DIRECT_QUERY_KEYS.has(key)) mismatched.push(`未知参数 ${key}`);
+  }
+  if (mismatched.length > 0) {
+    throw new Error(
+      `openclaw 路由目标与 OPENCLAW_PROFILE_TARGETS_JSON.${profileId} 不一致：${mismatched.join("、")}` +
+        "（目标由服务端登记，不能通过改 URL 改投）",
+    );
+  }
+}
+
 /** 直连投递时给 agent 的指令：明确要求原样发送，否则模型可能回静默、投递被吞 */
 function openclawDirectMessage(input: ChannelDeliveryInput): string {
   return `【life-assistant 主动通知】请把下面这条通知原样发送给用户：保留标题与正文，不要添加任何评论，不要调用工具，不要回复 NO_REPLY。\n\n${input.title}\n\n${input.bodyMd}`;
 }
 
+/** 401/400 是 openclaw 最常见的两类配置错误，给一条能直接照做的提示。 */
+function annotateOpenclawOutcome(outcome: ChannelOutcome): ChannelOutcome {
+  if (outcome.status !== "terminal_failure" && outcome.status !== "confirmed_failure") {
+    return outcome;
+  }
+  let error = outcome.error;
+  if (/HTTP 401\b/.test(error)) {
+    error +=
+      "（OpenClaw 只认该 Gateway 的 hooks.token；per-profile secret 仅适用于每个用户自己的 Gateway）";
+  }
+  if (/HTTP 400\b/.test(error) && /message required/i.test(error)) {
+    error += "（/hooks/agent 直连需要 channel/to；缺少时会退回映射载荷并被拒）";
+  }
+  return { ...outcome, error: truncateError(error) };
+}
+
+interface OpenclawPostResult {
+  outcome: ChannelOutcome;
+  body: unknown;
+}
+
+/** openclaw 投递：成功时读回响应体，供 waitForCompletion 解析 completion。 */
+async function postOpenclawDelivery(
+  url: string,
+  headers: Record<string, string>,
+  body: string,
+  timeoutMs: number,
+): Promise<OpenclawPostResult> {
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers,
+      body,
+      signal: AbortSignal.timeout(timeoutMs),
+      redirect: "manual",
+    });
+    if (response.ok) {
+      const text = await readBodyText(response, OPENCLAW_SUCCESS_BODY_LIMIT);
+      let parsed: unknown;
+      if (text.trim() !== "") {
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          parsed = undefined;
+        }
+      }
+      return { outcome: { status: "sent" }, body: parsed };
+    }
+    const detail = await readErrorDetail(response);
+    return {
+      outcome: annotateOpenclawOutcome(
+        outcomeFromStatus("openclaw", response.status, detail, OPENCLAW_RETRYABLE_STATUSES),
+      ),
+      body: undefined,
+    };
+  } catch (e) {
+    return {
+      outcome: annotateOpenclawOutcome(transportOutcome("openclaw", e, timeoutMs)),
+      body: undefined,
+    };
+  }
+}
+
+interface OpenclawCompletion {
+  status?: string;
+  delivered?: boolean;
+  deliveryAttempted?: boolean;
+  deliveryError?: string;
+  deliverySuppressionReason?: string;
+  replyDisposition?: string;
+}
+
+function readOpenclawString(value: Record<string, unknown>, key: string): string | undefined {
+  const raw = value[key];
+  return typeof raw === "string" && raw.trim() !== "" ? raw.trim() : undefined;
+}
+
+function readOpenclawCompletion(body: unknown): OpenclawCompletion | null {
+  if (typeof body !== "object" || body === null) return null;
+  const completion = (body as Record<string, unknown>).completion;
+  if (typeof completion !== "object" || completion === null) return null;
+  const value = completion as Record<string, unknown>;
+  const status = readOpenclawString(value, "status");
+  const deliveryError = readOpenclawString(value, "deliveryError");
+  const deliverySuppressionReason = readOpenclawString(value, "deliverySuppressionReason");
+  const replyDisposition = readOpenclawString(value, "replyDisposition");
+  return {
+    ...(status === undefined ? {} : { status }),
+    ...(typeof value.delivered === "boolean" ? { delivered: value.delivered } : {}),
+    ...(typeof value.deliveryAttempted === "boolean"
+      ? { deliveryAttempted: value.deliveryAttempted }
+      : {}),
+    ...(deliveryError === undefined ? {} : { deliveryError }),
+    ...(deliverySuppressionReason === undefined ? {} : { deliverySuppressionReason }),
+    ...(replyDisposition === undefined ? {} : { replyDisposition }),
+  };
+}
+
+function openclawRunId(body: unknown): string | undefined {
+  if (typeof body !== "object" || body === null) return undefined;
+  return readOpenclawString(body as Record<string, unknown>, "runId");
+}
+
+/**
+ * waitForCompletion=true 时，200 只代表 agent 跑完；只有 completion.delivered=true
+ * 才算真的送达。NO_REPLY / silent 抑制 / 通道投递失败都必须让通知保持未读，
+ * 否则用户既收不到、notify.pull 也捞不回来。
+ */
+function openclawCompletionOutcome(completion: OpenclawCompletion): ChannelOutcome {
+  if (completion.delivered === true) return { status: "sent" };
+  const reason =
+    completion.deliverySuppressionReason ??
+    completion.deliveryError ??
+    completion.replyDisposition ??
+    completion.status;
+  if (completion.deliverySuppressionReason !== undefined) {
+    return {
+      status: "terminal_failure",
+      error: truncateError(`openclaw 抑制了本次投递：${completion.deliverySuppressionReason}`),
+    };
+  }
+  if (completion.deliveryError !== undefined) {
+    return {
+      status: "confirmed_failure",
+      error: truncateError(`openclaw 投递失败：${completion.deliveryError}`),
+    };
+  }
+  if (completion.status !== undefined && completion.status !== "ok") {
+    return {
+      status: "confirmed_failure",
+      error: truncateError(`openclaw agent 运行未成功：${completion.status}`),
+    };
+  }
+  return {
+    status: "terminal_failure",
+    error: truncateError(`openclaw 未确认送达（${reason ?? "completion.delivered 不是 true"}）`),
+  };
+}
+
+function finishOpenclawDelivery(
+  input: ChannelDeliveryInput,
+  result: OpenclawPostResult,
+  waitForCompletion: boolean,
+): ChannelOutcome {
+  const runId = openclawRunId(result.body);
+  if (runId !== undefined) {
+    logger.debug(`openclaw 投递 ${input.requestId} 已受理 runId=${runId}`);
+  }
+  if (!waitForCompletion || result.outcome.status !== "sent") return result.outcome;
+  const completion = readOpenclawCompletion(result.body);
+  if (completion === null) {
+    logger.warn(`openclaw 投递 ${input.requestId} 等待完成但响应缺少 completion`);
+    return {
+      status: "terminal_failure",
+      error: "openclaw 未返回 completion，无法确认送达",
+    };
+  }
+  const outcome = openclawCompletionOutcome(completion);
+  if (outcome.status !== "sent") {
+    logger.warn(`openclaw 投递 ${input.requestId} 未送达：${outcome.error}`);
+  }
+  return outcome;
+}
+
+/**
+ * OpenClaw Gateway hooks 通道：route.url 是本机 Gateway 的 hook 地址，路径限定在
+ * `/hooks/<name>`（回环地址上还有大量别的本地服务，允许任意路径等于把 hooks token
+ * 交给任意本地服务的配置面）。
+ *
+ * 凭据与隔离：
+ * - 登记了 OPENCLAW_PROFILE_TARGETS_JSON 的 Profile 走「目标绑定」：token 可用共享的
+ *   OPENCLAW_HOOK_TOKEN，但 URL 必须与登记目标逐项一致，不能改投到别的 agent/聊天；
+ * - 未登记目标的旧部署保留 P2-17 行为：profile secret 优先，只有部署自身 profile /
+ *   未登记独立 token 的 profile 才回退全局 token；
+ * - 目标登记了 auth=profile 时只认该 Profile 的 secret（用于每个用户自己的 Gateway）。
+ * token 不进入路由或数据库，每次投递时读取；缺失时只终结本次投递，不影响 daemon 启动，
+ * 也不改变 webhook 的 HMAC V2 协议。
+ */
 export const openclawChannel: NotificationChannel = {
   name: "openclaw",
-  // 凭据可以来自 profile secret，也可以来自 master 的全局 OPENCLAW_HOOK_TOKEN：
-  // 后者在核心层（core/notify.ts 只检查 requiresSecret）看不见，所以「缺凭据不入队」
-  // 不能交给核心层判定，改由 notify route 的 master 口径在配置时把关（P2-17）。
+  // 凭据来源由 openclawTarget / secret / 全局 token 共同决定，见 resolveOpenclawCredentialSource。
   requiresSecret: false,
   requiresUrl: true,
 
@@ -402,6 +729,16 @@ export const openclawChannel: NotificationChannel = {
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
       throw new Error(`openclaw URL 仅支持 http/https: ${raw}`);
     }
+    if (parsed.username !== "" || parsed.password !== "") {
+      throw new Error("openclaw URL 不允许包含用户名/密码（凭据走 Authorization: Bearer）");
+    }
+    if (parsed.hash !== "") {
+      throw new Error("openclaw URL 不允许包含 # 片段");
+    }
+    if (parsed.searchParams.has("token")) {
+      throw new Error("openclaw 不接受 ?token=：凭据必须走 Authorization: Bearer 头");
+    }
+    assertNoDuplicateQueryKeys(parsed, "openclaw URL");
     const hostname = parsed.hostname.replace(/^\[/, "").replace(/\]$/, "");
     if (!LOOPBACK_HOSTS.has(hostname.toLowerCase())) {
       throw new Error(
@@ -425,11 +762,36 @@ export const openclawChannel: NotificationChannel = {
         `openclaw URL 路径不允许 .. 段、空段或百分号编码的 %2e/%2f（会被归一化成 /hooks/ 之外的路径），收到: ${rawPath}`,
       );
     }
-    const path = rawPath.replace(/\/+$/, "");
-    if (!path.startsWith("/hooks/")) {
+    const path = openclawPath(rawPath);
+    if (!path.startsWith(`${OPENCLAW_HOOKS_PREFIX}/`)) {
       throw new Error(
         `openclaw URL 路径必须是 /hooks/<name>（如 http://127.0.0.1:18789/hooks/life-default 或 /hooks/agent?channel=&to=），收到: ${rawPath}`,
       );
+    }
+    if (path === OPENCLAW_DIRECT_PATH) {
+      for (const key of parsed.searchParams.keys()) {
+        if (!OPENCLAW_DIRECT_QUERY_KEYS.has(key)) {
+          throw new Error(
+            `openclaw /hooks/agent 直连不接受 query 参数 ${key}（可用: channel / to / agentId / accountId）`,
+          );
+        }
+      }
+      const channel = parsed.searchParams.get("channel")?.trim() ?? "";
+      const to = parsed.searchParams.get("to")?.trim() ?? "";
+      if (channel === "") {
+        throw new Error("openclaw /hooks/agent 直连需要非空 channel（如 qqbot）");
+      }
+      if (channel === "last") {
+        throw new Error("openclaw /hooks/agent 直连的 channel 不能是 last，必须是具体通道");
+      }
+      if (to === "") {
+        throw new Error("openclaw /hooks/agent 直连需要非空 to（收件人目标）");
+      }
+      for (const key of ["agentId", "accountId"]) {
+        if (parsed.searchParams.has(key) && (parsed.searchParams.get(key)?.trim() ?? "") === "") {
+          throw new Error(`openclaw /hooks/agent 直连的 ${key} 不能为空`);
+        }
+      }
     }
     const serialized = parsed.toString();
     // 与 bark/ntfy 一样只在无 query/hash 时去尾斜杠，避免改动 query/hash 的内容。
@@ -437,26 +799,48 @@ export const openclawChannel: NotificationChannel = {
   },
 
   async deliver(input: ChannelDeliveryInput): Promise<ChannelOutcome> {
-    // 凭据来源：profile 自己的 secret 优先（非 master 路由必须走这条，绝不回退全局 token），
-    // 只有 master 配置的路由（没有 profile secret）才用 daemon 的全局 OPENCLAW_HOOK_TOKEN。
-    const profileSecret = input.secret?.trim();
-    const hasProfileSecret = profileSecret !== undefined && profileSecret !== "";
-    const globalToken = process.env.OPENCLAW_HOOK_TOKEN?.trim();
-    const token = hasProfileSecret ? profileSecret : globalToken;
-    if (!token) {
+    // 每次投递都重新校验路由形态：手工改库/旧路由不能把 token 带到别的端口或路径。
+    try {
+      openclawChannel.validateRoute({ url: input.route.url });
+    } catch (e) {
       return {
         status: "terminal_failure",
-        error:
-          `openclaw 通道缺少凭据：PROFILE_ROUTE_SECRETS_JSON 中没有 profile "${input.profileId}" 的 secret，` +
-          "daemon 也未配置 OPENCLAW_HOOK_TOKEN（部署自身 profile 的路由在 daemon 的 .env 里配置 OpenClaw hooks.token）",
+        error: e instanceof Error ? e.message : String(e),
       };
     }
-    // 隔离用户（登记了 Profile token 且非部署自身 profile）没有自己的 secret、实际回退了
-    // 全局 token：这通常是收紧前落库的路由。只告警一次（每个 profile），**不**拒绝投递 ——
-    // 拒绝会打断既有推送，需人工确认后再补 secret 或改通道。工具层「重新启用」走同一个函数。
+    const target = input.openclawTarget;
+    if (target !== undefined) {
+      // 投递前再校验一次：防手工改库/升级前落库的路由绕过配置期检查。
+      // 这里不抛错（会让 drain 整轮中断），而是把这条投递终结为 fallback。
+      try {
+        assertOpenclawRouteMatchesTarget(input.route.url, target, input.profileId);
+      } catch (e) {
+        return {
+          status: "terminal_failure",
+          error: e instanceof Error ? e.message : String(e),
+        };
+      }
+    }
+    const profileSecret = input.secret?.trim();
+    const globalToken =
+      input.openclawGlobalToken?.trim() ?? process.env.OPENCLAW_HOOK_TOKEN?.trim();
+    const source = resolveOpenclawCredentialSource({ profileSecret, globalToken, target });
+    const token = source === "profile" ? profileSecret : globalToken;
+    if (source === "missing" || token === undefined || token === "") {
+      const auth = target?.auth;
+      const hint =
+        auth === "profile"
+          ? `OPENCLAW_PROFILE_TARGETS_JSON.${input.profileId} 指定 auth=profile，但 PROFILE_ROUTE_SECRETS_JSON 没有对应 secret`
+          : auth === "global"
+            ? "OPENCLAW_PROFILE_TARGETS_JSON 指定 auth=global，但 daemon 未配置 OPENCLAW_HOOK_TOKEN（必须与 Gateway 的 hooks.token 一致）"
+            : `PROFILE_ROUTE_SECRETS_JSON 中没有 profile "${input.profileId}" 的 secret，daemon 也未配置 OPENCLAW_HOOK_TOKEN（部署自身 profile 的路由在 daemon 的 .env 里配置 OpenClaw hooks.token）`;
+      return { status: "terminal_failure", error: `openclaw 通道缺少凭据：${hint}` };
+    }
+    // 未登记目标的旧部署：隔离用户回退全局 token 时只告警一次（每个 profile），不拒绝投递。
+    // 登记了目标（target 非空）说明运维者已显式授权，不再告警。
     if (
-      !hasProfileSecret &&
-      globalToken !== undefined &&
+      target === undefined &&
+      source === "global" &&
       !canUseGlobalOpenclawTokenFromEnv(input.profileId)
     ) {
       warnOpenclawGlobalTokenFallback(input.profileId, globalToken);
@@ -470,8 +854,9 @@ export const openclawChannel: NotificationChannel = {
     };
 
     // 直连 /hooks/agent：目标写在 URL query 上，可带 accountId（多账号通道必需）。
-    const direct = parseOpenclawDirectTarget(input.route.url);
+    const direct = parseOpenclawDirectEndpoint(input.route.url);
     if (direct !== null) {
+      const waitForCompletion = input.openclawWaitForCompletion === true;
       const body = JSON.stringify({
         message: openclawDirectMessage(input),
         name: "life-assistant",
