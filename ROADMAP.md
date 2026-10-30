@@ -1,6 +1,6 @@
 # 路线图与进度
 
-> 当前版本 **v2.0.0** · 数据库 **schema v5** · 最后更新 **2026-10-26**
+> 当前版本 **v2.0.0** · 数据库 **schema v5** · 最后更新 **2026-10-31**
 >
 > 口径：以已合入 `main` 的实现为准。完成一项就勾选、补 commit 与落点，并更新顶部「最后更新」。
 > 详细分析与逐项证据（真实库采样、file:line）见本地报告 `feature-proposal-2026-10-20.md`——
@@ -49,7 +49,7 @@ CI 在 Node 22.16.0 / 22 / 24 三档矩阵全绿（`.github/workflows/ci.yml`）
 
 **功能项**
 
-1. **通知通道/偏好/聚合/受众** ✅（2026-10-20，`2cc2f5b` + `7161c01`）：Bark + ntfy + Telegram + SMTP + OpenClaw 通道（`openclaw`，2026-10-25，`033acc9` + `20f421c`；支持映射式与 `/hooks/agent` 直连）、按 kind 的 `notify_prefs`（默认逐笔回执不推）、家庭账本回执只发记账人、每晚 21:30 记账摘要、`notify prefs|test`。仍待办：按通道渲染格式、聚合窗口（当前只支持「推/不推」）；SMTP 的 TLS 成功路径未自动化（需受信证书）。原计划：Bark / ntfy / SMTP 邮件 + 按 `kind` 偏好、回执聚合、家庭级去重
+1. **通知通道/偏好/聚合/受众** ✅（2026-10-20，`2cc2f5b` + `7161c01`）：Bark + ntfy + Telegram + SMTP + OpenClaw 通道（`openclaw`，2026-10-25，`033acc9` + `20f421c`；支持映射式与 `/hooks/agent` 直连；2026-10-31 增加共享 Gateway 的 `OPENCLAW_PROFILE_TARGETS_JSON` 目标绑定、直连参数校验、409 可重试与 `waitForCompletion` 送达确认）、按 kind 的 `notify_prefs`（默认逐笔回执不推）、家庭账本回执只发记账人、每晚 21:30 记账摘要、`notify prefs|test`。仍待办：按通道渲染格式、聚合窗口（当前只支持「推/不推」）；SMTP 的 TLS 成功路径未自动化（需受信证书）。原计划：Bark / ntfy / SMTP 邮件 + 按 `kind` 偏好、回执聚合、家庭级去重
    （当前 172 条记账回执按 Profile 各发一遍，是最大噪声源）
 2. **写 API + 手机快捷入口** ✅（2026-10-20，`ecd18b3`）：`POST /api/quick/expenses|schedules`（复用 `request_id` 幂等）+ `GET /api/quick/bootstrap` + `/quick` PWA（记账/提醒、token 引导、预填参数）；HTTP Shortcuts 可直接导入 [docs/http-shortcuts.json](docs/http-shortcuts.json)（说明见 [docs/http-shortcuts.md](docs/http-shortcuts.md)），小布指令/NFC 用法见 [docs/quick-entry.md](docs/quick-entry.md)。
    目标：从打开对话降到点一下 / 两下。

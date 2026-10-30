@@ -211,16 +211,18 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   `fallback` 终态、保留 `request_started_at`（`requeueRoute` 只捞 `IS NULL`，不会自动重投），
   重发只能人工走 `notify.retry`/`retryDeliveries`。通道名按该 Profile **当前生效路由**反查
   （`deliveries` 无 channel 列），换过通道的极少数场景按更保守一侧处理。
-- **openclaw 通道的凭据边界**（P2-17）：Bearer token 优先取 `PROFILE_ROUTE_SECRETS_JSON[profile]`；
-  只有「部署自身 profile（`HERMES_PROFILE`，缺省 `default`，见 `config.deploymentProfile`）」与
-  「未登记独立 Profile token 的 profile」才回退全局 `OPENCLAW_HOOK_TOKEN`。登记了独立 token 的
-  隔离用户配置/重新启用 openclaw 路由必须自带 secret，否则明确 fail；`validateRoute` 把路径收紧到
-  `/hooks/<name>`（保留 `/hooks/agent?channel=&to=` 直连形态）。判定内核只有 `config.ts` 一份
-  （`openclawCanUseGlobalToken`），工具层与投递层不得各写一套。收紧前已落库的隔离路由仍会投递，
-  投递侧按 profile 打一条一次性 warn（不擅自拒绝，见 README 已知取舍 #33）。**存量**隔离路由允许
-  停用后重新启用（与投递层对齐：共用 `warnOpenclawGlobalTokenFallback`，同文案同去重表，N-2）；
-  `validateRoute` 另拒绝含 `..`/`.` 段、空段（`//`）或百分号编码 `%2e`/`%2f` 的 pathname
-  （会被反代/Gateway 归一化到 `/hooks/` 之外，N-3）。
+- **openclaw 通道的隔离是「目标绑定」**：一个 Gateway 只有一个 `hooks.token`，共享 Gateway 时所有
+  Profile 都用 `OPENCLAW_HOOK_TOKEN`，隔离靠 `OPENCLAW_PROFILE_TARGETS_JSON`（`config.openclawProfileTargets`）
+  在配置期与投递前校验 `agentId/channel/to/accountId`（映射式只校验 hook）。登记目标后 `notify route`
+  可省略 URL，`buildOpenclawRouteUrl` 生成；`assertOpenclawRouteMatchesTarget` 是唯一比较口径。
+  `PROFILE_ROUTE_SECRETS_JSON[profile]` 只用于目标 `auth:"profile"`（每个用户自己的 Gateway）；
+  未登记目标的旧部署保留 P2-17 行为（profile secret 优先，部署自身 profile / 未登记独立 token 的
+  profile 回退全局 token），存量隔离路由仍投递并打一次性 warn（`warnOpenclawGlobalTokenFallback`）。
+  `validateRoute` 把路径收紧到 `/hooks/<name>`（保留 `/hooks/agent?channel=&to=` 直连形态），直连还
+  拒绝缺 channel/to、`channel=last`、空 `agentId`/`accountId`、`?token=` 与未知 query；OpenClaw 的
+  409（配置热更新）按可重试处理。直连 `waitForCompletion` 只在 `completion.delivered=true` 时算送达，
+  静默抑制落 fallback 且通知保持未读。`validateRoute` 另拒绝含 `..`/`.` 段、空段（`//`）或百分号
+  编码 `%2e`/`%2f` 的 pathname（会被反代/Gateway 归一化到 `/hooks/` 之外，N-3）。
 - **日程终态只有 `done` 一种**（P2-1 / P2-6）：`complete {all:true}` 对**任意 kind**（含生日/纪念日）
   置 `done` 并如实回执「已结束整个系列」；限次（`count`）用尽或截止（`until`）到期、且**已无待发
   pending** 时由物化收尾置 `done`（`recurrenceExhausted()` 显式问「到 until 为止还有没有候选」，

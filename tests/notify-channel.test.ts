@@ -432,8 +432,8 @@ describe("OpenClaw 通道", () => {
       "http://127.0.0.1:18789/hooks/x",
     );
     assert.equal(
-      openclawChannel.validateRoute({ url: "http://127.0.0.1:18789/hooks/x/?token=a/" }),
-      "http://127.0.0.1:18789/hooks/x/?token=a/",
+      openclawChannel.validateRoute({ url: "http://127.0.0.1:18789/hooks/x/?foo=a/" }),
+      "http://127.0.0.1:18789/hooks/x/?foo=a/",
       "有 query 时不能剥掉路径或 query 末尾的斜杠",
     );
 

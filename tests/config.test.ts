@@ -6,7 +6,10 @@ import {
   canUseGlobalOpenclawToken,
   canUseGlobalOpenclawTokenFromEnv,
   loadConfig,
+  openclawTargetForProfile,
+  openclawWaitForCompletionEnabled,
   parseProfileId,
+  resolveOpenclawCredentialSource,
   urlHost,
 } from "../src/config.js";
 import { SECRET } from "./helpers.js";
@@ -358,5 +361,141 @@ describe("config", () => {
       true,
     );
     assert.equal(canUseGlobalOpenclawTokenFromEnv("bestie", {}), true);
+  });
+
+  it("OPENCLAW_PROFILE_TARGETS_JSON：直连/映射目标解析、默认值与非法结构拒绝", () => {
+    const targets = {
+      default: {
+        mode: "direct",
+        agentId: "main",
+        channel: "qqbot",
+        to: "qqbot:c2c:default",
+        accountId: "default",
+      },
+      bestie: { mode: "mapping", hook: "life-bestie" },
+    };
+    const config = loadConfig({
+      ...BASE,
+      OPENCLAW_PROFILE_TARGETS_JSON: JSON.stringify(targets),
+    });
+    const direct = openclawTargetForProfile(config, "default");
+    assert.equal(direct?.mode, "direct");
+    if (direct?.mode === "direct") {
+      assert.equal(direct.auth, "global", "auth 缺省 global");
+      assert.equal(direct.waitForCompletion, false, "waitForCompletion 缺省 false");
+      assert.equal(direct.baseUrl, "http://127.0.0.1:18789", "baseUrl 缺省回环 18789");
+    }
+    assert.equal(openclawWaitForCompletionEnabled(config), false);
+    const mapping = openclawTargetForProfile(config, "bestie");
+    assert.deepEqual(mapping, {
+      mode: "mapping",
+      auth: "global",
+      baseUrl: "http://127.0.0.1:18789",
+      hook: "life-bestie",
+    });
+
+    // 每个目标的 baseUrl/auth/waitForCompletion 可覆盖
+    const custom = loadConfig({
+      ...BASE,
+      OPENCLAW_BASE_URL: "http://localhost:19000",
+      OPENCLAW_WAIT_FOR_COMPLETION: "1",
+      OPENCLAW_PROFILE_TARGETS_JSON: JSON.stringify({
+        default: {
+          mode: "direct",
+          channel: "qqbot",
+          to: "x",
+          auth: "profile",
+          baseUrl: "http://127.0.0.1:19100",
+        },
+      }),
+    });
+    const customTarget = openclawTargetForProfile(custom, "default");
+    assert.equal(customTarget?.auth, "profile");
+    assert.equal(customTarget?.baseUrl, "http://127.0.0.1:19100");
+    if (customTarget?.mode === "direct") assert.equal(customTarget.waitForCompletion, true);
+    assert.equal(openclawWaitForCompletionEnabled(custom), true);
+
+    const invalid: Array<[Record<string, unknown>, RegExp]> = [
+      [{ mode: "direct" }, /channel 必须是字符串/],
+      [{ mode: "direct", channel: "last", to: "x" }, /channel 不能是 last/],
+      [{ mode: "direct", channel: "qqbot", to: "" }, /to 不能为空/],
+      [{ mode: "direct", channel: "qqbot", to: "x", extra: 1 }, /未知字段/],
+      [{ mode: "mapping", hook: "life/evil" }, /hook 只能是单个 hook 名/],
+      [{ mode: "direct", channel: "qqbot", to: "x", waitForCompletion: "yes" }, /布尔值/],
+      [{ mode: "other" }, /mode 必须是 direct 或 mapping/],
+    ];
+    for (const [target, pattern] of invalid) {
+      assert.throws(
+        () =>
+          loadConfig({
+            ...BASE,
+            OPENCLAW_PROFILE_TARGETS_JSON: JSON.stringify({ default: target }),
+          }),
+        pattern,
+      );
+    }
+    assert.throws(
+      () =>
+        loadConfig({
+          ...BASE,
+          OPENCLAW_PROFILE_TARGETS_JSON: "{坏 JSON",
+        }),
+      /不是合法 JSON/,
+    );
+    assert.throws(
+      () =>
+        loadConfig({
+          ...BASE,
+          OPENCLAW_PROFILE_TARGETS_JSON: JSON.stringify({
+            default: { mode: "direct", channel: "qqbot", to: "x", baseUrl: "http://192.168.1.2" },
+          }),
+        }),
+      /仅接受回环地址/,
+    );
+  });
+
+  it("openclaw 凭据来源：目标 auth=global/profile 与旧行为分流", () => {
+    assert.equal(
+      resolveOpenclawCredentialSource({ profileSecret: "p", globalToken: "g" }),
+      "profile",
+      "未登记目标：profile secret 优先（旧行为）",
+    );
+    assert.equal(resolveOpenclawCredentialSource({ globalToken: "g" }), "global");
+    assert.equal(resolveOpenclawCredentialSource({}), "missing");
+    const globalTarget = {
+      mode: "direct" as const,
+      auth: "global" as const,
+      baseUrl: "http://127.0.0.1:18789",
+      channel: "qqbot",
+      to: "x",
+      waitForCompletion: false,
+    };
+    assert.equal(
+      resolveOpenclawCredentialSource({
+        profileSecret: "p",
+        globalToken: "g",
+        target: globalTarget,
+      }),
+      "global",
+      "目标 auth=global 时不得误用 profile secret（共享 Gateway 会 401）",
+    );
+    assert.equal(
+      resolveOpenclawCredentialSource({ profileSecret: "p", target: globalTarget }),
+      "missing",
+    );
+    const profileTarget = { ...globalTarget, auth: "profile" as const };
+    assert.equal(
+      resolveOpenclawCredentialSource({
+        profileSecret: "p",
+        globalToken: "g",
+        target: profileTarget,
+      }),
+      "profile",
+    );
+    assert.equal(
+      resolveOpenclawCredentialSource({ globalToken: "g", target: profileTarget }),
+      "missing",
+      "目标 auth=profile 时不得回退全局 token",
+    );
   });
 });

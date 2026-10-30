@@ -60,8 +60,11 @@ npm run build
 | `PROFILE_TOKENS_JSON` | | 每人一个 token：`'{"default":"…","bestie":"…"}'`（各自 ≥32 字符，不能与 master 相同）。Profile token 绑定身份：MCP、`/api/quick/*` 与看板 `/api/*` 都按 token 反查 Profile（个人视图，按身份过滤）；`/metrics`、doctor 等运维接口仍只认 `WEB_API_TOKEN` |
 | `RATE_LIMIT_PER_MINUTE` | | 每来源 IP 每分钟请求上限（所有请求都计一层），默认 `120`；鉴权通过且带 Bearer 时再按 token 指纹加一层（同一人跨 IP 共用身份桶）。`0` 关闭（仅本地调试）。超限 429 + `Retry-After`；`/healthz`、`/readyz` 豁免，`/metrics` 受限流 |
 | `TRUST_PROXY` | | `1` 时采信 `X-Forwarded-For`（Lucky/nginx 反代后限流与日志用真实客户端 IP）；默认 `0` |
-| `PROFILE_ROUTE_SECRETS_JSON` | 主动推送需要 | `'{"default":"<openssl rand -hex 32>"}'`（整段用单引号包裹；每个 secret **至少 32 字符**）。`webhook` 通道必填；`openclaw` 通道对**隔离用户**必填（见下条） |
-| `OPENCLAW_HOOK_TOKEN` | openclaw 通道需要 | OpenClaw Gateway hooks token，属于 daemon 运维者（`HERMES_PROFILE` 指向的部署自身 profile）；必须与 `~/.openclaw/openclaw.json` 的 `hooks.token` 一致；只在投递时读取，缺失不影响 daemon 启动。登记了独立 Profile token 的**隔离用户**不能借用它：其 openclaw 路由必须自带 `PROFILE_ROUTE_SECRETS_JSON[profile]`，否则 `notify route` 明确拒绝配置/重新启用（P2-17） |
+| `PROFILE_ROUTE_SECRETS_JSON` | 主动推送需要 | `'{"default":"<openssl rand -hex 32>"}'`（整段用单引号包裹；每个 secret **至少 32 字符**）。`webhook` 通道必填；`openclaw` 只在「每个用户自己的 Gateway」场景需要（作为该 Gateway 的 `hooks.token`），共享 Gateway 请改用 `OPENCLAW_PROFILE_TARGETS_JSON` 做目标绑定 |
+| `OPENCLAW_HOOK_TOKEN` | openclaw 通道需要 | OpenClaw Gateway hooks token，必须与 `~/.openclaw/openclaw.json` 的 `hooks.token` 一致；只在投递时读取，缺失不影响 daemon 启动。**一个 Gateway 只有一个 token**：共享 Gateway 时所有 Profile 都用它，隔离靠下面的目标绑定（不是 per-profile secret） |
+| `OPENCLAW_BASE_URL` | | OpenClaw Gateway 基地址，默认 `http://127.0.0.1:18789`；只允许回环 http(s) origin。登记目标后 `notify route {channel:"openclaw"}` 可不传 URL，按基地址 + 目标自动生成 |
+| `OPENCLAW_PROFILE_TARGETS_JSON` | | 每个 Profile 的 openclaw 路由目标（共享 token + 目标绑定）：`'{"default":{"mode":"direct","agentId":"main","channel":"qqbot","to":"qqbot:c2c:<openid>","accountId":"default"},"bestie":{"mode":"direct","agentId":"bestie","channel":"qqbot","to":"qqbot:c2c:<openid>","accountId":"bestie"}}'`。登记后 URL 必须与目标逐项一致，改 URL 不能改投；映射式用 `{"mode":"mapping","hook":"life-bestie"}`。`auth` 缺省 `global`（用全局 token），`profile` 表示该 Profile 自己的 Gateway（用 `PROFILE_ROUTE_SECRETS_JSON[profile]`） |
+| `OPENCLAW_WAIT_FOR_COMPLETION` | | 直连模式是否等待 OpenClaw 返回 `completion.delivered`，默认 `0`。开启后单次投递最长约 30s；只有 `delivered=true` 才标已读，`NO_REPLY`/静默抑制会落 fallback 并保持未读。也可在单个目标里用 `waitForCompletion` 覆盖 |
 | `DAILY_BRIEF_CRON` | | 每日简报时间，默认 `'0 7 * * *'`（含空格需单引号，Asia/Shanghai） |
 | `EVENING_BRIEF_CRON` | | 晚报时间，默认 `'0 21 * * *'`；内容为明日天气/明日日程/今日未完成/明天补班或放假 |
 | `LEDGER_DIGEST_CRON` | | 每日记账摘要时间，默认 `'30 21 * * *'`；汇总当天笔数/合计/分类 top5 只发给记账的人（逐笔回执默认不推） |
@@ -142,13 +145,34 @@ Skill 安装：将 `skill/SKILL.md` 复制到该 Profile 的 `skills/life-assist
    `channel` 缺省为 `webhook`（HMAC V2 回环投递）；本地联调可传 `channel: "log"`，此时不需要 URL 与 secret，通知只写进程日志并标记为已投递；
 4. 用一条临时日程做端到端验证。
 
-OpenClaw Gateway 可将 `channel` 设为 `openclaw`，URL 只允许回环 hook 地址（如
-`http://127.0.0.1:18789/hooks/life-default`，路径必须落在 `/hooks/<name>` 下）；daemon 的 `.env`
-配置 `OPENCLAW_HOOK_TOKEN`，并与 `~/.openclaw/openclaw.json` 的 `hooks.token` 保持一致。
-凭据按 profile 分档（P2-17）：`HERMES_PROFILE` 指向的**部署自身 profile**、以及未登记独立
-Profile token 的 profile，用 daemon 的全局 `OPENCLAW_HOOK_TOKEN`；登记了独立 token 的
-**隔离用户**（如 `bestie`）必须自带 `PROFILE_ROUTE_SECRETS_JSON[profile]`（投递时作为
-Bearer token，不再回退全局 token），否则 `notify route` 明确报错。缺少凭据只会使对应投递失败，
+OpenClaw Gateway 可将 `channel` 设为 `openclaw`，URL 只允许回环 hook 地址（路径必须落在
+`/hooks/<name>` 下）；daemon 的 `.env` 配置 `OPENCLAW_HOOK_TOKEN`，并与
+`~/.openclaw/openclaw.json` 的 `hooks.token` 保持一致。
+
+**先理解 OpenClaw 的鉴权模型**：一个 Gateway 只有一个 `hooks.token`，没有 per-agent /
+per-mapping token。因此：
+
+- **共享一个 Gateway**（本部署）时，所有 Profile 都用 `OPENCLAW_HOOK_TOKEN`；隔离靠**目标绑定**，
+  不是 per-profile secret。
+- `PROFILE_ROUTE_SECRETS_JSON[profile]` 只在「每个用户跑自己的 Gateway」（不同端口 +
+  自己的 `hooks.token`）时有意义；共享 Gateway 下给它配一个随机 secret 会直接 401。
+
+受信任家庭/多 Profile 推荐用 `OPENCLAW_PROFILE_TARGETS_JSON` 做目标绑定：
+
+```bash
+OPENCLAW_HOOK_TOKEN=<与 Gateway 的 hooks.token 一致>
+OPENCLAW_PROFILE_TARGETS_JSON='{
+  "default":{"mode":"direct","agentId":"main","channel":"qqbot","to":"qqbot:c2c:<default-openid>","accountId":"default"},
+  "bestie":{"mode":"direct","agentId":"bestie","channel":"qqbot","to":"qqbot:c2c:<bestie-openid>","accountId":"bestie"}
+}'
+# 需要确认「真的送达」再打开（单次投递最长约 30s）
+OPENCLAW_WAIT_FOR_COMPLETION=1
+```
+
+登记后 `notify {action:"route", channel:"openclaw"}` 可以不传 URL，按 `OPENCLAW_BASE_URL` +
+登记目标自动生成；传了 URL 也必须与 `agentId/channel/to/accountId` 逐项一致。每个 Profile 只能投到
+自己的目标，改 URL 不能改投。未登记目标的旧部署保留 P2-17 行为：profile secret 优先，只有
+部署自身 profile / 未登记独立 token 的 profile 回退全局 token。缺少凭据只会使对应投递失败，
 不影响 daemon 启动。
 
 OpenClaw 侧的 hook 映射按 profile 分：每个 profile 一条 `mappings` 条目，`match.path`
@@ -176,10 +200,19 @@ OpenClaw 侧的 hook 映射按 profile 分：每个 profile 一条 `mappings` �
 http://127.0.0.1:18789/hooks/agent?channel=qqbot&to=qqbot%3Ac2c%3A<openid>&agentId=bestie&accountId=bestie
 ```
 
-daemon 识别到以 `/hooks/agent` 结尾且带 `channel`/`to` 的 URL 时，会改发 `/hooks/agent` 直连
-载荷（`message` 里已带「原样发送」指令，另带 `idempotencyKey`），而不是映射式
+daemon 识别到路径恰好是 `/hooks/agent` 且带 `channel`/`to` 的 URL 时，会改发直连载荷
+（`message` 里已带「原样发送」指令，另带 `idempotencyKey`），而不是映射式
 `event_type/notification` 载荷。`to` 用通道自己的目标格式（QQ 私聊为
-`qqbot:c2c:<openid>`）；`accountId` 必须是该通道里已配置并启用的账号。
+`qqbot:c2c:<openid>`）；`accountId` 必须是该通道里已配置并启用的账号。直连缺 `channel`/`to`、
+`channel=last`、`accountId` 为空、`?token=` 或未知 query 都会在 `notify route` 配置期被拒绝。
+
+**投递确认**：OpenClaw 默认返回的 `200 {ok:true,runId}` 只代表「已受理」，不代表用户真的收到。
+`OPENCLAW_WAIT_FOR_COMPLETION=1`（或单个目标里的 `waitForCompletion: true`）会让 daemon 等待
+`completion`：只有 `completion.delivered === true` 才标已读；`NO_REPLY`/`deliverySuppressionReason:
+"silent"`/通道投递失败都会落 `fallback` 并保持未读，可 `notify.pull` 或 `notify.retry`。映射式
+`/hooks/<name>` 不支持等待完成，只能确认「已受理」。常见错误：401 = Bearer 与 Gateway 的
+`hooks.token` 不一致；400 `message required` = `/hooks/agent` 直连参数缺失；409 = OpenClaw 配置
+热更新，daemon 会按可重试处理。
 
 只用单账号通道（如飞书）时，映射式（`/hooks/life-<profile>`）更省事；需要指定账号就走直连。
 
@@ -435,7 +468,7 @@ npm run db:cleanup:preview   # 零业务删除预演：occurrence 与保留策�
 14. **记账编辑只做「更正」，不触发推送、不保留历史**：`expense {action:"update"}` 改金额/分类/备注/日期后不会补发回执、也不会重新判定 80%/100% 预算阈值（避免修正金额时凭空多推一条），且不记录修改前值；如需按新金额触发提醒，只能等下一笔支出或人工核对预算。编辑也不能把账目挪到另一个账本。
 15. **出行模式一个 Profile 同时只保留一份计划**：`weather {view:"travel"}` 覆盖式保存，不支持多段行程/多城市串联，也没有历史行程查询；显式传 `city` 的查询始终优先于出行计划。计划只按本地日历日判断生效，跨时区行程仍以 Asia/Shanghai 为准；窗口结束后计划不会自动删除（`show` 显示未生效、可 `clear`）。简报的 `dedupeKey` 含城市名：同一天内把目的地改到另一个城市会再发一条新城市简报（旧城市那条已发出，无法撤回）。
 16. **看板 CSV 只导出家庭账本**：`/api/expenses.csv` 与看板同口径（共享 `WEB_API_TOKEN` 下不暴露个人账本），个人账本导出走 MCP `expense {action:"export"}`（仅当前 Profile 可见的账本）；CSV 只支持按月导出，不做任意区间。
-17. **投递通道有 `webhook`、`log`、`bark`、`ntfy`、`telegram`、`smtp`、`openclaw`**：`log` 只写进程日志（本地联调，不代表用户真收到）；`bark`（iOS）用 `https://api.day.app/<device_key>`；`ntfy`（Android/自建）用 `https://ntfy.sh/<topic>`；`telegram` 用 `https://api.telegram.org/bot<token>/sendMessage?chat_id=<id>`（超 4096 字符会截断并注明）；`smtp` 用 `smtp://user:pass@host:587?from=&to=`（`to` 可重复，≤10 个；465/`smtps` 隐式 TLS、587 STARTTLS、25 明文，`?tls=plain|starttls|implicit` 可覆盖；支持 AUTH LOGIN/PLAIN）；`openclaw` 用回环 OpenClaw Gateway hook（路径限 `/hooks/<name>`），Bearer token 按 profile 分档（P2-17）：优先取 `PROFILE_ROUTE_SECRETS_JSON[profile]`，只有「部署自身 profile（`HERMES_PROFILE`，缺省 `default`）」与「未登记独立 Profile token 的 profile」才回退 `OPENCLAW_HOOK_TOKEN`（必须与 Gateway 的 `hooks.token` 一致）；登记了独立 token 的隔离用户**新配置/换 URL** 时必须自带 secret，否则明确拒绝；其**存量**路由允许停用后重新启用（与投递层同口径：打一条一次性 warn，提示补 secret 或改通道，N-2）。路径只接受 `/hooks/<name>`，且拒绝含 `..`/`.` 段、空段（`//`）或百分号编码 `%2e`/`%2f` 的 pathname（这些会被反代/Gateway 归一化到 `/hooks/` 之外，N-3）。所有 URL 形态的凭据都会落库并可能被 `notify route` 回显，别用可猜的 topic、别把密码放进共享聊天。通道仍按 Markdown 原文投递（`bark`/`ntfy`/`telegram`/`smtp`/`openclaw` 收到的是 `body_md`），没有按通道渲染格式；SMTP 的 TLS 成功路径无自动化测试（需受信证书），真机建议先用 `?tls=plain` 验证账号再切 587/465。
+17. **投递通道有 `webhook`、`log`、`bark`、`ntfy`、`telegram`、`smtp`、`openclaw`**：`log` 只写进程日志（本地联调，不代表用户真收到）；`bark`（iOS）用 `https://api.day.app/<device_key>`；`ntfy`（Android/自建）用 `https://ntfy.sh/<topic>`；`telegram` 用 `https://api.telegram.org/bot<token>/sendMessage?chat_id=<id>`（超 4096 字符会截断并注明）；`smtp` 用 `smtp://user:pass@host:587?from=&to=`（`to` 可重复，≤10 个；465/`smtps` 隐式 TLS、587 STARTTLS、25 明文，`?tls=plain|starttls|implicit` 可覆盖；支持 AUTH LOGIN/PLAIN）；`openclaw` 用回环 OpenClaw Gateway hook（路径限 `/hooks/<name>`）。**一个 Gateway 只有一个 `hooks.token`**：共享 Gateway 时所有 Profile 都用 `OPENCLAW_HOOK_TOKEN`，隔离靠 `OPENCLAW_PROFILE_TARGETS_JSON` 的目标绑定（URL 必须与登记的 `agentId/channel/to/accountId` 逐项一致；`notify route` 可省略 URL，按登记目标生成）。`PROFILE_ROUTE_SECRETS_JSON[profile]` 仅用于「每个用户自己的 Gateway」（目标 `auth:"profile"`）；共享 Gateway 下配随机 secret 会 401。未登记目标的旧部署保留 P2-17 的 profile secret 优先 / 部署自身 profile 回退全局 token 行为，并对存量隔离路由打一次性 warn。路径只接受 `/hooks/<name>`，拒绝含 `..`/`.` 段、空段（`//`）或百分号编码 `%2e`/`%2f` 的 pathname（N-3），直连还拒绝缺 `channel`/`to`、`channel=last`、`?token=` 与未知 query。OpenClaw 的 409（配置热更新）按可重试处理；直连 200 只代表受理，`OPENCLAW_WAIT_FOR_COMPLETION=1` 时才按 `completion.delivered` 判送达（静默抑制落 fallback、保持未读）。所有 URL 形态的凭据都会落库并可能被 `notify route` 回显，别用可猜的 topic、别把密码放进共享聊天。通道仍按 Markdown 原文投递（`bark`/`ntfy`/`telegram`/`smtp`/`openclaw` 收到的是 `body_md`），没有按通道渲染格式；SMTP 的 TLS 成功路径无自动化测试（需受信证书），真机建议先用 `?tls=plain` 验证账号再切 587/465。
 18. ~~**内置备份 job 依赖 daemon 运行 / 无完整性校验 / 无恢复入口**~~ —— **已实施（2026-10-20）**：备份产物生成后即自校验（`quick_check` + `meta.schema_version`，坏产物删除并报错）；停机错过的备份由启动补发补跑；新增 `npm run db:restore`（校验 + 留底 + 拒绝在 daemon 运行时操作）；schema 前滚前自动落 `pre-v<旧版本>` 快照；`doctor --live` 检查备份新鲜度与命名异常。仍保留：`VACUUM INTO` 在主进程事件循环上同步执行，库很大时会短暂阻塞 HTTP/MCP（每日一次、个人规模可接受；彻底隔离需要 worker thread）；状态页暂不展示备份卡片。
 
 19. **启动补发只是「最近一次」**：每个白名单 job 只补最近一次错过的触发，且只支持「日与月为 `*`」的 cron（分钟/小时/星期支持单值、列表、`a-b` 与 `a-b/n` 步长；`7` 仅限单值/列表，特殊写法保守不反查）；连续停机多天不会逐天补齐（补 3 天前的日报只会打扰用户）。`CATCHUP_POLICY` 的键必须与真实 `module.job` 一致，`tests/jobs.test.ts` 会在键名拼错时立刻变红。
@@ -458,7 +491,7 @@ npm run db:cleanup:preview   # 零业务删除预演：occurrence 与保留策�
 
 32. **`audit_log` 目前只增不清**：每次 `/api/quick/*` 写入一行，个人规模量级可忽略；保留策略尚未接管（后续按天数清理或归档）。`/api/audit` 的 master 能看到所有 Profile 的审计 detail（含账本名/标题，但不含备注全文与 token）；Profile 只能看自己的。结构指纹是「上次启动结构 vs 当前结构」的对账，无法发现从未经过本程序的结构（首次启动/恢复旧快照后基线即当前结构）；回滚到 `pre-v4` 快照会丢掉升级后的 `audit_log` 行与指纹状态，属预期。
 
-33. **收紧前已落库的隔离用户 openclaw 路由仍用全局 token（P2-17 已知残留）**：配置/重新启用入口已拦住隔离用户（登记了独立 Profile token 且不是部署自身 profile 的人），但**收紧之前**就已写入且 `enabled=true` 的路由不会被改写——投递侧拿不到「这条路由是谁配的」，只能按 profile 打一条一次性 warn（提示补 `PROFILE_ROUTE_SECRETS_JSON` 或改通道），不擅自拒绝投递（否则会打断该用户正在工作的推送）。彻底关闭需要把请求身份（master / 某个 Profile）透传到投递层，属后续工作；已授权或可信的部署可直接为该 profile 补一条 route secret 收口。另：重启恢复的「通道是否幂等」按该 Profile **当前生效路由**反查（`deliveries` 没有 channel 列），崩溃前后若用户换过通道（如 `bark` → `webhook`），可能把非幂等行误判成幂等——概率极低，精确化需给 `deliveries` 加列（P2-10 已知近似）。顺带：隔离用户的存量 openclaw 路由**可以停用、也可以重新启用**（N-2 起与投递层对齐：重新启用会 requeue 并打同一条一次性 warn；只有「新配置/换 URL」才硬性要求 secret）。
+33. **OpenClaw 共享 Gateway 的隔离是「目标绑定」而非「凭据隔离」**：一个 Gateway 只有一个 `hooks.token`，无法按 Profile 签发不同 token；共享时所有 Profile 都持有同一个 token，隔离由 `OPENCLAW_PROFILE_TARGETS_JSON` 在配置期与投递前校验目标保证（改 URL 不能改投）。要真正的凭据隔离，需要每个用户自己的 Gateway（目标 `auth:"profile"` + 自己的 `hooks.token`）或改用 Bark/ntfy/Telegram/SMTP。未登记目标的存量隔离路由仍按旧行为投递并打一次性 warn（N-2）。另：重启恢复的「通道是否幂等」仍按该 Profile **当前生效路由**反查（`deliveries` 没有 channel 列），崩溃前后若用户换过通道（如 `bark` → `webhook`），可能把非幂等行误判成幂等——概率极低，精确化需给 `deliveries` 加列（P2-10 已知近似）。
 
 34. **P2-3 只拦新写入，不改存量死行**：`add`/`update` 现在会明确拒绝「公历一次性 + `start_date` 早于今天」，但**此前已写入**的同类行保持原样（`status='active'`、`next_run_at=null`、永不提醒），本次不做自动收尾、也不告警。自查 SQL（把 `date('now','+8 hours')` 换成当天即可）：
     `SELECT id, profile_id, title, start_date FROM schedules WHERE recurrence_json IS NULL AND calendar='solar' AND start_date < date('now','+8 hours') AND status='active';`
