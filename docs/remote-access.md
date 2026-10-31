@@ -30,7 +30,7 @@ daemon 只做「局域网内可信入口 + token 鉴权」；外网的攻击面�
 ## daemon 配置（`.env`）
 
 ```dotenv
-DATA_DIR=/Users/cracked/workspace/life-assistant/data
+DATA_DIR=/Users/cracked/workspace/projects/life-assistant/data
 HOST=0.0.0.0                 # 允许 NAS 反代进来；不要写 127.0.0.1
 PORT=3080
 REQUIRE_AUTH=1               # 即使只绑局域网也强制鉴权
