@@ -30,7 +30,7 @@ CI 在 Node 22.16.0 / 22 / 24 三档矩阵全绿（`.github/workflows/ci.yml`）
 阶段一遗留（已知、不影响使用，细节见 README「已知取舍」#19–#23）：
 
 - 状态页暂无「备份」卡片（`doctor --live` 已覆盖备份新鲜度与命名异常）
-- 启动补发只补**最近一次**，且只支持日/月/星期为 `*` 的 cron（如 `0 7 * * 1-5` 不补）
+- 启动补发只补**最近一次**，且只支持日与月为 `*` 的 cron（分钟/小时/星期支持单值、列表、范围与步长，如 `0 7 * * 1-5` 可补；`0 9 1 * *` 这类按日/月的不补）
 - `job_runs` 只保留 30 天、无耗时趋势（`/metrics`、`/readyz`、日志轮转已在阶段二补齐）
 - `VACUUM INTO` 仍在主进程事件循环上同步执行（库大时会短暂阻塞 HTTP/MCP）
 
@@ -57,7 +57,7 @@ CI 在 Node 22.16.0 / 22 / 24 三档矩阵全绿（`.github/workflows/ci.yml`）
 4. **per-profile token + 看板可见性** ✅（2026-10-20，`4bfce42` + `0cfa390`）：`PROFILE_TOKENS_JSON` + `/mcp` 强绑定 + `/api/quick/*` + 看板 `/api/*` 按 Profile 过滤（profile=自己的日程/通知 + 家庭/本人个人账本；master=家庭看板），`/api/status` 返回 `identity` 供页面显示身份。
 5. **预算看板/趋势/引导 + 可执行月报 + 周日周报** ✅（2026-10-20，`2b8349e`）：状态页预算卡片（`/api/budget`，进度条 + 未设/超支/花速过快/正常四类可执行建议）、周报 job `bookkeeping.weekly_report`（周日 20:00，分类 top5/最大单笔/环比/预算剩余）；月报已有预算对照行。趋势图未做（需要历史曲线再引入）。
 6. **分类字典/别名、CSV 公式注入修复、明细分页** ✅（2026-10-20，`88ed2b7`）：`expense categories|category_alias`、`expense add/update` 别名归一（大小写/空白折叠，不改历史）、`expenseCsv` 文本列防公式注入、`expense list` 与 `/api/expenses|deliveries` 支持 `offset` + 看板「加载更多」（OFFSET 游标，翻页期间数据变化可能重复/漏行，数据量大再换 keyset）。
-7. **可观测性** ✅（2026-10-20，`ecd18b3` + `589a87d`）：`/metrics` + `/readyz`（鉴权/限流计数器、投递状态、outbox 排队、job 最近成功、备份年龄、DB/WAL、QWeather 用量）；`notify test/history/retry`（历史分页、失败投递手动重试）；日志本地时间戳 + `maintenance.log_rotate`（每日 04:50 copytruncate，`LOG_DIR`/`LOG_MAX_MB`/`LOG_KEEP`）。
+7. **可观测性** ✅（2026-10-20，`ecd18b3` + `589a87d`）：`/metrics` + `/readyz`（鉴权/限流计数器、投递状态、outbox 排队、job 最近成功、备份年龄、DB/WAL、QWeather 用量）；`notify test/history/retry`（历史分页、失败投递手动重试）；日志本地时间戳 + `maintenance.log_rotate`（每日 04:55 copytruncate，`LOG_DIR`/`LOG_MAX_MB`/`LOG_KEEP`）。
 8. **迁移结构指纹 + 审计日志** ✅（2026-10-20，`7161c01`，schema v5）：`meta.schema_fingerprint` 启动对账（漂移 warn）+ `npm run db:fingerprint` CLI + doctor 检查；新增 `audit_log` 表与 `/api/audit`（master 全量、Profile 仅自己），`/api/quick/*` 写入后记审计；迁移纯附加式、单事务、升级前自动 `pre-v4` 快照。仍待办：audit 保留策略（目前只增不清）。
 
 ## 阶段三：新领域 —— 🔲 未开始（6–12 周）

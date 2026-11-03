@@ -104,9 +104,10 @@ registerModule({
     },
     {
       name: "log_rotate",
-      // 04:50：与保留策略同一波低峰维护（02:00 抓节假日、03:00 备份、03:15 checkpoint 之后）；
+      // 04:55：低峰维护的最后一步（02:00 抓节假日、03:00 备份、03:15 checkpoint、
+      // 04:30 occurrence 回收、04:50 保留策略之后），与保留策略错开避免同一分钟抢写库；
       // 错过的触发由 CATCHUP_POLICY["maintenance.log_rotate"] 在启动时补一次（幂等）
-      cron: "50 4 * * *",
+      cron: "55 4 * * *",
       handler: runLogRotate,
     },
   ],

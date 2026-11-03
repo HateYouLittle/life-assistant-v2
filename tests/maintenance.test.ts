@@ -395,12 +395,12 @@ describe("日志轮转 job", () => {
     return job;
   }
 
-  it("已注册，cron 固定 04:50（错过的触发由 CATCHUP_POLICY 补）", () => {
+  it("已注册，cron 固定 04:55（错过的触发由 CATCHUP_POLICY 补）", () => {
     const env = makeTestEnv();
     try {
       const job = logRotateJob();
       const cron = typeof job.def.cron === "function" ? job.def.cron() : job.def.cron;
-      assert.equal(cron, "50 4 * * *");
+      assert.equal(cron, "55 4 * * *");
     } finally {
       cleanupTestEnv(env);
     }
