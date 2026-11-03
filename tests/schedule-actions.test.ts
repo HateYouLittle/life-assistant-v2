@@ -347,7 +347,12 @@ describe("schedule complete：循环日程必须显式指定单次或结束系�
       // 生日默认按年循环（工具层 add 的 kind!=='todo' 缺省 recurrence=yearly）
       const id = addOnce(env, { title: "妈妈生日", kind: "birthday", date: D });
       const yearKeys = normalKeys(env, id);
-      assert.deepEqual(yearKeys, [`${D}T18:00#0`], "生日应物化本年度那一次");
+      // 生日默认三档提醒（提前 7 天 / 前 1 天 / 当天）：同一事件 #0..#2 三行
+      assert.deepEqual(
+        yearKeys,
+        [`${D}T18:00#0`, `${D}T18:00#1`, `${D}T18:00#2`],
+        "生日应物化本年度那一次（默认三档提醒）",
+      );
       const result = tool(env, { action: "complete", id, all: true }) as {
         isError?: boolean;
         content: { text: string }[];

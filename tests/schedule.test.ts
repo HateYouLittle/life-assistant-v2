@@ -640,10 +640,13 @@ describe("schedule 工具：生命周期", () => {
       // 且越过物化前瞻的至多 1 条。
       const rows = occurrenceRows(env, payload.已创建.id);
       const horizon = now().plus({ days: 63 });
-      assert.equal(rows.length, 1, "农历生日应恰好物化 1 条 occurrence");
+      // 生日默认三档提醒：同一事件 3 行（#0..#2），事件本身只有 1 次
+      const events = new Set(rows.map((r) => r.event_at as string));
+      assert.equal(events.size, 1, "农历生日应恰好物化 1 次发生");
+      assert.equal(rows.length, 3, "默认三档提醒：提前 7 天 / 前 1 天 / 当天");
       assert.ok(
-        rows.filter((r) => DateTime.fromISO(r.event_at as string) > horizon).length <= 1,
-        "越过物化前瞻的 occurrence 至多 1 条（首条豁免）",
+        [...events].filter((at) => DateTime.fromISO(at) > horizon).length <= 1,
+        "越过物化前瞻的发生至多 1 次（首条豁免）",
       );
     } finally {
       cleanupTestEnv(env);

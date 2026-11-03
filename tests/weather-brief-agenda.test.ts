@@ -84,6 +84,7 @@ function seedItem(
     allDay?: boolean;
     occurrenceStatus?: "pending" | "notified" | "done" | "cancelled";
     scheduleStatus?: "active" | "done" | "cancelled";
+    kind?: "todo" | "birthday" | "anniversary";
   },
 ): void {
   const id = `agenda-${++seq}`;
@@ -93,11 +94,12 @@ function seedItem(
     .prepare(
       `INSERT INTO schedules (id, profile_id, title, kind, calendar, start_date, time, all_day,
          remind_offsets_json, workday_filter, status, created_at, updated_at)
-       VALUES (?, 'default', ?, 'todo', 'solar', ?, ?, ?, '[0]', 'any', ?, ?, ?)`,
+       VALUES (?, 'default', ?, ?, 'solar', ?, ?, ?, '[0]', 'any', ?, ?, ?)`,
     )
     .run(
       id,
       opts.title,
+      opts.kind ?? "todo",
       opts.date,
       time,
       opts.allDay === true ? 1 : 0,
@@ -234,6 +236,40 @@ describe("每日简报：今日日程（A1）", () => {
       assert.match(body, /AQI 42（优）/, "天气内容应照常送达");
       assert.doesNotMatch(body, /今日日程/);
       assert.doesNotMatch(body, /逾期未完成/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
+describe("每日简报：近期生日/纪念日", () => {
+  it("14 天内有生日：追加「近期生日/纪念日」行（含当天、按日期升序）", async () => {
+    const env = makeTestEnv(ENV);
+    try {
+      seedItem(env, { title: "妈妈生日", date: dayOffset(5), allDay: true, kind: "birthday" });
+      seedItem(env, { title: "妹妹生日", date: todayIso(), allDay: true, kind: "birthday" });
+      seedItem(env, { title: "太远的生日", date: dayOffset(20), allDay: true, kind: "birthday" });
+      await withMockFetch(async () => {
+        await runDailyBrief();
+      });
+      const body = briefBody(env);
+      const line = body.split("\n").find((l) => l.includes("近期生日/纪念日"));
+      assert.ok(line !== undefined, body);
+      assert.match(line, /妹妹生日（今天）.*妈妈生日（还有 5 天）/);
+      assert.ok(!line.includes("太远的生日"));
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("14 天内没有：整栏省略，不出现「无」", async () => {
+    const env = makeTestEnv(ENV);
+    try {
+      seedItem(env, { title: "喝水", date: todayIso(), time: "09:00" });
+      await withMockFetch(async () => {
+        await runDailyBrief();
+      });
+      assert.ok(!briefBody(env).includes("近期生日/纪念日"));
     } finally {
       cleanupTestEnv(env);
     }

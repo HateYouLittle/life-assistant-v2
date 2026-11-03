@@ -27,7 +27,12 @@ import { airQuality, alerts, forecast, geoLookup } from "../../core/qweather.js"
 import { deleteSetting, listProfiles, readSetting, setSetting } from "../../core/settings.js";
 import { logger } from "../../core/logger.js";
 import type { ResolvedConfig } from "../../config.js";
-import { agendaForDate, type AgendaItem } from "../schedule/service.js";
+import {
+  agendaForDate,
+  upcomingSpecialDays,
+  type AgendaItem,
+  type UpcomingSpecialDay,
+} from "../schedule/service.js";
 
 function requireQweather(ctx: ToolContext): { host: string; key: string } {
   if (ctx.config.qweatherHost === undefined || ctx.config.qweatherKey === undefined) {
@@ -640,6 +645,35 @@ function appendAgendaNotes(
   }
 }
 
+/** 近期纪念日单条：`11-08 和对象认识纪念日（还有 4 天，5 周年 · 第 1827 天）` */
+function specialDayLabel(item: UpcomingSpecialDay): string {
+  const when = item.days_left === 0 ? "今天" : `还有 ${item.days_left} 天`;
+  const extra = item.milestone === null ? "" : `，${item.milestone}`;
+  return `${shortDate(item.event_date)} ${item.title}（${when}${extra}）`;
+}
+
+/**
+ * 早报「近期生日/纪念日」行：14 天内没有就整行省略（不输出「无」）；
+ * 查询失败与日程块同口径，只跳过该行，不影响早报。
+ */
+export function specialDayNotes(items: UpcomingSpecialDay[]): string[] {
+  if (items.length === 0) return [];
+  return [`近期生日/纪念日：${items.map(specialDayLabel).join("；")}`];
+}
+
+function appendSpecialDayNotes(
+  notes: string[],
+  db: DatabaseSync,
+  profileId: string,
+  today: string,
+): void {
+  try {
+    notes.push(...specialDayNotes(upcomingSpecialDays(db, profileId, today)));
+  } catch (e) {
+    logger.warn(`每日简报：近期生日/纪念日块已跳过（${profileId}）: ${errorMessage(e)}`);
+  }
+}
+
 /**
  * 每日简报：确定性组装，无 LLM；单边数据失败用另一侧，全部失败不发送。
  *
@@ -726,6 +760,7 @@ export async function runDailyBrief(at?: DateTime): Promise<void> {
       // 日程块放在天气结论之后：既不能挤掉「适宜出行」的兜底 note，
       // 也保证日程查询失败时早报只剩天气、照常发送。
       appendAgendaNotes(notes, rt.db, profileId, calendarToday);
+      appendSpecialDayNotes(notes, rt.db, profileId, calendarToday);
 
       await publishProfile(rt.db, rt.config, profileId, {
         kind: "weather.brief",

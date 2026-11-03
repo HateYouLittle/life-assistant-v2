@@ -38,6 +38,7 @@ import {
   type SchedulePatch,
   type ScheduleRow,
 } from "./service.js";
+import { defaultRemindOffsets } from "./anniversary.js";
 
 const recurrenceInput = z.object({
   freq: z.enum(["daily", "weekly", "monthly", "yearly"]).describe("循环频率"),
@@ -288,7 +289,9 @@ function scheduleToolInner(args: Record<string, unknown>, ctx: ToolContext) {
         // 否则即使传了 time，也会被展示成"全天"。
         allDay: patch.allDay ?? false,
         recurrence: patch.recurrence ?? (kind === "todo" ? null : { freq: "yearly", interval: 1 }),
-        remindOffsets: patch.remindOffsets ?? [0],
+        // 未显式给 remind_offsets 时按 kind 取默认：生日/纪念日「提前 7 天 + 前 1 天 + 当天」，
+        // 待办到点提醒。只影响新建；存量日程的 remind_offsets_json 不回写。
+        remindOffsets: patch.remindOffsets ?? defaultRemindOffsets(kind),
         resendMinutes: patch.resendMinutes ?? 0,
         escalation: patch.escalation ?? null,
         workdayFilter: patch.workdayFilter ?? "any",
@@ -500,7 +503,9 @@ registerModule({
           .min(1)
           .max(5)
           .optional()
-          .describe("提醒偏移分钟（相对事件时间，负数=提前），1-5 项，默认 [0]"),
+          .describe(
+            "提醒偏移分钟（相对事件时间，负数=提前），1-5 项；新建时默认：待办 [0]，生日/纪念日 [-10080,-1440,0]（提前 7 天 + 前 1 天 + 当天）",
+          ),
         resend_minutes: z
           .number()
           .int()

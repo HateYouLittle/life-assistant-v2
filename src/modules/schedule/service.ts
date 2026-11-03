@@ -18,6 +18,7 @@ import { ensureProfile } from "../../core/settings.js";
 import { logger } from "../../core/logger.js";
 import { reminderActionLinks } from "../../core/action-link.js";
 import type { ResolvedConfig } from "../../config.js";
+import { anniversaryMilestoneText, countdownText, daysBetween } from "./anniversary.js";
 
 export type ScheduleKind = "todo" | "birthday" | "anniversary";
 export type WorkdayFilter = "any" | "workday" | "holiday";
@@ -1677,6 +1678,88 @@ export function upcoming(db: DatabaseSync, profileId: string, limit: number): Up
     .slice(0, limit);
 }
 
+/** 早报「近期纪念日」栏的回看天数：今天起 14 天内（含第 14 天） */
+export const UPCOMING_SPECIAL_DAYS = 14;
+
+/** 即将到来的生日/纪念日（天气模块的早报直接 import；字段名是跨模块契约） */
+export interface UpcomingSpecialDay {
+  schedule_id: string;
+  title: string;
+  kind: "birthday" | "anniversary";
+  /** 本次发生的本地日期 YYYY-MM-DD */
+  event_date: string;
+  /** 距今天的天数（0 = 今天） */
+  days_left: number;
+  /** 「3 周年 · 第 1097 天」这类文案；只有公历纪念日有，否则 null */
+  milestone: string | null;
+}
+
+/**
+ * 某 Profile 从 `today` 起 `days` 天内（含两端）即将到来的生日/纪念日，按日期升序、同日按标题。
+ *
+ * 数据源是已物化的 occurrence（pending/notified，同一事件的多条提醒偏移按日期去重）：
+ * 物化前瞻 62 天 > 14 天，窗口内的发生一定已入库；已完成/已取消的那次不再列出。
+ */
+export function upcomingSpecialDays(
+  db: DatabaseSync,
+  profileId: string,
+  today: string,
+  days: number = UPCOMING_SPECIAL_DAYS,
+): UpcomingSpecialDay[] {
+  if (!DATE_RE.test(today) || !DateTime.fromISO(today, { zone: TZ }).isValid) {
+    throw new Error(`日期不合法: ${today}`);
+  }
+  const startDay = DateTime.fromISO(today, { zone: TZ }).startOf("day");
+  const from = startDay.toUTC().toISO() as string;
+  const to = startDay
+    .plus({ days: days + 1 })
+    .toUTC()
+    .toISO() as string;
+  return withReadTransaction(db, () => {
+    const rows = db
+      .prepare(
+        `SELECT DISTINCT s.id AS schedule_id, s.title AS title, s.kind AS kind,
+                s.calendar AS calendar, s.start_date AS start_date, o.event_at AS event_at
+         FROM occurrences o JOIN schedules s ON s.id = o.schedule_id
+         WHERE s.profile_id = ? AND s.status = 'active' AND s.kind IN ('birthday','anniversary')
+           AND o.status IN ('pending','notified') AND o.event_at >= ? AND o.event_at < ?`,
+      )
+      .all(profileId, from, to) as unknown as {
+      schedule_id: string;
+      title: string;
+      kind: "birthday" | "anniversary";
+      calendar: string;
+      start_date: string | null;
+      event_at: string;
+    }[];
+    const seen = new Map<string, UpcomingSpecialDay>();
+    for (const row of rows) {
+      const eventDate = instantToLocalDate(row.event_at);
+      const key = `${row.schedule_id}|${eventDate}`;
+      if (seen.has(key)) continue;
+      seen.set(key, {
+        schedule_id: row.schedule_id,
+        title: row.title,
+        kind: row.kind,
+        event_date: eventDate,
+        days_left: daysBetween(today, eventDate) ?? 0,
+        milestone: anniversaryMilestoneText(row, eventDate),
+      });
+    }
+    return [...seen.values()].sort((a, b) =>
+      a.event_date !== b.event_date
+        ? a.event_date < b.event_date
+          ? -1
+          : 1
+        : a.title < b.title
+          ? -1
+          : a.title > b.title
+            ? 1
+            : 0,
+    );
+  });
+}
+
 /**
  * 简报议程条目（天气模块的每日简报直接 import；字段名是跨模块契约，别改名）。
  */
@@ -1908,6 +1991,11 @@ export function reminderBlocks(
    * 不传 = 常规提醒，沿用 event_at + 日程时刻（既有形状不变）。
    */
   displayAt?: string,
+  /**
+   * 本次提醒的本地业务日（fireDue 传触发时刻的日期）：生日/纪念日据此给「倒计时」。
+   * 不传 = 不输出倒计时（既有调用方形状不变）。
+   */
+  today?: string,
 ): NotifyBlock {
   let timeText: string;
   if (row.all_day === 1) {
@@ -1923,7 +2011,17 @@ export function reminderBlocks(
     ["类型", KIND_LABEL[row.kind]],
     ["重复", repeatTextOf(row)],
   ];
-  if (row.note !== null && row.note !== "") rows.push(["备注", row.note]);
+  if (row.kind !== "todo") {
+    const eventDate = instantToLocalDate(eventAt);
+    if (today !== undefined) {
+      const countdown = countdownText(today, eventDate);
+      if (countdown !== null) rows.push(["倒计时", countdown]);
+    }
+    const milestone = anniversaryMilestoneText(row, eventDate);
+    if (milestone !== null) rows.push(["纪念", milestone]);
+  }
+  // 备注为空（NULL / 空串 / 纯空白）时整行省略，不输出空行
+  if (row.note !== null && row.note.trim() !== "") rows.push(["备注", row.note]);
   const notes = note === null ? [] : [note];
   // 待办提醒给一句回复提示：推送不一定进入对话上下文，提示语让用户的短回复带上明确意图，
   // agent 侧对应 complete {recent:true} / snooze（见 SKILL.md「完成回执」）
@@ -2191,7 +2289,13 @@ export async function fireDue(
       const dedupeKey = snoozed
         ? `sched:${schedule.id}:${occ.occurrence_key}@${occ.due_at}`
         : `sched:${schedule.id}:${occ.occurrence_key}`;
-      const blocks = reminderBlocks(schedule, occ.event_at, note, snoozed ? occ.due_at : undefined);
+      const blocks = reminderBlocks(
+        schedule,
+        occ.event_at,
+        note,
+        snoozed ? occ.due_at : undefined,
+        at.setZone(TZ).toISODate() ?? undefined,
+      );
       const links = config === undefined ? [] : actionLinksFor(config, db, schedule, occ);
       if (links.length > 0) blocks.notes = [...(blocks.notes ?? []), ...links];
       await services.publishProfile(schedule.profile_id, {
