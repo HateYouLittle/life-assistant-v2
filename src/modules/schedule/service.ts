@@ -16,6 +16,8 @@ import { errorMessage, type NotifyBlock, type Services } from "../../core/regist
 import { withReadTransaction, withTransaction } from "../../core/database.js";
 import { ensureProfile } from "../../core/settings.js";
 import { logger } from "../../core/logger.js";
+import { reminderActionLinks } from "../../core/action-link.js";
+import type { ResolvedConfig } from "../../config.js";
 
 export type ScheduleKind = "todo" | "birthday" | "anniversary";
 export type WorkdayFilter = "any" | "workday" | "holiday";
@@ -2095,7 +2097,39 @@ function hasDerivedRow(
 }
 
 /** 到点触发提醒；返回发布的条数 */
-export async function fireDue(db: DatabaseSync, services: Services, at: DateTime): Promise<number> {
+/**
+ * 待办提醒的一键操作链接（完成 / 推迟 30 分钟）。只给 todo：生日/纪念日没有「完成」语义，
+ * 正文保持简短。生成失败只 warn —— 链接是锦上添花，绝不能让提醒本身发不出去。
+ */
+function actionLinksFor(
+  config: ResolvedConfig,
+  db: DatabaseSync,
+  schedule: ScheduleRow,
+  occ: DueRow,
+): string[] {
+  if (schedule.kind !== "todo") return [];
+  try {
+    return reminderActionLinks(config, db, {
+      profileId: schedule.profile_id,
+      scheduleId: schedule.id,
+      occurrenceKey: occ.occurrence_key,
+      snoozable: isNormalReminderKey(occ.occurrence_key),
+    });
+  } catch (e) {
+    logger.warn(
+      `日程「${schedule.title}」(${schedule.id}) 生成操作链接失败，已省略: ${errorMessage(e)}`,
+    );
+    return [];
+  }
+}
+
+export async function fireDue(
+  db: DatabaseSync,
+  services: Services,
+  at: DateTime,
+  /** 传入时（daemon）按配置给待办提醒追加一键操作链接；不传 = 不加链接（既有测试/CLI） */
+  config?: ResolvedConfig,
+): Promise<number> {
   const cutoff = at.toUTC().toISO() ?? nowIso();
   const due = db
     .prepare(
@@ -2157,10 +2191,13 @@ export async function fireDue(db: DatabaseSync, services: Services, at: DateTime
       const dedupeKey = snoozed
         ? `sched:${schedule.id}:${occ.occurrence_key}@${occ.due_at}`
         : `sched:${schedule.id}:${occ.occurrence_key}`;
+      const blocks = reminderBlocks(schedule, occ.event_at, note, snoozed ? occ.due_at : undefined);
+      const links = config === undefined ? [] : actionLinksFor(config, db, schedule, occ);
+      if (links.length > 0) blocks.notes = [...(blocks.notes ?? []), ...links];
       await services.publishProfile(schedule.profile_id, {
         kind: "schedule.reminder",
         title: schedule.title,
-        blocks: reminderBlocks(schedule, occ.event_at, note, snoozed ? occ.due_at : undefined),
+        blocks,
         dedupeKey,
       });
       published += 1;
@@ -2228,9 +2265,10 @@ export async function tickSchedules(
   services: Services,
   db: DatabaseSync,
   fetchYear?: (url: string) => Promise<unknown>,
+  config?: ResolvedConfig,
 ): Promise<void> {
   catchupSweep(db);
-  await fireDue(db, services, at);
+  await fireDue(db, services, at, config);
   const active = db
     .prepare("SELECT * FROM schedules WHERE status = 'active'")
     .all() as unknown as ScheduleRow[];

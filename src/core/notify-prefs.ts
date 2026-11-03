@@ -14,7 +14,15 @@ export interface NotifyKindPref {
   push?: boolean;
   /** 只在这些通道上推送（路由通道不在其中则不发）；缺省不限 */
   channels?: string[];
+  /**
+   * 正文末尾是否追加一键操作链接（仅 `schedule.reminder` 生效）；缺省 true。
+   * 与 push/quiet_hours 互不影响：它只改正文内容，不决定发不发、何时发。
+   */
+  links?: boolean;
 }
+
+/** 支持 links 开关的 kind（其它 kind 不追加链接，正文保持简短） */
+export const LINK_KINDS = ["schedule.reminder"] as const;
 
 export type NotifyPrefs = Record<string, NotifyKindPref>;
 
@@ -48,6 +56,7 @@ export function getNotifyPrefs(db: DatabaseSync, profileId: string): NotifyPrefs
         .filter((item) => item !== "");
       if (channels.length > 0) pref.channels = channels;
     }
+    if (typeof entry.links === "boolean") pref.links = entry.links;
     out[kind] = pref;
   }
   return out;
@@ -73,4 +82,13 @@ export function kindPushDecision(
     return { push: false, reason: `该类型只允许通道 ${merged.channels.join("/")}` };
   }
   return { push: true };
+}
+
+/** 该 Profile 的日程提醒是否追加一键操作链接（缺省开启） */
+export function reminderLinksEnabled(db: DatabaseSync, profileId: string): boolean {
+  const merged: NotifyKindPref = {
+    ...DEFAULT_KIND_PREFS["schedule.reminder"],
+    ...getNotifyPrefs(db, profileId)["schedule.reminder"],
+  };
+  return merged.links !== false;
 }

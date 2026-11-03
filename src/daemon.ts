@@ -45,6 +45,7 @@ import {
 import { applySecureUmask, createRequestGuard, hardenDataDir } from "./core/security.js";
 import { ensureProfile, pruneCache } from "./core/settings.js";
 import { registerAllModules } from "./modules/index.js";
+import { createActionApp } from "./server/action.js";
 import { createCalendarApp } from "./server/calendar.js";
 import { createOpsApp } from "./server/ops.js";
 import { createQuickApp } from "./server/quick.js";
@@ -302,11 +303,12 @@ export function createHttpHandler(
   db: DatabaseSync,
   hooks: HttpHandlerHooks = {},
 ): (req: IncomingMessage, res: ServerResponse) => void {
-  // 手机入口（/quick、/api/quick/*）、日历订阅（/calendar.ics）与运维端点（/metrics、/readyz）
-  // 都是独立子应用，挂在同一个 Hono 上：共享 createHttpHandler 的 Host/Origin 守卫与限流。
+  // 手机入口（/quick、/api/quick/*）、日历订阅（/calendar.ics）、推送一键操作（/a/*）与
+  // 运维端点（/metrics、/readyz）都是独立子应用，挂在同一个 Hono 上：共享 createHttpHandler 的 Host/Origin 守卫与限流。
   const app = createStatusApp(config, db)
     .route("/", createQuickApp(config, db))
     .route("/", createCalendarApp(config, db))
+    .route("/", createActionApp(config, db))
     .route("/", createOpsApp(config, db));
   const honoListener = getRequestListener(app.fetch);
   // Host/Origin 守卫：状态页与 /mcp 都没有 CSRF token，浏览器跨站请求（含 DNS rebinding：

@@ -18,6 +18,7 @@
 | 部署安全 | 单实例锁（原子创建/接管）、umask 077（daemon 与 `db:backup` / `db:restore` / `db:cleanup:preview` / `db:fingerprint` 等 CLI 同口径；`import:v1`、doctor 只收紧 umask；库/备份 0600）、Host/Origin 守卫（DNS rebinding 防护）、`REQUIRE_AUTH` 强制鉴权、`WEB_ALLOWED_HOSTS` 放行名单 |
 | 手机入口 | `/quick` PWA（记一笔 / 设提醒，Profile token 鉴权）+ `POST /api/quick/expenses\|schedules`；HTTP Shortcuts 可直接导入 [docs/http-shortcuts.json](docs/http-shortcuts.json)（说明见 [docs/http-shortcuts.md](docs/http-shortcuts.md)）；小布指令/NFC 见 [docs/quick-entry.md](docs/quick-entry.md) |
 | 日历订阅 | `GET /calendar.ics` 签名 URL（HMAC + 有效期），iOS/Android 日历可订阅；`npm run calendar:url` 生成 |
+| 一键操作 | 待办提醒正文附「完成」/「推迟 30 分钟」签名链接：`GET /a/<token>` 只渲染确认页、`POST /a/<token>` 才执行（防预览/预取误触），写路径经 `registry.invokeTool` 并落 `audit_log`；基址取 `PUBLIC_BASE_URL`，未配置时回落 `WEB_ALLOWED_HOSTS` 第一个非回环条目，都没有则不加链接（绝不发 `127.0.0.1` 链接） |
 | 运维端点 | `GET /metrics`（Prometheus 文本，master token）与 `GET /readyz`（外部监控，无需凭据） |
 
 相对 v1 的主要变化：**单守护进程**（去掉 stdio 查询进程与 scheduler 的双进程并发防护）；**46 个工具收敛为 7 个**（域内 action 参数化）；**舍弃**油价、共享账本角色、生活指数、自动化 DSL、Open-Meteo 多源回退、React 仪表盘；通知改为 **Markdown 表格**渲染（微信/企业微信）。
@@ -57,6 +58,7 @@ npm run build
 | `MCP_DAEMON_TOKEN` | | stdio 壳访问 daemon 用的 token；缺省复用 `WEB_API_TOKEN` |
 | `REQUIRE_AUTH` | | 设为 `1` 时即使只绑回环也强制要求 `WEB_API_TOKEN`，缺失则拒绝启动（默认关闭，保留本地零配置） |
 | `WEB_ALLOWED_HOSTS` | | 额外放行的 Host 名单（逗号分隔；带端口则精确匹配，裸主机不限端口）。绑定 `0.0.0.0` 或经反代/DNS 名访问时必须配置，否则请求被 403 |
+| `PUBLIC_BASE_URL` | | 推送里一键操作链接的基址，形如 `https://life.example.com`（可带反代子路径，不能带 query/hash、不能是回环或 `0.0.0.0`）。留空则回落到 `WEB_ALLOWED_HOSTS` 第一个非回环条目；都没有就不发链接。**经反代对外时必须填公网地址**，否则链接指回内网 |
 | `PROFILE_TOKENS_JSON` | | 每人一个 token：`'{"default":"…","bestie":"…"}'`（各自 ≥32 字符，不能与 master 相同）。Profile token 绑定身份：MCP、`/api/quick/*` 与看板 `/api/*` 都按 token 反查 Profile（个人视图，按身份过滤）；`/metrics`、doctor 等运维接口仍只认 `WEB_API_TOKEN` |
 | `RATE_LIMIT_PER_MINUTE` | | 每来源 IP 每分钟请求上限（所有请求都计一层），默认 `120`；鉴权通过且带 Bearer 时再按 token 指纹加一层（同一人跨 IP 共用身份桶）。`0` 关闭（仅本地调试）。超限 429 + `Retry-After`；`/healthz`、`/readyz` 豁免，`/metrics` 受限流 |
 | `TRUST_PROXY` | | `1` 时采信 `X-Forwarded-For`（Lucky/nginx 反代后限流与日志用真实客户端 IP）；默认 `0` |
@@ -79,7 +81,7 @@ npm run build
 | `BACKUP_CRON` | | daemon 内置每日备份时间，默认 `'0 3 * * *'`（含空格需单引号，Asia/Shanghai）；非法 cron 拒绝启动 |
 | `BACKUP_KEEP` | | 备份保留份数，默认 `14`（1..365）；超出部分按文件名时间戳清理最旧的 |
 | `JOB_TIMEOUT_MINUTES` | | 单个定时任务执行超时，默认 `15`（整数、上限 1440；`0` 或负数 = 关闭看门狗）。超时后该次记 `failed`（`执行超时 N 分钟`）、释放互斥；挂死的 handler 进入后台僵尸，**收敛前同名任务跳过**（防 tick 堆积），停机时最多再等 2s |
-| `MCP_DAEMON_URL` | | stdio 壳连接的 daemon 地址，默认 `http://127.0.0.1:3080` |
+| `MCP_DAEMON_URL` | | stdio 壳连接的 daemon 地址；缺省跟随 `HOST`（绑 `0.0.0.0`/回环时用 `127.0.0.1`，绑局域网 IP 时用该 IP），否则绑非回环地址会连不上 |
 | `LOG_LEVEL` | | `debug`/`info`/`warn`/`error`，默认 `info` |
 
 > 安全默认：daemon 只应绑定回环地址。要跨机访问，请用 SSH 隧道或反代，并把
@@ -337,7 +339,9 @@ systemctl start life-assistant
 | 启动即退出，`schema 版本 N 高于程序支持的 M` | 用旧程序打开了新库：升级到对应版本的程序，不要改 `meta.schema_version` |
 | 状态页一直「未授权」 | 用 `http://127.0.0.1:3080/?token=<WEB_API_TOKEN>` 打开一次（页面会把凭据记进 localStorage 并抹掉地址栏） |
 | 状态页 `date-line` 变红报错 | 与上面同源：浏览器里存的凭据失效（换过 token），重新用 `?token=` 引导一次 |
-| stdio 壳报 `daemon 不可达` | daemon 没起或 `MCP_DAEMON_URL` 指错；壳只连 daemon、不自己开库 |
+| 提醒里没有「完成 / 推迟」链接 | 三个前提之一：`notify prefs` 里 `schedule.reminder` 的 `links` 被关；没有可用基址（`PUBLIC_BASE_URL` 与 `WEB_ALLOWED_HOSTS` 非回环条目都没有）；没有 `WEB_API_TOKEN`。生日/纪念日提醒本来就不带链接 |
+| 一键链接点开 403 / 打不开 | 过期（默认 7 天）或链接被改写：反代若重写路径/加 query 会毁掉签名；`PUBLIC_BASE_URL` 写成 `127.0.0.1` 时手机打不开（启动会直接拒绝这种配置） |
+| stdio 壳报 `daemon 不可达` | daemon 没起或 `MCP_DAEMON_URL` 指错；壳只连 daemon、不自己开库。`HOST` 绑了局域网 IP 时，壳的默认地址会跟着变成该 IP（`MCP_DAEMON_URL` 显式写死回环反而会连不上） |
 | MCP 直连报 `Session not found` | daemon 重启过：重新 `initialize`（stdio 壳会自动做） |
 | 收不到主动推送 | 依次查：`notify {action:"quiet_hours"}`（静默时段）→ `notify {action:"route"}`（路由与 `secretConfigured`）→ `notify {action:"history", unread:true}`（哪条没发、投递错误是什么）→ `notify {action:"retry", notification_id}` 重试 |
 | 日志太大 / 时间对不上 | 日志目录由 `LOG_DIR` 指定（默认 `~/Library/Logs/life-assistant`），job `maintenance.log_rotate` 每日 04:55 按 `LOG_MAX_MB`/`LOG_KEEP` 轮转；时间戳是本地 `+08:00`（不是 UTC `Z`） |
@@ -398,7 +402,7 @@ npm run db:cleanup:preview   # 零业务删除预演：occurrence 与保留策�
 > `db:backup` / `db:restore` / `calendar:url` / `db:fingerprint` / `db:cleanup:preview` / `doctor` / `import:v1` 跑的是 `dist/` 里的构建产物，先
 > `npm run build`（或改用对应的 `dev:*` 变体直接跑源码）。
 
-结构：`src/core`（database/fingerprint/audit/registry/jobs/lock/security/auth/http/logger/logrotate/metrics/ratelimit/settings/notify/notify-prefs/channels/smtp/render/qweather/qweather-jwt/holiday/recurrence/retention/backup/ics）、`src/modules`（weather/holiday/schedule/bookkeeping/notify/maintenance，经 `modules/index.ts` 注册，核心不反向依赖）、`src/server`（status/page/details/budget/quick/calendar/ops，状态页、只读 API、手机入口、日历订阅与运维端点）、`src/daemon.ts`、`src/stdio.ts`、`src/config.ts`、`src/time.ts`、`src/import-v1.ts`、`src/backup.ts`、`src/restore.ts`、`src/doctor.ts`、`src/fingerprint.ts`、`src/calendar-url.ts`、`src/cleanup-preview.ts`。
+结构：`src/core`（database/fingerprint/audit/registry/jobs/lock/security/auth/http/logger/logrotate/metrics/ratelimit/settings/notify/notify-prefs/channels/smtp/render/qweather/qweather-jwt/holiday/recurrence/retention/backup/ics）、`src/modules`（weather/holiday/schedule/bookkeeping/notify/maintenance，经 `modules/index.ts` 注册，核心不反向依赖）、`src/server`（status/page/details/budget/quick/calendar/action/ops，状态页、只读 API、手机入口、日历订阅、一键操作链接与运维端点）、`src/daemon.ts`、`src/stdio.ts`、`src/config.ts`、`src/time.ts`、`src/import-v1.ts`、`src/backup.ts`、`src/restore.ts`、`src/doctor.ts`、`src/fingerprint.ts`、`src/calendar-url.ts`、`src/cleanup-preview.ts`。
 
 ## 设计要点
 
@@ -409,6 +413,7 @@ npm run db:cleanup:preview   # 零业务删除预演：occurrence 与保留策�
 - **身份与可见性**：`WEB_API_TOKEN` 是 master（家庭看板、运维、doctor、Hermes stdio 壳）；`PROFILE_TOKENS_JSON` 给每人一个 token，MCP、`/api/quick/*` 与看板 `/api/*` 都按 token 反查 Profile（不再信任 `X-Hermes-Profile`），会话与 token 所属 Profile 不一致直接 403。看板可见性矩阵：支出（master=家庭账本；profile=家庭+本人个人）、日程/通知/投递/Profile 列表（master=全部；profile=仅自己）、预算与 CSV（始终家庭账本）、jobs/holidays（共享）；`/api/status` 返回 `identity` 字段供页面渲染「家庭看板 / 个人视图」。除 `/healthz`、`/readyz` 外的请求做两层固定窗口限流（所有请求按来源 IP 计一层，鉴权通过且带 Bearer 时再按 token 指纹加一层；无效/缺失凭据只计 IP 桶，轮换伪 token 不能绕过；429 + `Retry-After`），鉴权失败写 warn 日志并计入 `/metrics`。
 - **手机快捷入口**：`/quick` 是零构建 PWA（记一笔 / 设提醒，token 引导、常用分类 chips、`?type=&amount=&category=&title=` 预填），写接口 `POST /api/quick/expenses|schedules` 复用 MCP 同一份 service —— 幂等键、家庭账本回执、预算提醒、occurrence 物化语义完全一致；`GET /api/quick/bootstrap` 只返回该 Profile 可见账本与常用分类。OPPO/ColorOS 的 PWA、HTTP Shortcuts（可直接导入 `docs/http-shortcuts.json`，或按 [docs/quick-entry.md](docs/quick-entry.md) 用 cURL 导入）、小布指令/NFC 三种用法见 [docs/quick-entry.md](docs/quick-entry.md)。
 - **日历订阅**：`GET /calendar.ics?p=&exp=&sig=` 用 HMAC-SHA256(master, `"<profile>.<exp>"`) 签发**只读单个 Profile、带有效期**的链接（日历客户端无法附加请求头，所以不能直接用 token）；`npm run calendar:url -- --profile bestie --days 30 --base https://<域名>` 生成。只导出该 Profile **活跃**日程在未来 62 天内、状态为 `pending/notified` 的 occurrence；空数据也返回合法空日历。
+- **一键操作链接**：`GET|POST /a/<token>` 与 `/calendar.ics` 同档——**签名 URL**，不读任何 header 凭据。token = base64url(`1|<profile>|<schedule_id>|<occurrence_key>|<action>|<exp>`) + `.` + HMAC-SHA256(master, `"action:"+载荷`) 前 16 字节，默认 7 天有效、容忍 60 秒时钟偏移；`done`/`snooze30` 两种动作，一条 token 只能做一件事。**GET 绝不写库**（IM 链接预览、爬虫、浏览器预取都会发 GET），写操作只在 POST；重复 POST 按 occurrence 终态 / 审计里同一 token 指纹判为「已处理」，不重复写入。每次真正执行都落 `audit_log`（`link.schedule.done` / `link.schedule.snooze30`，只存 token 的 sha256 前 32 位，不存原文 —— 原文就是凭据）。
 - **运维端点**：`GET /metrics`（Prometheus 文本：鉴权/限流计数器、投递六状态、outbox 最老**到期**待投秒数（按 `next_attempt_at`，静默/退避中的行不算卡住）、每个 job 最近成功时间、备份年龄与 `life_assistant_backup_latest_verified`（读旁车、零开库，2/1/0 三态）、超时僵尸数 `life_assistant_job_zombies`、重试 >=3 次仍失败的投递数 `life_assistant_outbox_failed_retrying`、DB/WAL 大小、今日 QWeather 用量）仅 master token；`GET /readyz` 无需凭据，做 DB 可写探针、WAL 阈值与 outbox 卡住判定，异常 503 + `reasons`；结论缓存 1s（无鉴权且豁免限流，避免高频轮询每次都在单进程上跑 `BEGIN IMMEDIATE`，P2-15）——它是**秒级近似探针**，恢复也会延迟最多 1s，不是实时看门狗。两者与 `/healthz` 一样对外可用，但只有 `/readyz`/`/healthz` 豁免限流。
 - **时区**：全部调度固定 Asia/Shanghai，无 DST。
 - **任务运行记录与启动补发**：每次 job 执行写一行 `job_runs`（cron/startup/catchup/manual，running→ok/failed/skipped；进程崩溃遗留的 running 行在下次启动收敛为 failed），状态页「定时任务」卡片、`GET /api/jobs` 与 `doctor --live` 共用这份事实。启动补发只针对 `CATCHUP_POLICY` 白名单内的任务（早报、晚报、每日记账摘要、周报、日志轮转、预警巡检、调休提醒、节假日刷新、备份、WAL checkpoint、occurrence 清理、保留策略）：用自写的 cron 反向求值算出「上一次应触发时刻」，超窗口不补、已有成功记录不补，执行前再确认一次以避开与 cron 的竞态；单个失败只记日志；汇总日志区分「尝试/成功/跳过/失败」四态（`runExclusive` 会吞异常，不能把尝试数当成功数；`skipped` 表示同名 job 未执行，P2-16）。补发把「原定触发时刻」传给 handler，早报/晚报/记账摘要/周报/调休提醒按该时刻取业务日期与去重键（跨午夜补发不会用错日期、也不会占错 dedupe 键吞掉当晚正常推送）。`job_runs` 由保留策略顺带清理 30 天前的行。同步长任务阻塞事件循环跨过整分钟时，`CATCHUP_POLICY` 白名单内的 job 会回放这次错过的触发（node-cron `recoverMissedExecutions`，只对白名单开）—— 补跑按「原定时刻」执行、写 `job_runs`（trigger=`catchup`）并打 info 日志；同一触发时刻由**分钟级槽位守卫**保证只执行一次（node-cron 开启回放后即使无阻塞也会重复触发同一分钟，实测确认，P2-14）。cron 环境变量必须是**恰好 5 段**（分 时 日 月 周），不支持秒级 6 段（node-cron 能跑，但补发的反向求值只按 5 段实现，6 段会导致停机后静默不补发，启动时直接拒绝）；cron 反向求值支持 `*`、单值、逗号列表、`a-b` 范围与 `a-b/n` 步长（步长按 node-cron 的「展开范围后取模」语义，分钟/小时/星期统一按此口径）；星期字段的 `7` 只允许出现在单值/单值列表里（含 `7` 的范围/步长不做反向求值）；日/月字段不是 `*`、或出现「列表与步长混用」等无法确定语义的写法时不做反向求值（宁可漏补，不猜）。

@@ -39,11 +39,26 @@ export type CalendarVerifyResult = { ok: true } | { ok: false; reason: string };
  * `/calendar.ics` 若静默放行，就等于把全家日程公开在一个无鉴权 URL 上。
  */
 function calendarSecret(config: ResolvedConfig): string {
+  return signingSecret(config, "日历订阅");
+}
+
+/**
+ * 签名 URL 的共用密钥：既有的 WEB_API_TOKEN（master）。日历订阅与推送里的一键操作链接
+ * （core/action-link.ts）共用这一份口径，不另造密钥；两者的 HMAC 输入格式互不相交
+ * （日历是 `<profile>.<exp>`，Profile 名不含 `:`；操作链接以 `action:` 开头）。
+ */
+export function signingSecret(config: ResolvedConfig, purpose: string): string {
   const token = config.webApiToken;
   if (token === undefined || token === "") {
-    throw new Error("未配置 WEB_API_TOKEN，日历订阅签名不可用");
+    throw new Error(`未配置 WEB_API_TOKEN，${purpose}签名不可用`);
   }
   return token;
+}
+
+/** 常量时间比较两段字节；长度不同直接判不等（timingSafeEqual 对不等长会抛错） */
+export function constantTimeEqual(expected: Buffer, actual: Buffer): boolean {
+  if (expected.length !== actual.length) return false;
+  return timingSafeEqual(expected, actual);
 }
 
 function hmacHex(secret: string, profileId: string, exp: string): string {
@@ -109,10 +124,9 @@ export function verifyCalendarSignature(
     // 形状都不对说明链接被改过（或客户端截断了），按签名问题处理
     return { ok: false, reason: CALENDAR_SIGNATURE_MISMATCH };
   }
-  // 两边都是定长 hex，长度必然相同；timingSafeEqual 不会因长度不等抛错
   const expected = Buffer.from(hmacHex(secret, p, exp), "hex");
   const actual = Buffer.from(sig, "hex");
-  if (!timingSafeEqual(expected, actual)) {
+  if (!constantTimeEqual(expected, actual)) {
     return { ok: false, reason: CALENDAR_SIGNATURE_MISMATCH };
   }
   return { ok: true };

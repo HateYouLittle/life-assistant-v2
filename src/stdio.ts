@@ -1,6 +1,7 @@
 import { createInterface } from "node:readline";
 import { loadConfig, parseProfileId } from "./config.js";
 import { logger } from "./core/logger.js";
+import { isWildcardBindHost } from "./core/security.js";
 
 /**
  * stdio 兼容壳：把 MCP stdio JSON-RPC 转发到常驻 daemon 的 /mcp 端点。
@@ -9,12 +10,17 @@ import { logger } from "./core/logger.js";
 
 const config = loadConfig(process.env);
 const profile = parseProfileId(process.env.HERMES_PROFILE);
+/**
+ * 默认地址跟随 `HOST`：`HOST` 绑的是局域网 IP 时，127.0.0.1 根本没有监听，
+ * 写死回环会让每个请求都报「daemon 不可达」。通配绑定（0.0.0.0/::）与回环本身仍用 127.0.0.1。
+ * 与 `doctor` 的 liveBaseUrl 同一口径。
+ */
+const defaultDaemonHost = isWildcardBindHost(config.host) ? "127.0.0.1" : config.host;
 // 去掉尾斜杠：MCP_DAEMON_URL 写成 `http://127.0.0.1:3080/` 会拼出 `//mcp`，
 // 而 daemon 只认 /mcp → 每个请求 404，报错却指向「daemon 不可达」。
-const daemonUrl = (process.env.MCP_DAEMON_URL ?? `http://127.0.0.1:${config.port}`).replace(
-  /\/+$/,
-  "",
-);
+const daemonUrl = (
+  process.env.MCP_DAEMON_URL ?? `http://${defaultDaemonHost}:${config.port}`
+).replace(/\/+$/, "");
 const endpoint = `${daemonUrl}/mcp`;
 /** daemon 启用 WEB_API_TOKEN 时（绑定非回环地址必填），壳必须带同一个 token */
 const daemonToken = process.env.MCP_DAEMON_TOKEN?.trim() || config.webApiToken;

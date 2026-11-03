@@ -61,9 +61,13 @@ curl -s http://192.168.31.20:3080/healthz          # 局域网内应通
      `WEB_ALLOWED_HOSTS` 已包含它；
    - **改写为后端地址**：Lucky 把 Host 改成 `192.168.31.20:3080` → 白名单里的 LAN 项生效。
    - 两者都在白名单里，任选其一都不会 403。
-4. **响应缓冲**：`/quick`、`/api/quick/*`、`/calendar.ics`、`/readyz` 都是普通请求，无需特殊处理；
+4. **响应缓冲**：`/quick`、`/api/quick/*`、`/calendar.ics`、`/a/*`、`/readyz` 都是普通请求，无需特殊处理；
    **`/mcp` 是 Streamable HTTP + SSE，需要关闭 Lucky 的响应缓冲/超时改写**，否则 MCP 会卡住。
-   建议公网**不要暴露 `/mcp`**（Hermes 走内网或 stdio 壳即可），只放 `/`、`/quick`、`/api/quick/*`、`/calendar.ics`、`/readyz`。
+   建议公网**不要暴露 `/mcp`**（Hermes 走内网或 stdio 壳即可），只放 `/`、`/quick`、`/api/quick/*`、
+   `/calendar.ics`、`/a/*`、`/readyz`。
+   `/a/*` 是一键操作链接，反代必须**保留路径与 query**（签名在路径里，任何重写都会导致 403），
+   并把 `.env` 的 `PUBLIC_BASE_URL` 设成前端地址（如 `https://life.example.com`），
+   否则提醒里的链接仍指回内网 IP。`/a/*` 的 GET 只出确认页，**POST 才写库**，反代不得把 POST 改成 GET。
 5. **可选加固**（Lucky 侧）：Basic Auth/访问控制作为第二道门；只反代必要路径；
    如果有多个家庭站点，给这个服务单独的子域名。
 6. **HTTPS 强制**：Lucky 前端只开 HTTPS，HTTP 跳转或直接拒绝。

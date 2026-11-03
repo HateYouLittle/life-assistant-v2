@@ -78,8 +78,8 @@ function canonicalHostKey(key: HostKey): string {
   return `${key.host}${port}`;
 }
 
-/** 通配绑定地址（0.0.0.0 / ::）不是真实的 Host 值，不能靠它放行 */
-function isWildcardBindHost(host: string): boolean {
+/** 通配绑定地址（0.0.0.0 / ::）不是真实的 Host 值，不能靠它放行；也是「回环仍可连」的判据 */
+export function isWildcardBindHost(host: string): boolean {
   const h = host.replace(/^\[/, "").replace(/\]$/, "");
   return h === "0.0.0.0" || h === "::" || h === "::0" || /^0(:0){7}$/.test(h);
 }
