@@ -1235,9 +1235,165 @@ function categoryShareRows(
   return { rows, restNote };
 }
 
+/** 「近 N 月均值」回看的月数 */
+export const MONTHLY_AVERAGE_MONTHS = 3;
+
+/** 一段日历日区间（含两端） */
+export interface DateSpan {
+  from: string;
+  to: string;
+}
+
+export interface MonthComparisonPeriods {
+  /** 本月参与对比的区间：月初 → 截止日（报表月已结束 = 全月） */
+  current: DateSpan;
+  /** 上月同期：上月 1 号 → 同一天（上月没有这一天则取上月末） */
+  previous: DateSpan & { ym: string };
+  /** 近 N 个月（不含本月，由近到远）的同期区间，口径同 previous */
+  history: Array<DateSpan & { ym: string }>;
+  /** 报表月尚未结束（月中手动/补跑）：对比只取到截止日 */
+  partial: boolean;
+}
+
+function shiftMonth(ym: string, delta: number): string {
+  const d = DateTime.fromISO(`${ym}-01`, { zone: TZ }).plus({ months: delta });
+  return d.toFormat("yyyy-MM");
+}
+
+/** 某月 1 号 → 该月第 `day` 天（超出月长取月末） */
+function monthPrefix(ym: string, day: number): DateSpan {
+  const { from, to } = monthRange(ym);
+  const lastDay = Number(to.slice(8, 10));
+  const d = Math.min(day, lastDay);
+  return { from, to: `${ym}-${String(d).padStart(2, "0")}` };
+}
+
+/**
+ * 月报「同期对比」的区间口径（纯函数）。
+ *
+ * 截止日 D：`asOf` 已在报表月之后 → 报表月最后一天（每月 1 号推上月月报的常规情况）；
+ * `asOf` 落在报表月内 → 当天（月初看月报不会拿 3 天对比上月 30 天、永远「暴跌」）。
+ * 上月与近 N 月都取「1 号 → 第 D 天」，月份短于 D 时取该月末（3 月 31 日的同期在 2 月
+ * 就是 2 月 28/29 日，即整个 2 月；2 月月报的上月同期是 1 月 1–28 日）。
+ */
+export function monthComparisonPeriods(
+  ym: string,
+  asOf: string = todayIso(),
+  months: number = MONTHLY_AVERAGE_MONTHS,
+): MonthComparisonPeriods {
+  const full = monthRange(ym);
+  const partial = asOf >= full.from && asOf < full.to;
+  const day = partial ? Number(asOf.slice(8, 10)) : Number(full.to.slice(8, 10));
+  const history: Array<DateSpan & { ym: string }> = [];
+  for (let i = 1; i <= months; i++) {
+    const m = shiftMonth(ym, -i);
+    history.push({ ym: m, ...monthPrefix(m, day) });
+  }
+  return {
+    current: partial ? { from: full.from, to: asOf } : full,
+    previous: history[0] as DateSpan & { ym: string },
+    history,
+    partial,
+  };
+}
+
+export interface MonthComparisonFacts {
+  periods: MonthComparisonPeriods;
+  /** 本月对比区间合计（分） */
+  currentCents: number;
+  /** 上月同期合计（分）；null = 上月在账本首笔记账之前，没有可比数据 */
+  previousCents: number | null;
+  /** 近 N 月同期合计（分），只含账本首笔记账当月及之后的月份（由近到远） */
+  historyCents: number[];
+}
+
+function changeText(current: number, base: number): string {
+  if (base <= 0) return current > 0 ? "（基数为 0，不计百分比）" : "持平";
+  const pct = ((current - base) / base) * 100;
+  if (Math.abs(pct) < 0.05) return "持平";
+  return `${pct > 0 ? "+" : ""}${pct.toFixed(1)}%`;
+}
+
+function spanText(span: DateSpan): string {
+  return `${span.from.slice(5)}~${span.to.slice(5)}`;
+}
+
+/**
+ * 月报的对比行（纯函数）：上月同期、近 N 月同期均值。
+ * 没有可比数据（账本是本月才开始记的）时对应行整行省略，不输出「无数据」噪音；
+ * 可比月份不足 2 个时均值行省略（此时均值 = 上月同期）。
+ */
+export function monthComparisonLines(facts: MonthComparisonFacts): string[] {
+  const { periods } = facts;
+  const lines: string[] = [];
+  if (periods.partial) {
+    lines.push(`本月截至 ${periods.current.to.slice(5)}：¥${centsToYuan(facts.currentCents)}`);
+  }
+  if (facts.previousCents !== null) {
+    lines.push(
+      `较上月同期（${spanText(periods.previous)}，¥${centsToYuan(facts.previousCents)}）：${changeText(facts.currentCents, facts.previousCents)}`,
+    );
+  }
+  const n = facts.historyCents.length;
+  // 只有 1 个可比月份时均值就是上月同期，重复一行没有信息量
+  if (n >= 2) {
+    const avg = Math.round(facts.historyCents.reduce((sum, c) => sum + c, 0) / n);
+    const scope = periods.partial ? `同期均值` : `均值`;
+    lines.push(
+      `较近 ${n} 月${scope}（¥${centsToYuan(avg)}）：${changeText(facts.currentCents, avg)}`,
+    );
+  }
+  return lines;
+}
+
+/** 账本首笔记账的日期；空账本为 null */
+function firstSpentOn(db: DatabaseSync, ledgerId: string): string | null {
+  const row = db
+    .prepare("SELECT MIN(spent_on) AS first FROM expenses WHERE ledger_id = ?")
+    .get(ledgerId) as { first: string | null };
+  return row.first;
+}
+
+/** 区间合计（分）：只要一个数，不走 summarizeExpenses 的三条查询 */
+function spanTotalCents(db: DatabaseSync, ledgerId: string, span: DateSpan): number {
+  const row = db
+    .prepare(
+      "SELECT COALESCE(SUM(amount_cents), 0) AS total FROM expenses WHERE ledger_id = ? AND spent_on >= ? AND spent_on <= ?",
+    )
+    .get(ledgerId, span.from, span.to) as { total: number };
+  return row.total;
+}
+
+/**
+ * 读出某账本某月的对比事实。首笔记账之前的月份不计入（否则新账本的「近 3 月均值」
+ * 会被不存在的 0 月份拉低，成了另一种「暴涨」错觉）。
+ */
+export function monthComparisonFacts(
+  db: DatabaseSync,
+  ledgerId: string,
+  ym: string,
+  asOf: string = todayIso(),
+): MonthComparisonFacts {
+  const periods = monthComparisonPeriods(ym, asOf);
+  return withReadTransaction(db, () => {
+    const first = firstSpentOn(db, ledgerId);
+    const firstYm = first === null ? null : first.slice(0, 7);
+    const eligible = periods.history.filter((h) => firstYm !== null && h.ym >= firstYm);
+    const historyCents = eligible.map((h) => spanTotalCents(db, ledgerId, h));
+    const hasPrevious = eligible.some((h) => h.ym === periods.previous.ym);
+    return {
+      periods,
+      currentCents: spanTotalCents(db, ledgerId, periods.current),
+      previousCents: hasPrevious ? (historyCents[0] as number) : null,
+      historyCents,
+    };
+  });
+}
+
 export function monthlyReportBlocks(
   summary: ExpenseSummary,
   budget: BudgetStatus | null = null,
+  comparison: MonthComparisonFacts | null = null,
 ): NotifyBlock {
   const { rows } = categoryShareRows(summary);
   const notes = [`共 ${summary.count} 笔`];
@@ -1246,6 +1402,7 @@ export function monthlyReportBlocks(
       `记账人：${summary.profiles.map((p) => `${p.profile} ¥${centsToYuan(p.cents)}`).join("、")}`,
     );
   }
+  if (comparison !== null) notes.push(...monthComparisonLines(comparison));
   // 只有设了预算的账本才追加预算对照，未设预算的月报保持原样（不出现空行/「未设预算」噪音）
   if (budget !== null) {
     if (budget.total !== null) {
@@ -1414,7 +1571,7 @@ export async function pushMonthlyReports(
     const input = {
       kind: "bookkeeping.monthly",
       title: `${ym} 月度账单 · ${ledger.name}`,
-      blocks: monthlyReportBlocks(summary, budget),
+      blocks: monthlyReportBlocks(summary, budget, monthComparisonFacts(db, ledger.id, ym)),
       dedupeKey: `report:${ledger.id}:${ym}`,
     };
     pushed += await publishLedgerReport(ledger, input, services);
