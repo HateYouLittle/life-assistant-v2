@@ -531,7 +531,7 @@ describe("/api/quick/schedules", () => {
       const app = appFor(env);
       const payload = JSON.stringify({
         title: "交房租",
-        date: "2026-11-01",
+        date: "2099-11-01",
         time: "09:00",
         note: "转账",
         request_id: "quick-sch-1",
@@ -544,7 +544,7 @@ describe("/api/quick/schedules", () => {
       assert.equal(first.status, 201);
       const data = await body(first);
       assert.equal(data.ok, true);
-      assert.equal(data.事件时间, "2026-11-01 09:00");
+      assert.equal(data.事件时间, "2099-11-01 09:00");
 
       const row = env.db.prepare("SELECT * FROM schedules WHERE id = ?").get(String(data.id)) as {
         profile_id: string;

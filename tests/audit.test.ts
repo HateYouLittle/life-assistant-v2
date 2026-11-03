@@ -380,7 +380,7 @@ describe("/api/quick 写操作产生审计", () => {
         headers: bearer(BESTIE),
         body: JSON.stringify({
           title: "交房租",
-          date: "2026-11-01",
+          date: "2099-11-01",
           time: "09:00",
           note: "转账给房东",
           request_id: "audit-sch-1",
@@ -401,7 +401,7 @@ describe("/api/quick 写操作产生审计", () => {
       assert.equal(row.profile_id, "bestie");
       const detail = JSON.parse(row.detail_json) as Record<string, unknown>;
       assert.equal(detail.标题, "交房租");
-      assert.equal(detail.事件时间, "2026-11-01 09:00");
+      assert.equal(detail.事件时间, "2099-11-01 09:00");
       assert.doesNotMatch(row.detail_json, /房东/, "备注全文不得进审计");
 
       // master 代 bestie 记账：审计身份必须是目标 Profile（谁的数据），而不是 master

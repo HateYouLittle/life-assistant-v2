@@ -285,7 +285,7 @@ describe("/quick 页面脚本（vm 桩 + 真实 /api）", () => {
       await waitFor(() => (run.elements.get("summary")?.textContent ?? "").includes("本月已花"));
 
       field(run, "title").value = "交房租";
-      field(run, "when").value = "2026-11-01T09:00";
+      field(run, "when").value = "2099-11-01T09:00";
       run.click("submit-schedule");
       const done = await waitFor(() =>
         (run.elements.get("toast")?.textContent ?? "").includes("已设提醒"),
@@ -296,7 +296,7 @@ describe("/quick 页面脚本（vm 桩 + 真实 /api）", () => {
       assert.ok(post !== undefined);
       const payload = JSON.parse(post.body ?? "{}") as Record<string, unknown>;
       assert.equal(payload.title, "交房租");
-      assert.equal(payload.date, "2026-11-01");
+      assert.equal(payload.date, "2099-11-01");
       assert.equal(payload.time, "09:00");
       assert.equal(typeof payload.request_id, "string");
 
@@ -308,9 +308,9 @@ describe("/quick 页面脚本（vm 桩 + 真实 /api）", () => {
       assert.equal(rows.length, 1);
       // node:sqlite 返回 null 原型对象，逐字段比较
       assert.equal(rows[0]?.title, "交房租");
-      assert.equal(rows[0]?.start_date, "2026-11-01");
+      assert.equal(rows[0]?.start_date, "2099-11-01");
       assert.equal(rows[0]?.time, "09:00");
-      assert.match(run.elements.get("toast")?.textContent ?? "", /2026-11-01 09:00/);
+      assert.match(run.elements.get("toast")?.textContent ?? "", /2099-11-01 09:00/);
     } finally {
       cleanupTestEnv(env);
     }

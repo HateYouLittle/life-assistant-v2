@@ -61,7 +61,7 @@ describe("/api/quick/schedules：remind_offsets 边界（A6）", () => {
         headers: bearer(BESTIE),
         body: JSON.stringify({
           title: "越界提醒",
-          date: "2026-11-01",
+          date: "2099-11-01",
           remind_offsets: [999999],
         }),
       });
@@ -73,7 +73,7 @@ describe("/api/quick/schedules：remind_offsets 边界（A6）", () => {
         headers: bearer(BESTIE),
         body: JSON.stringify({
           title: "空偏移",
-          date: "2026-11-01",
+          date: "2099-11-01",
           remind_offsets: [],
         }),
       });
@@ -96,7 +96,7 @@ describe("/api/quick/schedules：remind_offsets 边界（A6）", () => {
         headers: bearer(BESTIE),
         body: JSON.stringify({
           title: "提前半小时",
-          date: "2026-11-01",
+          date: "2099-11-01",
           remind_offsets: [-30, 0],
         }),
       });
@@ -110,7 +110,7 @@ describe("/api/quick/schedules：remind_offsets 边界（A6）", () => {
         headers: bearer(BESTIE),
         body: JSON.stringify({
           title: "越界负数",
-          date: "2026-11-01",
+          date: "2099-11-01",
           remind_offsets: [-43201],
         }),
       });
@@ -131,7 +131,7 @@ describe("schedule 服务层：remind_offsets 边界（A6）", () => {
       title: "服务层校验",
       kind: "todo",
       calendar: "solar",
-      startDate: "2026-11-01",
+      startDate: "2099-11-01",
       time: "09:00",
       allDay: false,
       recurrence: null,
@@ -168,14 +168,14 @@ describe("schedule 服务层：remind_offsets 边界（A6）", () => {
     try {
       const ctx = toolCtx(env);
       const tooFar = scheduleTool(
-        { action: "add", title: "越界", date: "2026-11-01", remind_offsets: [999999] },
+        { action: "add", title: "越界", date: "2099-11-01", remind_offsets: [999999] },
         ctx,
       ) as { isError?: boolean; content: { text: string }[] };
       assert.equal(tooFar.isError, true);
       assert.match(text(tooFar), /remind_offsets/);
 
       const ok = scheduleTool(
-        { action: "add", title: "合法", date: "2026-11-01", remind_offsets: [-30, 0] },
+        { action: "add", title: "合法", date: "2099-11-01", remind_offsets: [-30, 0] },
         ctx,
       ) as { isError?: boolean; content: { text: string }[] };
       assert.notEqual(ok.isError, true, text(ok));
