@@ -342,7 +342,11 @@ describe("database schema v5", () => {
         )
           .map((r) => r.name)
           .sort();
-        assert.deepEqual(indexes, ["idx_expenses_client_token", "idx_schedules_client_token"]);
+        assert.deepEqual(indexes, [
+          "idx_expenses_client_token",
+          "idx_recurring_bills_client_token",
+          "idx_schedules_client_token",
+        ]);
       } finally {
         upgraded.close();
       }

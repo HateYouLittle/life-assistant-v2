@@ -21,11 +21,13 @@ import {
   getSchedule,
   KIND_LABEL,
   listSchedules,
+  occurrenceEventAt,
   parseEscalation,
   parseOffsets,
   parseRecurrence,
   pendingOccurrences,
   resolveCompletionTarget,
+  runCompletionHooks,
   runOccurrenceCleanup,
   skipSchedule,
   snoozeSchedule,
@@ -217,7 +219,23 @@ function candidateToPublic(c: CompletionCandidate): Record<string, unknown> {
 
 const RECENT_COMPLETION_HOURS = 12;
 
-function completeByDescription(db: DatabaseSync, profileId: string, args: Record<string, unknown>) {
+/**
+ * 单次完成后的模块回调（如周期账自动入账）：只在「完成了某一次发生」时触发，
+ * all=true 结束系列不算交了某一期。回调字段并进回执。
+ */
+function completionExtras(
+  ctx: ToolContext,
+  row: ScheduleRow,
+  occurrenceKey: string,
+  eventAt: string | null,
+): Record<string, unknown> {
+  if (eventAt === null) return {};
+  return runCompletionHooks({ db: ctx.db, ctx, schedule: row, occurrenceKey, eventAt });
+}
+
+function completeByDescription(ctx: ToolContext, args: Record<string, unknown>) {
+  const db = ctx.db;
+  const profileId = ctx.profileId;
   const resolution = resolveCompletionTarget(db, profileId, {
     match: args.match === undefined || args.match === null ? null : String(args.match),
     date: args.date === undefined || args.date === null ? null : String(args.date),
@@ -232,6 +250,7 @@ function completeByDescription(db: DatabaseSync, profileId: string, args: Record
         已完成: candidateToPublic(candidate),
         状态: row.status,
         "下次提醒(本地)": localStampText(row.next_run_at),
+        ...completionExtras(ctx, row, candidate.occurrenceKey, candidate.eventAt),
       });
     }
     case "candidates":
@@ -335,7 +354,7 @@ function scheduleToolInner(args: Record<string, unknown>, ctx: ToolContext) {
           return fail("complete 的 occurrence_key 只能配合 id 使用");
         }
         if (args.all === true) return fail("按描述完成不支持 all=true（结束系列请用 id + all）");
-        return completeByDescription(db, ctx.profileId, args);
+        return completeByDescription(ctx, args);
       }
       if (id === undefined) return fail("complete 需要 id，或用 match / recent:true 按描述完成");
       // null / 未提供都表示「不指定单次」（HTTP JSON 里 null 很常见，不要落成字符串 "null"）
@@ -343,10 +362,16 @@ function scheduleToolInner(args: Record<string, unknown>, ctx: ToolContext) {
         args.occurrence_key === undefined || args.occurrence_key === null
           ? null
           : String(args.occurrence_key);
+      const eventAt =
+        occurrenceKey === null || args.all === true
+          ? null
+          : occurrenceEventAt(db, String(id), occurrenceKey);
       // all=true 才结束整个系列（循环日程裸调 complete 会在 service 层被拒，防误点终止系列）
       const row = completeSchedule(db, ctx.profileId, id, occurrenceKey, {
         all: args.all === true,
       });
+      const extras =
+        occurrenceKey === null ? {} : completionExtras(ctx, row, occurrenceKey, eventAt);
       // P2-1：all=true 现在对任意 kind（含生日/纪念日）都置终态 done，回执必须说清「系列已结束」，
       // 不能只给一个「已完成」让调用方以为系列还在。状态字段仍与库内真实值同源（rowToPublic）。
       return okJson({
@@ -354,6 +379,7 @@ function scheduleToolInner(args: Record<string, unknown>, ctx: ToolContext) {
         ...(args.all === true
           ? { 说明: "已结束整个系列（状态置 done），不会再物化或提醒后续发生" }
           : {}),
+        ...extras,
       });
     }
     case "snooze": {

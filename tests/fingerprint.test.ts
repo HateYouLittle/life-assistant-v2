@@ -236,7 +236,7 @@ describe("db:fingerprint CLI", () => {
       assert.match(first.stdout, /computed: [0-9a-f]{64}/);
       assert.match(first.stdout, /stored:\s+（无/);
       assert.match(first.stdout, /match: false/);
-      assert.match(first.stdout, /schema: v5/);
+      assert.match(first.stdout, /schema: v6/);
 
       const second = runCli(dir);
       assert.equal(second.status, 0, second.stderr);

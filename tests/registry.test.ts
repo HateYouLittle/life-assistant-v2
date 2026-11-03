@@ -101,6 +101,7 @@ describe("registry 契约", () => {
     // 测试模块满足 —— 真实模块注册整个坏掉也照样绿，且全程没人调用 registerAllModules。
     registerAllModules();
     const realModules = new Set([
+      "bills",
       "bookkeeping",
       "holiday",
       "maintenance",
@@ -115,6 +116,7 @@ describe("registry 契约", () => {
     // 工具清单是面向 agent 的契约：改名/增删必须同步 README 与 skill/SKILL.md
     assert.deepEqual(tools, [
       "air_quality",
+      "bill",
       "expense",
       "holiday",
       "ledger",

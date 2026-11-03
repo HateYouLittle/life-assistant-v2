@@ -5,7 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
 import { Hono } from "hono";
 import { listAudit, recordAudit } from "../src/core/audit.js";
-import { getSchemaVersion, openDatabase } from "../src/core/database.js";
+import { getSchemaVersion, openDatabase, SCHEMA_VERSION } from "../src/core/database.js";
 import { schemaFingerprint, storedSchemaFingerprint } from "../src/core/fingerprint.js";
 import { createQuickApp } from "../src/server/quick.js";
 import { createStatusApp } from "../src/server/status.js";
@@ -91,7 +91,7 @@ describe("schema v4 -> v5 迁移", () => {
 
       const upgraded = openDatabase(env.config.dbPath, { backupDir: env.config.backupDir });
       try {
-        assert.equal(getSchemaVersion(upgraded), 5);
+        assert.equal(getSchemaVersion(upgraded), SCHEMA_VERSION);
         const table = upgraded
           .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'audit_log'")
           .get() as { sql: string } | undefined;
@@ -138,7 +138,7 @@ describe("schema v4 -> v5 迁移", () => {
       for (let i = 0; i < 2; i += 1) {
         const again = openDatabase(env.config.dbPath, { backupDir: env.config.backupDir });
         try {
-          assert.equal(getSchemaVersion(again), 5);
+          assert.equal(getSchemaVersion(again), SCHEMA_VERSION);
           const ledgers = again.prepare("SELECT COUNT(*) AS n FROM ledgers").get() as { n: number };
           assert.equal(ledgers.n, 1);
         } finally {

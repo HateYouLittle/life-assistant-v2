@@ -10,10 +10,11 @@ import { logger } from "./logger.js";
  * v4 新增：job_runs 运行记录表、expenses/schedules.client_token（写路径幂等键）。
  * v5 新增：audit_log 审计日志表（手机写 API 的操作留痕）；同时开始记录
  * `meta.schema_fingerprint`（结构指纹，见 core/fingerprint.ts）。
+ * v6 新增：recurring_bills 周期账模板表（到期提醒复用 schedules，见 modules/bills）。
  * 迁移前必须先备份：openDatabase 传了 backupDir 时会 VACUUM INTO 一份
  * `life-assistant-pre-v<旧版本>-<时间戳>.db`，失败则拒绝启动（宁可停，不带病改库）。
  */
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -226,6 +227,32 @@ CREATE TABLE IF NOT EXISTS audit_log (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS idx_audit_log_created_at ON audit_log(created_at);
 CREATE INDEX IF NOT EXISTS idx_audit_log_profile ON audit_log(profile_id, created_at);
+
+-- 周期账模板 v6：固定周期支出，例如话费、订阅。到期提醒不另起调度器，而是挂一条
+-- schedules 循环待办，schedule_id 指向它；日程被删时置 NULL，模板仍在。
+-- 金额沿用 expenses 的分为单位口径；status 只有 active 与 paused，停用后不再产生提醒，
+-- 历史 expenses 不受影响。client_token 是 bill add 的幂等键，分范围唯一索引见 migrate。
+-- 注意：本注释区域不要出现半角圆括号，原因同 audit_log。
+CREATE TABLE IF NOT EXISTS recurring_bills (
+  id TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+  category TEXT NOT NULL,
+  ledger_id TEXT NOT NULL REFERENCES ledgers(id) ON DELETE CASCADE,
+  start_date TEXT NOT NULL,
+  recurrence_json TEXT NOT NULL,
+  time TEXT NOT NULL DEFAULT '09:00',
+  auto_remind INTEGER NOT NULL DEFAULT 1 CHECK (auto_remind IN (0,1)),
+  schedule_id TEXT REFERENCES schedules(id) ON DELETE SET NULL,
+  note TEXT,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','paused')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  client_token TEXT
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_recurring_bills_profile ON recurring_bills(profile_id, status);
+CREATE INDEX IF NOT EXISTS idx_recurring_bills_schedule ON recurring_bills(schedule_id);
 `;
 
 export interface OpenDatabaseOptions {
@@ -404,6 +431,9 @@ function ensureClientTokenIndexes(db: DatabaseSync): void {
   db.exec(
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_schedules_client_token ON schedules(profile_id, client_token) WHERE client_token IS NOT NULL",
   );
+  db.exec(
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_recurring_bills_client_token ON recurring_bills(profile_id, client_token) WHERE client_token IS NOT NULL",
+  );
 }
 
 /**
@@ -477,6 +507,10 @@ export function migrate(db: DatabaseSync): void {
       // v5：audit_log 已由上面的 DDL 建出（CREATE TABLE IF NOT EXISTS），没有数据变换；
       // 这一步只前滚版本号。老库数据原样保留，重复打开幂等。
       version = 5;
+    }
+    if (version === 5) {
+      // v6：recurring_bills 已由上面的 DDL 建出；纯附加，既有表与数据不动，只前滚版本号。
+      version = 6;
     }
     if (version !== stored) {
       db.prepare("UPDATE meta SET value = ? WHERE key = 'schema_version'").run(String(version));

@@ -12,7 +12,12 @@ import {
   type OccurrenceSource,
   type Recurrence,
 } from "../../core/recurrence.js";
-import { errorMessage, type NotifyBlock, type Services } from "../../core/registry.js";
+import {
+  errorMessage,
+  type NotifyBlock,
+  type Services,
+  type ToolContext,
+} from "../../core/registry.js";
 import { withReadTransaction, withTransaction } from "../../core/database.js";
 import { ensureProfile } from "../../core/settings.js";
 import { logger } from "../../core/logger.js";
@@ -78,6 +83,87 @@ export const KIND_LABEL: Record<ScheduleKind, string> = {
 const CATCHUP_GRACE_MINUTES = 10;
 
 export const REMINDER_REPLY_HINT = "做完了直接回复「完成」，要晚点再提醒就回复「推迟半小时」";
+
+/**
+ * 提醒装饰：其它模块（如周期账 bills）给「挂在某条日程上」的提醒改标题、补表格行、换回复提示。
+ * 日程模块不 import 那些模块（依赖方向只能是 bills → schedule），由对方在模块加载时注册。
+ * 返回 null = 该日程与本装饰无关。装饰抛错只 warn、按原样发提醒（提醒本身绝不能因此丢）。
+ */
+export interface ReminderDecoration {
+  title?: string;
+  rows?: string[][];
+  /** 替换默认的 REMINDER_REPLY_HINT */
+  hint?: string;
+}
+export type ReminderDecorator = (
+  db: DatabaseSync,
+  schedule: ScheduleRow,
+) => ReminderDecoration | null;
+
+/**
+ * 单次发生被「完成」之后的回调（schedule complete 的单次路径，含 match/recent 与一键链接）。
+ * 返回值合并进 complete 回执；null = 无关。由工具层调用，服务层的 completeSchedule 不触发。
+ */
+export interface OccurrenceCompletedEvent {
+  db: DatabaseSync;
+  ctx: ToolContext;
+  schedule: ScheduleRow;
+  occurrenceKey: string;
+  /** 本次发生的事件时刻（UTC ISO） */
+  eventAt: string;
+}
+export type CompletionHook = (event: OccurrenceCompletedEvent) => Record<string, unknown> | null;
+
+const reminderDecorators: ReminderDecorator[] = [];
+const completionHooks: CompletionHook[] = [];
+
+export function registerReminderDecorator(fn: ReminderDecorator): void {
+  if (!reminderDecorators.includes(fn)) reminderDecorators.push(fn);
+}
+
+export function registerCompletionHook(fn: CompletionHook): void {
+  if (!completionHooks.includes(fn)) completionHooks.push(fn);
+}
+
+function decorationFor(db: DatabaseSync, schedule: ScheduleRow): ReminderDecoration | null {
+  for (const fn of reminderDecorators) {
+    try {
+      const deco = fn(db, schedule);
+      if (deco !== null) return deco;
+    } catch (e) {
+      logger.warn(
+        `日程「${schedule.title}」(${schedule.id}) 提醒装饰失败，按原样发送: ${errorMessage(e)}`,
+      );
+    }
+  }
+  return null;
+}
+
+/** 依次跑完成回调，合并各回调的回执字段；单个回调抛错由回调自己负责转成回执（这里兜底 warn） */
+export function runCompletionHooks(event: OccurrenceCompletedEvent): Record<string, unknown> {
+  let merged: Record<string, unknown> = {};
+  for (const fn of completionHooks) {
+    try {
+      const extra = fn(event);
+      if (extra !== null) merged = { ...merged, ...extra };
+    } catch (e) {
+      logger.warn(`日程完成回调失败（完成本身已生效）: ${event.schedule.id}: ${errorMessage(e)}`);
+    }
+  }
+  return merged;
+}
+
+/** 某次发生的事件时刻（UTC ISO）；不存在返回 null */
+export function occurrenceEventAt(
+  db: DatabaseSync,
+  scheduleId: string,
+  occurrenceKey: string,
+): string | null {
+  const row = db
+    .prepare("SELECT event_at FROM occurrences WHERE schedule_id = ? AND occurrence_key = ?")
+    .get(scheduleId, occurrenceKey) as { event_at: string } | undefined;
+  return row?.event_at ?? null;
+}
 const NEAR_HORIZON_DAYS = 62;
 const FAR_HORIZON_DAYS = 400;
 /** 强提醒（到点重发一次）行的 occurrence_key 后缀 */
@@ -2296,11 +2382,21 @@ export async function fireDue(
         snoozed ? occ.due_at : undefined,
         at.setZone(TZ).toISODate() ?? undefined,
       );
+      const deco = schedule.kind === "todo" ? decorationFor(db, schedule) : null;
+      if (deco !== null) {
+        if (deco.rows !== undefined && blocks.table !== undefined) {
+          blocks.table.rows = [...blocks.table.rows, ...deco.rows];
+        }
+        if (deco.hint !== undefined) {
+          const hint = deco.hint;
+          blocks.notes = (blocks.notes ?? []).map((n) => (n === REMINDER_REPLY_HINT ? hint : n));
+        }
+      }
       const links = config === undefined ? [] : actionLinksFor(config, db, schedule, occ);
       if (links.length > 0) blocks.notes = [...(blocks.notes ?? []), ...links];
       await services.publishProfile(schedule.profile_id, {
         kind: "schedule.reminder",
-        title: schedule.title,
+        title: deco?.title ?? schedule.title,
         blocks,
         dedupeKey,
       });
