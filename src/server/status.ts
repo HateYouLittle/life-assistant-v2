@@ -13,6 +13,7 @@ import { envClientAddress } from "../core/ratelimit.js";
 import { allJobs } from "../core/registry.js";
 import { expenseCsv, expenseCsvFilename } from "../modules/bookkeeping/service.js";
 import { TZ, todayIso } from "../time.js";
+import { backupStatus } from "../core/backup.js";
 import { budgetPayload } from "./budget.js";
 import {
   clampOffset,
@@ -194,6 +195,20 @@ export function statusPayload(
       })),
       next: holidays.upcoming[0] ?? null,
     },
+    // 备份卡片：只读旁车（零开库），最坏情况比「新鲜但坏」的误导要好
+    backup: (() => {
+      const status = backupStatus(config, undefined, { sidecar: true });
+      return {
+        dir: status.dir,
+        latest: status.latest,
+        age_hours: status.ageHours,
+        stale: status.stale,
+        verified: status.latestVerified,
+        sidecar: status.sidecarState,
+        count: status.files.length,
+        non_canonical: status.nonCanonical.length,
+      };
+    })(),
     jobs: {
       // job 数量取注册表（而未运行的 job 也要显示成「未运行」，不能因为没记录就消失）
       total: allJobs().length,

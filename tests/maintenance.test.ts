@@ -75,6 +75,36 @@ describe("保留策略", () => {
     }
   });
 
+  it("审计日志按 180 天收敛：老行删、新行留，预演数与实删一致", () => {
+    const env = makeTestEnv();
+    try {
+      const seedAudit = (action: string, createdAt: string): void => {
+        env.db
+          .prepare(
+            "INSERT INTO audit_log (id, profile_id, action, target_kind, target_id, detail_json, created_at) VALUES (?, 'default', ?, 'expense', 'x', NULL, ?)",
+          )
+          .run(`a-${action}-${createdAt}`, action, createdAt);
+      };
+      seedAudit("old.done", OLD);
+      seedAudit("old.snooze", OLD);
+      seedAudit("recent.done", RECENT);
+
+      const preview = retentionPreview(env.db);
+      assert.equal(preview.auditLog, 2, "只预演到两条过期审计");
+
+      const result = runRetention(env.db);
+      assert.equal(result.auditLog, 2, "预演数与实删数必须一致");
+      const left = (
+        env.db.prepare("SELECT action FROM audit_log ORDER BY action").all() as {
+          action: string;
+        }[]
+      ).map((r) => r.action);
+      assert.deepEqual(left, ["recent.done"], "半年内的审计必须保留");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("月报通知不参与保留清理：dedupe_key 是补发判定的持久证据", () => {
     const env = makeTestEnv();
     try {

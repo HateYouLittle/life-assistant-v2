@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { loadConfig } from "./config.js";
 import { openDatabase } from "./core/database.js";
 import {
+  AUDIT_RETENTION_DAYS,
   CANCELLED_SCHEDULE_RETENTION_DAYS,
   NOTIFICATION_RETENTION_DAYS,
   retentionPreview,
@@ -44,11 +45,11 @@ function main(): void {
     const retention = retentionPreview(db);
     console.log("");
     console.log(
-      `保留策略（通知 ${NOTIFICATION_RETENTION_DAYS} 天 / 已取消日程 ${CANCELLED_SCHEDULE_RETENTION_DAYS} 天）：`,
+      `保留策略（通知 ${NOTIFICATION_RETENTION_DAYS} 天 / 已取消日程 ${CANCELLED_SCHEDULE_RETENTION_DAYS} 天 / 审计 ${AUDIT_RETENTION_DAYS} 天）：`,
     );
     console.log(
       `将删除已读通知 ${retention.notifications} 条（其中投递记录 ${retention.deliveries} 条随外键级联）、` +
-        `已取消日程 ${retention.cancelledSchedules} 条`,
+        `已取消日程 ${retention.cancelledSchedules} 条、审计日志 ${retention.auditLog} 条`,
     );
     console.log("未读通知与仍有待投递的通知不会删；使用 recurrence.count 的日程不删。");
   } finally {

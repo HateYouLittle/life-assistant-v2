@@ -308,6 +308,13 @@ export const SCRIPT = `
   function yuan(cents) {
     return '¥' + (cents / 100).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   }
+  /* 备份文件大小：1.2 MB / 820 KB（不足 1 KB 也按 KB 显示，避免出现 0.0 MB） */
+  function mbText(bytes) {
+    var n = Number(bytes);
+    if (!isFinite(n) || n < 0) return '—';
+    if (n >= 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB';
+    return Math.max(1, Math.round(n / 1024)) + ' KB';
+  }
   function esc(text) {
     return String(text === null || text === undefined ? '' : text).replace(/[&<>"']/g, function (c) {
       return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
@@ -441,6 +448,27 @@ export const SCRIPT = `
       ? '最近运行 ' + jobChip(latestJob.status) + ' · ' + esc(stampShort(latestJob.started_at)) +
         (latestJob.error ? ' · <span class="bad">' + esc(String(latestJob.error).slice(0, 80)) + '</span>' : '')
       : '<span class="muted">还没有运行记录</span>';
+
+    // 备份：最近一份 + 旁车可信状态（trusted/untrusted/missing 三态）。
+    // 只读旁车、零开库，所以这里显示的是「备份成功时自校验的声明」，不是现场校验结果。
+    var bk = s.backup || null;
+    if (bk === null) {
+      el('backup-stats').innerHTML = '<div class="stat"><div class="n muted">—</div><div class="l">暂无备份</div></div>';
+      el('backup-last').textContent = '备份目录不可读';
+    } else {
+      var bkTrust = { trusted: ['ok', '可信'], untrusted: ['bad', '不可信'], missing: ['warn', '无校验标记'] }[bk.sidecar] ||
+        ['warn', '未知'];
+      var bkAge = bk.age_hours === null ? '—' : (bk.age_hours < 1 ? '刚刚' : Math.round(bk.age_hours) + ' 小时前');
+      el('backup-stats').innerHTML =
+        '<div class="stat"><div class="n ' + (bk.stale ? 'warn' : 'ok') + '">' + bk.count + '</div><div class="l">份备份</div></div>' +
+        '<div class="stat"><div class="n ' + bkTrust[0] + '">' + esc(bkTrust[1]) + '</div><div class="l">最新校验</div></div>' +
+        '<div class="stat"><div class="n' + (bk.stale ? ' bad' : '') + '">' + esc(bkAge) + '</div><div class="l">最新一份</div></div>';
+      el('backup-last').innerHTML = bk.latest
+        ? esc(String(bk.latest.name || '')) +
+          ' · ' + esc(mbText(bk.latest.sizeBytes)) +
+          (bk.non_canonical > 0 ? ' · <span class="warn">' + bk.non_canonical + ' 个非规范文件</span>' : '')
+        : '<span class="muted">还没有备份</span>';
+    }
 
     el('ops').innerHTML =
       row('Profile', esc(s.profiles.join(' · ') || '暂无')) +

@@ -596,6 +596,25 @@ describe("看板「定时任务」卡片", () => {
     }
   });
 
+  it("备份卡片：无备份时显示 0 份与「无校验标记」，有非规范文件时提示", async () => {
+    const env = makeTestEnv();
+    try {
+      const run = runPageScript(env, "");
+      const rendered = await waitFor(() =>
+        (run.elements.get("backup-stats")?.innerHTML ?? "").includes("份备份"),
+      );
+      assert.ok(rendered, `备份卡片没有渲染：${run.elements.get("backup-stats")?.innerHTML}`);
+      assert.match(
+        run.elements.get("backup-stats")?.innerHTML ?? "",
+        /0<\/div><div class="l">份备份/,
+      );
+      assert.match(run.elements.get("backup-stats")?.innerHTML ?? "", /无校验标记|可信/);
+      assert.match(run.elements.get("backup-last")?.innerHTML ?? "", /还没有备份/);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("没有运行记录时给出「还没有运行记录」而不是空白", async () => {
     const env = makeTestEnv();
     try {

@@ -93,6 +93,12 @@ export function statusPage(version: string, nonce?: string): string {
     <div class="tiny" id="job-last"></div>
   </section>
 
+  <section class="card backup">
+    <div class="card-k">备份</div>
+    <div class="stats" id="backup-stats"></div>
+    <div class="tiny" id="backup-last"></div>
+  </section>
+
   <section class="card ops clickable" data-drawer="system" tabindex="0" role="button" aria-label="查看系统信息">
     <div id="ops"></div>
   </section>

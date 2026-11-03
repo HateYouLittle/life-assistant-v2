@@ -16,6 +16,11 @@ import { recurrenceDeclaresCount } from "./recurrence.js";
 
 export const NOTIFICATION_RETENTION_DAYS = 180;
 export const CANCELLED_SCHEDULE_RETENTION_DAYS = 180;
+/**
+ * 审计日志保留期：只增不减，且每次写接口都留痕，长期运行必然膨胀。
+ * 与通知同口径 180 天——出问题时能对上「最近半年谁改了什么」，更早的靠备份里的库。
+ */
+export const AUDIT_RETENTION_DAYS = 180;
 
 /** 未终结的投递状态：这些通知不能删（删了推送就永远发不出去） */
 const PENDING_DELIVERY_STATUSES = ["queued", "sending", "failed"] as const;
@@ -24,6 +29,7 @@ export interface RetentionPreview {
   notifications: number;
   deliveries: number;
   cancelledSchedules: number;
+  auditLog: number;
 }
 
 function cutoffIso(days: number, now: number = Date.now()): string {
@@ -90,6 +96,19 @@ export function cancelledScheduleRetentionPlan(
   return { count: ids.length, cutoff, ids };
 }
 
+/** 审计日志：按 created_at 收敛（写接口每次成功都留一行，长期必然膨胀） */
+export function auditRetentionPlan(
+  db: DatabaseSync,
+  days: number = AUDIT_RETENTION_DAYS,
+  now: number = Date.now(),
+): { count: number; cutoff: string } {
+  const cutoff = cutoffIso(days, now);
+  const row = db
+    .prepare("SELECT COUNT(*) AS n FROM audit_log WHERE created_at < ?")
+    .get(cutoff) as { n: number };
+  return { count: row.n, cutoff };
+}
+
 export function retentionPreview(db: DatabaseSync, now: number = Date.now()): RetentionPreview {
   const notifications = notificationRetentionPlan(db, NOTIFICATION_RETENTION_DAYS, now);
   const cancelledSchedules = cancelledScheduleRetentionPlan(
@@ -107,7 +126,12 @@ export function retentionPreview(db: DatabaseSync, now: number = Date.now()): Re
        )`,
     )
     .get(notifications.cutoff) as { n: number };
-  return { notifications: notifications.count, deliveries: deliveries.n, cancelledSchedules };
+  return {
+    notifications: notifications.count,
+    deliveries: deliveries.n,
+    cancelledSchedules,
+    auditLog: auditRetentionPlan(db, AUDIT_RETENTION_DAYS, now).count,
+  };
 }
 
 /** 执行保留策略；返回各表删除行数。与 preview 共用同一份判定，避免预演与实删不一致。 */
@@ -137,10 +161,16 @@ export function runRetention(db: DatabaseSync, now: number = Date.now()): Retent
     notifications: Number(deletedNotifications.changes),
     deliveries: plan.deliveries,
     cancelledSchedules: deletedSchedules,
+    auditLog: 0,
   };
-  if (result.notifications > 0 || result.cancelledSchedules > 0) {
+  // 审计日志：最近半年可查即可，更早的留在备份库里
+  const deletedAudit = db
+    .prepare("DELETE FROM audit_log WHERE created_at < ?")
+    .run(cutoffIso(AUDIT_RETENTION_DAYS, now));
+  result.auditLog = Number(deletedAudit.changes);
+  if (result.notifications > 0 || result.cancelledSchedules > 0 || result.auditLog > 0) {
     logger.info(
-      `保留策略清理：通知 ${result.notifications} 条（含投递 ${result.deliveries} 条）、已取消日程 ${result.cancelledSchedules} 条`,
+      `保留策略清理：通知 ${result.notifications} 条（含投递 ${result.deliveries} 条）、已取消日程 ${result.cancelledSchedules} 条、审计 ${result.auditLog} 条`,
     );
   }
   return result;
