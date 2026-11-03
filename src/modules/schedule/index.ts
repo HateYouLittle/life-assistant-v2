@@ -25,6 +25,7 @@ import {
   parseOffsets,
   parseRecurrence,
   pendingOccurrences,
+  resolveCompletionTarget,
   runOccurrenceCleanup,
   skipSchedule,
   snoozeSchedule,
@@ -32,6 +33,7 @@ import {
   upcoming,
   updateSchedule,
   validateEscalation,
+  type CompletionCandidate,
   type ScheduleInput,
   type SchedulePatch,
   type ScheduleRow,
@@ -201,6 +203,54 @@ function rowToPublic(row: ScheduleRow): Record<string, unknown> {
   };
 }
 
+/** 回执里的单次发生描述：本地事件时间 + key（多候选时让 agent 原样列给用户选） */
+function candidateToPublic(c: CompletionCandidate): Record<string, unknown> {
+  return {
+    id: c.schedule.id,
+    标题: c.schedule.title,
+    occurrence_key: c.occurrenceKey,
+    事件时间: localStampText(c.eventAt),
+    ...(c.schedule.note === null ? {} : { 备注: c.schedule.note }),
+  };
+}
+
+const RECENT_COMPLETION_HOURS = 12;
+
+function completeByDescription(db: DatabaseSync, profileId: string, args: Record<string, unknown>) {
+  const resolution = resolveCompletionTarget(db, profileId, {
+    match: args.match === undefined || args.match === null ? null : String(args.match),
+    date: args.date === undefined || args.date === null ? null : String(args.date),
+    recentHours: args.recent === true ? RECENT_COMPLETION_HOURS : null,
+  });
+  switch (resolution.kind) {
+    case "single": {
+      const { candidate } = resolution;
+      const row = completeSchedule(db, profileId, candidate.schedule.id, candidate.occurrenceKey);
+      return okJson({
+        结果: "已完成",
+        已完成: candidateToPublic(candidate),
+        状态: row.status,
+        "下次提醒(本地)": localStampText(row.next_run_at),
+      });
+    }
+    case "candidates":
+      return okJson({
+        结果: "多个候选",
+        说明: "匹配到多个待完成的发生，请让用户确认是哪一个，再用 id + occurrence_key 完成",
+        候选: resolution.candidates.map(candidateToPublic),
+      });
+    case "already":
+      return okJson({
+        结果: "已处理",
+        说明: `「${resolution.schedule.title}」${resolution.eventDate} 那次已经完成，无需重复操作`,
+        id: resolution.schedule.id,
+        "下次提醒(本地)": localStampText(resolution.schedule.next_run_at),
+      });
+    case "none":
+      return okJson({ 结果: "未找到", 说明: resolution.reason });
+  }
+}
+
 function workdayFilterLabel(value: ScheduleRow["workday_filter"]): string {
   if (value === "workday") return "仅工作日";
   if (value === "holiday") return "仅节假日";
@@ -274,7 +324,17 @@ function scheduleToolInner(args: Record<string, unknown>, ctx: ToolContext) {
     }
     case "complete": {
       const id = args.id as string;
-      if (id === undefined) return fail("complete 需要 id");
+      const byDescription =
+        (args.match !== undefined && args.match !== null) || args.recent === true;
+      if (byDescription) {
+        if (id !== undefined) return fail("complete 的 id 与 match/recent 不能同时提供");
+        if (args.occurrence_key !== undefined && args.occurrence_key !== null) {
+          return fail("complete 的 occurrence_key 只能配合 id 使用");
+        }
+        if (args.all === true) return fail("按描述完成不支持 all=true（结束系列请用 id + all）");
+        return completeByDescription(db, ctx.profileId, args);
+      }
+      if (id === undefined) return fail("complete 需要 id，或用 match / recent:true 按描述完成");
       // null / 未提供都表示「不指定单次」（HTTP JSON 里 null 很常见，不要落成字符串 "null"）
       const occurrenceKey =
         args.occurrence_key === undefined || args.occurrence_key === null
@@ -391,6 +451,7 @@ registerModule({
         "action=add 创建（calendar=lunar 时需 lunar_month/lunar_day 且按年循环；生日/纪念日默认按年循环；可选 request_id 幂等键，重试不会重复创建）；" +
         "list 查询（每行「待办发生」给出可用的 occurrence_key）；update 修改（escalation 传 [] 清除阶梯）；" +
         "complete 完成：一次性日程直接完成；循环日程必须带 occurrence_key 只完成该次，结束整个系列请显式传 all=true；" +
+        "用户口头说某事做完了时，优先用 complete + match（关键词）或 recent:true（只说「交了/搞定了」时）由服务端定位，不必先 list；" +
         "snooze 推迟单次提醒（minutes 或 until）；skip 跳过单次发生（循环系列继续；一次性待办则跳过并结束该待办，回执的「状态」为 done）；delete 删除；upcoming 查即将提醒。",
       inputSchema: {
         action: z.enum([
@@ -408,7 +469,13 @@ registerModule({
         note: z.string().max(500).optional(),
         kind: z.enum(["todo", "birthday", "anniversary"]).optional().describe("默认 todo"),
         calendar: z.enum(["solar", "lunar"]).optional().describe("默认 solar"),
-        date: z.string().regex(DATE_RE).optional().describe("公历开始日期 YYYY-MM-DD"),
+        date: z
+          .string()
+          .regex(DATE_RE)
+          .optional()
+          .describe(
+            "add/update：公历开始日期 YYYY-MM-DD；complete+match：要完成的那一天，缺省今天",
+          ),
         lunar_month: z.number().int().min(1).max(12).optional(),
         lunar_day: z.number().int().min(1).max(30).optional(),
         leap_policy: z.enum(["follow", "regular"]).optional().describe("闰月策略，默认 follow"),
@@ -457,6 +524,20 @@ registerModule({
           .boolean()
           .optional()
           .describe("complete 时结束整个系列（循环日程必须显式传 true 才会终止系列）"),
+        match: z
+          .string()
+          .min(1)
+          .max(60)
+          .optional()
+          .describe(
+            "complete 按描述完成（不传 id）：标题/备注关键词，如「巡检」「话费」；在 date（缺省今天）那天的未完成发生里定位，唯一则直接完成，多个返回候选，已完成返回「已处理」",
+          ),
+        recent: z
+          .boolean()
+          .optional()
+          .describe(
+            "complete 按最近推送完成（不传 id/match）：用户只说「交了/做完了/打了」而对话里没有对应提醒时用；取最近 12 小时内已推送且未处理的提醒，唯一则直接完成，多个返回候选",
+          ),
         minutes: z
           .number()
           .int()

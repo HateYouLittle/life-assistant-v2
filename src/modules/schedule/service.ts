@@ -73,6 +73,8 @@ export const KIND_LABEL: Record<ScheduleKind, string> = {
 };
 
 const CATCHUP_GRACE_MINUTES = 10;
+
+export const REMINDER_REPLY_HINT = "做完了直接回复「完成」，要晚点再提醒就回复「推迟半小时」";
 const NEAR_HORIZON_DAYS = 62;
 const FAR_HORIZON_DAYS = 400;
 /** 强提醒（到点重发一次）行的 occurrence_key 后缀 */
@@ -1447,6 +1449,165 @@ export function deleteSchedule(db: DatabaseSync, profileId: string, id: string):
   });
 }
 
+/** 「按描述完成」的候选：一个事件（同一事件的多条提醒行只算一次） */
+export interface CompletionCandidate {
+  schedule: ScheduleRow;
+  occurrenceKey: string;
+  eventAt: string;
+  dueAt: string;
+}
+
+export type CompletionResolution =
+  | { kind: "single"; candidate: CompletionCandidate }
+  | { kind: "candidates"; candidates: CompletionCandidate[] }
+  | { kind: "already"; schedule: ScheduleRow; eventDate: string }
+  | { kind: "none"; reason: string };
+
+export interface CompletionQuery {
+  /** 标题/备注关键词（子串匹配） */
+  match?: string | null;
+  /** match 模式的目标本地日期，缺省今天 */
+  date?: string | null;
+  /** recent 模式：最近 N 小时内已推送、尚未处理的提醒 */
+  recentHours?: number | null;
+}
+
+const MAX_COMPLETION_CANDIDATES = 10;
+
+/** 按事件前缀去重，代表行优先取普通提醒行、其次 due_at 最早 */
+function groupByEvent(
+  rows: (OccurrenceRow & { schedule_id: string })[],
+): Map<string, OccurrenceRow & { schedule_id: string }> {
+  const chosen = new Map<string, OccurrenceRow & { schedule_id: string }>();
+  for (const row of rows) {
+    const key = `${row.schedule_id}|${eventPrefixOf(row.occurrence_key) ?? row.occurrence_key}`;
+    const prev = chosen.get(key);
+    if (
+      prev === undefined ||
+      (!isNormalReminderKey(prev.occurrence_key) && isNormalReminderKey(row.occurrence_key))
+    ) {
+      chosen.set(key, row);
+    }
+  }
+  return chosen;
+}
+
+/**
+ * 「用户口头说做完了」的服务端定位（替代 agent 自己 list → 匹配 → 挑 key 的多步流程）。
+ *
+ * - match：在该 Profile 的 active 日程里按标题/备注子串匹配，取**本地日期 = date（缺省今天）**
+ *   的未完成发生；一次性日程在未显式给 date 时不限日期（「取消酒店订单搞定了」的事件可能在未来）。
+ *   匹配到日程但当天那次已完成 → already（如实告知，不重复操作）。
+ * - recentHours：不需要任何关键词，取最近 N 小时内**已推送（notified）且未处理**的提醒。
+ *   用于推送没有进入对话上下文、用户只回一句「交了 / 巡检过了」的场景。
+ *
+ * 只读：真正的完成仍由调用方走 completeSchedule（同一套事件前缀收敛与一次性收尾语义）。
+ */
+export function resolveCompletionTarget(
+  db: DatabaseSync,
+  profileId: string,
+  query: CompletionQuery,
+): CompletionResolution {
+  const match = query.match?.trim() ?? "";
+  const hasMatch = match !== "";
+  const hasRecent = query.recentHours !== null && query.recentHours !== undefined;
+  if (hasMatch === hasRecent) throw new Error("按描述完成需要且只能提供 match 或 recent 之一");
+
+  if (hasRecent) {
+    const hours = query.recentHours as number;
+    const nowAt = now();
+    const since = nowAt.minus({ hours }).toUTC().toISO() as string;
+    const rows = db
+      .prepare(
+        `SELECT o.schedule_id, o.occurrence_key, o.event_at, o.due_at, o.status
+         FROM occurrences o JOIN schedules s ON s.id = o.schedule_id
+         WHERE s.profile_id = ? AND s.status = 'active' AND o.status = 'notified'
+           AND o.due_at >= ? AND o.due_at <= ?
+         ORDER BY o.due_at DESC`,
+      )
+      .all(profileId, since, nowIso()) as unknown as (OccurrenceRow & { schedule_id: string })[];
+    // 同一事件若还有未推送的兄弟行（如 #1 尚 pending）也照样算这一个事件；已 done 的事件
+    // 不会出现在 notified 里（completeSchedule 按前缀整体收敛）。
+    const candidates = toCandidates(db, profileId, groupByEvent(rows));
+    if (candidates.length === 0) {
+      return { kind: "none", reason: `最近 ${hours} 小时没有已推送且未处理的提醒` };
+    }
+    return candidates.length === 1
+      ? { kind: "single", candidate: candidates[0] as CompletionCandidate }
+      : { kind: "candidates", candidates: candidates.slice(0, MAX_COMPLETION_CANDIDATES) };
+  }
+
+  const explicitDate = query.date !== null && query.date !== undefined;
+  const date = explicitDate ? (query.date as string) : todayIso();
+  const schedules = db
+    .prepare(
+      `SELECT * FROM schedules
+       WHERE profile_id = ? AND status = 'active'
+         AND (instr(lower(title), lower(?)) > 0 OR instr(lower(COALESCE(note, '')), lower(?)) > 0)
+       ORDER BY created_at`,
+    )
+    .all(profileId, match, match) as unknown as ScheduleRow[];
+  if (schedules.length === 0)
+    return { kind: "none", reason: `没有标题或备注包含「${match}」的进行中日程` };
+
+  const picked = new Map<string, OccurrenceRow & { schedule_id: string }>();
+  let already: { schedule: ScheduleRow; eventDate: string } | null = null;
+  for (const schedule of schedules) {
+    const rows = (
+      db
+        .prepare(
+          `SELECT occurrence_key, event_at, due_at, status FROM occurrences
+           WHERE schedule_id = ? ORDER BY event_at, due_at, occurrence_key`,
+        )
+        .all(schedule.id) as unknown as OccurrenceRow[]
+    ).map((row) => ({ ...row, schedule_id: schedule.id }));
+    const oneOffAnyDate = schedule.recurrence_json === null && !explicitDate;
+    const onDate = rows.filter((row) => oneOffAnyDate || instantToLocalDate(row.event_at) === date);
+    const open = onDate.filter((row) => row.status === "pending" || row.status === "notified");
+    if (open.length === 0) {
+      if (already === null && onDate.some((row) => row.status === "done")) {
+        already = { schedule, eventDate: date };
+      }
+      continue;
+    }
+    // 一次性日程不限日期时取最早那次；其余情况当天的发生按事件去重
+    for (const [key, row] of groupByEvent(open)) {
+      picked.set(key, row);
+      if (oneOffAnyDate) break;
+    }
+  }
+  const candidates = toCandidates(db, profileId, picked);
+  if (candidates.length === 1)
+    return { kind: "single", candidate: candidates[0] as CompletionCandidate };
+  if (candidates.length > 1) {
+    return { kind: "candidates", candidates: candidates.slice(0, MAX_COMPLETION_CANDIDATES) };
+  }
+  if (already !== null) return { kind: "already", ...already };
+  return {
+    kind: "none",
+    reason: `「${match}」相关日程在 ${date} 没有待完成的发生`,
+  };
+}
+
+function toCandidates(
+  db: DatabaseSync,
+  profileId: string,
+  grouped: Map<string, OccurrenceRow & { schedule_id: string }>,
+): CompletionCandidate[] {
+  const out: CompletionCandidate[] = [];
+  for (const row of grouped.values()) {
+    const schedule = getSchedule(db, profileId, row.schedule_id);
+    if (schedule === undefined) continue;
+    out.push({
+      schedule,
+      occurrenceKey: row.occurrence_key,
+      eventAt: row.event_at,
+      dueAt: row.due_at,
+    });
+  }
+  return out;
+}
+
 export interface UpcomingItem {
   schedule_id: string;
   title: string;
@@ -1761,7 +1922,14 @@ export function reminderBlocks(
     ["重复", repeatTextOf(row)],
   ];
   if (row.note !== null && row.note !== "") rows.push(["备注", row.note]);
-  return { table: { columns: ["项目", "内容"], rows }, notes: note === null ? undefined : [note] };
+  const notes = note === null ? [] : [note];
+  // 待办提醒给一句回复提示：推送不一定进入对话上下文，提示语让用户的短回复带上明确意图，
+  // agent 侧对应 complete {recent:true} / snooze（见 SKILL.md「完成回执」）
+  if (row.kind === "todo") notes.push(REMINDER_REPLY_HINT);
+  return {
+    table: { columns: ["项目", "内容"], rows },
+    notes: notes.length === 0 ? undefined : notes,
+  };
 }
 
 /**

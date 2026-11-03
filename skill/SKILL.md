@@ -1,10 +1,11 @@
 ---
 name: life-assistant
-description: 个人生活助理：天气/空气质量/节假日调休/日程提醒（公历+农历）/支出记账/通知管理
+description: 个人生活助理：天气/空气质量/节假日调休/日程提醒（公历+农历）/完成回执/支出记账/通知管理
 read_when:
   - 用户问天气、空气、预警、穿衣出行建议
   - 用户问节假日、调休、某天是否上班
   - 用户想设提醒、待办、生日、纪念日（含农历）
+  - 用户说某件事做完了/搞定了（巡检、打卡、报销等），要把对应待办标记完成
   - 用户想记账、查支出、看月度账单
   - 用户提到通知、静默时段、推送设置
 ---
@@ -65,6 +66,23 @@ read_when:
 - `list`/`upcoming` 里的 `下次提醒`、`提醒时间` 是 **UTC ISO**；同一对象另给 `下次提醒(本地)`/`提醒时间(本地)`（Asia/Shanghai，`YYYY-MM-DD HH:mm`）—— **向用户报时间一律用「(本地)」键**，直接读 UTC 值会差 8 小时。`list`/`upcoming`/`add`/`update` 的回执还带 `备注`、`工作日筛选`（不限/仅工作日/仅节假日）与 `重发分钟`，需要确认用户设置时直接读这些字段。
 - 历史 occurrence 超 90 天由服务端自动清理（只清**已提醒/已完成/已取消**的行；`pending` 永不删；使用 `recurrence.count` 的日程整条豁免，因为次数上限依赖历史行数）。用户问「很久以前的提醒怎么查不到」时按此解释。
 
+### 完成回执（用户口头报告已做完）
+
+用户说「巡检搞定了」「下班卡打了」「交了」「XX 已经做完」这类话，是**完成回执**，不是闲聊也不是让我新建日程。服务端负责定位，**不要先 list 再自己挑 key**：
+
+- 话里有事项关键词 → `schedule {action:"complete", match:"巡检"}`；用户说的是别的日子（「昨天的巡检做了」）再加 `date:"YYYY-MM-DD"`，缺省今天。
+- 只说「交了 / 做完了 / 打了」、对话里也看不出指哪件事（主动推送不一定在对话上下文里）→ `schedule {action:"complete", recent:true}`：取最近 12 小时内**已推送且未处理**的提醒。不要反问用户「你指什么」，先调它。
+- 对话里刚好有 `[Webhook delivery: life-…]` 开头的提醒原文时，用那条的标题作 `match`。
+
+按回执的 `结果` 回报：
+- `已完成` → 「已标记完成 <标题>（<事件时间>），下次 <下次提醒(本地)>」；一次性待办 `状态` 为 done 时说「这件事已结束」。
+- `多个候选` → 把 `候选` 的标题和事件时间列给用户选，选定后用该项的 `id` + `occurrence_key` 调 `complete`。
+- `已处理` → 说明这次之前已经标记过，不重复操作。
+- `未找到` → 如实说没找到对应日程，可以问要不要新建；绝不擅自 `add`。
+- 用户说「推迟半小时 / 晚点再提醒」→ 用候选或匹配到的 `id` 调 `snooze {minutes:30}`。
+
+`complete` 的 `match`/`recent` 与 `id`/`occurrence_key`/`all` 互斥；日常回执永远不要用 `all:true`（会结束整个系列）。
+
 ## 记账
 
 - 只记支出，金额单位为元（`amount: 12.34`）。
@@ -87,6 +105,8 @@ read_when:
 
 - 分类字典：`expense {action:"categories"}` 看标准分类/别名/近 90 天用量；`expense {action:"category_alias", category:"餐饮", alias:"吃饭"}` 建别名（`remove:true` 删除）。建好后 `expense add` 写「吃饭」会自动记成「餐饮」，历史数据不改。
 - 明细翻页：`expense {action:"list", ledger_id, limit: 50, offset: 50}`，回执里有「偏移」「还有更多」；看板明细有「加载更多」按钮。
+- 静默时段：`notify {action:"quiet_hours"}` 查看；`start:"23:00", end:"07:00"`（HH:MM，可跨午夜，二者必须同时给）设置；`clear:true` 清除。
+- 撤回一条还没发出的推送：`notify {action:"cancel", id}`（id 来自 `pull`/`history`）。回执会如实说明是真取消了、已经发出（撤不回）、还是根本没有投递；已在发送中的那次拦不住。
 - 静默时段内主动推送暂停，`notify.pull` 不受影响——用户说"没收到通知"时先 pull（`pull` 默认 20 条、上限 100；一次拉不完就再拉一次）。
 - 推送路由配置：`notify {action: "route", url: "...", channel: "webhook"}`；secret 由环境变量提供，工具配置失败时检查服务端 env。`channel` 缺省 `webhook`，可选 `log`（只写服务端日志，本地联调）、`bark`（`https://api.day.app/<device_key>`，iOS）、`ntfy`（`https://ntfy.sh/<topic>` 或自建，Android/跨平台）、`telegram`（`https://api.telegram.org/bot<token>/sendMessage?chat_id=<id>`）、`smtp`（`smtp://user:pass@host:587?from=&to=`，`to` 可重复；465/`smtps` 隐式 TLS、587 STARTTLS、25 明文，`?tls=` 可覆盖；SMTP 密码会随路由回显，别放进共享聊天）、`openclaw`（回环 OpenClaw Gateway hook：映射式如 `http://127.0.0.1:18789/hooks/life-default`；微信/QQ 这类多账号通道用直连式 `http://127.0.0.1:18789/hooks/agent?channel=qqbot&to=qqbot%3Ac2c%3A<openid>&agentId=bestie&accountId=bestie`——路径恰好是 `/hooks/agent` 且带 `channel`/`to` 时改发直连载荷，可带 `agentId`/`accountId`，映射式不带 `accountId`；服务端登记 `OPENCLAW_PROFILE_TARGETS_JSON` 后可直接 `notify {action:"route", channel:"openclaw"}` 不传 url，但传了必须与登记目标一致；共享 Gateway 只有一个 `hooks.token`，不要再给 openclaw 配 per-profile secret（`PROFILE_ROUTE_SECRETS_JSON` 只用于每个用户自己的 Gateway）；`OPENCLAW_WAIT_FOR_COMPLETION=1` 时只有 `delivered=true` 才算送达，NO_REPLY/静默抑制会落 fallback；401=token 与 Gateway 不一致，400 `message required`=直连缺 channel/to，409 会自动重试）—— `bark`/`ntfy`/`telegram`/`smtp` 的 URL 本身就是凭据，提醒用户别用可猜的 topic、别把密码贴进群聊。
 - 按类型静音/限通道：`notify {action: "prefs"}` 看当前偏好与内置默认，`notify {action: "prefs", kind: "bookkeeping.entry", push: true}` 恢复逐笔记账回执，`channels: ["ntfy"]` 限定通道。关闭推送的通知仍会入库，`notify.pull` 照样取得到。
