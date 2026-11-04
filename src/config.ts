@@ -27,38 +27,6 @@ export type LogLevel = "debug" | "info" | "warn" | "error";
 /** 气象预警推送的级别阈值（含），由 ALERT_MIN_LEVEL 配置。 */
 export type AlertLevel = "blue" | "yellow" | "orange" | "red";
 
-/**
- * OpenClaw 的「目标绑定」：token 可以共享，但每个 Profile 只能投到自己登记的目标。
- * 这是功能隔离（消息/日程/账单各归各位）的核心，不依赖 per-profile secret。
- */
-export interface OpenclawTargetBase {
-  /** global = 用 daemon 的 OPENCLAW_HOOK_TOKEN；profile = 用 PROFILE_ROUTE_SECRETS_JSON[profile] */
-  auth: "global" | "profile";
-  /** Gateway 基地址（默认 OPENCLAW_BASE_URL）；解析后一定是回环 http(s) origin */
-  baseUrl: string;
-}
-
-/** 直连 /hooks/agent：目标写在 query 上，支持 accountId（多账号通道必需）。 */
-export interface OpenclawDirectProfileTarget extends OpenclawTargetBase {
-  mode: "direct";
-  agentId?: string;
-  channel: string;
-  to: string;
-  accountId?: string;
-  /** 直连模式是否等待 OpenClaw 返回 completion.delivered；默认 OPENCLAW_WAIT_FOR_COMPLETION */
-  waitForCompletion: boolean;
-}
-
-/** 映射式 /hooks/<hook>：目标由 OpenClaw 的 mapping 固定，life-assistant 只校验 hook 名。 */
-export interface OpenclawMappingProfileTarget extends OpenclawTargetBase {
-  mode: "mapping";
-  hook: string;
-}
-
-export type OpenclawProfileTarget = OpenclawDirectProfileTarget | OpenclawMappingProfileTarget;
-
-export type OpenclawCredentialSource = "profile" | "global" | "missing";
-
 export interface ResolvedConfig {
   dataDir: string;
   dbPath: string;
@@ -99,21 +67,9 @@ export interface ResolvedConfig {
   profileRouteSecrets: Record<string, string>;
   /**
    * 部署自身 profile（HERMES_PROFILE，缺省 "default"）：daemon 自己代表的那个 Profile。
-   * 它由运维者持有，即使同时登记在 PROFILE_TOKENS_JSON 里也仍按 master 代表处理 ——
-   * openclaw 通道的全局 token 准入（P2-17）靠它区分「运维者本人」与「隔离用户」。
+   * 它由运维者持有，即使同时登记在 PROFILE_TOKENS_JSON 里也仍按 master 代表处理。
    */
   deploymentProfile: string;
-  /** OpenClaw Gateway hooks token（OPENCLAW_HOOK_TOKEN）；仅 openclaw 通道投递时使用。 */
-  openclawHookToken?: string;
-  /** OpenClaw Gateway 基地址（OPENCLAW_BASE_URL，默认 http://127.0.0.1:18789） */
-  openclawBaseUrl: string;
-  /** 直连模式默认是否等待 completion.delivered（OPENCLAW_WAIT_FOR_COMPLETION，默认 false） */
-  openclawWaitForCompletion: boolean;
-  /**
-   * 每个 Profile 的 openclaw 路由目标（OPENCLAW_PROFILE_TARGETS_JSON）。
-   * 登记后：共享 token 也可用，但 URL 必须与登记目标逐项一致；未登记时保留旧行为。
-   */
-  openclawProfileTargets: Record<string, OpenclawProfileTarget>;
   dailyBriefCron: string;
   /** 气象预警巡检 cron（Asia/Shanghai） */
   alertWatchCron: string;
@@ -141,147 +97,6 @@ export interface ResolvedConfig {
    * 并释放 busy，挂死的 handler 继续在后台跑但不阻塞后续触发与停机。
    */
   jobTimeoutMs: number;
-}
-
-const OPENCLAW_DIRECT_TARGET_KEYS = new Set([
-  "mode",
-  "auth",
-  "baseUrl",
-  "agentId",
-  "channel",
-  "to",
-  "accountId",
-  "waitForCompletion",
-]);
-const OPENCLAW_MAPPING_TARGET_KEYS = new Set(["mode", "auth", "baseUrl", "hook"]);
-const OPENCLAW_HOOK_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-
-/** OpenClaw Gateway 基地址：只允许回环 http(s) origin，凭据不会被引到别的机器。 */
-function parseOpenclawBaseUrl(raw: string | undefined, name: string): string {
-  const value = raw?.trim() || "http://127.0.0.1:18789";
-  let parsed: URL;
-  try {
-    parsed = new URL(value);
-  } catch {
-    throw new Error(`${name} 不是合法 URL: ${value}`);
-  }
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw new Error(`${name} 仅支持 http/https: ${value}`);
-  }
-  if (parsed.username !== "" || parsed.password !== "") {
-    throw new Error(`${name} 不允许包含用户名/密码: ${value}`);
-  }
-  if (parsed.pathname !== "/" || parsed.search !== "" || parsed.hash !== "") {
-    throw new Error(
-      `${name} 只能是 origin（如 http://127.0.0.1:18789），不能带路径/query/hash: ${value}`,
-    );
-  }
-  const hostname = parsed.hostname.replace(/^\[/, "").replace(/\]$/, "");
-  if (!isLoopbackHost(hostname)) {
-    throw new Error(`${name} 仅接受回环地址（127.0.0.1 / localhost / [::1]）: ${value}`);
-  }
-  return parsed.origin;
-}
-
-/** 目标字段的通用校验：非空、长度受限、不含控制字符。 */
-function targetString(value: unknown, name: string, max = 256): string {
-  if (typeof value !== "string") throw new Error(`${name} 必须是字符串`);
-  const trimmed = value.trim();
-  if (trimmed === "") throw new Error(`${name} 不能为空`);
-  if (trimmed.length > max) throw new Error(`${name} 过长（≤${max} 字符）`);
-  for (const char of trimmed) {
-    const code = char.codePointAt(0) ?? 0;
-    if (code < 0x20 || code === 0x7f) throw new Error(`${name} 不允许控制字符`);
-  }
-  return trimmed;
-}
-
-function optionalTargetString(value: unknown, name: string): string | undefined {
-  if (value === undefined) return undefined;
-  return targetString(value, name);
-}
-
-/**
- * OPENCLAW_PROFILE_TARGETS_JSON：把「每个 Profile 只能投到自己的目标」变成配置事实。
- * 结构示例：
- * {"default":{"mode":"direct","agentId":"main","channel":"qqbot","to":"...","accountId":"default"}}
- */
-function parseOpenclawTargets(
-  raw: string | undefined,
-  defaultBaseUrl: string,
-  defaultWaitForCompletion: boolean,
-): Record<string, OpenclawProfileTarget> {
-  if (raw === undefined || raw.trim() === "") return {};
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    throw new Error(
-      'OPENCLAW_PROFILE_TARGETS_JSON 不是合法 JSON：值里的引号可能被 shell 吃掉，请用单引号包裹整段（例：OPENCLAW_PROFILE_TARGETS_JSON=\'{"default":{"mode":"direct","channel":"qqbot","to":"..."}}\'）',
-    );
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw new Error("OPENCLAW_PROFILE_TARGETS_JSON 必须是 {profile: target} 对象");
-  }
-  const entries = Object.entries(parsed as Record<string, unknown>);
-  if (entries.length > 32) throw new Error("OPENCLAW_PROFILE_TARGETS_JSON 最多 32 个 Profile");
-  const out: Record<string, OpenclawProfileTarget> = {};
-  for (const [profile, value] of entries) {
-    if (!PROFILE_ID_RE.test(profile)) {
-      throw new Error(`OPENCLAW_PROFILE_TARGETS_JSON 的 Profile 名不合法: ${profile}`);
-    }
-    const prefix = `OPENCLAW_PROFILE_TARGETS_JSON.${profile}`;
-    if (typeof value !== "object" || value === null || Array.isArray(value)) {
-      throw new Error(`${prefix} 必须是对象`);
-    }
-    const obj = value as Record<string, unknown>;
-    const mode = obj.mode;
-    if (mode !== "direct" && mode !== "mapping") {
-      throw new Error(`${prefix}.mode 必须是 direct 或 mapping`);
-    }
-    const allowed = mode === "direct" ? OPENCLAW_DIRECT_TARGET_KEYS : OPENCLAW_MAPPING_TARGET_KEYS;
-    for (const key of Object.keys(obj)) {
-      if (!allowed.has(key)) throw new Error(`${prefix} 未知字段: ${key}（mode=${mode} 不接受）`);
-    }
-    const authRaw = obj.auth ?? "global";
-    if (authRaw !== "global" && authRaw !== "profile") {
-      throw new Error(`${prefix}.auth 必须是 global 或 profile`);
-    }
-    const baseUrl =
-      obj.baseUrl === undefined
-        ? defaultBaseUrl
-        : parseOpenclawBaseUrl(String(obj.baseUrl), `${prefix}.baseUrl`);
-    if (mode === "mapping") {
-      const hook = targetString(obj.hook, `${prefix}.hook`, 64);
-      if (!OPENCLAW_HOOK_NAME_RE.test(hook)) {
-        throw new Error(`${prefix}.hook 只能是单个 hook 名（字母/数字/._-）: ${hook}`);
-      }
-      out[profile] = { mode, auth: authRaw, baseUrl, hook };
-      continue;
-    }
-    const channel = targetString(obj.channel, `${prefix}.channel`);
-    if (channel === "last") {
-      throw new Error(`${prefix}.channel 不能是 last（OpenClaw 直连投递要求具体通道）`);
-    }
-    const to = targetString(obj.to, `${prefix}.to`);
-    const agentId = optionalTargetString(obj.agentId, `${prefix}.agentId`);
-    const accountId = optionalTargetString(obj.accountId, `${prefix}.accountId`);
-    const waitRaw = obj.waitForCompletion;
-    if (waitRaw !== undefined && typeof waitRaw !== "boolean") {
-      throw new Error(`${prefix}.waitForCompletion 必须是布尔值`);
-    }
-    out[profile] = {
-      mode,
-      auth: authRaw,
-      baseUrl,
-      channel,
-      to,
-      ...(agentId === undefined ? {} : { agentId }),
-      ...(accountId === undefined ? {} : { accountId }),
-      waitForCompletion: waitRaw ?? defaultWaitForCompletion,
-    };
-  }
-  return out;
 }
 
 function parseSecrets(raw: string | undefined): Record<string, string> {
@@ -604,18 +419,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
   // 反代（Lucky/nginx）后面关闭信任：只有显式开启才采信 X-Forwarded-For 做限流/日志。
   const trustProxy = parseBooleanFlag(env.TRUST_PROXY, "TRUST_PROXY", false);
 
-  const openclawBaseUrl = parseOpenclawBaseUrl(env.OPENCLAW_BASE_URL, "OPENCLAW_BASE_URL");
-  const openclawWaitForCompletion = parseBooleanFlag(
-    env.OPENCLAW_WAIT_FOR_COMPLETION,
-    "OPENCLAW_WAIT_FOR_COMPLETION",
-    false,
-  );
-  const openclawProfileTargets = parseOpenclawTargets(
-    env.OPENCLAW_PROFILE_TARGETS_JSON,
-    openclawBaseUrl,
-    openclawWaitForCompletion,
-  );
-
   const { host: qweatherHost, key: qweatherKey, auth: qweatherAuth } = resolveQweather(env);
   // 注入给 qweather 客户端（模块级）：天气工具按旧签名只传 host+key，JWT 签名器走这里
   setQweatherAuth(qweatherAuth ?? null);
@@ -728,10 +531,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
     defaultCity: env.DEFAULT_CITY?.trim() || "北京",
     profileRouteSecrets: parseSecrets(env.PROFILE_ROUTE_SECRETS_JSON),
     deploymentProfile,
-    openclawHookToken: env.OPENCLAW_HOOK_TOKEN?.trim() || undefined,
-    openclawBaseUrl,
-    openclawWaitForCompletion,
-    openclawProfileTargets,
     dailyBriefCron,
     alertWatchCron,
     alertMinLevel: alertMinLevel.data,
@@ -772,113 +571,3 @@ export function urlHost(host: string): string {
 
 /** 部署自身 profile 的缺省名（HERMES_PROFILE 未设置时） */
 export const DEFAULT_DEPLOYMENT_PROFILE = "default";
-
-/**
- * openclaw 全局 hooks token 的准入口径（**未登记 OPENCLAW_PROFILE_TARGETS_JSON 的旧部署**）：
- * 1. `profileId` 是**部署自身 profile**（HERMES_PROFILE）→ 可用（运维者本人，master 代表）；
- * 2. 其它**登记在 PROFILE_TOKENS_JSON** 的 profile → 不可用（必须提供自己的 route secret，
- *    否则不得借用 master 的全局 token）；
- * 3. **未登记独立 token** 的 profile → 可用（PROFILE_TOKENS_JSON 为空或未含该 profile：
- *    回环零配置 / 仅 master 部署没有独立用户身份，保持既有行为）。
- *
- * 登记目标后走目标绑定：token 可共享，URL 必须与登记目标一致（见 openclawTargetForProfile /
- * resolveOpenclawCredentialSource）；本函数只作为未登记目标时的兼容口径。
- * 判定内核只有这一份：ownProfile / profileHasOwnToken 由调用方从配置或环境快照取出，
- * 避免「配置层」与「投递层」各写一套口径而漂移。
- */
-export function openclawCanUseGlobalToken(
-  profileId: string,
-  ownProfile: string,
-  profileHasOwnToken: boolean,
-): boolean {
-  return profileId === ownProfile || !profileHasOwnToken;
-}
-
-/** ResolvedConfig 版本：notify 工具层的 openclaw 准入门槛用这个 */
-export function canUseGlobalOpenclawToken(config: ResolvedConfig, profileId: string): boolean {
-  return openclawCanUseGlobalToken(
-    profileId,
-    config.deploymentProfile,
-    // Object.hasOwn：profile 名允许 "constructor" 这类原型键，直接取值会命中 Object.prototype
-    Object.hasOwn(config.profileTokens, profileId),
-  );
-}
-
-/** HERMES_PROFILE 缺省/空白 → 部署自身 profile 缺省名；其余原样（非法值在启动时已拒绝） */
-function deploymentProfileFromEnv(env: NodeJS.ProcessEnv): string {
-  const raw = env.HERMES_PROFILE?.trim();
-  return raw === undefined || raw === "" ? DEFAULT_DEPLOYMENT_PROFILE : raw;
-}
-
-/** 环境快照里的 PROFILE_TOKENS_JSON 是否登记了该 profile（解析失败按「未登记」处理） */
-function profileHasOwnTokenInEnv(profileId: string, env: NodeJS.ProcessEnv): boolean {
-  const raw = env.PROFILE_TOKENS_JSON;
-  if (raw === undefined || raw.trim() === "") return false;
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return false;
-    return Object.hasOwn(parsed as Record<string, unknown>, profileId);
-  } catch {
-    return false;
-  }
-}
-
-/**
- * 环境快照版本：`src/core/channels.ts` 的投递路径拿不到 ResolvedConfig（ChannelDeliveryInput
- * 只有 profileId/secret/route），只能按 daemon 进程环境判定 —— 仅用于「隔离用户回退全局
- * token」的一次性告警，准入拦截仍以 canUseGlobalOpenclawToken(config, …) 为准。
- * 解析失败/缺失一律按「可用全局 token」处理：宁可少告警，也不把 master 的投递误报成越权。
- */
-export function canUseGlobalOpenclawTokenFromEnv(
-  profileId: string,
-  env: NodeJS.ProcessEnv = process.env,
-): boolean {
-  return openclawCanUseGlobalToken(
-    profileId,
-    deploymentProfileFromEnv(env),
-    profileHasOwnTokenInEnv(profileId, env),
-  );
-}
-
-/** 是否存在需要等待 OpenClaw completion 的直连目标（停机 drain 上界据此放宽）。 */
-export function openclawWaitForCompletionEnabled(config: ResolvedConfig): boolean {
-  if (config.openclawWaitForCompletion) return true;
-  return Object.values(config.openclawProfileTargets).some(
-    (target) => target.mode === "direct" && target.waitForCompletion,
-  );
-}
-
-/** 全局 openclaw token：优先配置快照，测试/特殊场景回退进程环境（与投递层同口径） */
-export function resolveOpenclawGlobalToken(config: ResolvedConfig): string | undefined {
-  return config.openclawHookToken ?? process.env.OPENCLAW_HOOK_TOKEN?.trim();
-}
-
-/** 取该 Profile 的 openclaw 目标（Object.hasOwn：profile 名可能是 constructor 这类原型键） */
-export function openclawTargetForProfile(
-  config: ResolvedConfig,
-  profileId: string,
-): OpenclawProfileTarget | undefined {
-  return Object.hasOwn(config.openclawProfileTargets, profileId)
-    ? config.openclawProfileTargets[profileId]
-    : undefined;
-}
-
-/**
- * 凭据来源判定（工具层、投递层、跳过判定共用一份）：
- * - 目标登记了 auth=global → 只认全局 token；
- * - 目标登记了 auth=profile → 只认该 Profile 的 route secret；
- * - 未登记目标（旧行为）→ profile secret 优先，其次全局 token。
- */
-export function resolveOpenclawCredentialSource(input: {
-  profileSecret?: string;
-  globalToken?: string;
-  target?: OpenclawProfileTarget;
-}): OpenclawCredentialSource {
-  const profileSecret = input.profileSecret?.trim();
-  const globalToken = input.globalToken?.trim();
-  if (input.target?.auth === "profile") return profileSecret ? "profile" : "missing";
-  if (input.target?.auth === "global") return globalToken ? "global" : "missing";
-  if (profileSecret) return "profile";
-  if (globalToken) return "global";
-  return "missing";
-}

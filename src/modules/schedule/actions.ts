@@ -75,7 +75,7 @@ export function createSchedule(
   clientToken: string | null = null,
 ): ScheduleRow {
   validateScheduleInput(input);
-  // 服务层再收口一道 remind_offsets 边界（MCP 有 zod，quick 直接走工具层绕过了它）。
+  // 服务层再收口一道 remind_offsets 边界（MCP 有 zod，直接调服务层的路径绕过了它）。
   validateRemindOffsets(input.remindOffsets);
   // P2-3：一次性日程的开始日期早于今天时，物化永远产不出 occurrence（游标从昨天起、
   // 引擎只产出严格晚于游标的日期）。此前这种写入会「成功」但 0 提醒、永久 active ——
@@ -168,7 +168,7 @@ export function updateSchedule(
 ): ScheduleRow {
   const row = getSchedule(db, profileId, id);
   if (row === undefined) throw new Error(`日程不存在: ${id}`);
-  // 只有**本次显式传入**的 remind_offsets 才做完整边界校验（quick 绕过 MCP schema 的
+  // 只有**本次显式传入**的 remind_offsets 才做完整边界校验（绕过 MCP schema 的
   // 路径主要走 create；update 的显式值同样要收口）。未传时沿用库里的历史值，
   // 存量脏数据（越界/多余项）不能被无关 patch 卡死 —— validateScheduleInput 里的
   // 「最多 5 个」长度检查保持不变，这里只补范围/整数/非空。

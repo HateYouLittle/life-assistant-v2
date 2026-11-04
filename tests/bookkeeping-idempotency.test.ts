@@ -218,7 +218,7 @@ describe("bookkeeping 幂等：request_id → client_token", () => {
 
   // P2-4：命中幂等时回执必须整体取自原记录。此前「账本」取自本次调用解析出的 ledger，
   // 于是同一 request_id 换账本重试（或默认账本被改）会得到「金额/分类是原记录、账本却是本次参数」
-  // 的自相矛盾回执，quick 的 audit_log.detail 也一并被污染。
+  // 的自相矛盾回执。
   it("幂等命中时回执的账本取自原记录，不随本次参数漂移（P2-4）", () => {
     const env = makeTestEnv();
     const t = tools(env);

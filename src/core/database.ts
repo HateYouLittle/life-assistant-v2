@@ -212,8 +212,8 @@ CREATE TABLE IF NOT EXISTS cn_holiday_years (
   last_error TEXT
 ) STRICT;
 
--- 审计日志（v5）：记录谁在何时对什么做了什么。首期只接手机写 API（quick.expense.add /
--- quick.schedule.add）：那是唯一不经 MCP、直接由 HTTP 凭据驱动的写路径。
+-- 审计日志（v5）：记录谁在何时对什么做了什么。首期接的手机写 API 已移除，
+-- 表与 /api/audit 保留，存量行照常可查。
 -- 只增不改；detail_json 只放非隐私摘要，不放 token/备注全文。
 -- 注意：本注释区域不要出现半角圆括号，Node 22 的 SQLite 重建表时会按 token 解析建表语句。
 CREATE TABLE IF NOT EXISTS audit_log (

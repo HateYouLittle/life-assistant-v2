@@ -666,7 +666,7 @@ export function updateExpense(db: DatabaseSync, id: string, patch: ExpensePatch)
 
 /**
  * 更正一笔支出（带分类字典归一）。`updateExpense` 不知道 Profile（导入/测试直接调用），
- * 因此把「别名 → 标准名」放在这一层：MCP 工具与 /api/quick 等写路径都走它。
+ * 因此把「别名 → 标准名」放在这一层：MCP 工具与 invokeTool 等写路径都走它。
  *
  * 只归一**本次显式传入**的 category；不传 category 时原值不动（不改已存在数据的分类）。
  */

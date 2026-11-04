@@ -25,9 +25,9 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
 - 只跑单个测试文件：`node --import tsx/esm --test tests/schedule.test.ts`
 - `npm run dev` 用 tsx 跑 `src/daemon.ts`；`npm start` 跑构建产物 `dist/daemon.js`
   （需先 `npm run build`）。`db:backup` / `db:cleanup:preview` / `db:restore` / `db:fingerprint` /
-  `doctor` / `import:v1` / `calendar:url` 同理：无前缀脚本依赖 `dist/`，`dev:*` 变体直接跑 TS 源码。
+  `doctor` 同理：无前缀脚本依赖 `dist/`，`dev:*` 变体直接跑 TS 源码。
 - `.env` 只会被 `start` / `dev` / `db:backup` / `db:cleanup:preview` / `db:restore` /
-  `calendar:url` / `db:fingerprint` / `doctor` / `import:v1` 及其 `dev:*` 变体通过
+  `db:fingerprint` / `doctor` 及其 `dev:*` 变体通过
   `--env-file-if-exists` 自动读取。
   其他命令需手动 `set -a; source .env; set +a`。
 - 首次运行会创建 `$DATA_DIR/life-assistant.db`；测试使用一次性临时目录。
@@ -35,8 +35,8 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
 ## 架构
 
 - `src/core/` 是框架层：database/fingerprint/audit/registry/action-tool/jobs/lock/security/auth/http/
-  logger/logrotate/settings/notify/notify-prefs/channels/smtp/render/qweather/qweather-jwt/holiday/recurrence/
-  retention/backup/ratelimit/metrics/ics。`src/modules/`
+  logger/logrotate/settings/notify/notify-prefs/channels/render/qweather/qweather-jwt/holiday/recurrence/
+  retention/backup/ratelimit/metrics。`src/modules/`
   （weather/holiday/schedule/bookkeeping/bills/notify/maintenance）通过 `src/modules/index.ts` 的
   副作用 import 接入，遵循 `tools / jobs / tick / onStart` 四个契约扩展点。`maintenance`
   注册每日备份（与 `db:backup` CLI 共用 `src/core/backup.ts`）、每日 WAL checkpoint 与日志轮转三个 job。
@@ -45,9 +45,7 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   不能换桶绕过）；桶数有硬上限（默认 10_000，满时淘汰最旧）。`clientAddress`/`envClientAddress`
   统一地址口径（只有 `TRUST_PROXY=1` 才采信 `X-Forwarded-For`）。
   `src/core/metrics.ts`：进程内计数器（`auth_failed_total` / `auth_forbidden_total` / `rate_limited_total`）。
-  `src/core/ics.ts`：日历订阅的签名 URL（HMAC-SHA256(master, `"<profile>.<exp>"`)）与 ICS 文本工具。
-  `src/server/quick.ts`（`/quick` + `/api/quick/*`）、`src/server/calendar.ts`（`/calendar.ics`）、
-  `src/server/ops.ts`（`/metrics` + `/readyz`）是三个独立子应用，由 `createHttpHandler` 挂到
+  `src/server/ops.ts`（`/metrics` + `/readyz`）是独立子应用，由 `createHttpHandler` 挂到
   同一个 Hono 上（共享 Host/Origin 守卫与限流）；`src/server/budget.ts` 是预算看板的纯函数层。
 - `src/core/jobs.ts`：`job_runs` 运行记录（running→ok/failed/skipped）、`CATCHUP_POLICY`
   启动补发白名单、`previousFireTime`（自写 cron 反向求值：支持 `*`、单值、逗号列表、
@@ -64,7 +62,7 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   `src/core/security.ts`：`applySecureUmask`/`hardenDataDir`/`applyCliSecurityBaseline`/
   `createRequestGuard`（umask 077 与目录/库/备份收紧对 daemon 与 `db:backup`/`db:restore`/
   `db:cleanup:preview`/`db:fingerprint` 同口径：库不存在时只设 umask、不 chmod 可能写错的目录；
-  `import:v1`/doctor 只设 umask；
+  doctor 只设 umask；
   `createRequestGuard` 是 Host/Origin 守卫，daemon 的 `createHttpHandler` 对所有路径统一调用）。
   `src/restore.ts` 是 `npm run db:restore` 的实现（校验/留底/替换，复用 `backupStatus` 的
   规范文件口径；锁文件损坏/不可读时拒绝恢复）。
@@ -72,13 +70,11 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   而不仅是运行时查重。新模块在 `modules/index.ts` 注册。
 - **非 MCP 调用方一律经 `registry.invokeTool(name, args, ctx)` 调工具**（P2-24）：按名取
   `allTools()` 里的 def、用模块自己的 zod raw shape 校验参数、把 handler 抛错转成工具错误结果。
-  手机快捷入口 `src/server/quick.ts` 的写路径已改为这条，**不得再 import 模块 index 里的 handler**。
+  新增 HTTP 写入口也必须走这条，**不得 import 模块 index 里的 handler**。
 - server 层的既有例外（`tests/registry.test.ts` 扫描 core + server 两层，例外逐条白名单，白名单
   过期即报错）：`src/server/details.ts` 与 `src/server/budget.ts` 直接 import bookkeeping/schedule
   的**纯函数**（monthRange / KIND_LABEL / budgetStatus 等）；`src/server/status.ts` 的 CSV 导出
-  import bookkeeping 的 `expenseCsv`；`src/server/quick.ts` 保留两处**只读** service import
-  （bootstrap 首屏聚合 + 幂等命中时回读原记录的事件时间——不能从本次请求参数推算，与 P2-4 同因）；
-  以及 `import "../modules/index.js"`（模块注册入口，非模块内部实现）。模块间还有一条：
+  import bookkeeping 的 `expenseCsv`；以及 `import "../modules/index.js"`（模块注册入口，非模块内部实现）。模块间还有一条：
   `src/modules/weather/briefs.ts` 直接 import `schedule/service.ts` 的 `agendaForDate`。改这些签名可能
   静默破坏状态页或简报——记得同步检查这几处。
 - Runtime 是进程级单例（`src/core/registry.ts` 的 `initRuntime`/`runtime`），只能初始化一次。
@@ -110,16 +106,14 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   务必在 `finally` 里 `cleanupTestEnv(env)`。
 - 状态页内联 JS 在 `node:vm` + DOM 桩里做端到端测试（`tests/status-page-script.test.ts`），
   因为纯字符串断言看不出整页渲染故障。浏览器脚本是 `src/server/assets/` 下的真实 `.js`：
-  `shared.js`（`el`/`esc`/`yuan`，两页共用、只此一份）+ `status-page.js`（看板）/
-  `quick-page.js`（`/quick`）。`page-script.ts` 与 `quick.ts` 在模块加载时 `readAsset` 读入，
-  前面拼一段前导（`var token = (resolveToken)(...)` 等服务端注入的全局），`SCRIPT` /
-  `QUICK_SCRIPT` = 前导 + shared + 页面脚本。每页一个 `tsconfig.<页>.json`（checkJs，
-  `strict:false`，两页在全局作用域有同名函数，不能放进同一个程序）由 `npm run typecheck` 覆盖，
-  前导注入的全局在 `*globals.d.ts` 声明；biome 对 `src/server/assets/**` 用单引号并关闭
+  `shared.js`（`el`/`esc`/`yuan`，只此一份）+ `status-page.js`（看板）。`page-script.ts` 在模块加载时
+  `readAsset` 读入，前面拼一段前导（`var token = (resolveToken)(...)` 等服务端注入的全局），`SCRIPT`
+  = 前导 + shared + 页面脚本。`tsconfig.status.json`（checkJs，`strict:false`）由 `npm run typecheck` 覆盖，
+  前导注入的全局在 `globals.d.ts` 声明；biome 对 `src/server/assets/**` 用单引号并关闭
   `noInnerDeclarations`（块内 `var` 改 `let` 会改作用域）。`npm run build` 把 `assets/*.js`
   拷到 `dist/server/assets/`，漏拷会让 dist 启动时读文件失败。
-  `tests/status-page-script-syntax.test.ts` 对两页脚本跑 `node --check`（P2-23），并断言
-  `esc`/`yuan` 不出现第二份。部分测试按单行文本断言脚本片段（如 `tests/expense-export.test.ts`），
+  `tests/status-page-script-syntax.test.ts` 对状态页脚本跑 `node --check`（P2-23），并断言
+  `esc`/`yuan`/`el` 不出现第二份。部分测试按单行文本断言脚本片段（如 `tests/expense-export.test.ts`），
   被 biome 折行时用 `// biome-ignore format:` 保留整句，不要改断言。
 - 走 `createHttpHandler` 的测试会经过 Host/Origin 守卫：用 `http.request` 指向 `127.0.0.1`
   时 Host 自动放行（回环主机名不限端口）；要测拒绝路径就直接构造 `IncomingMessage` 风格的
@@ -148,10 +142,10 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
 - 写路径幂等：`expense add` / `schedule add` 的可选 `request_id` 落 `client_token`（分范围唯一）。
   新增有副作用的写工具应沿用同一模式——插入撞唯一索引后按 token 查回原记录并标 `已存在`，
   不要只在应用层「先查后写」（并发/MCP 重试下不可靠）。
-- 打开老库可能升级 schema 的入口（daemon、`doctor`、`db:cleanup:preview`、`import:v1`）都传
+- 打开老库可能升级 schema 的入口（daemon、`doctor`、`db:cleanup:preview`）都传
   `openDatabase(dbPath, { backupDir: config.backupDir })`；新增 CLI 若会打开主库也要这样传，
   否则前滚不会有迁移前快照（仅 warn）。
-- 所有 HTTP 请求都过 Host/Origin 守卫：缺 Host 或不在允许名单 → 403；带 Origin 时必须同源（**例外**：自带签名凭据的 `/calendar.ics` 跳过 Origin 校验 —— 凭据在 URL 里、没有 cookie 可被跨站带走，而 IM 内置浏览器打开链接会带 `Origin: null`；Host 检查仍保留）
+- 所有 HTTP 请求都过 Host/Origin 守卫：缺 Host 或不在允许名单 → 403；带 Origin 时必须同源（没有任何路径豁免 Origin 校验）
   （无 Origin 的 CLI/agent 放行）。绑定 `0.0.0.0` 或经反代/域名访问时，把实际 Host 写进
   `WEB_ALLOWED_HOSTS`，否则是预期内的 403。
 - 启动补发只覆盖 `CATCHUP_POLICY` 白名单内的 job，且只补最近一次；cron **环境变量必须恰好
@@ -168,10 +162,9 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   `setMilliseconds(0)` 后下一次轮询再匹配一次），守卫保证同一触发时刻只执行一次。
 - **鉴权矩阵**：`/api/*`（看板/只读）认 master 与 Profile token —— master=家庭看板（家庭账本
   支出 + 所有 Profile 日程/通知），Profile token=个人视图（家庭+本人个人账本、仅自己的日程/
-  通知/投递）；`/api/quick/*` 同上；身份由 `resolveIdentity` 反查（**绝不读 `X-Hermes-Profile`**）；
+  通知/投递）；身份由 `resolveIdentity` 反查（**绝不读 `X-Hermes-Profile`**）；
   `/mcp` 两者都认，但 Profile token 强绑定自己的 Profile，会话与 token 不一致 → 403；
-  `/metrics` 只认 master；`/readyz`、`/healthz` 无需凭据；`/calendar.ics` 用签名 URL
-  （`src/core/ics.ts`），不使用 header。新增接口时先想清楚属于哪一档、按什么身份过滤。
+  `/metrics` 只认 master；`/readyz`、`/healthz` 无需凭据。新增接口时先想清楚属于哪一档、按什么身份过滤。
 - **限流豁免**：`/healthz` 与 `/readyz` 不参与限流（外部监控高频轮询会被 429 误判）；
   `/metrics` 与业务接口一样受限流。`RATE_LIMIT_PER_MINUTE=0` 时整体关闭限流（仅本地调试）。
   改 `createHttpHandler` 的豁免名单要同步 `docs/remote-access.md`。
@@ -214,23 +207,15 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   `notify {action:"cancel"}` 的回执按真实状态分档（`cancelPendingDeliveries` 返回
   `{cancelled, sending}`）——已 sent / 无投递 / sending 在途 都与「真取消」区分，不再一律回
   「已取消…待投递」（P2-26）。
-- **重启时的「不确定投递」按通道幂等性分叉**（P2-10）：`recoverStaleSending` 只对 `webhook`
-  （对端按 `X-Request-ID` 去重）复位重发；bark/ntfy/telegram/smtp/openclaw 及「通道未知」一律判
+- **重启时的「不确定投递」只有 webhook 自动复位**（P2-10）：`recoverStaleSending` 只对 `webhook`
+  （对端按 `X-Request-ID` 去重）复位重发；`log`、已移除的旧通道及「通道未知」一律判
   `fallback` 终态、保留 `request_started_at`（`requeueRoute` 只捞 `IS NULL`，不会自动重投），
   重发只能人工走 `notify.retry`/`retryDeliveries`。通道名按该 Profile **当前生效路由**反查
   （`deliveries` 无 channel 列），换过通道的极少数场景按更保守一侧处理。
-- **openclaw 通道的隔离是「目标绑定」**：一个 Gateway 只有一个 `hooks.token`，共享 Gateway 时所有
-  Profile 都用 `OPENCLAW_HOOK_TOKEN`，隔离靠 `OPENCLAW_PROFILE_TARGETS_JSON`（`config.openclawProfileTargets`）
-  在配置期与投递前校验 `agentId/channel/to/accountId`（映射式只校验 hook）。登记目标后 `notify route`
-  可省略 URL，`buildOpenclawRouteUrl` 生成；`assertOpenclawRouteMatchesTarget` 是唯一比较口径。
-  `PROFILE_ROUTE_SECRETS_JSON[profile]` 只用于目标 `auth:"profile"`（每个用户自己的 Gateway）；
-  未登记目标的旧部署保留 P2-17 行为（profile secret 优先，部署自身 profile / 未登记独立 token 的
-  profile 回退全局 token），存量隔离路由仍投递并打一次性 warn（`warnOpenclawGlobalTokenFallback`）。
-  `validateRoute` 把路径收紧到 `/hooks/<name>`（保留 `/hooks/agent?channel=&to=` 直连形态），直连还
-  拒绝缺 channel/to、`channel=last`、空 `agentId`/`accountId`、`?token=` 与未知 query；OpenClaw 的
-  409（配置热更新）按可重试处理。直连 `waitForCompletion` 只在 `completion.delivered=true` 时算送达，
-  静默抑制落 fallback 且通知保持未读。`validateRoute` 另拒绝含 `..`/`.` 段、空段（`//`）或百分号
-  编码 `%2e`/`%2f` 的 pathname（会被反代/Gateway 归一化到 `/hooks/` 之外，N-3）。
+- **内置通道只有 `webhook` 与 `log`**（bark/ntfy/telegram/smtp/openclaw 已移除，不做数据迁移）：
+  库里残留旧通道的路由由 `skipReason` 判为 `removedChannelError(name)`（「通道 X 已移除，请用 notify route
+  重新配置为 webhook」）落 fallback，不抛错、不卡 drain；`request_started_at` 仍为 NULL，重新配置路由后
+  `requeueRoute` 会把它们捞回。旧 `.env` 里的 `OPENCLAW_*` 被 config 直接忽略。
 - **日程终态只有 `done` 一种**（P2-1 / P2-6）：`complete {all:true}` 对**任意 kind**（含生日/纪念日）
   置 `done` 并如实回执「已结束整个系列」；限次（`count`）用尽或截止（`until`）到期、且**已无待发
   pending** 时由物化收尾置 `done`（`recurrenceExhausted()` 显式问「到 until 为止还有没有候选」，

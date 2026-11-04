@@ -88,7 +88,7 @@ describe("文档一致性", () => {
       .filter((name) => !name.startsWith("dev:"));
     assert.ok(
       withEnvFile.length >= 4,
-      `应至少有 start/dev/db:backup/db:cleanup:preview/import:v1，实际 ${withEnvFile.join(", ")}`,
+      `应至少有 start/dev/db:backup/db:cleanup:preview，实际 ${withEnvFile.join(", ")}`,
     );
 
     const readmeList = envFileList("README.md") ?? "";
@@ -105,7 +105,7 @@ describe("文档一致性", () => {
 
   it("SKILL.md 的农历 interval 条款不承诺「填了会直接报错」", () => {
     // 回归（N11）：条款曾写「填 interval: 2 会直接报错」，但这只在**显式传**时成立。
-    // 当时有两条绕过路径（solar→lunar 转换不传 recurrence、import:v1 裸 INSERT），
+    // 当时有两条绕过路径（solar→lunar 转换不传 recurrence、已移除的 v1 导入器裸 INSERT），
     // 文档的过度承诺让 agent 无法判断该行还能不能编辑。N9 已在写入侧收口，
     // 这里钉住文档口径与实装一致：必须同时说清「显式传才报错」与「旧数据仍可编辑」。
     const skill = read("skill/SKILL.md");

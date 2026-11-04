@@ -9,7 +9,7 @@
   "main": "dist/daemon.js",
   "scripts": {
     "build": "tsc -p tsconfig.json && mkdir -p dist/server/assets && cp src/server/assets/*.js dist/server/assets/",
-    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit && tsc -p src/server/assets/tsconfig.status.json && tsc -p src/server/assets/tsconfig.quick.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit && tsc -p src/server/assets/tsconfig.status.json",
     "lint": "biome lint src tests",
     "lint:fix": "biome lint --write src tests",
     "format": "biome format --write src tests",
@@ -21,16 +21,12 @@
     "dev:db:backup": "tsx --env-file-if-exists=.env src/backup.ts",
     "db:restore": "node --env-file-if-exists=.env dist/restore.js",
     "dev:db:restore": "tsx --env-file-if-exists=.env src/restore.ts",
-    "calendar:url": "node --env-file-if-exists=.env dist/calendar-url.js",
-    "dev:calendar:url": "tsx --env-file-if-exists=.env src/calendar-url.ts",
     "db:fingerprint": "node --env-file-if-exists=.env dist/fingerprint.js",
     "dev:db:fingerprint": "tsx --env-file-if-exists=.env src/fingerprint.ts",
     "db:cleanup:preview": "node --env-file-if-exists=.env dist/cleanup-preview.js",
     "dev:db:cleanup:preview": "tsx --env-file-if-exists=.env src/cleanup-preview.ts",
     "doctor": "node --env-file-if-exists=.env dist/doctor.js",
-    "dev:doctor": "tsx --env-file-if-exists=.env src/doctor.ts",
-    "import:v1": "node --env-file-if-exists=.env dist/import-v1.js",
-    "dev:import:v1": "tsx --env-file-if-exists=.env src/import-v1.ts"
+    "dev:doctor": "tsx --env-file-if-exists=.env src/doctor.ts"
   },
   "dependencies": {
     "@hono/node-server": "^2.0.12",

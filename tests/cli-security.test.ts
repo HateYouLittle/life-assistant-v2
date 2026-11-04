@@ -22,7 +22,7 @@ import { applyCliSecurityBaseline } from "../src/core/security.js";
 
 /**
  * CLI 安全基线（Round1 审查 C4）：daemon 启动时有 `applySecureUmask` + `hardenDataDir`，
- * 但 `db:backup` / `db:restore` / `import:v1` / `db:cleanup:preview` / `db:fingerprint`
+ * 但 `db:backup` / `db:restore` / `db:cleanup:preview` / `db:fingerprint`
  * 由用户手工执行，此前按默认 umask 把库/备份/迁移前快照落成 0644、目录 0755。
  * 这里钉住：共享 helper 生效，且真实 `db:backup` CLI 的产物是 0600、目录 0700。
  *

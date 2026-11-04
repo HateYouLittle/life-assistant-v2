@@ -245,7 +245,7 @@ describe("notify 工具", () => {
     const def = allTools().find((t) => t.def.name === "notify")?.def;
     assert.ok(def !== undefined, "notify 工具应已注册");
     const channels = supportedChannels();
-    assert.ok(channels.length > 3, `通道数应多于 3，否则这条回归无意义: ${channels.join(",")}`);
+    assert.deepEqual(channels, ["webhook", "log"]);
     const shape = def.inputSchema as Record<string, { description?: string } | undefined>;
     const fieldDescription = shape.channel?.description ?? "";
     assert.notEqual(fieldDescription, "", "channel 字段必须有 describe（agent 只看得见 schema）");
@@ -255,6 +255,11 @@ describe("notify 工具", () => {
         `channel 字段描述缺少通道 ${name}：${fieldDescription}`,
       );
       assert.ok(def.description.includes(name), `工具总描述缺少通道 ${name}`);
+    }
+    // 已移除的通道不得再出现在 agent 看得见的 schema 里
+    for (const removed of ["bark", "ntfy", "telegram", "smtp", "openclaw"]) {
+      assert.ok(!fieldDescription.includes(removed), `channel 字段描述仍含已移除通道 ${removed}`);
+      assert.ok(!def.description.includes(removed), `工具总描述仍含已移除通道 ${removed}`);
     }
   });
 });

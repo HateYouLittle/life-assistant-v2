@@ -1,12 +1,12 @@
 import type { DatabaseSync } from "node:sqlite";
-import {
-  openclawTargetForProfile,
-  type ResolvedConfig,
-  resolveOpenclawCredentialSource,
-  resolveOpenclawGlobalToken,
-} from "../config.js";
+import type { ResolvedConfig } from "../config.js";
 import { inQuietWindow, nowIso, quietResumeAt } from "../time.js";
-import { findChannel, getChannel, type NotificationChannel } from "./channels.js";
+import {
+  findChannel,
+  getChannel,
+  type NotificationChannel,
+  removedChannelError,
+} from "./channels.js";
 import { withTransaction } from "./database.js";
 import { logger } from "./logger.js";
 import { getNotifyPrefs, kindPushDecision } from "./notify-prefs.js";
@@ -28,10 +28,6 @@ const MAX_CONFIRMED_FAILURES = 5;
 const MAX_TRANSPORT_FAILURES = 3;
 const IDEMPOTENCY_WINDOW_MS = 55 * 60 * 1000;
 const BATCH_LIMIT = 100;
-/** openclaw 凭据缺失时，把待投行延后多久再试（保持 queued，不落终态）。 */
-const OPENCLAW_CREDENTIAL_DEFER_MS = 5 * 60 * 1000;
-/** 每个 Profile 的「凭据缺失」告警只打一次，避免每轮 drain 刷屏。 */
-const openclawCredentialWarned = new Set<string>();
 const CONCURRENCY = 5;
 const DRAIN_BUDGET_MS = 45_000;
 
@@ -214,20 +210,9 @@ export function publishProfile(
   const createdAt = nowIso();
   const routable = routableRoute(getPushRoute(db, profileId));
   const secret = routeSecret(config, profileId);
-  const openclawTarget =
-    routable?.channel.name === "openclaw" ? openclawTargetForProfile(config, profileId) : undefined;
-  // webhook 看 route secret；openclaw 的凭据来源由目标 auth 决定（global/profile），
-  // log 等无凭据通道不受影响。缺凭据时不再落注定失败的投递行。
+  // webhook 看 route secret；log 无凭据通道不受影响。缺凭据时不再落注定失败的投递行。
   const credentialMissing =
-    routable !== null &&
-    (routable.channel.requiresSecret
-      ? secret === undefined
-      : routable.channel.name === "openclaw" &&
-        resolveOpenclawCredentialSource({
-          profileSecret: secret,
-          globalToken: resolveOpenclawGlobalToken(config),
-          target: openclawTarget,
-        }) === "missing");
+    routable !== null && routable.channel.requiresSecret && secret === undefined;
   // 按 kind 的通知偏好：判定必须发生在**建 delivery 之前**。关闭推送的语义是「不打扰，但记录还在」——
   // 若改成「建了 delivery 再投失败」，通知会被投递成功路径标已读、notify.pull 也取不到，
   // 用户既没收到推送也看不到通知。通道白名单用当前路由的通道名判定（无路由时为空串，必然不匹配）。
@@ -282,9 +267,7 @@ export function publishProfile(
   // 关闭推送的 kind 不该再为「缺凭据」刷 warn：那是用户主动选择的安静，不是配置错误
   if (credentialMissing && decision.push) {
     logger.warn(
-      routable?.channel.name === "openclaw"
-        ? `Profile ${profileId} 的 openclaw 路由缺少可用凭据（检查 OPENCLAW_HOOK_TOKEN 或 PROFILE_ROUTE_SECRETS_JSON），通知仅保留可 pull`
-        : `Profile ${profileId} 已配置推送路由但 PROFILE_ROUTE_SECRETS_JSON 缺少对应 secret，通知仅保留可 pull`,
+      `Profile ${profileId} 已配置推送路由但 PROFILE_ROUTE_SECRETS_JSON 缺少对应 secret，通知仅保留可 pull`,
     );
   }
   if (!decision.push) {
@@ -353,10 +336,7 @@ export function cancelPendingDeliveries(
 /**
  * 幂等通道：请求带唯一 request_id，对端按 id 去重，重发不会让用户收到第二条推送。
  * 目前只有 webhook（回环 Hermes 网关按 X-Request-ID 去重）。
- *
- * openclaw 虽然也带 `idempotencyKey`，但网关侧是否真的按它去重无法在本仓库核实 ——
- * 按**非幂等**保守处理：宁可让用户手工重发（`notify.retry`），也不冒「用户收到两条」的风险。
- * 将来若确认对端去重语义，把它加进这个集合即可。
+ * log 只写本地日志（不会停在 sending），已移除的旧通道与未知通道按非幂等保守处理。
  */
 const IDEMPOTENT_CHANNELS = new Set<string>(["webhook"]);
 
@@ -374,13 +354,13 @@ export const UNCERTAIN_EXCEEDED_WINDOW_ERROR =
 /**
  * 启动/每轮 drain：收拾上次进程留下的 `sending` 行（「请求已发出、结果未知」）。
  *
- * 关键取舍（P2-10）：**幂等通道与非幂等通道必须分开处理**。
- * - 幂等通道（webhook，Hermes 按 X-Request-ID 去重）：未超窗 → 复位 `queued`，重发时复用
+ * 关键取舍（P2-10）：**只有 webhook 自动复位**。
+ * - webhook（Hermes 按 X-Request-ID 去重）：未超窗 → 复位 `queued`，重发时复用
  *   原 request_id，对端去重、用户不会收到第二条；超窗（>55min，对端可能已清掉去重记录）
  *   → 终态 `fallback`，不盲重发。
- * - 非幂等通道（bark/ntfy/telegram/smtp/openclaw）：重启发生在「请求已发出、未落库」之间时，
- *   那条推送**可能已经真的送达**，重发就是给用户多发一条。因此无论是否超窗一律判终态
- *   `fallback`，由用户 `notify.retry` 确认后手工重发。
+ * - 其它（log、已移除的旧通道、路由缺失/通道未知）：那条推送**可能已经真的送达**，
+ *   重发就是给用户多发一条。因此无论是否超窗一律判终态 `fallback`，由用户
+ *   `notify.retry` 确认后手工重发。
  *
  * 通道名按「该 Profile 当前生效路由」反查（`deliveries` 行没有 channel 列，且本项不允许改
  * schema）；路由已删除/通道未知时一律按**非幂等**保守处理 —— 这条路径上「漏发等人工确认」
@@ -679,22 +659,6 @@ export function drainDue(
             }
             continue;
           }
-          if (skip === "openclaw credentials missing") {
-            // 凭据缺失通常是配置问题（token 写错/还没加载），不是这条通知的终态：
-            // 保持 queued 并延后重试，别让用户必须手工 notify.retry。
-            const retryAt = new Date(Date.now() + OPENCLAW_CREDENTIAL_DEFER_MS).toISOString();
-            db.prepare(
-              "UPDATE deliveries SET next_attempt_at = ?, last_error = ?, updated_at = ? WHERE id = ?",
-            ).run(retryAt, skip, nowIso(), row.id);
-            if (!openclawCredentialWarned.has(row.profile_id)) {
-              openclawCredentialWarned.add(row.profile_id);
-              logger.warn(
-                `Profile ${row.profile_id} 的 openclaw 凭据缺失，待投通知暂缓 ${OPENCLAW_CREDENTIAL_DEFER_MS / 60000} 分钟（保持 queued，不落终态）`,
-              );
-            }
-            advanced = true;
-            continue;
-          }
           db.prepare(
             "UPDATE deliveries SET status = 'fallback', last_error = ?, updated_at = ? WHERE id = ?",
           ).run(skip, nowIso(), row.id);
@@ -764,23 +728,14 @@ function skipReason(db: DatabaseSync, config: ResolvedConfig, row: DeliveryRow):
   const route = getPushRoute(db, row.profile_id);
   if (route === null || !route.enabled) return "route removed";
   const channel = findChannel(route.channel);
-  // 未知通道名按路由不可用处理（手工改库/降级回滚）：不能让 drain 每轮抛错卡住别的 Profile
-  if (channel === null || (channel.requiresUrl && route.url === "")) return "route removed";
+  // 已移除的旧通道（bark/ntfy/telegram/smtp/openclaw）或未知通道名（手工改库/降级回滚）：
+  // 落 fallback 并给出可操作的中文原因，不能让 drain 每轮抛错卡住别的 Profile。
+  // 行的 request_started_at 仍为 NULL，用户重新配置路由后 requeueRoute 会把它们重新入队。
+  if (channel === null) return removedChannelError(route.channel?.trim() || "(空)");
+  if (channel.requiresUrl && route.url === "") return "route removed";
   if (route.name !== row.route_name) return "route drift";
   const secret = routeSecret(config, row.profile_id);
   if (channel.requiresSecret && secret === undefined) return "secret missing";
-  if (channel.name === "openclaw") {
-    const target = openclawTargetForProfile(config, row.profile_id);
-    if (
-      resolveOpenclawCredentialSource({
-        profileSecret: secret,
-        globalToken: resolveOpenclawGlobalToken(config),
-        target,
-      }) === "missing"
-    ) {
-      return "openclaw credentials missing";
-    }
-  }
   return null;
 }
 
@@ -797,19 +752,7 @@ async function deliverOne(
   if (route === null || channel === null) return false;
   if (channel.requiresUrl && route.url === "") return false;
   const secret = routeSecret(config, row.profile_id);
-  const openclawTarget =
-    channel.name === "openclaw" ? openclawTargetForProfile(config, row.profile_id) : undefined;
   if (channel.requiresSecret && secret === undefined) return false;
-  if (
-    channel.name === "openclaw" &&
-    resolveOpenclawCredentialSource({
-      profileSecret: secret,
-      globalToken: resolveOpenclawGlobalToken(config),
-      target: openclawTarget,
-    }) === "missing"
-  ) {
-    return false;
-  }
 
   const claimId = newId();
   const routeName = headerSafe(row.route_name).slice(0, 80);
@@ -846,12 +789,6 @@ async function deliverOne(
     generation: row.generation,
     route: { name: route.name, url: route.url },
     secret,
-    openclawTarget,
-    openclawGlobalToken: resolveOpenclawGlobalToken(config),
-    openclawWaitForCompletion:
-      openclawTarget === undefined || openclawTarget.mode === "direct"
-        ? (openclawTarget?.waitForCompletion ?? config.openclawWaitForCompletion)
-        : false,
   });
   if (outcome.status === "sent") {
     markSent(db, row);

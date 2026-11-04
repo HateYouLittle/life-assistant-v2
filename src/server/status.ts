@@ -208,12 +208,6 @@ export function createStatusApp(config: ResolvedConfig, db: DatabaseSync): Hono<
     if (c.req.path.startsWith("/api/")) c.header("Cache-Control", "no-store");
   });
   app.use("/api/*", async (c, next) => {
-    // `/api/quick/*` 是手机快捷入口（记账/提醒），由 Profile token 授权、按身份过滤，
-    // 自己在路由里解析 identity。
-    if (c.req.path.startsWith("/api/quick/")) {
-      await next();
-      return;
-    }
     const identity = resolveIdentity({
       masterToken: config.webApiToken,
       profileTokens: config.profileTokens,

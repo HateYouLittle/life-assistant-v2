@@ -280,7 +280,7 @@ export function createOpsApp(
       authorization: c.req.header("Authorization"),
     });
     if (identity === null) {
-      // 与状态页/quick/calendar 同一口径：鉴权失败既计数也写 warn 日志。
+      // 与状态页同一口径：鉴权失败既计数也写 warn 日志。
       // 公网暴露后 /metrics 是扫描目标之一，只有计数器而没有日志会丢掉「谁在试」的线索。
       incCounter("auth_failed_total");
       // 来源可能来自 X-Forwarded-For（TRUST_PROXY=1），净化+截断后再落单行日志。

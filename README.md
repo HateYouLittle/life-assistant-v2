@@ -13,12 +13,10 @@
 | 节假日 | 大陆法定节假日/调休日历，每日 02:00 自动抓取校验（数据源 `NateScarlet/holiday-cn` 的 jsDelivr / GitHub raw；无外网时 `workday/holiday` 过滤的日程会暂停并在状态页 `holidays.failed` 显示原因；次年数据未发布记 `pending` 而不是失败） |
 | 记账 | 家庭/个人多账本、只记支出（可编辑已记支出）、CSV 导出（已做公式注入防护）、分类字典/别名（「吃饭」自动归到「餐饮」）；默认账本/常用分类降低摩擦。记账本身不推送，晚报末尾附一句「今天记了 N 笔，共 ¥X」；周报/月报只在聊天里问时由 `expense summary` 给 |
 | 周期账 | `bill` 模板（名称/金额/分类/账本/周期）到期推「该交话费了 ¥50（通讯）」——复用 schedule 的物化与提醒链路，到期日按日号锚定（31 日模板在小月取当月最后一天）；回「交了」走 `bill pay`（或 `schedule complete` 自动挂钩）一步完成提醒并入账，同一期幂等只入一笔；`pause` / `resume` 停用与恢复 |
-| 通知 | SQLite outbox + 可扩展投递通道（webhook / log / bark / ntfy / telegram / smtp / openclaw，细节见已知取舍 #17）、静默时段、`notify.pull` 兜底 |
+| 通知 | SQLite outbox + 可扩展投递通道（webhook / log，细节见已知取舍 #17）、静默时段、`notify.pull` 兜底 |
 | 备份 | daemon 内置每日 03:00 `VACUUM INTO` 备份（保留 14 份，时间与份数可配），产物自校验；schema 升级前自动留快照；`npm run db:restore` 校验并留底后一键恢复 |
 | 任务可靠性 | 每个定时任务写 `job_runs`（running→ok/failed/skipped）；停机期间错过的定时任务在启动时按白名单补发；状态页「定时任务」卡片与 `doctor --live` 可见 |
-| 部署安全 | 单实例锁（原子创建/接管）、umask 077（daemon 与 `db:backup` / `db:restore` / `db:cleanup:preview` / `db:fingerprint` 等 CLI 同口径；`import:v1`、doctor 只收紧 umask；库/备份 0600）、Host/Origin 守卫（DNS rebinding 防护）、`REQUIRE_AUTH` 强制鉴权、`WEB_ALLOWED_HOSTS` 放行名单 |
-| 手机入口 | `/quick` PWA（记一笔 / 设提醒，Profile token 鉴权）+ `POST /api/quick/expenses\|schedules`；HTTP Shortcuts 可直接导入 [docs/http-shortcuts.json](docs/http-shortcuts.json)（说明见 [docs/http-shortcuts.md](docs/http-shortcuts.md)）；小布指令/NFC 见 [docs/quick-entry.md](docs/quick-entry.md) |
-| 日历订阅 | `GET /calendar.ics` 签名 URL（HMAC + 有效期），iOS/Android 日历可订阅；`npm run calendar:url` 生成 |
+| 部署安全 | 单实例锁（原子创建/接管）、umask 077（daemon 与 `db:backup` / `db:restore` / `db:cleanup:preview` / `db:fingerprint` 等 CLI 同口径；doctor 只收紧 umask；库/备份 0600）、Host/Origin 守卫（DNS rebinding 防护）、`REQUIRE_AUTH` 强制鉴权、`WEB_ALLOWED_HOSTS` 放行名单 |
 | 运维端点 | `GET /metrics`（Prometheus 文本，master token）与 `GET /readyz`（外部监控，无需凭据） |
 
 相对 v1 的主要变化：**单守护进程**（去掉 stdio 查询进程与 scheduler 的双进程并发防护）；**46 个工具收敛为 8 个**（域内 action 参数化）；**舍弃**油价、共享账本角色、生活指数、自动化 DSL、Open-Meteo 多源回退、React 仪表盘；通知改为 **Markdown 表格**渲染（微信/企业微信；QQ 经 Hermes 已渲染）。
@@ -38,7 +36,7 @@ npm run build
 ```
 
 `npm start` / `npm run dev` / `npm run db:backup` / `npm run db:cleanup:preview` /
-`npm run db:restore` / `npm run db:fingerprint` / `npm run calendar:url` / `npm run doctor` / `npm run import:v1` 会用 Node 的 `--env-file-if-exists=.env` 自动读取同目录 `.env`
+`npm run db:restore` / `npm run db:fingerprint` / `npm run doctor` 会用 Node 的 `--env-file-if-exists=.env` 自动读取同目录 `.env`
 （已存在的环境变量优先，systemd 的 `EnvironmentFile` 不受影响）。手工执行其他命令时可
 `set -a; source .env; set +a`。
 
@@ -58,14 +56,10 @@ npm run build
 | `MCP_DAEMON_TOKEN` | | stdio 壳访问 daemon 用的 token；缺省复用 `WEB_API_TOKEN` |
 | `REQUIRE_AUTH` | | 设为 `1` 时即使只绑回环也强制要求 `WEB_API_TOKEN`，缺失则拒绝启动（默认关闭，保留本地零配置） |
 | `WEB_ALLOWED_HOSTS` | | 额外放行的 Host 名单（逗号分隔；带端口则精确匹配，裸主机不限端口）。绑定 `0.0.0.0` 或经反代/DNS 名访问时必须配置，否则请求被 403 |
-| `PROFILE_TOKENS_JSON` | | 每人一个 token：`'{"default":"…","bestie":"…"}'`（各自 ≥32 字符，不能与 master 相同）。Profile token 绑定身份：MCP、`/api/quick/*` 与看板 `/api/*` 都按 token 反查 Profile（个人视图，按身份过滤）；`/metrics`、doctor 等运维接口仍只认 `WEB_API_TOKEN` |
+| `PROFILE_TOKENS_JSON` | | 每人一个 token：`'{"default":"…","bestie":"…"}'`（各自 ≥32 字符，不能与 master 相同）。Profile token 绑定身份：MCP 与看板 `/api/*` 都按 token 反查 Profile（个人视图，按身份过滤）；`/metrics`、doctor 等运维接口仍只认 `WEB_API_TOKEN` |
 | `RATE_LIMIT_PER_MINUTE` | | 每来源 IP 每分钟请求上限（所有请求都计一层），默认 `120`；鉴权通过且带 Bearer 时再按 token 指纹加一层（同一人跨 IP 共用身份桶）。`0` 关闭（仅本地调试）。超限 429 + `Retry-After`；`/healthz`、`/readyz` 豁免，`/metrics` 受限流 |
 | `TRUST_PROXY` | | `1` 时采信 `X-Forwarded-For`（Lucky/nginx 反代后限流与日志用真实客户端 IP）；默认 `0` |
-| `PROFILE_ROUTE_SECRETS_JSON` | 主动推送需要 | `'{"default":"<openssl rand -hex 32>"}'`（整段用单引号包裹；每个 secret **至少 32 字符**）。`webhook` 通道必填；`openclaw` 只在「每个用户自己的 Gateway」场景需要（作为该 Gateway 的 `hooks.token`），共享 Gateway 请改用 `OPENCLAW_PROFILE_TARGETS_JSON` 做目标绑定 |
-| `OPENCLAW_HOOK_TOKEN` | openclaw 通道需要 | OpenClaw Gateway hooks token，必须与 `~/.openclaw/openclaw.json` 的 `hooks.token` 一致；只在投递时读取，缺失不影响 daemon 启动。**一个 Gateway 只有一个 token**：共享 Gateway 时所有 Profile 都用它，隔离靠下面的目标绑定（不是 per-profile secret） |
-| `OPENCLAW_BASE_URL` | | OpenClaw Gateway 基地址，默认 `http://127.0.0.1:18789`；只允许回环 http(s) origin。登记目标后 `notify route {channel:"openclaw"}` 可不传 URL，按基地址 + 目标自动生成 |
-| `OPENCLAW_PROFILE_TARGETS_JSON` | | 每个 Profile 的 openclaw 路由目标（共享 token + 目标绑定）：`'{"default":{"mode":"direct","agentId":"main","channel":"qqbot","to":"qqbot:c2c:<openid>","accountId":"default"},"bestie":{"mode":"direct","agentId":"bestie","channel":"qqbot","to":"qqbot:c2c:<openid>","accountId":"bestie"}}'`。登记后 URL 必须与目标逐项一致，改 URL 不能改投；映射式用 `{"mode":"mapping","hook":"life-bestie"}`。`auth` 缺省 `global`（用全局 token），`profile` 表示该 Profile 自己的 Gateway（用 `PROFILE_ROUTE_SECRETS_JSON[profile]`） |
-| `OPENCLAW_WAIT_FOR_COMPLETION` | | 直连模式是否等待 OpenClaw 返回 `completion.delivered`，默认 `0`。开启后单次投递最长约 30s；只有 `delivered=true` 才标已读，`NO_REPLY`/静默抑制会落 fallback 并保持未读。也可在单个目标里用 `waitForCompletion` 覆盖 |
+| `PROFILE_ROUTE_SECRETS_JSON` | 主动推送需要 | `'{"default":"<openssl rand -hex 32>"}'`（整段用单引号包裹；每个 secret **至少 32 字符**）。`webhook` 通道必填（`log` 通道不需要） |
 | `DAILY_BRIEF_CRON` | | 每日简报时间，默认 `'0 7 * * *'`（含空格需单引号，Asia/Shanghai） |
 | `EVENING_BRIEF_CRON` | | 晚报时间，默认 `'0 21 * * *'`；内容为明日天气/明日日程/今日未完成/明天补班或放假 |
 | `LOG_DIR` | | daemon 日志目录（launchd 重定向目标），默认 `~/Library/Logs/life-assistant`；维护 job 每日 04:55 copytruncate 轮转 |
@@ -143,77 +137,6 @@ Skill 安装：将 `skill/SKILL.md` 复制到该 Profile 的 `skills/life-assist
 3. 在对话中或直接调用：`notify {action: "route", url: "http://127.0.0.1:<gateway端口>/...", platform: "wechat"}`；
    `channel` 缺省为 `webhook`（HMAC V2 回环投递）；本地联调可传 `channel: "log"`，此时不需要 URL 与 secret，通知只写进程日志并标记为已投递；
 4. 用一条临时日程做端到端验证。
-
-OpenClaw Gateway 可将 `channel` 设为 `openclaw`，URL 只允许回环 hook 地址（路径必须落在
-`/hooks/<name>` 下）；daemon 的 `.env` 配置 `OPENCLAW_HOOK_TOKEN`，并与
-`~/.openclaw/openclaw.json` 的 `hooks.token` 保持一致。
-
-**先理解 OpenClaw 的鉴权模型**：一个 Gateway 只有一个 `hooks.token`，没有 per-agent /
-per-mapping token。因此：
-
-- **共享一个 Gateway**（本部署）时，所有 Profile 都用 `OPENCLAW_HOOK_TOKEN`；隔离靠**目标绑定**，
-  不是 per-profile secret。
-- `PROFILE_ROUTE_SECRETS_JSON[profile]` 只在「每个用户跑自己的 Gateway」（不同端口 +
-  自己的 `hooks.token`）时有意义；共享 Gateway 下给它配一个随机 secret 会直接 401。
-
-受信任家庭/多 Profile 推荐用 `OPENCLAW_PROFILE_TARGETS_JSON` 做目标绑定：
-
-```bash
-OPENCLAW_HOOK_TOKEN=<与 Gateway 的 hooks.token 一致>
-OPENCLAW_PROFILE_TARGETS_JSON='{
-  "default":{"mode":"direct","agentId":"main","channel":"qqbot","to":"qqbot:c2c:<default-openid>","accountId":"default"},
-  "bestie":{"mode":"direct","agentId":"bestie","channel":"qqbot","to":"qqbot:c2c:<bestie-openid>","accountId":"bestie"}
-}'
-# 需要确认「真的送达」再打开（单次投递最长约 30s）
-OPENCLAW_WAIT_FOR_COMPLETION=1
-```
-
-登记后 `notify {action:"route", channel:"openclaw"}` 可以不传 URL，按 `OPENCLAW_BASE_URL` +
-登记目标自动生成；传了 URL 也必须与 `agentId/channel/to/accountId` 逐项一致。每个 Profile 只能投到
-自己的目标，改 URL 不能改投。未登记目标的旧部署保留 P2-17 行为：profile secret 优先，只有
-部署自身 profile / 未登记独立 token 的 profile 回退全局 token。缺少凭据只会使对应投递失败，
-不影响 daemon 启动。
-
-OpenClaw 侧的 hook 映射按 profile 分：每个 profile 一条 `mappings` 条目，`match.path`
-对应 daemon 路由里的 hook 路径（如 `life-default` / `life-bestie`），并写死 `agentId`、
-`channel`、`to`。**映射的 `messageTemplate` 必须明确要求「原样发送、不要回 NO_REPLY」**，
-否则 agent 收到通知后可能返回静默回复，OpenClaw 会把这次投递判为
-`deliverySuppressionReason: "silent"` 并吞掉——日志里 `delivered: false` 但 `status: ok`，
-看着像通道故障，实际是投递被判定为无需发送。参考模板：
-
-```
-【life-assistant 主动通知】请把下面这条通知原样发送给用户：保留标题与正文，
-不要添加任何评论，不要调用工具，不要回复 NO_REPLY。
-
-{{notification.title}}
-
-{{notification.body}}
-```
-
-另外，hook 映射不暴露 `accountId`。微信/QQ 这类多账号通道在主动投递时必须用**收件人所属的
-那个账号**发；如果默认账号不是收件人的账号，投递会以「缺 contextToken」或静默方式失败。
-
-多账号场景用**直连模式**：路由 URL 指向 `/hooks/agent`，把目标写在 query 上（可带 `accountId`）：
-
-```
-http://127.0.0.1:18789/hooks/agent?channel=qqbot&to=qqbot%3Ac2c%3A<openid>&agentId=bestie&accountId=bestie
-```
-
-daemon 识别到路径恰好是 `/hooks/agent` 且带 `channel`/`to` 的 URL 时，会改发直连载荷
-（`message` 里已带「原样发送」指令，另带 `idempotencyKey`），而不是映射式
-`event_type/notification` 载荷。`to` 用通道自己的目标格式（QQ 私聊为
-`qqbot:c2c:<openid>`）；`accountId` 必须是该通道里已配置并启用的账号。直连缺 `channel`/`to`、
-`channel=last`、`accountId` 为空、`?token=` 或未知 query 都会在 `notify route` 配置期被拒绝。
-
-**投递确认**：OpenClaw 默认返回的 `200 {ok:true,runId}` 只代表「已受理」，不代表用户真的收到。
-`OPENCLAW_WAIT_FOR_COMPLETION=1`（或单个目标里的 `waitForCompletion: true`）会让 daemon 等待
-`completion`：只有 `completion.delivered === true` 才标已读；`NO_REPLY`/`deliverySuppressionReason:
-"silent"`/通道投递失败都会落 `fallback` 并保持未读，可 `notify.pull` 或 `notify.retry`。映射式
-`/hooks/<name>` 不支持等待完成，只能确认「已受理」。常见错误：401 = Bearer 与 Gateway 的
-`hooks.token` 不一致；400 `message required` = `/hooks/agent` 直连参数缺失；409 = OpenClaw 配置
-热更新，daemon 会按可重试处理。
-
-只用单账号通道（如飞书）时，映射式（`/hooks/life-<profile>`）更省事；需要指定账号就走直连。
 
 注意：路由是「从此刻起生效」，不会把配置之前已产生的通知补推一遍（那些仍可由
 `notify.pull` 取到）；配置后新产生的通知才会走已配置的通道。
@@ -351,33 +274,6 @@ systemctl start life-assistant
 | `db:restore` 报「daemon 仍在运行」/「锁文件…无法确认」 | 先停 daemon；锁内 pid 仍存活，或锁文件内容损坏/不可读（无法确认已停）都拒绝恢复：确认停服后手工删除 `$DATA_DIR/daemon.lock` 再重试；pid 已死的残留锁会自动放行 |
 | Profile token 打开看板 | 预期行为：Profile token 现在是「个人视图」——只看到家庭账本 + 自己的个人账本支出、自己的日程、自己的通知；master 才是家庭看板。若仍 403/401，检查 token 是否写错或已轮换 |
 | `/readyz` 返回 503 | `reasons` 是原因标识：`db_not_writable`（库打不开/只读）、`wal_too_large`（>512MB）、`outbox_stalled`（最老**到期** queued >30 分钟；静默时段的行会被推到窗口结束，不会误报）；结合 `/metrics` 与日志定位 |
-| 日历订阅 401 / 403 / 503 | 401=缺参、链接过期或 Profile 名非法（重新生成）；403=签名被改过；503=未配置 `WEB_API_TOKEN`，签名功能不可用 |
-| 手机快捷页 401 | token 写错或已被轮换：用 `?token=<新 token>` 重新引导一次 |
-
-
-## 从 v1 迁移
-
-```bash
-npm run import:v1 -- --from /旧/DATA_DIR [--force]
-```
-
-导入在单个写事务中完成。若目标 daemon 正在运行，建议先停掉它（或留足维护窗口）：导入持锁期间 daemon 的写入可能等满 `busy_timeout`（5s）后报错。
-
-一次性导入旧库的 Profile、静默时段、日程、账本（导入为**家庭账本**，所有 Profile 可编辑）、支出账目、节假日数据。旧 occurrence 不迁移（v2 按规则重新物化）；收入/转账账目、deadline 提醒、共享账本角色不迁移，均会在报告中列明。建议先对旧库做备份。
-
-导入是**逐行隔离**的：单条坏数据（金额非法、日期无法解析、引用不存在的账本、主键冲突等）
-不会中断整次导入，而是被跳过并在最后以 `[表] id：原因` 列出，进程以退出码 2 结束。
-合法数据照常入库，不必因为一条脏数据重来。若旧库的某一整张表读不出来（例如某行是超出
-JS 安全整数范围的 int64、或旧库仍被 v1 进程占用），该表会整表跳过并同样记入上面这份
-`原因` 清单 —— 不会伪装成「旧库没有这张表」的成功报告。唯一例外是 `profiles` 表：
-它读不出来时整个导入直接中止（退出码 1、目标库不被修改），而不是在缺 Profile 的前提下
-继续写日程。
-
-`--force` 只覆盖**本次成功写入的同主键行**（日程按 id 精确替换并清掉其旧 occurrence，账目按 id 替换；账本按 id upsert，因此不影响其上的月度预算）。读取失败或逐行校验失败的行不会先删除目标库原行——旧库某行坏掉时，目标库里同 id 的既有数据保持原样。导入从不写入的数据不会被清 —— 目标库里已有的通知/投递历史、v2 期间新增的日程与账目、以及任意账本的预算都会保留；只有整个事务级别的致命失败（例如 profiles 表读不出来）才会整体回滚。
-
-例外是节假日两张表：`cn_holiday_days` / `cn_holiday_years` 始终用 `INSERT OR IGNORE`
-写入，既不参与 `--force` 的清除，也不会覆盖目标库中已由 daemon 抓取的更新数据，
-因此它们只增不改（报告里的「已导入 N 天」只统计真正写入的行，被忽略的不计入）。
 
 ## 开发
 
@@ -389,29 +285,26 @@ npm run format:check   # Biome 格式检查（CI 也跑）
 npm run doctor         # 自检：配置/目录/库完整性/鉴权/JWT 私钥/备份（--network 另有连通性检查；--live 连运行中的 daemon：/healthz、任务新鲜度 /api/jobs、备份新鲜度）
 npm run db:backup      # VACUUM INTO 备份，按 BACKUP_KEEP 保留（默认 14 份），产物自校验
 npm run db:restore     # 从备份恢复（--latest 缺省 / --file 指定 / --dry-run 预演；daemon 运行中拒绝）
-npm run calendar:url   # 生成日历订阅签名 URL：--profile bestie --days 30 [--base https://<域名>]
 npm run db:fingerprint # 打印 schema 结构指纹（computed/stored/match）；漂移时提示已自动修复
 npm run db:cleanup:preview   # 零业务删除预演：occurrence 与保留策略会删掉哪些行（数字与 job 同一份判定；打开旧库时可能做附加式 schema 升级）
 ```
 
-> `db:backup` / `db:restore` / `calendar:url` / `db:fingerprint` / `db:cleanup:preview` / `doctor` / `import:v1` 跑的是 `dist/` 里的构建产物，先
+> `db:backup` / `db:restore` / `db:fingerprint` / `db:cleanup:preview` / `doctor` 跑的是 `dist/` 里的构建产物，先
 > `npm run build`（或改用对应的 `dev:*` 变体直接跑源码）。
 
-结构：`src/core`（database/fingerprint/audit/registry/jobs/lock/security/auth/http/logger/logrotate/metrics/ratelimit/settings/notify/notify-prefs/channels/smtp/render/qweather/qweather-jwt/holiday/recurrence/retention/backup/ics）、`src/modules`（weather/holiday/schedule/bookkeeping/bills/notify/maintenance，经 `modules/index.ts` 注册，核心不反向依赖）、`src/server`（status/page/details/budget/quick/calendar/action/ops，状态页、只读 API、手机入口、日历订阅、一键操作链接与运维端点）、`src/daemon.ts`、`src/stdio.ts`、`src/config.ts`、`src/time.ts`、`src/import-v1.ts`、`src/backup.ts`、`src/restore.ts`、`src/doctor.ts`、`src/fingerprint.ts`、`src/calendar-url.ts`、`src/cleanup-preview.ts`。
+结构：`src/core`（database/fingerprint/audit/registry/jobs/lock/security/auth/http/logger/logrotate/metrics/ratelimit/settings/notify/notify-prefs/channels/render/qweather/qweather-jwt/holiday/recurrence/retention/backup）、`src/modules`（weather/holiday/schedule/bookkeeping/bills/notify/maintenance，经 `modules/index.ts` 注册，核心不反向依赖）、`src/server`（status/page/page-script/details/budget/ops，状态页、只读 API 与运维端点）、`src/daemon.ts`、`src/stdio.ts`、`src/config.ts`、`src/time.ts`、`src/backup.ts`、`src/restore.ts`、`src/doctor.ts`、`src/fingerprint.ts`、`src/cleanup-preview.ts`。
 
 ## 设计要点
 
 - **单写者**：所有 SQLite 写入收敛到 daemon，WAL + 严格 schema（STRICT 表、CHECK、外键）。schema 版本记在 `meta.schema_version`，启动时逐级自动升级（只做附加式加列/加表，升级失败即拒绝启动）；库版本高于程序时同样拒绝启动。注意 `schedules.escalation_json` 是有意只走幂等补列、不提升版本的（重建 `schedules` 会牵动 `occurrences` 外键与 `kind` 的 CHECK），因此 `schema_version` 表示「升级阶梯走到了哪一级」，而非表结构的完整指纹。迁移整体包在单个事务里（失败整笔回滚，不会留下「版本号前滚了、列还没补」的半升级库）；前滚前若传了备份目录，会先 `VACUUM INTO` 一份 `life-assistant-pre-v<旧版本>-<时间戳>.db` 快照，备份失败则拒绝启动；活动账本名唯一索引建不出来同样拒绝启动（宁可停，也不让同名账本串范围）。schema v4 新增 `job_runs` 与 `expenses/schedules.client_token`（写路径幂等键）；v5 新增 `audit_log`（写接口审计）与 `meta.schema_fingerprint`（结构指纹对账，漂移会 warn，`npm run db:fingerprint` 可查）；v6 新增 `recurring_bills`（周期账模板，到期提醒复用一条 `schedules` 循环待办，删日程时 `schedule_id` 置 NULL、模板保留）。
 - **模块契约**：模块注册 `tools / jobs / tick / onStart` 四个扩展点；调度保证 tick 不重叠；核心不 import 模块内部。非 MCP 调用方（HTTP 子应用，如手机快捷入口）改为经 `registry.invokeTool(name, args, ctx)` 调工具 —— 按名取 def、用模块自己的 zod raw shape 校验参数（参数校验强度只增不减），不再直接 import 模块 handler（P2-24，`tests/registry.test.ts` 的静态扫描已覆盖 core 与 server 两层，例外逐条白名单）。8 个 action 参数化工具统一到「`action` 为规范名、`view` 为兼容别名」，`air_quality` 与 `weather {action:"air"}` 共用同一实现；与当前 action 无关的字段会**显式拒绝**（`未知字段: X（action=Y 不接受）`）而不是静默忽略（P2-20 / P2-21）。
 - **recurrence 引擎**：自研纯函数替代 rrule，只覆盖 daily/weekly/monthly/yearly × 农历 + 工作日过滤；漏触发只补最近一次。
-- **outbox**：通知 + 投递记录同事务写入；发布即触发投递；静默时段只拦主动推送；带 `expiresAt` 的通知（气象预警）到点仍未投出即作废，不会在静默时段结束后补投一条已经失效的告警（通知本身保留，`notify.pull` 仍可取到）。投递通道由 `src/core/channels.ts` 抽象：`webhook` 逐字保留原 HMAC V2 协议与重试语义，`log` 只写进程日志（本地联调用），`bark`/`ntfy`/`telegram`/`smtp` 直投外部服务（URL 即凭据，格式见已知取舍 #17），`openclaw` 直投回环 OpenClaw Gateway hook（Bearer token 优先取 `PROFILE_ROUTE_SECRETS_JSON[profile]`，仅部署自身 profile 缺省时回退 `OPENCLAW_HOOK_TOKEN`，见已知取舍 #17）；路由的 `channel` 字段缺省为 `webhook`，旧 `push_route` 数据不需要迁移。重启恢复时按通道幂等性分叉（P2-10）：`sending` 行若落在「请求已发出、终态未落库」窗口，只有 `webhook`（对端按 `X-Request-ID` 去重）会复位重发，其余通道一律判 `fallback` 终态并保留 `request_started_at`（`requeueRoute` 不会自动捞回），需要人工 `notify.retry` 重发 —— 宁可少发一条，也不重复打扰。`notify {action:"cancel"}` 的回执按真实投递状态分档（已取消 n 条 / 没有投递记录 / 已发出 / 仍有 m 条在途拦不住），不再一律回「已取消…待投递」（P2-26）。
-- **身份与可见性**：`WEB_API_TOKEN` 是 master（家庭看板、运维、doctor、Hermes stdio 壳）；`PROFILE_TOKENS_JSON` 给每人一个 token，MCP、`/api/quick/*` 与看板 `/api/*` 都按 token 反查 Profile（不再信任 `X-Hermes-Profile`），会话与 token 所属 Profile 不一致直接 403。看板可见性矩阵：支出（master=家庭账本；profile=家庭+本人个人）、日程/通知/投递/Profile 列表（master=全部；profile=仅自己）、预算与 CSV（始终家庭账本）、jobs/holidays（共享）；`/api/status` 返回 `identity` 字段供页面渲染「家庭看板 / 个人视图」。除 `/healthz`、`/readyz` 外的请求做两层固定窗口限流（所有请求按来源 IP 计一层，鉴权通过且带 Bearer 时再按 token 指纹加一层；无效/缺失凭据只计 IP 桶，轮换伪 token 不能绕过；429 + `Retry-After`），鉴权失败写 warn 日志并计入 `/metrics`。
-- **手机快捷入口**：`/quick` 是零构建 PWA（记一笔 / 设提醒，token 引导、常用分类 chips、`?type=&amount=&category=&title=` 预填），写接口 `POST /api/quick/expenses|schedules` 复用 MCP 同一份 service —— 幂等键、家庭账本回执、预算提醒、occurrence 物化语义完全一致；`GET /api/quick/bootstrap` 只返回该 Profile 可见账本与常用分类。OPPO/ColorOS 的 PWA、HTTP Shortcuts（可直接导入 `docs/http-shortcuts.json`，或按 [docs/quick-entry.md](docs/quick-entry.md) 用 cURL 导入）、小布指令/NFC 三种用法见 [docs/quick-entry.md](docs/quick-entry.md)。
-- **日历订阅**：`GET /calendar.ics?p=&exp=&sig=` 用 HMAC-SHA256(master, `"<profile>.<exp>"`) 签发**只读单个 Profile、带有效期**的链接（日历客户端无法附加请求头，所以不能直接用 token）；`npm run calendar:url -- --profile bestie --days 30 --base https://<域名>` 生成。只导出该 Profile **活跃**日程在未来 62 天内、状态为 `pending/notified` 的 occurrence；空数据也返回合法空日历。
+- **outbox**：通知 + 投递记录同事务写入；发布即触发投递；静默时段只拦主动推送；带 `expiresAt` 的通知（气象预警）到点仍未投出即作废，不会在静默时段结束后补投一条已经失效的告警（通知本身保留，`notify.pull` 仍可取到）。投递通道由 `src/core/channels.ts` 抽象：`webhook` 逐字保留原 HMAC V2 协议与重试语义，`log` 只写进程日志（本地联调用）；路由的 `channel` 字段缺省为 `webhook`，旧 `push_route` 数据不需要迁移。重启恢复（P2-10）：`sending` 行若落在「请求已发出、终态未落库」窗口，只有 `webhook`（对端按 `X-Request-ID` 去重）会复位重发，其余（`log`、已移除的旧通道、路由缺失）一律判 `fallback` 终态并保留 `request_started_at`（`requeueRoute` 不会自动捞回），需要人工 `notify.retry` 重发 —— 宁可少发一条，也不重复打扰。`notify {action:"cancel"}` 的回执按真实投递状态分档（已取消 n 条 / 没有投递记录 / 已发出 / 仍有 m 条在途拦不住），不再一律回「已取消…待投递」（P2-26）。
+- **身份与可见性**：`WEB_API_TOKEN` 是 master（家庭看板、运维、doctor、Hermes stdio 壳）；`PROFILE_TOKENS_JSON` 给每人一个 token，MCP 与看板 `/api/*` 都按 token 反查 Profile（不再信任 `X-Hermes-Profile`），会话与 token 所属 Profile 不一致直接 403。看板可见性矩阵：支出（master=家庭账本；profile=家庭+本人个人）、日程/通知/投递/Profile 列表（master=全部；profile=仅自己）、预算与 CSV（始终家庭账本）、jobs/holidays（共享）；`/api/status` 返回 `identity` 字段供页面渲染「家庭看板 / 个人视图」。除 `/healthz`、`/readyz` 外的请求做两层固定窗口限流（所有请求按来源 IP 计一层，鉴权通过且带 Bearer 时再按 token 指纹加一层；无效/缺失凭据只计 IP 桶，轮换伪 token 不能绕过；429 + `Retry-After`），鉴权失败写 warn 日志并计入 `/metrics`。
 - **运维端点**：`GET /metrics`（Prometheus 文本：鉴权/限流计数器、投递六状态、outbox 最老**到期**待投秒数（按 `next_attempt_at`，静默/退避中的行不算卡住）、每个 job 最近成功时间、备份年龄与 `life_assistant_backup_latest_verified`（读旁车、零开库，2/1/0 三态）、超时僵尸数 `life_assistant_job_zombies`、重试 >=3 次仍失败的投递数 `life_assistant_outbox_failed_retrying`、DB/WAL 大小、今日 QWeather 用量）仅 master token；`GET /readyz` 无需凭据，做 DB 可写探针、WAL 阈值与 outbox 卡住判定，异常 503 + `reasons`；结论缓存 1s（无鉴权且豁免限流，避免高频轮询每次都在单进程上跑 `BEGIN IMMEDIATE`，P2-15）——它是**秒级近似探针**，恢复也会延迟最多 1s，不是实时看门狗。两者与 `/healthz` 一样对外可用，但只有 `/readyz`/`/healthz` 豁免限流。
 - **时区**：全部调度固定 Asia/Shanghai，无 DST。
 - **任务运行记录与启动补发**：每次 job 执行写一行 `job_runs`（cron/startup/catchup/manual，running→ok/failed/skipped；进程崩溃遗留的 running 行在下次启动收敛为 failed），状态页「定时任务」卡片、`GET /api/jobs` 与 `doctor --live` 共用这份事实。启动补发只针对 `CATCHUP_POLICY` 白名单内的任务（早报、晚报、日志轮转、预警巡检、调休提醒、节假日刷新、备份、WAL checkpoint、occurrence 清理、保留策略）：用自写的 cron 反向求值算出「上一次应触发时刻」，超窗口不补、已有成功记录不补，执行前再确认一次以避开与 cron 的竞态；单个失败只记日志；汇总日志区分「尝试/成功/跳过/失败」四态（`runExclusive` 会吞异常，不能把尝试数当成功数；`skipped` 表示同名 job 未执行，P2-16）。补发把「原定触发时刻」传给 handler，早报/晚报/调休提醒按该时刻取业务日期与去重键（跨午夜补发不会用错日期、也不会占错 dedupe 键吞掉当晚正常推送）。`job_runs` 由保留策略顺带清理 30 天前的行。同步长任务阻塞事件循环跨过整分钟时，`CATCHUP_POLICY` 白名单内的 job 会回放这次错过的触发（node-cron `recoverMissedExecutions`，只对白名单开）—— 补跑按「原定时刻」执行、写 `job_runs`（trigger=`catchup`）并打 info 日志；同一触发时刻由**分钟级槽位守卫**保证只执行一次（node-cron 开启回放后即使无阻塞也会重复触发同一分钟，实测确认，P2-14）。cron 环境变量必须是**恰好 5 段**（分 时 日 月 周），不支持秒级 6 段（node-cron 能跑，但补发的反向求值只按 5 段实现，6 段会导致停机后静默不补发，启动时直接拒绝）；cron 反向求值支持 `*`、单值、逗号列表、`a-b` 范围与 `a-b/n` 步长（步长按 node-cron 的「展开范围后取模」语义，分钟/小时/星期统一按此口径）；星期字段的 `7` 只允许出现在单值/单值列表里（含 `7` 的范围/步长不做反向求值）；日/月字段不是 `*`、或出现「列表与步长混用」等无法确定语义的写法时不做反向求值（宁可漏补，不猜）。
-- **部署安全基线**：启动先原子取 `daemon.lock`（写完整临时文件后 `link` 抢占；锁内容含 pid + 进程启动时间 + 随机 token，接管前做「pid 存活 + 启动时间一致 + token 一致」三重交叉校验：pid 存活但启动时间不符判为 pid 复用并按失效锁原子接管并 warn，读不到启动时间时保守拒绝启动并给出「疑似 pid 复用，确认后删除锁」指引，P2-11）再开库 —— 两个 daemon 同时跑会让 outbox 重复投递；`umask(0o077)` 并把数据目录/库/备份收紧到 0700/0600，daemon 与 `db:backup` / `db:restore` / `db:cleanup:preview` / `db:fingerprint` 等会建库/备份的 CLI 同口径（库不存在时只收紧 umask、不 chmod 可能写错的目录；`import:v1` 只收紧 umask——目标库可能尚未创建；doctor 只收紧 umask，不改用户现有文件权限）；HTTP 入口统一校验 Host（缺失或不在允许名单即 403）与 Origin（存在时必须同源，CLI/agent 这类无 Origin 的请求放行），挡 DNS rebinding 与跨站请求；`REQUIRE_AUTH=1` 让回环部署也强制 token。
+- **部署安全基线**：启动先原子取 `daemon.lock`（写完整临时文件后 `link` 抢占；锁内容含 pid + 进程启动时间 + 随机 token，接管前做「pid 存活 + 启动时间一致 + token 一致」三重交叉校验：pid 存活但启动时间不符判为 pid 复用并按失效锁原子接管并 warn，读不到启动时间时保守拒绝启动并给出「疑似 pid 复用，确认后删除锁」指引，P2-11）再开库 —— 两个 daemon 同时跑会让 outbox 重复投递；`umask(0o077)` 并把数据目录/库/备份收紧到 0700/0600，daemon 与 `db:backup` / `db:restore` / `db:cleanup:preview` / `db:fingerprint` 等会建库/备份的 CLI 同口径（库不存在时只收紧 umask、不 chmod 可能写错的目录；doctor 只收紧 umask，不改用户现有文件权限）；HTTP 入口统一校验 Host（缺失或不在允许名单即 403）与 Origin（存在时必须同源，CLI/agent 这类无 Origin 的请求放行），挡 DNS rebinding 与跨站请求；`REQUIRE_AUTH=1` 让回环部署也强制 token。
 - **QWeather 请求治理**：按数据类型短 TTL 缓存（`CACHE_TTL_MS`：实时 20min / 逐天 2h 且取 `min(2h, 距本地次日 00:00)` / 空气质量 45min，只有成功响应才写缓存；预警的缓存 TTL 跟随 `ALERT_WATCH_CRON` 间隔 +30s（复杂 cron 回退 15min）——工具查询仍用 10min，巡检不再每轮穿透缓存、日请求量约减半）；同进程并发上限 3；仅对 429/5xx 与网络故障做指数退避（`2^c` 秒 + 抖动，c 上限 10），**4xx 一律立即抛出** —— 官方明确反复重试错误请求会被判定为攻击并冻结账号。认证优先 JWT（EdDSA），API KEY 保留回退。**GeoAPI 结果不得落盘缓存/批量存储/建索引**（官方版权限制），只允许进程内 memo —— 唯一例外是用户经 `weather locate` **显式选定的位置会作为该 Profile 的配置长期保存**（`settings.location`），属用户主动设置而非缓存/批量索引，供后续查询与每日简报复用；`weather travel` 设置的出行计划同理，只保存城市/经纬度与起止日期（`settings.travel_plan`），生效期间直接复用、**不再请求 GeoAPI**。
 - **主动推送**：定时任务组装**确定性**通知（无 LLM），走 outbox 投递，正文一律是**手机一屏看完的 1–4 行纯文本**（没有内容的行整行省略，不写「无」「未知」）：每日早报与调休/补班提醒 07:00、晚报 21:00（可配）、到点提醒、气象预警巡检每 20 分钟（缓存 TTL 跟随巡检间隔）；节假日数据刷新 02:00、内置备份 03:00、WAL checkpoint 03:15、历史 occurrence 回收 04:30、保留策略清理 04:50、日志轮转 04:55。早报：天气一行（带伞/温差/预警/污染只在需要时追加）+「📌 今天：」待办一行（最多 4 条，逾期不列）+ 7 天内生日/纪念日一行 + 明天补班/放假或 7 天内假期倒计时一行。晚报：明天天气 + 明天待办 + 明天补班/放假 + 今天记账一句话。**当天补班只由调休模块的独立通知承载**，早报不重复。预警与补班都靠 `dedupe_key` 去重（预警按「id + 级别」，级别升级会再推一次、降级不重推；补班按「事件 + 日期」），静默时段在投递层统一拦截。12-25~12-31 跨年区间若**下一年度**数据未就绪一律按 `unknown` 暂停物化（不按星期兜底猜），数据到达后自动复核该窗口的 pending 行（P2-5）；出行模式生效期间，简报与预警巡检自动改用目的地城市，天气行标注「（出行中）」。
 - **结构指纹与审计**：启动时对 `sqlite_master` 做一次规范快照并记入 `meta.schema_fingerprint`，与上次启动对比——不一致会 warn（手工 ALTER/升级异常的早期信号），`npm run db:fingerprint` 打印 computed/stored/match，`doctor` 也会检查；它是「结构漂移」检测，不是完整性校验（完整性靠 `quick_check`）。写接口（`/api/quick/*`）成功后写 `audit_log`（身份/动作/对象/摘要，不含备注全文与 token），`GET /api/audit` master 看全部、Profile 只看自己。
@@ -468,7 +361,7 @@ npm run db:cleanup:preview   # 零业务删除预演：occurrence 与保留策�
 14. **记账编辑只做「更正」，不触发推送、不保留历史**：`expense {action:"update"}` 改金额/分类/备注/日期后不记录修改前值。编辑也不能把账目挪到另一个账本。
 15. **出行模式一个 Profile 同时只保留一份计划**：`weather {view:"travel"}` 覆盖式保存，不支持多段行程/多城市串联，也没有历史行程查询；显式传 `city` 的查询始终优先于出行计划。计划只按本地日历日判断生效，跨时区行程仍以 Asia/Shanghai 为准；窗口结束后计划不会自动删除（`show` 显示未生效、可 `clear`）。简报的 `dedupeKey` 含城市名：同一天内把目的地改到另一个城市会再发一条新城市简报（旧城市那条已发出，无法撤回）。
 16. **看板 CSV 只导出家庭账本**：`/api/expenses.csv` 与看板同口径（共享 `WEB_API_TOKEN` 下不暴露个人账本），个人账本导出走 MCP `expense {action:"export"}`（仅当前 Profile 可见的账本）；CSV 只支持按月导出，不做任意区间。
-17. **投递通道有 `webhook`、`log`、`bark`、`ntfy`、`telegram`、`smtp`、`openclaw`**：`log` 只写进程日志（本地联调，不代表用户真收到）；`bark`（iOS）用 `https://api.day.app/<device_key>`；`ntfy`（Android/自建）用 `https://ntfy.sh/<topic>`；`telegram` 用 `https://api.telegram.org/bot<token>/sendMessage?chat_id=<id>`（超 4096 字符会截断并注明）；`smtp` 用 `smtp://user:pass@host:587?from=&to=`（`to` 可重复，≤10 个；465/`smtps` 隐式 TLS、587 STARTTLS、25 明文，`?tls=plain|starttls|implicit` 可覆盖；支持 AUTH LOGIN/PLAIN）；`openclaw` 用回环 OpenClaw Gateway hook（路径限 `/hooks/<name>`）。**一个 Gateway 只有一个 `hooks.token`**：共享 Gateway 时所有 Profile 都用 `OPENCLAW_HOOK_TOKEN`，隔离靠 `OPENCLAW_PROFILE_TARGETS_JSON` 的目标绑定（URL 必须与登记的 `agentId/channel/to/accountId` 逐项一致；`notify route` 可省略 URL，按登记目标生成）。`PROFILE_ROUTE_SECRETS_JSON[profile]` 仅用于「每个用户自己的 Gateway」（目标 `auth:"profile"`）；共享 Gateway 下配随机 secret 会 401。未登记目标的旧部署保留 P2-17 的 profile secret 优先 / 部署自身 profile 回退全局 token 行为，并对存量隔离路由打一次性 warn。路径只接受 `/hooks/<name>`，拒绝含 `..`/`.` 段、空段（`//`）或百分号编码 `%2e`/`%2f` 的 pathname（N-3），直连还拒绝缺 `channel`/`to`、`channel=last`、`?token=` 与未知 query。OpenClaw 的 409（配置热更新）按可重试处理；直连 200 只代表受理，`OPENCLAW_WAIT_FOR_COMPLETION=1` 时才按 `completion.delivered` 判送达（静默抑制落 fallback、保持未读）。所有 URL 形态的凭据都会落库并可能被 `notify route` 回显，别用可猜的 topic、别把密码放进共享聊天。通道仍按 Markdown 原文投递（`bark`/`ntfy`/`telegram`/`smtp`/`openclaw` 收到的是 `body_md`），没有按通道渲染格式；QQ 经 Hermes 已渲染（qqbot 适配器默认开启 markdown 并按 msg_type=2 发送），无需服务端另做纯文本版本；SMTP 的 TLS 成功路径无自动化测试（需受信证书），真机建议先用 `?tls=plain` 验证账号再切 587/465。
+17. **投递通道只有 `webhook` 与 `log`**（2026-11-04 移除 `bark`/`ntfy`/`telegram`/`smtp`/`openclaw`）：`log` 只写进程日志（本地联调，不代表用户真收到）。库里残留已移除通道的路由不做迁移、也不会让投递抛错：待投行落 `fallback`，`last_error` 为「通道 X 已移除，请用 notify route 重新配置为 webhook」，`notify route` 查看时同样提示；重新配置为 webhook 后这些从未发出的行会自动重新入队。旧 `.env` 里的 `OPENCLAW_*` 变量被直接忽略，不影响启动。通道按 Markdown 原文投递（`body_md`），没有按通道渲染格式；QQ 经 Hermes 已渲染（qqbot 适配器默认开启 markdown 并按 msg_type=2 发送），无需服务端另做纯文本版本。
 18. ~~**内置备份 job 依赖 daemon 运行 / 无完整性校验 / 无恢复入口**~~ —— **已实施（2026-10-20）**：备份产物生成后即自校验（`quick_check` + `meta.schema_version`，坏产物删除并报错）；停机错过的备份由启动补发补跑；新增 `npm run db:restore`（校验 + 留底 + 拒绝在 daemon 运行时操作）；schema 前滚前自动落 `pre-v<旧版本>` 快照；`doctor --live` 检查备份新鲜度与命名异常。仍保留：`VACUUM INTO` 在主进程事件循环上同步执行，库很大时会短暂阻塞 HTTP/MCP（每日一次、个人规模可接受；彻底隔离需要 worker thread）。状态页「备份」卡片已加（份数 / 最新一份大小与时间 / 旁车三态），但它只读旁车、不做现场校验，需要真校验请用 `doctor --live`。
 
 19. **启动补发只是「最近一次」**：每个白名单 job 只补最近一次错过的触发，且只支持「日与月为 `*`」的 cron（分钟/小时/星期支持单值、列表、`a-b` 与 `a-b/n` 步长；`7` 仅限单值/列表，特殊写法保守不反查）；连续停机多天不会逐天补齐（补 3 天前的日报只会打扰用户）。`CATCHUP_POLICY` 的键必须与真实 `module.job` 一致，`tests/jobs.test.ts` 会在键名拼错时立刻变红。
@@ -477,10 +370,10 @@ npm run db:cleanup:preview   # 零业务删除预演：occurrence 与保留策�
 22. **`db:restore` 的运行中检测只认锁**：若有人绕过锁直接跑旧版 daemon，恢复无法感知；同理恢复后删除 `-wal`/`-shm` 依赖「已停机」这个前提。
 23. **Host/Origin 守卫对回环主机名不限端口**（Host 头端口不参与路由，DNS rebinding 的边界是主机名），但 Origin 始终要求端口精确 —— 本机其它端口上的页面不会被当成同源。绑定 `0.0.0.0` 时局域网 IP/域名必须显式写进 `WEB_ALLOWED_HOSTS`，否则 403 是预期行为。
 
-24. ~~**Profile token 的权限边界**~~ —— **已实施（2026-10-20）**：MCP、`/api/quick/*`、看板 `/api/*` 都按 Profile 过滤（见「身份与可见性」）。仍保留：家庭账本支出对全家可见（含记账人字段），预算/CSV 只覆盖家庭账本；`/` 静态壳不含身份信息，身份只来自受鉴权的 `/api/status`。
+24. ~~**Profile token 的权限边界**~~ —— **已实施（2026-10-20）**：MCP、看板 `/api/*` 都按 Profile 过滤（见「身份与可见性」）。仍保留：家庭账本支出对全家可见（含记账人字段），预算/CSV 只覆盖家庭账本；`/` 静态壳不含身份信息，身份只来自受鉴权的 `/api/status`。
 25. **`/metrics` 是进程内计数器**：daemon 重启归零，没有直方图/耗时分布，也不持久化（持久事实看 `job_runs` 与 `deliveries`）。`/readyz` 的阈值（WAL 512MB、outbox 30 分钟）是代码常量，调整口径需要改代码。
-26. **ICS 未做 RFC 5545 的 75 octet 行折叠**：超长 `DESCRIPTION` 仍输出为一行，主流客户端可接受；严格合规可后续补。订阅链接一旦泄露等于该 Profile 的日程只读泄露，请用 `--days` 控制有效期并定期轮换。
-27. **`/quick` 没有离线缓存 / service worker**：「添加到主屏幕」只是快捷方式，断网时是空白页；弱网下靠 `request_id` 幂等，重复提交不会重复记账。
+26. ~~**ICS 未做 RFC 5545 的 75 octet 行折叠**~~ —— 日历订阅（`/calendar.ics`）已于 2026-11-04 移除。
+27. ~~**`/quick` 没有离线缓存 / service worker**~~ —— 手机快捷入口（`/quick`、`/api/quick/*`）已于 2026-11-04 移除。
 
 28. **预算看板只覆盖家庭账本**：个人账本属于「归属人私密」，不进看板/`/api/budget`（个人预算仍可通过 MCP `expense budget` 查看）；没设预算的账本只显示「未设预算」，**不显示本月已花多少**（避免为展示而多做一次聚合，个人规模取舍）。`/api/status` 多带了 `budget` 段，基线 payload 略增。
 
@@ -488,9 +381,9 @@ npm run db:cleanup:preview   # 零业务删除预演：occurrence 与保留策�
 
 31. **日志轮转是 copytruncate，不是 reopen**：daemon 无法控制 launchd 持有的 stdout/stderr fd，所以只能「先复制副本再清空原文件」；copy 与 truncate 之间新写入的日志可能只落在一处（凌晨低峰执行，概率很低）。要做零丢失需 daemon 自己管理日志文件（重定向改由进程内 reopen），属后续工作。`freedBytes` 指活动日志归零量，不是净磁盘释放（副本仍占盘，按 `LOG_KEEP` 删旧才真正释放）。
 
-32. **`audit_log` 目前只增不清**：每次 `/api/quick/*` 写入一行，个人规模量级可忽略；保留策略尚未接管（后续按天数清理或归档）。`/api/audit` 的 master 能看到所有 Profile 的审计 detail（含账本名/标题，但不含备注全文与 token）；Profile 只能看自己的。结构指纹是「上次启动结构 vs 当前结构」的对账，无法发现从未经过本程序的结构（首次启动/恢复旧快照后基线即当前结构）；回滚到 `pre-v4` 快照会丢掉升级后的 `audit_log` 行与指纹状态，属预期。
+32. **`audit_log` 目前只增不清**：原先只有手机快捷入口会写入（该入口已于 2026-11-04 移除，表与存量行保留），个人规模量级可忽略；保留策略尚未接管（后续按天数清理或归档）。`/api/audit` 的 master 能看到所有 Profile 的审计 detail（含账本名/标题，但不含备注全文与 token）；Profile 只能看自己的。结构指纹是「上次启动结构 vs 当前结构」的对账，无法发现从未经过本程序的结构（首次启动/恢复旧快照后基线即当前结构）；回滚到 `pre-v4` 快照会丢掉升级后的 `audit_log` 行与指纹状态，属预期。
 
-33. **OpenClaw 共享 Gateway 的隔离是「目标绑定」而非「凭据隔离」**：一个 Gateway 只有一个 `hooks.token`，无法按 Profile 签发不同 token；共享时所有 Profile 都持有同一个 token，隔离由 `OPENCLAW_PROFILE_TARGETS_JSON` 在配置期与投递前校验目标保证（改 URL 不能改投）。要真正的凭据隔离，需要每个用户自己的 Gateway（目标 `auth:"profile"` + 自己的 `hooks.token`）或改用 Bark/ntfy/Telegram/SMTP。未登记目标的存量隔离路由仍按旧行为投递并打一次性 warn（N-2）。另：重启恢复的「通道是否幂等」仍按该 Profile **当前生效路由**反查（`deliveries` 没有 channel 列），崩溃前后若用户换过通道（如 `bark` → `webhook`），可能把非幂等行误判成幂等——概率极低，精确化需给 `deliveries` 加列（P2-10 已知近似）。
+33. ~~**OpenClaw 共享 Gateway 的隔离是「目标绑定」而非「凭据隔离」**~~ —— openclaw 通道已于 2026-11-04 移除。仍保留的近似：重启恢复的「通道是否幂等」按该 Profile **当前生效路由**反查（`deliveries` 没有 channel 列），崩溃前后若用户换过通道（如 `log` → `webhook`），可能把非幂等行误判成幂等——概率极低，精确化需给 `deliveries` 加列（P2-10 已知近似）。
 
 34. **P2-3 只拦新写入，不改存量死行**：`add`/`update` 现在会明确拒绝「公历一次性 + `start_date` 早于今天」，但**此前已写入**的同类行保持原样（`status='active'`、`next_run_at=null`、永不提醒），本次不做自动收尾、也不告警。自查 SQL（把 `date('now','+8 hours')` 换成当天即可）：
     `SELECT id, profile_id, title, start_date FROM schedules WHERE recurrence_json IS NULL AND calendar='solar' AND start_date < date('now','+8 hours') AND status='active';`

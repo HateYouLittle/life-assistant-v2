@@ -7,7 +7,8 @@ import {
   DEFAULT_CHANNEL,
   getChannel,
   type NotificationChannel,
-  openclawChannel,
+  REMOVED_CHANNELS,
+  removedChannelError,
   supportedChannels,
 } from "../src/core/channels.js";
 import {
@@ -36,7 +37,6 @@ interface Captured {
 function withHookServer(
   respond: (req: IncomingMessage, res: ServerResponse, body: string) => void,
   fn: (url: string, captured: Captured[], server: Server) => Promise<void>,
-  // openclaw 的路由路径被收紧到 /hooks/<name>（P2-17）；webhook 用例继续用缺省 /hook
   path = "/hook",
 ): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -75,36 +75,6 @@ function unusedPort(): Promise<number> {
   });
 }
 
-function openclawDeliveryInput(
-  url: string,
-  over: Partial<ChannelDeliveryInput> = {},
-): ChannelDeliveryInput {
-  return {
-    profileId: "default",
-    notificationId: "n-openclaw",
-    kind: "test.kind",
-    title: "OpenClaw 标题",
-    bodyMd: "OpenClaw 正文",
-    createdAt: "2026-10-24T00:00:00.000Z",
-    requestId: "request-openclaw-1",
-    generation: 0,
-    route: { name: "openclaw-route", url },
-    ...over,
-  };
-}
-
-async function withOpenclawToken<T>(token: string | undefined, fn: () => Promise<T>): Promise<T> {
-  const previous = process.env.OPENCLAW_HOOK_TOKEN;
-  if (token === undefined) delete process.env.OPENCLAW_HOOK_TOKEN;
-  else process.env.OPENCLAW_HOOK_TOKEN = token;
-  try {
-    return await fn();
-  } finally {
-    if (previous === undefined) delete process.env.OPENCLAW_HOOK_TOKEN;
-    else process.env.OPENCLAW_HOOK_TOKEN = previous;
-  }
-}
-
 function forceDue(db: TestEnv["db"]): void {
   db.exec("UPDATE deliveries SET next_attempt_at = '2000-01-01T00:00:00.000Z'");
 }
@@ -132,15 +102,7 @@ function text(result: { content: { text: string }[] }): string {
 describe("投递通道抽象", () => {
   it("通道清单与默认通道稳定（工具 schema 与文档共用这份清单）", () => {
     assert.equal(DEFAULT_CHANNEL, "webhook");
-    assert.deepEqual(supportedChannels(), [
-      "webhook",
-      "log",
-      "bark",
-      "ntfy",
-      "telegram",
-      "smtp",
-      "openclaw",
-    ]);
+    assert.deepEqual(supportedChannels(), ["webhook", "log"]);
     const channel: NotificationChannel = getChannel(undefined);
     assert.equal(channel.name, DEFAULT_CHANNEL, "缺省 channel 必须解析为 webhook");
   });
@@ -413,214 +375,43 @@ describe("投递通道抽象", () => {
       cleanupTestEnv(env);
     }
   });
-});
 
-describe("OpenClaw 通道", () => {
-  it("注册、回环 URL 校验与路径/query 保留", () => {
-    assert.equal(getChannel("openclaw"), openclawChannel);
-    assert.equal(openclawChannel.requiresSecret, false);
-    assert.equal(openclawChannel.requiresUrl, true);
-
-    for (const url of [
-      "http://127.0.0.1:18789/hooks/life-default",
-      "http://localhost:18789/hooks/x",
-    ]) {
-      assert.equal(openclawChannel.validateRoute({ url }), url);
-    }
-    assert.equal(
-      openclawChannel.validateRoute({ url: "http://127.0.0.1:18789/hooks/x/" }),
-      "http://127.0.0.1:18789/hooks/x",
-    );
-    assert.equal(
-      openclawChannel.validateRoute({ url: "http://127.0.0.1:18789/hooks/x/?foo=a/" }),
-      "http://127.0.0.1:18789/hooks/x/?foo=a/",
-      "有 query 时不能剥掉路径或 query 末尾的斜杠",
-    );
-
-    for (const url of [
-      "http://192.168.1.5/hook",
-      "https://example.com/hook",
-      "ftp://127.0.0.1/hook",
-    ]) {
-      assert.throws(() => openclawChannel.validateRoute({ url }), /openclaw/);
-    }
-    // P2-17：路径收紧到 Gateway 的 /hooks/<name>，任意回环路径不再接受
-    for (const url of [
-      "http://127.0.0.1:18789/hook",
-      "http://127.0.0.1:18789/",
-      "http://127.0.0.1:18789/hooks",
-      "http://127.0.0.1:18789/hooks/",
-      "http://127.0.0.1:18789/hooksx/life-default",
-      // N-3：这三条过去都能通过「以 /hooks/ 开头」的字符串前缀检查
-      "http://127.0.0.1:18789/hooks/..%2fadmin",
-      "http://127.0.0.1:18789/hooks/%2e%2e/admin",
-      "http://127.0.0.1:18789/hooks//evil",
-    ]) {
-      assert.throws(
-        () => openclawChannel.validateRoute({ url }),
-        /\/hooks\//,
-        `非 /hooks/<name> 路径必须拒绝: ${url}`,
-      );
-    }
-    // N-3：畸形路径的报错必须说明原因（不是笼统的「路径必须是 /hooks/<name>」）
-    for (const url of [
-      "http://127.0.0.1:18789/hooks/..%2fadmin",
-      "http://127.0.0.1:18789/hooks//evil",
-      "http://127.0.0.1:18789/hooks/..%2Fadmin",
-    ]) {
-      assert.throws(
-        () => openclawChannel.validateRoute({ url }),
-        /不允许 \.\. 段、空段或百分号编码的 %2e\/%2f/,
-        `畸形路径必须按 N-3 的理由拒绝: ${url}`,
-      );
-    }
-    // %2e%2e 已被 WHATWG URL 归一化成 /admin（URL 本身就带出去了），仍必须拒绝
-    assert.throws(
-      () => openclawChannel.validateRoute({ url: "http://127.0.0.1:18789/hooks/%2E%2E/admin" }),
-      /\/hooks\//,
-      "归一化后的路径已不在 /hooks/ 下，必须拒绝",
-    );
-    assert.equal(
-      openclawChannel.validateRoute({
-        url: "http://127.0.0.1:18789/hooks/agent?channel=qqbot&to=qqbot%3Ac2c%3Ax",
-      }),
-      "http://127.0.0.1:18789/hooks/agent?channel=qqbot&to=qqbot%3Ac2c%3Ax",
-      "直连 /hooks/agent 形态必须保留（多账号通道）",
-    );
-  });
-
-  it("deliver 发送 Bearer token、幂等头与通知 JSON", async () => {
-    await withOpenclawToken("  openclaw-test-token  ", async () => {
-      await withHookServer(
-        (_req, res) => {
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end('{"ok":true}');
-        },
-        async (url, captured) => {
-          const input = openclawDeliveryInput(url, {
-            title: "交房租",
-            bodyMd: "**今天**记得转账",
-            requestId: "req-openclaw-123",
-          });
-          const outcome = await openclawChannel.deliver(input);
-          assert.equal(outcome.status, "sent");
-
-          const request = captured[0];
-          assert.ok(request !== undefined);
-          assert.equal(request.headers.authorization, "Bearer openclaw-test-token");
-          assert.equal(request.headers["content-type"], "application/json");
-          assert.equal(request.headers["x-request-id"], "req-openclaw-123");
-          assert.equal(request.headers["idempotency-key"], "req-openclaw-123");
-
-          const payload = JSON.parse(request.body) as {
-            event_type: string;
-            notification: {
-              profileId: string;
-              source: string;
-              title: string;
-              body: string;
-              createdAt: string;
-            };
-          };
-          assert.equal(payload.event_type, EVENT_TYPE);
-          assert.deepEqual(payload.notification, {
-            profileId: "default",
-            source: "test.kind",
-            title: "交房租",
-            body: "**今天**记得转账",
-            createdAt: "2026-10-24T00:00:00.000Z",
-          });
-        },
-        "/hooks/life-default",
-      );
-    });
-  });
-
-  it("状态码映射：2xx sent、429 confirmed、400 terminal；闭端口 transport", async () => {
-    await withOpenclawToken("openclaw-test-token", async () => {
-      for (const [status, expected] of [
-        [200, "sent"],
-        [429, "confirmed_failure"],
-        [400, "terminal_failure"],
-      ] as const) {
-        await withHookServer(
-          (_req, res) => {
-            res.writeHead(status);
-            res.end("boom");
-          },
-          async (url) => {
-            const outcome = await openclawChannel.deliver(openclawDeliveryInput(url));
-            assert.equal(outcome.status, expected, `HTTP ${status}`);
-            if (outcome.status !== "sent") assert.match(outcome.error, /^openclaw 返回 HTTP/);
-          },
-          "/hooks/life-default",
-        );
+  it("已移除通道（bark/ntfy/telegram/smtp/openclaw）的存量路由：待投行落 fallback 并提示重新配置，不抛错", async () => {
+    const env = makeTestEnv({ PROFILE_ROUTE_SECRETS_JSON: JSON.stringify({ default: SECRET }) });
+    try {
+      for (const removed of REMOVED_CHANNELS) {
+        assert.throws(() => getChannel(removed), /不支持的推送通道/, `${removed} 不应再可配置`);
       }
-
-      const port = await unusedPort();
-      const outcome = await openclawChannel.deliver(
-        openclawDeliveryInput(`http://127.0.0.1:${port}/hooks/life-default`),
-      );
-      assert.equal(outcome.status, "transport_failure");
-      if (outcome.status === "transport_failure") {
-        assert.match(outcome.error, /^openclaw 投递失败：/);
-      }
-    });
-  });
-
-  it("缺少 profile secret 与 OPENCLAW_HOOK_TOKEN 时终结本次投递并给出中文配置提示", async () => {
-    await withOpenclawToken(undefined, async () => {
-      const outcome = await openclawChannel.deliver(
-        openclawDeliveryInput("http://127.0.0.1:1/hooks/life-default"),
-      );
-      // P2-17：消息必须点明两个凭据来源（profile secret 与部署自身 profile 的全局 token），
-      // 不能只说「缺 OPENCLAW_HOOK_TOKEN」—— 否则隔离用户不知道该配哪一个
-      assert.deepEqual(outcome, {
-        status: "terminal_failure",
-        error:
-          'openclaw 通道缺少凭据：PROFILE_ROUTE_SECRETS_JSON 中没有 profile "default" 的 secret，' +
-          "daemon 也未配置 OPENCLAW_HOOK_TOKEN（部署自身 profile 的路由在 daemon 的 .env 里配置 OpenClaw hooks.token）",
+      // 先用 webhook 落一条待投行（模拟通道移除前已入队的通知），再把路由改写成旧通道
+      setPushRoute(env.db, "default", { url: "http://127.0.0.1:9/hook" });
+      publishProfile(env.db, env.config, "default", { kind: "k", title: "旧", blocks: {} });
+      assert.equal(deliveryRows(env.db).length, 1);
+      setSetting(env.db, "default", "push_route", {
+        name: "life-assistant-default",
+        url: "https://api.day.app/XXXX",
+        platform: null,
+        enabled: true,
+        channel: "bark",
       });
-    });
-  });
+      forceDue(env.db);
+      await drainDue(env.db, env.config);
+      const [row] = deliveryRows(env.db);
+      assert.equal(row?.status, "fallback");
+      assert.equal(row?.last_error, removedChannelError("bark"));
+      assert.equal(row?.last_error, "通道 bark 已移除，请用 notify route 重新配置为 webhook");
+      assert.equal(row?.request_started_at, null, "从未发出请求：重新配置后可自动重新入队");
 
-  it("notify route 接受 openclaw（未登记独立 token 的 profile），outbox 无 profile secret 也能按 Profile 投递", async () => {
-    await withOpenclawToken("openclaw-test-token", async () => {
-      // 没有 PROFILE_TOKENS_JSON = 回环零配置：没有独立用户身份，所有 profile 按 master 代表
-      const env = makeTestEnv();
-      try {
-        await withHookServer(
-          (_req, res) => {
-            res.writeHead(200);
-            res.end("ok");
-          },
-          async (url, captured) => {
-            const configured = tool(env, { action: "route", channel: "openclaw", url });
-            assert.ok(
-              !configured.isError,
-              "master 配置 openclaw 不应要求 PROFILE_ROUTE_SECRETS_JSON",
-            );
-            const pub = publishProfile(env.db, env.config, "default", {
-              kind: "test.kind",
-              title: "OpenClaw outbox",
-              blocks: {},
-            });
-            await drainDue(env.db, env.config);
+      // 查看路由不抛错，原样回显旧通道名并给出同一句提示
+      const view = tool(env, { action: "route" });
+      assert.equal(view.isError, undefined);
+      assert.match(text(view), /通道 bark 已移除，请用 notify route 重新配置为 webhook/);
 
-            const row = env.db
-              .prepare("SELECT status, last_error FROM deliveries WHERE notification_id = ?")
-              .get(pub.id) as { status: string; last_error: string | null } | undefined;
-            assert.ok(row !== undefined);
-            assert.equal(row.status, "sent", row.last_error ?? "");
-            assert.equal(captured.length, 1);
-            // master 路由仍用全局 OPENCLAW_HOOK_TOKEN（既有行为不回归）
-            assert.equal(captured[0]?.headers.authorization, "Bearer openclaw-test-token");
-          },
-          "/hooks/life-default",
-        );
-      } finally {
-        cleanupTestEnv(env);
-      }
-    });
+      // 用户按提示改回 webhook：之前落 fallback 的行重新入队
+      const reconfigured = tool(env, { action: "route", url: "http://127.0.0.1:9/hook" });
+      assert.equal(reconfigured.isError, undefined, text(reconfigured));
+      assert.equal(deliveryRows(env.db)[0]?.status, "queued");
+    } finally {
+      cleanupTestEnv(env);
+    }
   });
 });

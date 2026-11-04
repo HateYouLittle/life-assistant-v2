@@ -221,10 +221,10 @@ export function sourceOf(row: ScheduleRow): OccurrenceSource {
  *
  * - **freq ≠ yearly**：农历引擎对 once/daily/weekly/monthly/yearly 一视同仁按农历年触发
  *   （core/recurrence.ts 的 iterate 对 calendar==="lunar" 直接 yield* iterateLunar，freq
- *   被完全丢弃）。这类行多来自 import:v1 的旧数据。校验若按原值拒，用户会被**完全锁死**：
+ *   被完全丢弃）。这类行多来自已移除的 v1 导入器写入的旧数据。校验若按原值拒，用户会被**完全锁死**：
  *   连「只改标题」都不行，唯一出路是显式传 `recurrence: {freq:"yearly", interval:1}` ——
  *   而对原本 v1 `once` 的一行，那等于把一次性事件改成每年重复。存量行只能改标题/删除才合理。
- * - **recurrence 为 null**：v1 的 `once` / `{}` / 缺字段经 import:v1 落库后是零 occurrence
+ * - **recurrence 为 null**：v1 的 `once` / `{}` / 缺字段经 v1 导入器落库后是零 occurrence
  *   的死行（iterateLunar 首行 `if recurrence===null return`），同样不该把用户锁死。
  *
  * - **interval ≠ 1**（N5）：农历引擎只做 lunarYear++，与 interval=1 完全等价。
@@ -343,8 +343,8 @@ export const MAX_REMIND_OFFSET_MINUTES = 43200;
 /**
  * 提醒偏移的写入边界校验。
  *
- * MCP 入口由 zod schema 校验（1-5 项、整数、±43200），但 `/api/quick/schedules` 直接
- * 调用工具层、服务层也可能被直接调用，绕不过这一层：不在这里收口，quick 就能写入
+ * MCP 入口由 zod schema 校验（1-5 项、整数、±43200），但服务层可能被非 MCP 调用方
+ * 直接调用，绕不过这一层：不在这里收口，就能写入
  * `[999999]` 这类超出契约的值（提醒时刻算到 2 年后）或空数组（物化出零提醒的死日程）。
  *
  * 只校验**本次写入的值**：update 未显式传 `remindOffsets` 时沿用库里的历史值，

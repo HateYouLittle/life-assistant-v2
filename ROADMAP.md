@@ -1,10 +1,10 @@
 # 路线图与进度
 
-> 当前版本 **v2.0.0** · 数据库 **schema v5** · 最后更新 **2026-10-31**
+> 当前版本 **v2.0.0** · 数据库 **schema v5** · 最后更新 **2026-11-04**
 >
 > 口径：以已合入 `main` 的实现为准。完成一项就勾选、补 commit 与落点，并更新顶部「最后更新」。
-> 详细分析与逐项证据（真实库采样、file:line）见本地报告 `feature-proposal-2026-10-20.md`——
-> 该报告是设计依据，按约定不入库；本文件是仓库内的进度唯一事实来源。
+> 详细分析与逐项证据（真实库采样、file:line）见 `~/workspace/tasks/life-assistant-review-2026-10/feature-proposal-2026-10-20.md`
+> （已归档的过程报告，不入库、不作执行依据）；本文件是仓库内的进度唯一事实来源。
 
 ## 阶段一：可靠性 + 安全基线 + 每日闭环 —— ✅ 已完成（2026-10-20）
 
@@ -49,16 +49,30 @@ CI 在 Node 22.16.0 / 22 / 24 三档矩阵全绿（`.github/workflows/ci.yml`）
 
 **功能项**
 
-1. **通知通道/偏好/聚合/受众** ✅（2026-10-20，`2cc2f5b` + `7161c01`）：Bark + ntfy + Telegram + SMTP + OpenClaw 通道（`openclaw`，2026-10-25，`033acc9` + `20f421c`；支持映射式与 `/hooks/agent` 直连；2026-10-31 增加共享 Gateway 的 `OPENCLAW_PROFILE_TARGETS_JSON` 目标绑定、直连参数校验、409 可重试与 `waitForCompletion` 送达确认）、按 kind 的 `notify_prefs`（默认逐笔回执不推）、家庭账本回执只发记账人、每晚 21:30 记账摘要、`notify prefs|test`。仍待办：按通道渲染格式、聚合窗口（当前只支持「推/不推」）；SMTP 的 TLS 成功路径未自动化（需受信证书）。原计划：Bark / ntfy / SMTP 邮件 + 按 `kind` 偏好、回执聚合、家庭级去重
+~~1. **通知通道/偏好/聚合/受众** ✅（2026-10-20，`2cc2f5b` + `7161c01`）：Bark + ntfy + Telegram + SMTP + OpenClaw 通道（`openclaw`，2026-10-25，`033acc9` + `20f421c`；支持映射式与 `/hooks/agent` 直连；2026-10-31 增加共享 Gateway 的 `OPENCLAW_PROFILE_TARGETS_JSON` 目标绑定、直连参数校验、409 可重试与 `waitForCompletion` 送达确认）、按 kind 的 `notify_prefs`（默认逐笔回执不推）、家庭账本回执只发记账人、每晚 21:30 记账摘要、`notify prefs|test`。仍待办：按通道渲染格式、聚合窗口（当前只支持「推/不推」）；SMTP 的 TLS 成功路径未自动化（需受信证书）。原计划：Bark / ntfy / SMTP 邮件 + 按 `kind` 偏好、回执聚合、家庭级去重~~（2026-11-04 裁剪，见下）
    （当前 172 条记账回执按 Profile 各发一遍，是最大噪声源）
-2. **写 API + 手机快捷入口** ✅（2026-10-20，`ecd18b3`）：`POST /api/quick/expenses|schedules`（复用 `request_id` 幂等）+ `GET /api/quick/bootstrap` + `/quick` PWA（记账/提醒、token 引导、预填参数）；HTTP Shortcuts 可直接导入 [docs/http-shortcuts.json](docs/http-shortcuts.json)（说明见 [docs/http-shortcuts.md](docs/http-shortcuts.md)），小布指令/NFC 用法见 [docs/quick-entry.md](docs/quick-entry.md)。
+~~2. **写 API + 手机快捷入口** ✅（2026-10-20，`ecd18b3`）：`POST /api/quick/expenses|schedules`（复用 `request_id` 幂等）+ `GET /api/quick/bootstrap` + `/quick` PWA（记账/提醒、token 引导、预填参数）；HTTP Shortcuts 可直接导入 [docs/http-shortcuts.json](docs/http-shortcuts.json)（说明见 [docs/http-shortcuts.md](docs/http-shortcuts.md)），小布指令/NFC 用法见 [docs/quick-entry.md](docs/quick-entry.md)。~~（2026-11-04 裁剪，见下）
    目标：从打开对话降到点一下 / 两下。
-3. **ICS 日历订阅** ✅（2026-10-20，`ecd18b3`）：`GET /calendar.ics` 签名 URL（HMAC + 有效期，只读单个 Profile）、`npm run calendar:url` 生成；未做 RFC 5545 的 75 octet 行折叠。
+~~3. **ICS 日历订阅** ✅（2026-10-20，`ecd18b3`）：`GET /calendar.ics` 签名 URL（HMAC + 有效期，只读单个 Profile）、`npm run calendar:url` 生成；未做 RFC 5545 的 75 octet 行折叠。~~（2026-11-04 裁剪，见下）
 4. **per-profile token + 看板可见性** ✅（2026-10-20，`4bfce42` + `0cfa390`）：`PROFILE_TOKENS_JSON` + `/mcp` 强绑定 + `/api/quick/*` + 看板 `/api/*` 按 Profile 过滤（profile=自己的日程/通知 + 家庭/本人个人账本；master=家庭看板），`/api/status` 返回 `identity` 供页面显示身份。
-5. **预算看板/趋势/引导 + 可执行月报 + 周日周报** ✅（2026-10-20，`2b8349e`）：状态页预算卡片（`/api/budget`，进度条 + 未设/超支/花速过快/正常四类可执行建议）、周报 job `bookkeeping.weekly_report`（周日 20:00，分类 top5/最大单笔/环比/预算剩余）；月报已有预算对照行。趋势图未做（需要历史曲线再引入）。
+~~5. **预算看板/趋势/引导 + 可执行月报 + 周日周报** ✅（2026-10-20，`2b8349e`）：状态页预算卡片（`/api/budget`，进度条 + 未设/超支/花速过快/正常四类可执行建议）、周报 job `bookkeeping.weekly_report`（周日 20:00，分类 top5/最大单笔/环比/预算剩余）；月报已有预算对照行。趋势图未做（需要历史曲线再引入）。~~（2026-11-04 裁剪，见下）
 6. **分类字典/别名、CSV 公式注入修复、明细分页** ✅（2026-10-20，`88ed2b7`）：`expense categories|category_alias`、`expense add/update` 别名归一（大小写/空白折叠，不改历史）、`expenseCsv` 文本列防公式注入、`expense list` 与 `/api/expenses|deliveries` 支持 `offset` + 看板「加载更多」（OFFSET 游标，翻页期间数据变化可能重复/漏行，数据量大再换 keyset）。
 7. **可观测性** ✅（2026-10-20，`ecd18b3` + `589a87d`）：`/metrics` + `/readyz`（鉴权/限流计数器、投递状态、outbox 排队、job 最近成功、备份年龄、DB/WAL、QWeather 用量）；`notify test/history/retry`（历史分页、失败投递手动重试）；日志本地时间戳 + `maintenance.log_rotate`（每日 04:55 copytruncate，`LOG_DIR`/`LOG_MAX_MB`/`LOG_KEEP`）。
 8. **迁移结构指纹 + 审计日志** ✅（2026-10-20，`7161c01`，schema v5）：`meta.schema_fingerprint` 启动对账（漂移 warn）+ `npm run db:fingerprint` CLI + doctor 检查；新增 `audit_log` 表与 `/api/audit`（master 全量、Profile 仅自己），`/api/quick/*` 写入后记审计；迁移纯附加式、单事务、升级前自动 `pre-v4` 快照。仍待办：audit 保留策略（目前只增不清）。
+
+## 2026-11-04 使用体验裁剪 —— ✅
+
+> 依据：两人家庭只在 QQ 聊天里用，手机上推送「太多、看着费劲就不看」，循环待办「想闭环但嫌麻烦」，
+> 记账「只要能记、偶尔查」。方案见 `~/.claude/plans/dapper-jumping-swing.md`。
+
+| 改动 | 提交 |
+|---|---|
+| 循环待办过了当天自动作废、当天 20:00 追一次；`complete {recent:true}` 只认当天；删除 `/a/*` 一键链接 | `c381807` |
+| 推送改成 1–4 行纯文本（早报/晚报/提醒/预警）；删除周报、月报、每日记账摘要、预算阈值提醒、逐笔回执 | `e042735` |
+| 读类记账 action 缺省走默认账本，summary 默认自然月全月；SKILL.md 25KB → 7KB | `a52fe2f` |
+| 删除 bark/ntfy/telegram/smtp/openclaw 通道（只留 webhook/log）、`/quick` PWA 与 HTTP Shortcuts、ICS 订阅、v1 导入器；根目录过程报告移到 `tasks/` | 本阶段 |
+
+阶段二第 1/2/3/5 项因此划线；阶段三未开始的条目按需再议，新增前先确认真有人用。
 
 ## 阶段三：新领域 —— 🔲 未开始（6–12 周）
 

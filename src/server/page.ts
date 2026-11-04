@@ -9,7 +9,7 @@ import { SCRIPT, STYLE } from "./page-script.js";
 
 /**
  * 页面凭据引导：实现随 SCRIPT 一起搬到 page-script.ts（SCRIPT 用 toString() 内联它的函数体），
- * 这里只是给既有调用方（quick.ts / tests/status.test.ts）转出，保持原 import 路径可用。
+ * 这里只是给既有调用方（tests/status.test.ts）转出，保持原 import 路径可用。
  */
 export { resolveToken } from "./page-script.js";
 

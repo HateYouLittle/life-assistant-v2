@@ -47,9 +47,6 @@ const MODULE_REGISTRATION_ENTRY = "../modules/index.js";
 const SERVER_MODULE_IMPORT_ALLOWLIST: Record<string, string[]> = {
   "budget.ts": ["../modules/bookkeeping/service.js"],
   "details.ts": ["../modules/bookkeeping/service.js", "../modules/schedule/service.js"],
-  // P2-24：写路径已改为 registry.invokeTool（不再 import bookkeeping/schedule 的 handler）；
-  // 剩下的只是 bootstrap 与「创建后回读事件时间」用的只读 service 函数。
-  "quick.ts": ["../modules/bookkeeping/service.js", "../modules/schedule/service.js"],
   "status.ts": ["../modules/bookkeeping/service.js"],
 };
 
@@ -211,8 +208,8 @@ describe("registry 契约", () => {
   });
 
   it("server 层不得直接 import 模块内部（静态扫描 + 显式白名单）", () => {
-    // P2-24：quick.ts 曾直接 import bookkeeping/schedule 的 handler 与 service，绕过 registry ——
-    // 于是 inputSchema 不再是唯一契约（quick 手写一套校验）、新增工具在手机端永远不可达。
+    // P2-24：已移除的手机快捷入口曾直接 import bookkeeping/schedule 的 handler，绕过 registry ——
+    // 于是 inputSchema 不再是唯一契约（手写一套校验）。
     // 这里把 core→modules 的扫描扩到 server 层：模块内部 import 必须逐条登记在白名单里。
     const serverDir = fileURLToPath(new URL("../src/server/", import.meta.url));
     const files = readdirSync(serverDir).filter((f) => f.endsWith(".ts"));
@@ -260,22 +257,23 @@ describe("registry 契约", () => {
   });
 
   it("契约扫描能抓住「server 直接 import 模块内部」的新违规（变异自证）", () => {
-    // ① 在真实的 quick.ts 源码上插一行直调模块 index（handler 层，比 service 更深一层）：
+    // ① 在真实的 details.ts 源码上插一行直调模块 index（handler 层，比 service 更深一层）：
     //    扫描必须把它判成违规，且白名单里不得有它 —— 否则这条测试只是恒绿摆设。
     const serverDir = fileURLToPath(new URL("../src/server/", import.meta.url));
-    const quickSource = readFileSync(join(serverDir, "quick.ts"), "utf8");
+    const detailsSource = readFileSync(join(serverDir, "details.ts"), "utf8");
     assert.ok(
-      !quickSource.includes("modules/schedule/index.js"),
-      "quick.ts 不应再 import 模块 handler（本任务就是要删掉它）",
+      !detailsSource.includes("modules/schedule/index.js"),
+      "details.ts 不应 import 模块 handler（只允许只读 service 纯函数）",
     );
-    const mutated = `${quickSource}\nimport { scheduleTool } from "../modules/schedule/index.js";\n`;
+    const mutated = `${detailsSource}\nimport { scheduleTool } from "../modules/schedule/index.js";\n`;
     const found = moduleImportSpecifiers(mutated);
     assert.ok(
       found.includes("../modules/schedule/index.js"),
       `变异后的直调没有被扫描抓到：${JSON.stringify(found)}`,
     );
+    const allowed = new Set(SERVER_MODULE_IMPORT_ALLOWLIST["details.ts"] ?? []);
     assert.ok(
-      !(SERVER_MODULE_IMPORT_ALLOWLIST["quick.ts"] ?? []).includes("../modules/schedule/index.js"),
+      found.some((specifier) => specifier !== MODULE_REGISTRATION_ENTRY && !allowed.has(specifier)),
       "白名单不得放行模块 index（handler 层），否则违规会被静默吞掉",
     );
     // 同一变异若在 core 层，同样必须被 core 扫描抓到

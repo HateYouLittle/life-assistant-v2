@@ -9,14 +9,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 import { DateTime } from "luxon";
 import cron from "node-cron";
-import {
-  bindHost,
-  loadConfig,
-  openclawWaitForCompletionEnabled,
-  parseProfileId,
-  type ResolvedConfig,
-  urlHost,
-} from "./config.js";
+import { bindHost, loadConfig, parseProfileId, type ResolvedConfig, urlHost } from "./config.js";
 import { bearerToken, resolveIdentity, tokenFingerprint } from "./core/auth.js";
 import { openDatabase } from "./core/database.js";
 import { createInFlightTracker, type InFlightTracker } from "./core/inflight.js";
@@ -46,9 +39,7 @@ import {
 import { applySecureUmask, createRequestGuard, hardenDataDir } from "./core/security.js";
 import { ensureProfile, pruneCache } from "./core/settings.js";
 import { registerAllModules } from "./modules/index.js";
-import { createCalendarApp } from "./server/calendar.js";
 import { createOpsApp } from "./server/ops.js";
-import { createQuickApp } from "./server/quick.js";
 import { createStatusApp } from "./server/status.js";
 import { now, TZ } from "./time.js";
 
@@ -68,7 +59,7 @@ const SESSION_IDLE_MS = 2 * 3600 * 1000;
 const MAX_SESSIONS = 200;
 /** 停机时等待在途 cron job / tick 的上限（它们可能正在发布通知） */
 const JOB_SHUTDOWN_WAIT_MS = 10_000;
-/** 停机时等在途 HTTP/MCP 请求收敛的上界：写工具可能发通知/写 SMTP（5~10s），取 8s */
+/** 停机时等在途 HTTP/MCP 请求收敛的上界：写工具可能发通知（webhook 单次 10s 超时），取 8s */
 const HTTP_SHUTDOWN_WAIT_MS = 8_000;
 
 async function buildMcpServer(
@@ -309,12 +300,8 @@ export function createHttpHandler(
   db: DatabaseSync,
   hooks: HttpHandlerHooks = {},
 ): (req: IncomingMessage, res: ServerResponse) => void {
-  // 手机入口（/quick、/api/quick/*）、日历订阅（/calendar.ics）、推送一键操作（/a/*）与
-  // 运维端点（/metrics、/readyz）都是独立子应用，挂在同一个 Hono 上：共享 createHttpHandler 的 Host/Origin 守卫与限流。
-  const app = createStatusApp(config, db)
-    .route("/", createQuickApp(config, db))
-    .route("/", createCalendarApp(config, db))
-    .route("/", createOpsApp(config, db));
+  // 运维端点（/metrics、/readyz）是独立子应用，挂在同一个 Hono 上：共享 createHttpHandler 的 Host/Origin 守卫与限流。
+  const app = createStatusApp(config, db).route("/", createOpsApp(config, db));
   const honoListener = getRequestListener(app.fetch);
   // Host/Origin 守卫：状态页与 /mcp 都没有 CSRF token，浏览器跨站请求（含 DNS rebinding：
   // 攻击者把域名解析到 127.0.0.1）会带着伪造 Host 直接读写个人数据。没有 Origin 的
@@ -394,7 +381,7 @@ export function createHttpHandler(
         .finally(() => done?.());
       return;
     }
-    // 其余（状态页/quick/api/metrics/readyz）都是短响应：按响应结束/连接关闭计
+    // 其余（状态页/api/metrics/readyz）都是短响应：按响应结束/连接关闭计
     const done = hooks.inFlight?.begin();
     if (done !== undefined) res.once("close", done);
     honoListener(req, res);
@@ -776,9 +763,8 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
       // 已落库但未投出的行留着，下次启动会由 outbox 继续投递（不丢）。
       cancelPendingDrain();
       // 在途的 outbox 投递也有 10s 级网络超时：不等它收敛就会在关库后继续写。
-      // 与 onStart 一样给个上界，避免停机被长时间拖住；openclaw waitForCompletion
-      // 的单次投递最长约 30s，此时上界放宽到 35s（没有在途投递时 waitForDrain 立即返回）。
-      const drainGraceMs = openclawWaitForCompletionEnabled(config) ? 35_000 : 10_000;
+      // 与 onStart 一样给个上界，避免停机被长时间拖住（没有在途投递时 waitForDrain 立即返回）。
+      const drainGraceMs = 10_000;
       await Promise.race([
         waitForDrain(),
         new Promise<void>((resolve) => setTimeout(resolve, drainGraceMs).unref()),

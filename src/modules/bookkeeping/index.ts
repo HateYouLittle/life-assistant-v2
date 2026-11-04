@@ -221,7 +221,7 @@ function ledgerBudget(args: Record<string, unknown>, ctx: ToolContext): ToolResu
  * 「导出当月全部」、非 budget 的 amount 被直接丢弃，都属于「成功返回但语义错误」，
  * 比报错更难发现（M-05）。这里统一显式拒绝，文案与 notify 侧完全一致。
  *
- * 值为 undefined 的键不算「传了字段」：MCP/quick 可能显式带上未使用的可选键。
+ * 值为 undefined 的键不算「传了字段」：MCP/invokeTool 调用方可能显式带上未使用的可选键。
  * `from/to`（export）与 `ledger_id`（update）仍由各自分支给出更具体、可操作的报错
  * （既有用例钉住这两条文案），故列入白名单让它走到那条分支，而不是被通用文案抢先。
  */
@@ -356,8 +356,7 @@ function expenseAdd(args: Record<string, unknown>, ctx: ToolContext): ToolResult
   const entry = result.entry;
   // 幂等命中（P2-4）：返回的行来自**首次写入**，回显字段必须全部取自原记录。
   // 本次调用解析出的 ledger 可能与之不同（重试时显式换了 ledger_id，或默认账本被改），
-  // 用它回显会让「账本」与金额/分类/日期（都来自 entry）自相矛盾，误导人工对账，
-  // 也会把错误的账本写进 quick 的 audit_log.detail。
+  // 用它回显会让「账本」与金额/分类/日期（都来自 entry）自相矛盾，误导人工对账。
   const entryLedger = result.reused ? (getLedger(db, entry.ledger_id) ?? ledger) : ledger;
   if (result.reused) {
     logger.debug(

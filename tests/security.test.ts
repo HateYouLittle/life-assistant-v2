@@ -72,21 +72,26 @@ describe("Host/Origin 请求守卫", () => {
     assert.deepEqual(guard(request({ host: "127.0.0.1:3080" })), { ok: true });
   });
 
-  it("自带签名的路径（/calendar.ics）忽略 Origin：IM 内置浏览器会带 Origin: null", () => {
+  it("没有任何路径豁免 Origin 校验：Origin: null 一律 403（含已移除的 /calendar.ics 与 /a/*）", () => {
     const { guard } = guardFor({ HOST: "127.0.0.1", WEB_ALLOWED_HOSTS: "life.example.com:30301" });
     const headers = { host: "life.example.com:30301", origin: "null" };
-    assert.deepEqual(guard(request(headers, "/calendar.ics?p=x&exp=1&sig=y")), { ok: true });
-    // 只豁免 Origin：Host 仍是必过的一道门
-    assert.equal(
-      guard(request({ host: "attacker.com:30301", origin: "null" }, "/calendar.ics?p=x")).ok,
-      false,
-      "签名路径也必须过 Host 检查（DNS rebinding）",
-    );
-    // 其它路径照旧拒绝 null：跨站防护不能被顺带削弱
-    assert.equal(guard(request(headers, "/api/status")).ok, false);
-    assert.equal(guard(request(headers, "/quick")).ok, false);
-    // 一键链接已移除：/a/* 不再豁免
-    assert.equal(guard(request(headers, "/a/MXxkZWZhdWx0fDE")).ok, false);
+    for (const path of [
+      "/calendar.ics?p=x&exp=1&sig=y",
+      "/a/MXxkZWZhdWx0fDE",
+      "/api/status",
+      "/",
+    ]) {
+      const result = guard(request(headers, path));
+      assert.equal(result.ok, false, `${path} 不应豁免 Origin`);
+      if (!result.ok) {
+        assert.equal(result.status, 403);
+        assert.match(result.body, /Origin 不被允许/);
+      }
+    }
+    // 无 Origin 的同一请求照常放行（Host 已在允许名单内）
+    assert.deepEqual(guard(request({ host: "life.example.com:30301" }, "/calendar.ics")), {
+      ok: true,
+    });
   });
 
   it("同源 Origin 放行；跨站 Origin 403；file:// 与 null 也拒绝", () => {

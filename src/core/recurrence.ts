@@ -149,7 +149,7 @@ function* iterate(source: OccurrenceSource, afterDay: DateTime): Generator<DateT
  * 而两条写入路径会绕过它：
  * - MCP 的 solar→lunar 转换：patch 不传 recurrence 时校验看到的是归一值（interval=1），
  *   落库却写回继承来的原值；
- * - import:v1 的裸 SQL INSERT：整条路径不经任何校验。
+ * - 已移除的 v1 导入器的裸 SQL INSERT：整条路径不经任何校验，存量行仍在库里。
  * 两条都在**落库前**走这里收敛，故脏数据没有第二个产生入口。
  *
  * 只收 interval，不动 freq/until/count：那些是合法的用户配置（农历 freq 必须是
@@ -278,7 +278,7 @@ const ALL_MONTHS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
 /**
  * 农历月/日「缺失或越界」的判定与统一文案；无问题时返回 null。
  *
- * 存量脏数据（import:v1 的裸 INSERT 可静默写入 NULL 月/日；schedules 的 CHECK 写的是
+ * 存量脏数据（已移除的 v1 导入器的裸 INSERT 曾静默写入 NULL 月/日；schedules 的 CHECK 写的是
  * `IS NULL OR (1..12)`，即只放行 NULL、拒掉 0/13 这类越界值）会让裸插值回显
  * 「农历null月null日」——用户看到的是模板漏字，而不是「这条日程坏掉了」。
  * 同时 iterateLunar 的范围判断让它产出零 occurrence（N12 的 B 类死行），文案必须如实说。

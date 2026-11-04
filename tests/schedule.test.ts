@@ -1599,7 +1599,7 @@ describe("schedule 创建/更新的原子性", () => {
 });
 
 /**
- * N15：农历月/日为 NULL 的存量脏行（import:v1 可静默入库；schedules 的 CHECK 写的是
+ * N15：农历月/日为 NULL 的存量脏行（已移除的 v1 导入器曾静默入库；schedules 的 CHECK 写的是
  * `IS NULL OR (1..12)`，只放行 NULL、拒绝 0/13 越界）曾让同一份输出里出现
  * 「日历=农历null月null日」而「重复=…缺失或越界…」——第 5 轮 N12 只修了「重复」。
  * 裸插值的 null 是用户看到的模板漏洞，必须与「重复」同口径。
@@ -1634,7 +1634,7 @@ describe("schedule 农历缺月日脏行的回显", () => {
   }
 
   /**
-   * 走 import-v1 的那条路径造脏数据：先按合法农历创建（让它物化出 occurrence），
+   * 模拟已移除的 v1 导入器那条路径造脏数据：先按合法农历创建（让它物化出 occurrence），
    * 再直接改库把月/日置 NULL。绕过写入侧校验，模拟存量脏行。
    */
   function createDirtyNullLunar(env: TestEnv, title: string): string {
@@ -1723,10 +1723,10 @@ describe("schedule 农历缺月日脏行的回显", () => {
     }
   });
 
-  it("零 occurrence 的缺月日脏行（import:v1 路径）：字符串里仍不得漏出 null", () => {
+  it("零 occurrence 的缺月日脏行（v1 导入器路径）：字符串里仍不得漏出 null", () => {
     const env = makeTestEnv();
     try {
-      // import:v1 的裸 INSERT 直接入库 NULL 月日，从不物化 → next_run_at 也是 NULL，
+      // v1 导入器的裸 INSERT 直接入库 NULL 月日，从不物化 → next_run_at 也是 NULL，
       // 因此「下次提醒」等键的值是合法 JSON null；此处只判定「字符串里没有裸插值」。
       const ts = "2026-01-01T00:00:00.000Z";
       env.db

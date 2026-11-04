@@ -183,11 +183,11 @@ export function errorMessage(e: unknown): string {
 }
 
 /**
- * 经注册表调用工具（非 MCP 的调用方，如 HTTP 子应用 `/api/quick/*` 用）。
+ * 经注册表调用工具（非 MCP 的调用方用，如 HTTP 子应用）。
  *
  * 为什么要有它：`inputSchema` 是模块对外唯一契约（MCP 侧由 SDK 按同一份 zod raw shape
  * 校验）。绕过 registry 直接 import 模块 handler，等于让每个调用方自己手写一套参数校验 ——
- * 两边迟早漂移（手机端曾漏掉长度上限、只能靠 service 兜底），新增工具也不会自动在
+ * 两边迟早漂移（已移除的手机快捷入口曾漏掉长度上限、只能靠 service 兜底），新增工具也不会自动在
  * HTTP 侧可达。这里按名取 def、用同一份 schema 校验参数，再调 handler。
  *
  * 失败口径与 MCP 侧一致：未注册 / 参数不合法 / handler 抛错都返回 `fail(...)`

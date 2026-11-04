@@ -1,17 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { describe, it } from "node:test";
-import {
-  bindHost,
-  canUseGlobalOpenclawToken,
-  canUseGlobalOpenclawTokenFromEnv,
-  loadConfig,
-  openclawTargetForProfile,
-  openclawWaitForCompletionEnabled,
-  parseProfileId,
-  resolveOpenclawCredentialSource,
-  urlHost,
-} from "../src/config.js";
+import { bindHost, loadConfig, parseProfileId, urlHost } from "../src/config.js";
 import { SECRET } from "./helpers.js";
 
 const BASE = { DATA_DIR: "/tmp/la-test", HERMES_PROFILE: "default" };
@@ -39,7 +29,6 @@ describe("config", () => {
     assert.equal(config.backupKeep, 14);
     assert.equal(config.defaultCity, "北京");
     assert.equal(config.webApiToken, undefined);
-    assert.equal(config.openclawHookToken, undefined);
     assert.equal(config.requireAuth, false);
     assert.deepEqual(config.allowedHosts, []);
   });
@@ -241,12 +230,16 @@ describe("config", () => {
     assert.equal(config.profileRouteSecrets.default, SECRET);
   });
 
-  it("OPENCLAW_HOOK_TOKEN 可选、去空白，空值不影响配置加载", () => {
-    assert.equal(
-      loadConfig({ ...BASE, OPENCLAW_HOOK_TOKEN: "  hook-token  " }).openclawHookToken,
-      "hook-token",
-    );
-    assert.equal(loadConfig({ ...BASE, OPENCLAW_HOOK_TOKEN: "  " }).openclawHookToken, undefined);
+  it("已移除通道的旧环境变量（OPENCLAW_*）仍在 .env 里时照常启动、直接忽略", () => {
+    const config = loadConfig({
+      ...BASE,
+      OPENCLAW_HOOK_TOKEN: "  hook-token  ",
+      OPENCLAW_BASE_URL: "http://example.com/not-loopback",
+      OPENCLAW_WAIT_FOR_COMPLETION: "maybe",
+      OPENCLAW_PROFILE_TARGETS_JSON: "{坏 JSON",
+    });
+    assert.equal(config.dataDir, BASE.DATA_DIR);
+    assert.ok(!Object.keys(config).some((key) => key.toLowerCase().includes("openclaw")));
   });
 
   it("PROFILE_TOKENS_JSON：合法映射生效；非 JSON / 短 token / 非法名 / 重复 token / 与 master 相同都拒绝", () => {
@@ -317,185 +310,5 @@ describe("config", () => {
       "空白 HERMES_PROFILE 按未设置处理",
     );
     assert.throws(() => loadConfig({ ...BASE, HERMES_PROFILE: "大写" }), /HERMES_PROFILE/);
-  });
-
-  it("openclaw 全局 token 三档口径：部署自身 / 隔离用户 / 未登记", () => {
-    const owner = "o".repeat(32);
-    const bestie = "b".repeat(32);
-    const config = loadConfig({
-      ...BASE,
-      WEB_API_TOKEN: SECRET,
-      PROFILE_TOKENS_JSON: JSON.stringify({ default: owner, bestie }),
-    });
-    // ① 部署自身 profile（default）即使登记了 Profile token，也仍可用全局 token
-    assert.equal(canUseGlobalOpenclawToken(config, "default"), true);
-    // ② 其它登记了独立 token 的 profile = 隔离用户，必须自带 route secret
-    assert.equal(canUseGlobalOpenclawToken(config, "bestie"), false);
-    // ③ 未登记独立 token 的 profile 仍按 master 代表处理
-    assert.equal(canUseGlobalOpenclawToken(config, "guest"), true);
-    // 口径是配置驱动：把 HERMES_PROFILE 换成 bestie，两者互换
-    const swapped = loadConfig({
-      ...BASE,
-      HERMES_PROFILE: "bestie",
-      WEB_API_TOKEN: SECRET,
-      PROFILE_TOKENS_JSON: JSON.stringify({ default: owner, bestie }),
-    });
-    assert.equal(canUseGlobalOpenclawToken(swapped, "bestie"), true);
-    assert.equal(canUseGlobalOpenclawToken(swapped, "default"), false);
-    // PROFILE_TOKENS_JSON 为空：所有 profile 都按 master 代表（既有行为）
-    const zeroConfig = loadConfig({ ...BASE, WEB_API_TOKEN: SECRET });
-    assert.equal(canUseGlobalOpenclawToken(zeroConfig, "default"), true);
-    assert.equal(canUseGlobalOpenclawToken(zeroConfig, "bestie"), true);
-    // 环境快照版本（投递层告警用）与配置版本同口径
-    assert.equal(
-      canUseGlobalOpenclawTokenFromEnv("bestie", {
-        HERMES_PROFILE: "default",
-        PROFILE_TOKENS_JSON: JSON.stringify({ default: owner, bestie }),
-      }),
-      false,
-    );
-    assert.equal(canUseGlobalOpenclawTokenFromEnv("bestie", { HERMES_PROFILE: "bestie" }), true);
-    // 解析失败/缺失一律按「可用全局 token」处理（fail-safe：少告警，不误告警）
-    assert.equal(
-      canUseGlobalOpenclawTokenFromEnv("bestie", { PROFILE_TOKENS_JSON: "{坏 JSON" }),
-      true,
-    );
-    assert.equal(canUseGlobalOpenclawTokenFromEnv("bestie", {}), true);
-  });
-
-  it("OPENCLAW_PROFILE_TARGETS_JSON：直连/映射目标解析、默认值与非法结构拒绝", () => {
-    const targets = {
-      default: {
-        mode: "direct",
-        agentId: "main",
-        channel: "qqbot",
-        to: "qqbot:c2c:default",
-        accountId: "default",
-      },
-      bestie: { mode: "mapping", hook: "life-bestie" },
-    };
-    const config = loadConfig({
-      ...BASE,
-      OPENCLAW_PROFILE_TARGETS_JSON: JSON.stringify(targets),
-    });
-    const direct = openclawTargetForProfile(config, "default");
-    assert.equal(direct?.mode, "direct");
-    if (direct?.mode === "direct") {
-      assert.equal(direct.auth, "global", "auth 缺省 global");
-      assert.equal(direct.waitForCompletion, false, "waitForCompletion 缺省 false");
-      assert.equal(direct.baseUrl, "http://127.0.0.1:18789", "baseUrl 缺省回环 18789");
-    }
-    assert.equal(openclawWaitForCompletionEnabled(config), false);
-    const mapping = openclawTargetForProfile(config, "bestie");
-    assert.deepEqual(mapping, {
-      mode: "mapping",
-      auth: "global",
-      baseUrl: "http://127.0.0.1:18789",
-      hook: "life-bestie",
-    });
-
-    // 每个目标的 baseUrl/auth/waitForCompletion 可覆盖
-    const custom = loadConfig({
-      ...BASE,
-      OPENCLAW_BASE_URL: "http://localhost:19000",
-      OPENCLAW_WAIT_FOR_COMPLETION: "1",
-      OPENCLAW_PROFILE_TARGETS_JSON: JSON.stringify({
-        default: {
-          mode: "direct",
-          channel: "qqbot",
-          to: "x",
-          auth: "profile",
-          baseUrl: "http://127.0.0.1:19100",
-        },
-      }),
-    });
-    const customTarget = openclawTargetForProfile(custom, "default");
-    assert.equal(customTarget?.auth, "profile");
-    assert.equal(customTarget?.baseUrl, "http://127.0.0.1:19100");
-    if (customTarget?.mode === "direct") assert.equal(customTarget.waitForCompletion, true);
-    assert.equal(openclawWaitForCompletionEnabled(custom), true);
-
-    const invalid: Array<[Record<string, unknown>, RegExp]> = [
-      [{ mode: "direct" }, /channel 必须是字符串/],
-      [{ mode: "direct", channel: "last", to: "x" }, /channel 不能是 last/],
-      [{ mode: "direct", channel: "qqbot", to: "" }, /to 不能为空/],
-      [{ mode: "direct", channel: "qqbot", to: "x", extra: 1 }, /未知字段/],
-      [{ mode: "mapping", hook: "life/evil" }, /hook 只能是单个 hook 名/],
-      [{ mode: "direct", channel: "qqbot", to: "x", waitForCompletion: "yes" }, /布尔值/],
-      [{ mode: "other" }, /mode 必须是 direct 或 mapping/],
-    ];
-    for (const [target, pattern] of invalid) {
-      assert.throws(
-        () =>
-          loadConfig({
-            ...BASE,
-            OPENCLAW_PROFILE_TARGETS_JSON: JSON.stringify({ default: target }),
-          }),
-        pattern,
-      );
-    }
-    assert.throws(
-      () =>
-        loadConfig({
-          ...BASE,
-          OPENCLAW_PROFILE_TARGETS_JSON: "{坏 JSON",
-        }),
-      /不是合法 JSON/,
-    );
-    assert.throws(
-      () =>
-        loadConfig({
-          ...BASE,
-          OPENCLAW_PROFILE_TARGETS_JSON: JSON.stringify({
-            default: { mode: "direct", channel: "qqbot", to: "x", baseUrl: "http://192.168.1.2" },
-          }),
-        }),
-      /仅接受回环地址/,
-    );
-  });
-
-  it("openclaw 凭据来源：目标 auth=global/profile 与旧行为分流", () => {
-    assert.equal(
-      resolveOpenclawCredentialSource({ profileSecret: "p", globalToken: "g" }),
-      "profile",
-      "未登记目标：profile secret 优先（旧行为）",
-    );
-    assert.equal(resolveOpenclawCredentialSource({ globalToken: "g" }), "global");
-    assert.equal(resolveOpenclawCredentialSource({}), "missing");
-    const globalTarget = {
-      mode: "direct" as const,
-      auth: "global" as const,
-      baseUrl: "http://127.0.0.1:18789",
-      channel: "qqbot",
-      to: "x",
-      waitForCompletion: false,
-    };
-    assert.equal(
-      resolveOpenclawCredentialSource({
-        profileSecret: "p",
-        globalToken: "g",
-        target: globalTarget,
-      }),
-      "global",
-      "目标 auth=global 时不得误用 profile secret（共享 Gateway 会 401）",
-    );
-    assert.equal(
-      resolveOpenclawCredentialSource({ profileSecret: "p", target: globalTarget }),
-      "missing",
-    );
-    const profileTarget = { ...globalTarget, auth: "profile" as const };
-    assert.equal(
-      resolveOpenclawCredentialSource({
-        profileSecret: "p",
-        globalToken: "g",
-        target: profileTarget,
-      }),
-      "profile",
-    );
-    assert.equal(
-      resolveOpenclawCredentialSource({ globalToken: "g", target: profileTarget }),
-      "missing",
-      "目标 auth=profile 时不得回退全局 token",
-    );
   });
 });

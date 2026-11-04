@@ -134,9 +134,9 @@ describe("按 kind 的通知偏好", () => {
     const env = makeTestEnv();
     try {
       configureLogRoute(env); // 当前路由通道 = log
-      setNotifyPrefs(env.db, "default", { "weather.brief": { channels: ["bark"] } });
+      setNotifyPrefs(env.db, "default", { "weather.brief": { channels: ["webhook"] } });
       publish(env, { kind: "weather.brief", title: "早报" });
-      assert.equal(counts(env).deliveries, 0, "路由通道 log 不在白名单 [bark] 内");
+      assert.equal(counts(env).deliveries, 0, "路由通道 log 不在白名单 [webhook] 内");
 
       setNotifyPrefs(env.db, "default", { "weather.brief": { channels: ["log"] } });
       publish(env, { kind: "weather.brief", title: "早报2" });

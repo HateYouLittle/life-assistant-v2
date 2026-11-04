@@ -10,6 +10,7 @@ import {
   UNCERTAIN_EXCEEDED_WINDOW_ERROR,
   UNCERTAIN_NON_IDEMPOTENT_ERROR,
 } from "../src/core/notify.js";
+import { setSetting } from "../src/core/settings.js";
 import { createOpsApp } from "../src/server/ops.js";
 import { cleanupTestEnv, makeTestEnv, SECRET, type TestEnv } from "./helpers.js";
 // 副作用 import：/metrics 的 job 行才有内容（与 ops.test.ts / daemon 同一份注册表）
@@ -19,9 +20,9 @@ import "../src/modules/index.js";
  * P2-10 回归：重启后「结果不确定」的 sending 行如何收场。
  *
  * 起因：重启发生在「请求已发出、未落库」之间时，旧实现把所有 sending 行复位 queued，
- * 于是非幂等通道（bark/ntfy/telegram/smtp/openclaw）会在下次启动重投 —— 用户收到两条。
- * 现在按通道分叉：幂等通道（webhook，对端按 X-Request-ID 去重）才允许复位重投；
- * 非幂等通道一律判终态 fallback，由用户手工确认后重发。
+ * 于是当时的非幂等通道会在下次启动重投 —— 用户收到两条。
+ * 现在只有 webhook（对端按 X-Request-ID 去重）允许复位重投；其它（log、已移除的旧通道、
+ * 路由缺失）一律判终态 fallback，由用户手工确认后重发。
  *
  * 断言口径：① 非幂等不重投（DB 终态 + 真实假服务零请求 + /metrics 计数）；
  * ② webhook 行为不回归（复位重投且复用 request_id）；③ 未超窗/超窗两个分支都有断言。
@@ -117,93 +118,80 @@ const recentIso = (): string => new Date(Date.now() - 1000).toISOString();
 const exceededWindowIso = (): string => new Date(Date.now() - 56 * 60 * 1000).toISOString();
 
 describe("recoverStaleSending：重启后不确定投递的通道级语义", () => {
-  it("非幂等通道（bark）未超窗：不重投、判 fallback 终态、指标计数、人工重发仍可用", async () => {
+  it("非幂等通道（log）未超窗：不重投、判 fallback 终态、指标计数、人工重发仍可用", async () => {
     const env = makeTestEnv();
     try {
-      await withServer(
-        (_req, res) => {
-          res.writeHead(200);
-          res.end("ok");
-        },
-        async (base, captured) => {
-          const route = setPushRoute(env.db, "default", {
-            channel: "bark",
-            url: `${base.url}/key`,
-          });
-          seedUncertainSending(env, {
-            id: "d1",
-            routeName: route.name,
-            startedAt: recentIso(),
-            requestId: "req-bark-1",
-          });
+      const route = setPushRoute(env.db, "default", { channel: "log" });
+      seedUncertainSending(env, {
+        id: "d1",
+        routeName: route.name,
+        startedAt: recentIso(),
+        requestId: "req-log-1",
+      });
 
-          recoverStaleSending(env.db);
-          const after = deliveryOf(env, "d1");
-          assert.equal(
-            after.status,
-            "fallback",
-            "非幂等通道的不确定投递必须是终态，不能复位 queued",
-          );
-          assert.equal(after.last_error, UNCERTAIN_NON_IDEMPOTENT_ERROR);
-          assert.notEqual(
-            after.request_started_at,
-            null,
-            "保留 request_started_at 才能阻止 requeueRoute 在路由变更时自动重投",
-          );
-
-          // 启动后的常规 drain（内含 recoverStaleSending）不得把这条再发一次
-          forceDue(env);
-          await drainDue(env.db, env.config);
-          assert.equal(captured.length, 0, "非幂等通道的不确定投递不得被自动重投");
-          assert.equal(deliveryOf(env, "d1").status, "fallback");
-
-          // 指标沿用既有口径：这些行落 fallback，由 life_assistant_deliveries 计数
-          const metrics = await metricsText(env);
-          assert.match(metrics, /^life_assistant_deliveries\{status="fallback"\} 1$/m);
-
-          // 用户确认后手工重发：retryDeliveries 显式清空在途标记并重新入队
-          const retried = retryDeliveries(env.db, { profileId: "default", deliveryId: "d1" });
-          assert.equal(retried.retried, 1);
-          assert.equal(deliveryOf(env, "d1").status, "queued");
-          forceDue(env);
-          await drainDue(env.db, env.config);
-          assert.equal(captured.length, 1, "人工确认后必须能真正发出去");
-          assert.equal(deliveryOf(env, "d1").status, "sent");
-        },
+      recoverStaleSending(env.db);
+      const after = deliveryOf(env, "d1");
+      assert.equal(after.status, "fallback", "非幂等通道的不确定投递必须是终态，不能复位 queued");
+      assert.equal(after.last_error, UNCERTAIN_NON_IDEMPOTENT_ERROR);
+      assert.notEqual(
+        after.request_started_at,
+        null,
+        "保留 request_started_at 才能阻止 requeueRoute 在路由变更时自动重投",
       );
+
+      // 启动后的常规 drain（内含 recoverStaleSending）不得把这条再发一次
+      forceDue(env);
+      await drainDue(env.db, env.config);
+      assert.equal(
+        deliveryOf(env, "d1").status,
+        "fallback",
+        "非幂等通道的不确定投递不得被自动重投",
+      );
+
+      // 指标沿用既有口径：这些行落 fallback，由 life_assistant_deliveries 计数
+      const metrics = await metricsText(env);
+      assert.match(metrics, /^life_assistant_deliveries\{status="fallback"\} 1$/m);
+
+      // 用户确认后手工重发：retryDeliveries 显式清空在途标记并重新入队
+      const retried = retryDeliveries(env.db, { profileId: "default", deliveryId: "d1" });
+      assert.equal(retried.retried, 1);
+      assert.equal(deliveryOf(env, "d1").status, "queued");
+      forceDue(env);
+      await drainDue(env.db, env.config);
+      assert.equal(deliveryOf(env, "d1").status, "sent", "人工确认后必须能真正发出去");
     } finally {
       cleanupTestEnv(env);
     }
   });
 
-  it("非幂等通道超窗：同样是 fallback（窗口分支不影响非幂等通道的结论）", async () => {
+  it("已移除的旧通道（bark）超窗：同样是 fallback，不自动重投、不抛错", async () => {
     const env = makeTestEnv();
     try {
-      await withServer(
-        (_req, res) => {
-          res.writeHead(200);
-          res.end("ok");
-        },
-        async (base, captured) => {
-          const route = setPushRoute(env.db, "default", {
-            channel: "bark",
-            url: `${base.url}/key`,
-          });
-          seedUncertainSending(env, {
-            id: "d-old",
-            routeName: route.name,
-            startedAt: exceededWindowIso(),
-            requestId: "req-bark-old",
-          });
+      // 已移除通道只能来自存量数据：直接写设置，模拟通道移除前落库的路由
+      setSetting(env.db, "default", "push_route", {
+        name: "life-assistant-default",
+        url: "https://api.day.app/XXXX",
+        platform: null,
+        enabled: true,
+        channel: "bark",
+      });
+      seedUncertainSending(env, {
+        id: "d-old",
+        routeName: "life-assistant-default",
+        startedAt: exceededWindowIso(),
+        requestId: "req-bark-old",
+      });
 
-          recoverStaleSending(env.db);
-          assert.equal(deliveryOf(env, "d-old").status, "fallback");
-          assert.equal(deliveryOf(env, "d-old").last_error, UNCERTAIN_NON_IDEMPOTENT_ERROR);
+      recoverStaleSending(env.db);
+      assert.equal(deliveryOf(env, "d-old").status, "fallback");
+      assert.equal(deliveryOf(env, "d-old").last_error, UNCERTAIN_NON_IDEMPOTENT_ERROR);
 
-          forceDue(env);
-          await drainDue(env.db, env.config);
-          assert.equal(captured.length, 0, "超窗的非幂等不确定投递同样不得自动重投");
-        },
+      forceDue(env);
+      await drainDue(env.db, env.config);
+      assert.equal(
+        deliveryOf(env, "d-old").status,
+        "fallback",
+        "超窗的非幂等不确定投递不得自动重投",
       );
     } finally {
       cleanupTestEnv(env);

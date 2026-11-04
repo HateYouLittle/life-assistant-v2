@@ -245,7 +245,7 @@ describe("/metrics", () => {
       const denied = await a.request("/metrics");
       assert.equal(denied.status, 401, "无凭据必须拒绝");
       assert.equal(denied.headers.get("cache-control"), "no-store");
-      // 与状态页/quick/calendar 同口径：失败鉴权既计数也写 warn 日志（公网扫描要可见）
+      // 与状态页同口径：失败鉴权既计数也写 warn 日志（公网扫描要可见）
       assert.ok(
         logs.some((line) => line.includes("鉴权失败: /metrics")),
         `应写鉴权失败日志：${logs.join("\n")}`,

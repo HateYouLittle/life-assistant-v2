@@ -7,7 +7,6 @@ import { Hono } from "hono";
 import { listAudit, recordAudit } from "../src/core/audit.js";
 import { getSchemaVersion, openDatabase, SCHEMA_VERSION } from "../src/core/database.js";
 import { schemaFingerprint, storedSchemaFingerprint } from "../src/core/fingerprint.js";
-import { createQuickApp } from "../src/server/quick.js";
 import { createStatusApp } from "../src/server/status.js";
 import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
 
@@ -15,8 +14,7 @@ import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
  * 审计日志（schema v5）：
  * ① v4 老库升级后 audit_log 存在、旧数据保留、重复打开幂等（且留了 pre-v4 快照）；
  * ② recordAudit 永不抛错（外键失败/库已关闭/不可序列化 detail 都只吞掉）；
- * ③ /api/quick/expenses|schedules 成功写审计（target 指向返回 id；detail 不含备注/token）；
- * ④ /api/audit 鉴权（401）、master 全量、profile 仅自己、分页与非法参数、detail 不跨 Profile。
+ * ③ /api/audit 鉴权（401）、master 全量、profile 仅自己、分页与非法参数、detail 不跨 Profile。
  */
 
 const MASTER = "m".repeat(64);
@@ -278,144 +276,6 @@ describe("recordAudit / listAudit", () => {
         listAudit(env.db, { offset: -5 }).items.map((row) => row.id),
         all.items.map((row) => row.id),
       );
-    } finally {
-      cleanupTestEnv(env);
-    }
-  });
-});
-
-describe("/api/quick 写操作产生审计", () => {
-  function quickAppFor(env: TestEnv): Hono {
-    return new Hono().route("/", createQuickApp(env.config, env.db));
-  }
-
-  it("记账成功写 quick.expense.add（target=返回 id，detail 无备注/token）", async () => {
-    const env = buildEnv();
-    try {
-      env.db
-        .prepare(
-          "INSERT INTO ledgers (id, name, created_at) VALUES ('l-family', '家庭账本', '2026-01-01T00:00:00.000Z')",
-        )
-        .run();
-      const app = quickAppFor(env);
-      const payload = {
-        amount: 12.5,
-        ledger_id: "l-family",
-        category: "餐饮",
-        note: "敏感备注：血压药",
-        request_id: "audit-exp-1",
-      };
-      const first = await app.request("/api/quick/expenses", {
-        method: "POST",
-        headers: bearer(BESTIE),
-        body: JSON.stringify(payload),
-      });
-      assert.equal(first.status, 201);
-      const firstBody = await jsonBody(first);
-
-      const rows = env.db.prepare("SELECT * FROM audit_log ORDER BY created_at").all() as {
-        profile_id: string;
-        action: string;
-        target_kind: string;
-        target_id: string;
-        detail_json: string;
-      }[];
-      assert.equal(rows.length, 1);
-      assert.equal(rows[0]?.action, "quick.expense.add");
-      assert.equal(rows[0]?.target_kind, "expense");
-      assert.equal(rows[0]?.target_id, firstBody.id);
-      assert.equal(rows[0]?.profile_id, "bestie");
-      const detail = JSON.parse(rows[0]?.detail_json ?? "{}") as Record<string, unknown>;
-      assert.equal(detail.金额, 12.5);
-      assert.equal(detail.分类, "餐饮");
-      assert.equal(detail.账本, "家庭账本");
-      assert.equal(detail.已存在, undefined);
-      // 隐私：备注全文与 token 都不能进审计
-      assert.doesNotMatch(rows[0]?.detail_json ?? "", /血压/);
-      assert.doesNotMatch(rows[0]?.detail_json ?? "", new RegExp(BESTIE));
-
-      // 幂等重试：第二次也要留痕，并标记 已存在
-      const second = await app.request("/api/quick/expenses", {
-        method: "POST",
-        headers: bearer(BESTIE),
-        body: JSON.stringify(payload),
-      });
-      assert.equal(second.status, 201);
-      const dupRows = env.db
-        .prepare("SELECT detail_json FROM audit_log ORDER BY created_at")
-        .all() as { detail_json: string }[];
-      assert.equal(dupRows.length, 2);
-      assert.equal(
-        (JSON.parse(dupRows[1]?.detail_json ?? "{}") as Record<string, unknown>).已存在,
-        true,
-      );
-    } finally {
-      cleanupTestEnv(env);
-    }
-  });
-
-  it("设提醒成功写 quick.schedule.add；失败请求不写审计；master 代操作记目标 Profile", async () => {
-    const env = buildEnv();
-    try {
-      env.db
-        .prepare(
-          "INSERT INTO ledgers (id, name, created_at) VALUES ('l-family', '家庭账本', '2026-01-01T00:00:00.000Z')",
-        )
-        .run();
-      const app = quickAppFor(env);
-      // 失败请求（标题为空）：不应留下审计
-      const bad = await app.request("/api/quick/schedules", {
-        method: "POST",
-        headers: bearer(BESTIE),
-        body: JSON.stringify({ title: "   " }),
-      });
-      assert.equal(bad.status, 400);
-      assert.equal(
-        (env.db.prepare("SELECT COUNT(*) AS n FROM audit_log").get() as { n: number }).n,
-        0,
-      );
-
-      const created = await app.request("/api/quick/schedules", {
-        method: "POST",
-        headers: bearer(BESTIE),
-        body: JSON.stringify({
-          title: "交房租",
-          date: "2099-11-01",
-          time: "09:00",
-          note: "转账给房东",
-          request_id: "audit-sch-1",
-        }),
-      });
-      assert.equal(created.status, 201);
-      const createdBody = await jsonBody(created);
-      const row = env.db
-        .prepare("SELECT * FROM audit_log WHERE action = 'quick.schedule.add'")
-        .get() as {
-        target_kind: string;
-        target_id: string;
-        detail_json: string;
-        profile_id: string;
-      };
-      assert.equal(row.target_kind, "schedule");
-      assert.equal(row.target_id, createdBody.id);
-      assert.equal(row.profile_id, "bestie");
-      const detail = JSON.parse(row.detail_json) as Record<string, unknown>;
-      assert.equal(detail.标题, "交房租");
-      assert.equal(detail.事件时间, "2099-11-01 09:00");
-      assert.doesNotMatch(row.detail_json, /房东/, "备注全文不得进审计");
-
-      // master 代 bestie 记账：审计身份必须是目标 Profile（谁的数据），而不是 master
-      const delegated = await app.request("/api/quick/expenses?profile=bestie", {
-        method: "POST",
-        headers: bearer(MASTER),
-        body: JSON.stringify({ amount: 5, ledger_id: "l-family" }),
-      });
-      assert.equal(delegated.status, 201);
-      const delegatedRow = env.db
-        .prepare("SELECT profile_id, target_id FROM audit_log WHERE action = 'quick.expense.add'")
-        .get() as { profile_id: string; target_id: string };
-      assert.equal(delegatedRow.profile_id, "bestie");
-      assert.equal(delegatedRow.target_id, (await jsonBody(delegated)).id);
     } finally {
       cleanupTestEnv(env);
     }

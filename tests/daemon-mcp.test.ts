@@ -435,12 +435,12 @@ describe("双层限流与鉴权失败日志", () => {
       const second = await fetch(url);
       assert.equal(second.status, 429);
       await second.text();
-      // 日历签名同理（IP 桶已耗尽，这一条也必然被限流）
-      const calendar = await fetch(
-        `http://127.0.0.1:${harness.port}/calendar.ics?p=default&exp=9999999999&sig=${sig}`,
+      // 签名类 query（sig）同理（IP 桶已耗尽，这一条也必然被限流）
+      const signed = await fetch(
+        `http://127.0.0.1:${harness.port}/metrics?p=default&exp=9999999999&sig=${sig}`,
       );
-      assert.equal(calendar.status, 429);
-      await calendar.text();
+      assert.equal(signed.status, 429);
+      await signed.text();
     } finally {
       console.error = original;
       await harness.close();
@@ -452,10 +452,9 @@ describe("双层限流与鉴权失败日志", () => {
     assert.ok(line.includes("view=2"), `非敏感参数应保留：${line}`);
     assert.ok(!line.includes("\x1b") && !line.includes("\n"), "日志必须单行且无控制字符");
 
-    const calendarLine =
-      logs.find((l) => l.includes("已限流") && l.includes("/calendar.ics")) ?? "";
-    assert.ok(calendarLine.includes("sig=***"), `签名参数应打码：${calendarLine}`);
-    assert.ok(!calendarLine.includes(sig), `日志不得含 sig 原文：${calendarLine}`);
+    const signedLine = logs.find((l) => l.includes("已限流") && l.includes("/metrics")) ?? "";
+    assert.ok(signedLine.includes("sig=***"), `签名参数应打码：${signedLine}`);
+    assert.ok(!signedLine.includes(sig), `日志不得含 sig 原文：${signedLine}`);
   });
 
   it("请求可控字段净化：X-Forwarded-For 来源被截断，日志单行无控制字符", async () => {

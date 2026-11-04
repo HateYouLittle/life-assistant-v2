@@ -5,9 +5,8 @@ import { logger } from "./logger.js";
 /**
  * 审计日志（schema v5）：记录「谁、何时、对什么、做了什么」。
  *
- * 首期只覆盖手机快捷入口（`/api/quick/*`）的写操作 —— 那是唯一不经 MCP、直接由 HTTP
- * 凭据驱动的写路径，出了问题（多记一笔、给错人建提醒）需要能回溯到具体请求；
- * MCP 侧的调用本身已由 Hermes 的会话记录覆盖，不重复落库。
+ * 首期覆盖的手机快捷入口（HTTP 凭据驱动的写路径）已移除；表与 `/api/audit` 保留，
+ * 存量行照常可查。MCP 侧的调用本身已由 Hermes 的会话记录覆盖，不重复落库。
  *
  * 纪律：
  * - 只增不改，且**永不抛出**：审计是旁路，写失败只记 error，绝不能让一次已经成功的
@@ -24,7 +23,7 @@ const AUDIT_MAX_OFFSET = 100_000;
 export interface RecordAuditInput {
   /** 操作者（Profile token 绑定的人；master 代操作时是目标 Profile） */
   profileId: string;
-  /** 稳定的动作名，如 quick.expense.add / quick.schedule.add */
+  /** 稳定的动作名，如 expense.add / schedule.add */
   action: string;
   /** 目标对象类型，如 expense / schedule */
   targetKind?: string | null;

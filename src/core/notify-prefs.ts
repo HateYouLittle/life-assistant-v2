@@ -57,7 +57,7 @@ export function setNotifyPrefs(db: DatabaseSync, profileId: string, prefs: Notif
 
 /**
  * 该 kind 在该 Profile 上是否应该主动推送。
- * `routeChannel` 是当前路由的通道名（webhook/log/bark/ntfy），用于 channels 白名单判定。
+ * `routeChannel` 是当前路由的通道名（webhook/log），用于 channels 白名单判定。
  */
 export function kindPushDecision(
   prefs: NotifyPrefs,
