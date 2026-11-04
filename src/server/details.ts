@@ -1,11 +1,19 @@
 import type { DatabaseSync } from "node:sqlite";
 import { DateTime } from "luxon";
-import { withReadTransaction } from "../core/database.js";
 import { holidayPeriods } from "../core/holiday.js";
 import { type JobRunRow, type JobRunStatus, lastJobRun, recentJobRuns } from "../core/jobs.js";
 import { allJobs, type JobDef } from "../core/registry.js";
-import { monthRange } from "../modules/bookkeeping/service.js";
-import { KIND_LABEL, parseEscalation, type ScheduleKind } from "../modules/schedule/service.js";
+import {
+  type ExpenseEntry,
+  expenseMonthAggregates,
+  monthRange,
+} from "../modules/bookkeeping/service.js";
+import {
+  activeSchedulesWithNextOccurrence,
+  KIND_LABEL,
+  parseEscalation,
+  type ScheduleKind,
+} from "../modules/schedule/service.js";
 import { TZ, todayIso } from "../time.js";
 
 /**
@@ -52,16 +60,7 @@ export function clampOffset(raw: string | undefined, max = 100_000): number {
   return Math.max(0, Math.min(Math.trunc(value), max));
 }
 
-export interface ExpenseEntry {
-  id: string;
-  ledger_id: string;
-  ledger_name: string;
-  amount_cents: number;
-  category: string;
-  note: string | null;
-  spent_on: string;
-  created_by_profile: string;
-}
+export type { ExpenseEntry };
 
 export interface ExpenseDetails {
   month: string;
@@ -104,109 +103,41 @@ export function expenseDetails(
   const { from, to } = monthRange(month);
   const limit = clampLimit(rawLimit, 50);
   const offset = clampOffset(rawOffset);
-  // SQL 片段只由本文件拼出（不含用户输入），Profile id 始终走参数绑定
-  const ledgerFilter =
-    scope?.profileId === undefined
-      ? { sql: "l.owner_profile_id IS NULL", params: [] as string[] }
-      : {
-          sql: "(l.owner_profile_id IS NULL OR l.owner_profile_id = ?)",
-          params: [scope.profileId],
-        };
-
-  // 6 条独立 SELECT 需要一个一致快照：并发写入时否则「合计」与「分类/明细」会对不上
-  // （与 bookkeeping 的 summarizeExpenses 同口径）。
-  return withReadTransaction(db, () => {
-    const totals = db
-      .prepare(
-        `SELECT COALESCE(SUM(e.amount_cents), 0) AS cents, COUNT(*) AS count
-       FROM expenses e JOIN ledgers l ON l.id = e.ledger_id
-       WHERE e.spent_on >= ? AND e.spent_on <= ? AND ${ledgerFilter.sql}`,
-      )
-      .get(from, to, ...ledgerFilter.params) as { cents: number; count: number };
-
-    const categories = db
-      .prepare(
-        `SELECT e.category, SUM(e.amount_cents) AS cents, COUNT(*) AS count FROM expenses e
-       JOIN ledgers l ON l.id = e.ledger_id
-       WHERE e.spent_on >= ? AND e.spent_on <= ? AND ${ledgerFilter.sql}
-       GROUP BY e.category ORDER BY cents DESC`,
-      )
-      .all(from, to, ...ledgerFilter.params) as {
-      category: string;
-      cents: number;
-      count: number;
-    }[];
-
-    const daily = db
-      .prepare(
-        `SELECT e.spent_on AS date, SUM(e.amount_cents) AS cents FROM expenses e
-       JOIN ledgers l ON l.id = e.ledger_id
-       WHERE e.spent_on >= ? AND e.spent_on <= ? AND ${ledgerFilter.sql}
-       GROUP BY e.spent_on ORDER BY e.spent_on`,
-      )
-      .all(from, to, ...ledgerFilter.params) as { date: string; cents: number }[];
-
-    const ledgers = db
-      .prepare(
-        `SELECT e.ledger_id AS ledger_id, l.name AS ledger_name, SUM(e.amount_cents) AS cents, COUNT(*) AS count
-       FROM expenses e JOIN ledgers l ON l.id = e.ledger_id
-       WHERE e.spent_on >= ? AND e.spent_on <= ? AND ${ledgerFilter.sql}
-       GROUP BY e.ledger_id ORDER BY cents DESC`,
-      )
-      .all(from, to, ...ledgerFilter.params) as {
-      ledger_id: string;
-      ledger_name: string;
-      cents: number;
-      count: number;
-    }[];
-
-    // 家庭看板只展示家庭账本；带 Profile 作用域时额外含**本人**个人账本（他人个人账本永不出现）。
-    // 排序补上 e.id 兜底：spent_on + created_at 完全相同的两条在分页时有稳定顺序，
-    // 否则 SQLite 的返回顺序不确定，翻页可能出现重复或漏行。
-    const entries = db
-      .prepare(
-        `SELECT e.id, e.ledger_id, l.name AS ledger_name, e.amount_cents, e.category,
-              e.note, e.spent_on, e.created_by_profile
-       FROM expenses e JOIN ledgers l ON l.id = e.ledger_id
-       WHERE e.spent_on >= ? AND e.spent_on <= ? AND ${ledgerFilter.sql}
-       ORDER BY e.spent_on DESC, e.created_at DESC, e.id DESC LIMIT ? OFFSET ?`,
-      )
-      .all(from, to, ...ledgerFilter.params, limit, offset) as unknown as ExpenseEntry[];
-
-    const prevMonth = previousMonthOf(month);
-    const prevRange = monthRange(prevMonth);
-    const prev = db
-      .prepare(
-        `SELECT COALESCE(SUM(e.amount_cents), 0) AS cents FROM expenses e
-       JOIN ledgers l ON l.id = e.ledger_id
-       WHERE e.spent_on >= ? AND e.spent_on <= ? AND ${ledgerFilter.sql}`,
-      )
-      .get(prevRange.from, prevRange.to, ...ledgerFilter.params) as { cents: number };
-
-    const entriesTotal = totals.count;
-    const hasMore = offset + entries.length < entriesTotal;
-    return {
-      month,
-      range: { from, to },
-      total_cents: totals.cents,
-      count: totals.count,
-      prev: { month: prevMonth, total_cents: prev.cents },
-      categories: categories.map((c) => ({
-        category: c.category,
-        cents: c.cents,
-        count: c.count,
-        share: totals.cents > 0 ? c.cents / totals.cents : 0,
-      })),
-      daily,
-      ledgers,
-      entries,
-      entries_total: entriesTotal,
-      offset,
-      has_more: hasMore,
-      // 用「实际返回条数」推进而不是 offset + limit：越界/末页不满时也不会跳过数据
-      next_offset: hasMore ? offset + entries.length : null,
-    };
+  const prevMonth = previousMonthOf(month);
+  const prevRange = monthRange(prevMonth);
+  const { totals, categories, daily, ledgers, entries, prevCents } = expenseMonthAggregates(db, {
+    from,
+    to,
+    prevFrom: prevRange.from,
+    prevTo: prevRange.to,
+    profileId: scope?.profileId,
+    limit,
+    offset,
   });
+
+  const entriesTotal = totals.count;
+  const hasMore = offset + entries.length < entriesTotal;
+  return {
+    month,
+    range: { from, to },
+    total_cents: totals.cents,
+    count: totals.count,
+    prev: { month: prevMonth, total_cents: prevCents },
+    categories: categories.map((c) => ({
+      category: c.category,
+      cents: c.cents,
+      count: c.count,
+      share: totals.cents > 0 ? c.cents / totals.cents : 0,
+    })),
+    daily,
+    ledgers,
+    entries,
+    entries_total: entriesTotal,
+    offset,
+    has_more: hasMore,
+    // 用「实际返回条数」推进而不是 offset + limit：越界/末页不满时也不会跳过数据
+    next_offset: hasMore ? offset + entries.length : null,
+  };
 }
 
 export interface ScheduleDetailItem {
@@ -233,22 +164,6 @@ export interface ScheduleDetailItem {
   is_deadline: boolean;
 }
 
-interface ScheduleJoinRow {
-  id: string;
-  profile_id: string;
-  title: string;
-  kind: ScheduleKind;
-  calendar: string;
-  time: string;
-  all_day: number;
-  note: string | null;
-  workday_filter: string;
-  escalation_json: string | null;
-  created_at: string;
-  next_event_at: string | null;
-  next_due_at: string | null;
-}
-
 function localStamp(iso: string | null, allDay: boolean): string | null {
   if (iso === null) return null;
   const dt = DateTime.fromISO(iso, { zone: TZ });
@@ -266,28 +181,7 @@ export function scheduleDetails(
   profileId?: string,
 ): ScheduleDetailItem[] {
   const limit = clampLimit(rawLimit, 50, 500);
-  const profileFilter = profileId === undefined ? "" : " AND s.profile_id = ?";
-  const rows = db
-    .prepare(
-      `SELECT s.id, s.profile_id, s.title, s.kind, s.calendar, s.time, s.all_day, s.note,
-              s.workday_filter, s.escalation_json, s.created_at,
-              o.event_at AS next_event_at, o.due_at AS next_due_at
-       FROM schedules s
-       LEFT JOIN occurrences o ON o.schedule_id = s.id AND o.status = 'pending'
-         AND o.occurrence_key = (
-           -- 取「最近的事件」而非「最近的提醒」：卡片显示的是事件日，倒计时与排序必须同源；
-           -- 同一事件有多个提醒偏移时按 occurrence_key 收敛成一行，避免列表重复。
-           SELECT o2.occurrence_key FROM occurrences o2
-           WHERE o2.schedule_id = s.id AND o2.status = 'pending'
-           ORDER BY o2.event_at ASC, o2.due_at ASC LIMIT 1
-         )
-       WHERE s.status = 'active'${profileFilter}
-       ORDER BY COALESCE(o.event_at, '9999') ASC, s.created_at ASC
-       LIMIT ?`,
-    )
-    .all(
-      ...(profileId === undefined ? [limit] : [profileId, limit]),
-    ) as unknown as ScheduleJoinRow[];
+  const rows = activeSchedulesWithNextOccurrence(db, limit, profileId);
 
   const todayStart = DateTime.fromISO(todayIso(), { zone: TZ });
   return rows.map((r) => {

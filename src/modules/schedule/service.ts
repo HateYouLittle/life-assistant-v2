@@ -2509,3 +2509,56 @@ export async function tickSchedules(
     logger.warn(`跨年节假日复核异常: ${errorMessage(e)}`);
   }
 }
+
+/** 看板日程列表的一行：日程本体 + 最近一条 pending 发生记录的事件/提醒时刻。 */
+export interface ActiveScheduleRow {
+  id: string;
+  profile_id: string;
+  title: string;
+  kind: ScheduleKind;
+  calendar: string;
+  time: string;
+  all_day: number;
+  note: string | null;
+  workday_filter: string;
+  escalation_json: string | null;
+  created_at: string;
+  next_event_at: string | null;
+  next_due_at: string | null;
+}
+
+/**
+ * 活跃日程及其最近一次待发生的事件，按事件时间升序（无待发的排最后），同刻按创建时间。
+ *
+ * @param db 数据库连接
+ * @param limit 最多返回条数
+ * @param profileId 可选；给了只返回该 Profile 自己的日程（日程是 Profile 私有数据），缺省 = 跨 Profile
+ */
+export function activeSchedulesWithNextOccurrence(
+  db: DatabaseSync,
+  limit: number,
+  profileId?: string,
+): ActiveScheduleRow[] {
+  const profileFilter = profileId === undefined ? "" : " AND s.profile_id = ?";
+  return db
+    .prepare(
+      `SELECT s.id, s.profile_id, s.title, s.kind, s.calendar, s.time, s.all_day, s.note,
+              s.workday_filter, s.escalation_json, s.created_at,
+              o.event_at AS next_event_at, o.due_at AS next_due_at
+       FROM schedules s
+       LEFT JOIN occurrences o ON o.schedule_id = s.id AND o.status = 'pending'
+         AND o.occurrence_key = (
+           -- 取「最近的事件」而非「最近的提醒」：卡片显示的是事件日，倒计时与排序必须同源；
+           -- 同一事件有多个提醒偏移时按 occurrence_key 收敛成一行，避免列表重复。
+           SELECT o2.occurrence_key FROM occurrences o2
+           WHERE o2.schedule_id = s.id AND o2.status = 'pending'
+           ORDER BY o2.event_at ASC, o2.due_at ASC LIMIT 1
+         )
+       WHERE s.status = 'active'${profileFilter}
+       ORDER BY COALESCE(o.event_at, '9999') ASC, s.created_at ASC
+       LIMIT ?`,
+    )
+    .all(
+      ...(profileId === undefined ? [limit] : [profileId, limit]),
+    ) as unknown as ActiveScheduleRow[];
+}

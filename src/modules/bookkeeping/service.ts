@@ -1759,3 +1759,144 @@ export function findMissingMonthlyReports(
   }
   return { missing, tooOld };
 }
+
+/** 看板「支出明细」的逐笔行（含账本名）。 */
+export interface ExpenseEntry {
+  id: string;
+  ledger_id: string;
+  ledger_name: string;
+  amount_cents: number;
+  category: string;
+  note: string | null;
+  spent_on: string;
+  created_by_profile: string;
+}
+
+/** {@link expenseMonthAggregates} 的返回：各条查询的原始行，不做占比等派生计算。 */
+export interface ExpenseMonthAggregates {
+  /** 本月合计（分）与笔数 */
+  totals: { cents: number; count: number };
+  /** 按分类汇总，金额降序 */
+  categories: { category: string; cents: number; count: number }[];
+  /** 按天汇总，日期升序 */
+  daily: { date: string; cents: number }[];
+  /** 按账本汇总，金额降序 */
+  ledgers: { ledger_id: string; ledger_name: string; cents: number; count: number }[];
+  /** 本页逐笔（已按 limit/offset 分页） */
+  entries: ExpenseEntry[];
+  /** 上一个区间（prevFrom~prevTo）的合计（分） */
+  prevCents: number;
+}
+
+/**
+ * 看板用的某月支出聚合：合计、分类、按天、按账本、分页逐笔、上月合计，共 6 条 SELECT。
+ *
+ * `profileId` 给了时：可见账本 = 家庭账本（owner_profile_id IS NULL）+ 该 Profile 的个人账本；
+ * 缺省 = 只家庭账本（master 的「家庭看板」口径，保持历史行为）。
+ *
+ * 为什么账本过滤要下推到每一条 SQL：合计/分类/按天/按账本/逐笔/上月对照共用同一口径，
+ * 只在 entries 上过滤会让卡片合计与明细对不上（且会把别人的个人账本金额算进总额）。
+ *
+ * 6 条独立 SELECT 包在 `withReadTransaction` 里取一致快照：并发写入时否则「合计」与
+ * 「分类/明细」会对不上（与 summarizeExpenses 同口径）。
+ *
+ * @param db 数据库连接
+ * @param opts.from 本期起始日（含，YYYY-MM-DD）
+ * @param opts.to 本期结束日（含）
+ * @param opts.prevFrom 对照期起始日（含）
+ * @param opts.prevTo 对照期结束日（含）
+ * @param opts.profileId 可选，带上则额外包含该 Profile 的个人账本
+ * @param opts.limit 逐笔分页大小
+ * @param opts.offset 逐笔分页起点
+ */
+export function expenseMonthAggregates(
+  db: DatabaseSync,
+  opts: {
+    from: string;
+    to: string;
+    prevFrom: string;
+    prevTo: string;
+    profileId?: string;
+    limit: number;
+    offset: number;
+  },
+): ExpenseMonthAggregates {
+  const { from, to, prevFrom, prevTo, profileId, limit, offset } = opts;
+  // SQL 片段只由本文件拼出（不含用户输入），Profile id 始终走参数绑定
+  const ledgerFilter =
+    profileId === undefined
+      ? { sql: "l.owner_profile_id IS NULL", params: [] as string[] }
+      : {
+          sql: "(l.owner_profile_id IS NULL OR l.owner_profile_id = ?)",
+          params: [profileId],
+        };
+
+  return withReadTransaction(db, () => {
+    const totals = db
+      .prepare(
+        `SELECT COALESCE(SUM(e.amount_cents), 0) AS cents, COUNT(*) AS count
+       FROM expenses e JOIN ledgers l ON l.id = e.ledger_id
+       WHERE e.spent_on >= ? AND e.spent_on <= ? AND ${ledgerFilter.sql}`,
+      )
+      .get(from, to, ...ledgerFilter.params) as { cents: number; count: number };
+
+    const categories = db
+      .prepare(
+        `SELECT e.category, SUM(e.amount_cents) AS cents, COUNT(*) AS count FROM expenses e
+       JOIN ledgers l ON l.id = e.ledger_id
+       WHERE e.spent_on >= ? AND e.spent_on <= ? AND ${ledgerFilter.sql}
+       GROUP BY e.category ORDER BY cents DESC`,
+      )
+      .all(from, to, ...ledgerFilter.params) as {
+      category: string;
+      cents: number;
+      count: number;
+    }[];
+
+    const daily = db
+      .prepare(
+        `SELECT e.spent_on AS date, SUM(e.amount_cents) AS cents FROM expenses e
+       JOIN ledgers l ON l.id = e.ledger_id
+       WHERE e.spent_on >= ? AND e.spent_on <= ? AND ${ledgerFilter.sql}
+       GROUP BY e.spent_on ORDER BY e.spent_on`,
+      )
+      .all(from, to, ...ledgerFilter.params) as { date: string; cents: number }[];
+
+    const ledgers = db
+      .prepare(
+        `SELECT e.ledger_id AS ledger_id, l.name AS ledger_name, SUM(e.amount_cents) AS cents, COUNT(*) AS count
+       FROM expenses e JOIN ledgers l ON l.id = e.ledger_id
+       WHERE e.spent_on >= ? AND e.spent_on <= ? AND ${ledgerFilter.sql}
+       GROUP BY e.ledger_id ORDER BY cents DESC`,
+      )
+      .all(from, to, ...ledgerFilter.params) as {
+      ledger_id: string;
+      ledger_name: string;
+      cents: number;
+      count: number;
+    }[];
+
+    // 家庭看板只展示家庭账本；带 Profile 作用域时额外含**本人**个人账本（他人个人账本永不出现）。
+    // 排序补上 e.id 兜底：spent_on + created_at 完全相同的两条在分页时有稳定顺序，
+    // 否则 SQLite 的返回顺序不确定，翻页可能出现重复或漏行。
+    const entries = db
+      .prepare(
+        `SELECT e.id, e.ledger_id, l.name AS ledger_name, e.amount_cents, e.category,
+              e.note, e.spent_on, e.created_by_profile
+       FROM expenses e JOIN ledgers l ON l.id = e.ledger_id
+       WHERE e.spent_on >= ? AND e.spent_on <= ? AND ${ledgerFilter.sql}
+       ORDER BY e.spent_on DESC, e.created_at DESC, e.id DESC LIMIT ? OFFSET ?`,
+      )
+      .all(from, to, ...ledgerFilter.params, limit, offset) as unknown as ExpenseEntry[];
+
+    const prev = db
+      .prepare(
+        `SELECT COALESCE(SUM(e.amount_cents), 0) AS cents FROM expenses e
+       JOIN ledgers l ON l.id = e.ledger_id
+       WHERE e.spent_on >= ? AND e.spent_on <= ? AND ${ledgerFilter.sql}`,
+      )
+      .get(prevFrom, prevTo, ...ledgerFilter.params) as { cents: number };
+
+    return { totals, categories, daily, ledgers, entries, prevCents: prev.cents };
+  });
+}
