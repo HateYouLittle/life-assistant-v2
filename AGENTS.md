@@ -34,8 +34,8 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
 
 ## 架构
 
-- `src/core/` 是框架层：database/fingerprint/audit/registry/jobs/lock/security/auth/http/logger/
-  logrotate/settings/notify/notify-prefs/channels/smtp/render/qweather/qweather-jwt/holiday/recurrence/
+- `src/core/` 是框架层：database/fingerprint/audit/registry/action-tool/jobs/lock/security/auth/http/
+  logger/logrotate/settings/notify/notify-prefs/channels/smtp/render/qweather/qweather-jwt/holiday/recurrence/
   retention/backup/ratelimit/metrics/ics。`src/modules/`
   （weather/holiday/schedule/bookkeeping/bills/notify/maintenance）通过 `src/modules/index.ts` 的
   副作用 import 接入，遵循 `tools / jobs / tick / onStart` 四个契约扩展点。`maintenance`
@@ -238,6 +238,11 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   别名（两者都传且冲突要明确报错）；`air_quality` 与 `weather {action:"air"}` 共用同一个 `airView()`。
   与当前 action 无关的字段**显式拒绝**（`未知字段: X（action=Y 不接受）`，bookkeeping 与 notify
   两侧逐字一致），不再静默忽略；两条既有更具体文案（export 的 from/to、update 的 ledger_id）保留。
+  分发统一走 `src/core/action-tool.ts` 的 `defineActionTool({ actions: { <名>: { fields, requires,
+  group, handler } } })`：action/view 别名与冲突、未知 action、未知字段、必填校验与 action 枚举
+  都由它生成，文案只在该文件定义（`unknownFieldMessage` / `unknownActionMessage`），模块里不得再
+  手写这些字面量。weather/holiday 开 `viewAlias` 且不设 `fields`（不做未知字段校验，保持现状）；
+  bookkeeping/notify/schedule 设 `fields`。bills 暂未迁移，只复用 `findUnknownField` + 共享文案。
 - **`doctor --live` 的「过期一次性日程」检查**（N-1）：`recurrence_json IS NULL AND calendar='solar'
   AND start_date < 今天 AND status='active'` 的行报 warn（列 id/profile/title + 收尾指引），
   用独立只读连接查（不升级 schema、不写库、不 fail）。
