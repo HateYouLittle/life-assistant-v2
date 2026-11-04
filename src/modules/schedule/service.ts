@@ -2562,3 +2562,16 @@ export function activeSchedulesWithNextOccurrence(
       ...(profileId === undefined ? [limit] : [profileId, limit]),
     ) as unknown as ActiveScheduleRow[];
 }
+
+/** 活跃日程数：profileId 缺省 = 全部 Profile（家庭看板） */
+export function countActiveSchedules(db: DatabaseSync, profileId?: string): number {
+  const row =
+    profileId === undefined
+      ? (db.prepare("SELECT COUNT(*) AS n FROM schedules WHERE status = 'active'").get() as
+          | { n: number }
+          | undefined)
+      : (db
+          .prepare("SELECT COUNT(*) AS n FROM schedules WHERE status = 'active' AND profile_id = ?")
+          .get(profileId) as { n: number } | undefined);
+  return row?.n ?? 0;
+}

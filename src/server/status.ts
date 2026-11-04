@@ -6,17 +6,22 @@ import { DateTime } from "luxon";
 import type { ResolvedConfig } from "../config.js";
 import { AUDIT_DEFAULT_LIMIT, AUDIT_MAX_LIMIT, type AuditRow, listAudit } from "../core/audit.js";
 import { type Identity, resolveIdentity } from "../core/auth.js";
+import { pingDatabase } from "../core/database.js";
+import { failedHolidayYears } from "../core/holiday.js";
+import { countFailedJobRunsSince } from "../core/jobs.js";
 import { logger, sanitizeLogText } from "../core/logger.js";
 import { incCounter } from "../core/metrics.js";
 import { qweatherUsage } from "../core/qweather.js";
 import { envClientAddress } from "../core/ratelimit.js";
 import { allJobs } from "../core/registry.js";
-import { expenseCsv, expenseCsvFilename } from "../modules/bookkeeping/service.js";
+import { listProfiles } from "../core/settings.js";
+import { countLedgers, expenseCsv, expenseCsvFilename } from "../modules/bookkeeping/service.js";
 import { TZ, todayIso } from "../time.js";
 import { backupStatus } from "../core/backup.js";
 import { budgetPayload } from "./budget.js";
 import {
   clampOffset,
+  activeScheduleCount,
   deliveryDetails,
   expenseDetails,
   holidayDetails,
@@ -88,11 +93,6 @@ export function statusPayload(
   const month = today.slice(0, 7);
   const profileId = visibleProfileId(identity);
 
-  const count = (sql: string, ...params: (string | number)[]): number => {
-    const row = db.prepare(sql).get(...params) as { n: number } | undefined;
-    return row?.n ?? 0;
-  };
-
   const expenses = expenseDetails(db, month, "1", undefined, { profileId });
   const deliveries = deliveryDetails(db, "1", undefined, profileId);
   const schedules = scheduleDetails(db, "50", profileId);
@@ -116,12 +116,7 @@ export function statusPayload(
     qweather_usage: qweatherUsage(),
     daily_brief_cron: config.dailyBriefCron,
     // 个人视图只列自己：Profile 列表本身也是「其他用户存在」的元数据
-    profiles:
-      profileId === undefined
-        ? (db.prepare("SELECT id FROM profiles ORDER BY id").all() as { id: string }[]).map(
-            (r) => r.id,
-          )
-        : [profileId],
+    profiles: profileId === undefined ? listProfiles(db) : [profileId],
     today: {
       date: today,
       weekday: `周${WEEKDAY_CN[at.weekday - 1] ?? ""}`,
@@ -129,13 +124,7 @@ export function statusPayload(
       label: `${at.toFormat("yyyy年L月d日")} 周${WEEKDAY_CN[at.weekday - 1] ?? ""}`,
     },
     schedules: {
-      active:
-        profileId === undefined
-          ? count("SELECT COUNT(*) AS n FROM schedules WHERE status = 'active'")
-          : count(
-              "SELECT COUNT(*) AS n FROM schedules WHERE status = 'active' AND profile_id = ?",
-              profileId,
-            ),
+      active: activeScheduleCount(db, profileId),
       // 概览只带最近 5 条；完整列表走 /api/schedules
       next: schedules.slice(0, 5),
     },
@@ -147,26 +136,8 @@ export function statusPayload(
     },
     ledgers: {
       // Profile 视图把自己可见的账本都算上（家庭 + 自己的个人账本），与支出卡片口径一致
-      total:
-        profileId === undefined
-          ? count(
-              "SELECT COUNT(*) AS n FROM ledgers WHERE archived_at IS NULL AND owner_profile_id IS NULL",
-            )
-          : count(
-              `SELECT COUNT(*) AS n FROM ledgers
-               WHERE archived_at IS NULL AND (owner_profile_id IS NULL OR owner_profile_id = ?)`,
-              profileId,
-            ),
-      archived:
-        profileId === undefined
-          ? count(
-              "SELECT COUNT(*) AS n FROM ledgers WHERE archived_at IS NOT NULL AND owner_profile_id IS NULL",
-            )
-          : count(
-              `SELECT COUNT(*) AS n FROM ledgers
-               WHERE archived_at IS NOT NULL AND (owner_profile_id IS NULL OR owner_profile_id = ?)`,
-              profileId,
-            ),
+      total: countLedgers(db, { archived: false, profileId }),
+      archived: countLedgers(db, { archived: true, profileId }),
     },
     expenses: {
       month: expenses.month,
@@ -183,13 +154,7 @@ export function statusPayload(
     holidays: {
       years: holidays.years,
       // 长期抓取失败的年份此前只显示「未导入」，看不出原因
-      failed: (
-        db
-          .prepare(
-            "SELECT year, last_error FROM cn_holiday_years WHERE status = 'failed' ORDER BY year",
-          )
-          .all() as { year: number; last_error: string | null }[]
-      ).map((r) => ({
+      failed: failedHolidayYears(db).map((r) => ({
         year: r.year,
         error: (r.last_error ?? "").slice(0, 200),
       })),
@@ -213,8 +178,8 @@ export function statusPayload(
       // job 数量取注册表（而未运行的 job 也要显示成「未运行」，不能因为没记录就消失）
       total: allJobs().length,
       // 直接按 job_runs 统计：与看板上「24 小时失败」同口径，不受 runs 被截断影响
-      failed_24h: count(
-        "SELECT COUNT(*) AS n FROM job_runs WHERE status = 'failed' AND started_at >= ?",
+      failed_24h: countFailedJobRunsSince(
+        db,
         new Date(Date.now() - 24 * 3600 * 1000).toISOString(),
       ),
       // 概览只带 20 个 job；完整列表（含每 job 最近几次运行）走 /api/jobs
@@ -346,7 +311,7 @@ export function createStatusApp(config: ResolvedConfig, db: DatabaseSync): Hono<
     let healthy = db.isOpen;
     if (healthy) {
       try {
-        healthy = db.prepare("SELECT 1 AS ok").get() !== undefined;
+        healthy = pingDatabase(db);
       } catch {
         healthy = false;
       }

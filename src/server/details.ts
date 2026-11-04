@@ -22,6 +22,7 @@ import {
 } from "../modules/bookkeeping/service.js";
 import {
   activeSchedulesWithNextOccurrence,
+  countActiveSchedules,
   KIND_LABEL,
   parseEscalation,
   type ScheduleKind,
@@ -512,4 +513,9 @@ function nextRunHint(expr: string): string | undefined {
     }
   }
   return undefined;
+}
+
+/** 活跃日程数（状态页用；status.ts 不能直接 import schedule service，经此薄包装） */
+export function activeScheduleCount(db: DatabaseSync, profileId?: string): number {
+  return countActiveSchedules(db, profileId);
 }

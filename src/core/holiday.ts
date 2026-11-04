@@ -542,3 +542,12 @@ export function holidayDaysInRange(db: DatabaseSync, from: string, to: string): 
     )
     .all(from, to) as unknown as HolidayDayRow[];
 }
+
+/** 抓取失败的年份（附最近一次错误原文，截断由调用方决定） */
+export function failedHolidayYears(
+  db: DatabaseSync,
+): { year: number; last_error: string | null }[] {
+  return db
+    .prepare("SELECT year, last_error FROM cn_holiday_years WHERE status = 'failed' ORDER BY year")
+    .all() as { year: number; last_error: string | null }[];
+}

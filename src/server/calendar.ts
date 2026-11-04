@@ -7,6 +7,8 @@ import {
   escapeIcsText,
   formatIcsUtc,
   verifyCalendarSignature,
+  calendarOccurrenceRows,
+  type CalendarOccurrenceRow,
 } from "../core/ics.js";
 import { logger, sanitizeLogText } from "../core/logger.js";
 import { incCounter } from "../core/metrics.js";
@@ -28,14 +30,7 @@ const WINDOW_PAST_DAYS = 1;
 /** 定时事件的默认时长：occurrence 只有起始时刻（event_at），没有结束时刻 */
 const TIMED_EVENT_MINUTES = 60;
 
-interface CalendarRow {
-  schedule_id: string;
-  occurrence_key: string;
-  event_at: string;
-  title: string;
-  note: string | null;
-  all_day: number;
-}
+type CalendarRow = CalendarOccurrenceRow;
 
 /** 校验失败 → HTTP 状态：503 是服务端没密钥；403 只给「签名被改过」；其余按 401 */
 function errorStatus(config: ResolvedConfig, reason: string): 401 | 403 | 503 {
@@ -104,16 +99,7 @@ function buildIcs(rows: CalendarRow[], now: Date): string {
 function calendarRows(db: DatabaseSync, profileId: string, now: Date): CalendarRow[] {
   const from = new Date(now.getTime() - WINDOW_PAST_DAYS * 24 * 3600 * 1000).toISOString();
   const to = new Date(now.getTime() + WINDOW_FUTURE_DAYS * 24 * 3600 * 1000).toISOString();
-  return db
-    .prepare(
-      `SELECT o.schedule_id, o.occurrence_key, o.event_at, s.title, s.note, s.all_day
-       FROM occurrences o JOIN schedules s ON s.id = o.schedule_id
-       WHERE s.profile_id = ? AND s.status = 'active'
-         AND o.status IN ('pending','notified')
-         AND o.event_at >= ? AND o.event_at <= ?
-       ORDER BY o.event_at ASC, o.occurrence_key ASC`,
-    )
-    .all(profileId, from, to) as unknown as CalendarRow[];
+  return calendarOccurrenceRows(db, profileId, from, to);
 }
 
 export function createCalendarApp(config: ResolvedConfig, db: DatabaseSync): Hono {

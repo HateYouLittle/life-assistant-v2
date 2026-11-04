@@ -204,3 +204,33 @@ export function reminderActionLinks(
     return `${ACTION_LABEL[action]}：${base}/a/${token}`;
   });
 }
+
+export interface ActionLinkScheduleView {
+  id: string;
+  profile_id: string;
+  title: string;
+  status: string;
+}
+
+export interface ActionLinkOccurrenceView {
+  event_at: string;
+  due_at: string;
+  status: string;
+}
+
+/** 动作链接目标：日程本身与对应的那一次发生（任一不存在则为 undefined） */
+export function loadActionLinkTarget(
+  db: DatabaseSync,
+  scheduleId: string,
+  occurrenceKey: string,
+): { schedule?: ActionLinkScheduleView; occurrence?: ActionLinkOccurrenceView } {
+  const schedule = db
+    .prepare("SELECT id, profile_id, title, status FROM schedules WHERE id = ?")
+    .get(scheduleId) as ActionLinkScheduleView | undefined;
+  const occurrence = db
+    .prepare(
+      "SELECT event_at, due_at, status FROM occurrences WHERE schedule_id = ? AND occurrence_key = ?",
+    )
+    .get(scheduleId, occurrenceKey) as ActionLinkOccurrenceView | undefined;
+  return { schedule, occurrence };
+}

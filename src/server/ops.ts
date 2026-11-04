@@ -4,7 +4,15 @@ import { Hono } from "hono";
 import type { ResolvedConfig } from "../config.js";
 import { resolveIdentity } from "../core/auth.js";
 import { backupStatus } from "../core/backup.js";
-import { lastJobRun } from "../core/jobs.js";
+import { probeWritable } from "../core/database.js";
+import { lastJobRun, lastOkJobRun } from "../core/jobs.js";
+import {
+  deliveryStatusCounts,
+  failedRetryingDeliveryCount,
+  notificationCount,
+  oldestPendingDeliveryAt,
+  oldestQueuedDeliveryAt,
+} from "../core/notify.js";
 import { logger, sanitizeLogText } from "../core/logger.js";
 import { gaugeValue, incCounter, snapshotCounters } from "../core/metrics.js";
 import { qweatherUsage } from "../core/qweather.js";
@@ -74,10 +82,6 @@ function fileBytes(path: string): number {
   return statSync(path, { throwIfNoEntry: false })?.size ?? 0;
 }
 
-function count(db: DatabaseSync, sql: string): number {
-  return (db.prepare(sql).get() as { n: number } | undefined)?.n ?? 0;
-}
-
 /** 各 job 最近一次成功运行的时刻（Unix 秒）；从未成功返回 0 */
 function lastSuccessSeconds(db: DatabaseSync, jobName: string): number {
   // 先用 lastJobRun 取「最近一次运行」：它恰好成功时省掉第二次查询。
@@ -85,15 +89,7 @@ function lastSuccessSeconds(db: DatabaseSync, jobName: string): number {
   // 昨天成功、今天失败的 job 显示成 0，监控于是误报「从未成功」并掩盖真实故障点。
   const latest = lastJobRun(db, jobName);
   const okRow: { started_at: string; finished_at: string | null } | undefined =
-    latest?.status === "ok"
-      ? latest
-      : (db
-          .prepare(
-            `SELECT started_at, finished_at FROM job_runs
-             WHERE job_name = ? AND status = 'ok'
-             ORDER BY started_at DESC, id DESC LIMIT 1`,
-          )
-          .get(jobName) as { started_at: string; finished_at: string | null } | undefined);
+    latest?.status === "ok" ? latest : lastOkJobRun(db, jobName);
   if (okRow === undefined) return 0;
   // 成功时刻取 finished_at（「跑完并成功」才算成功）；老记录缺 finished_at 时退回 started_at
   const at = Date.parse(okRow.finished_at ?? okRow.started_at);
@@ -118,9 +114,7 @@ function metricsText(config: ResolvedConfig, db: DatabaseSync, nowMs: number): s
     counter(`life_assistant_${key}`, `进程内累计计数 ${key}`, counters[key] ?? 0);
   }
 
-  const deliveryRows = db
-    .prepare("SELECT status, COUNT(*) AS n FROM deliveries GROUP BY status")
-    .all() as { status: string; n: number }[];
+  const deliveryRows = deliveryStatusCounts(db);
   const deliveryCounts = new Map<string, number>(
     deliveryRows.map((row): [string, number] => [row.status, row.n]),
   );
@@ -138,11 +132,7 @@ function metricsText(config: ResolvedConfig, db: DatabaseSync, nowMs: number): s
   // 口径用 next_attempt_at（与 /readyz 一致，P2-7）：静默时段/退避中的行只是「还没到点」，
   // 用 created_at 会让每个静默窗口把指标顶到 30 分钟以上，监控天天夜里报警。
   // 时间戳可能被手工改库写坏：解析失败或落在未来一律按 0，宁可少报积压也不误报。
-  const oldestRow = db
-    .prepare(
-      "SELECT MIN(next_attempt_at) AS oldest FROM deliveries WHERE status IN ('queued','failed')",
-    )
-    .get() as { oldest: string | null } | undefined;
+  const oldestRow = oldestPendingDeliveryAt(db);
   const oldestMs = oldestRow?.oldest == null ? Number.NaN : Date.parse(oldestRow.oldest);
   gauge(
     "life_assistant_outbox_oldest_pending_seconds",
@@ -153,20 +143,17 @@ function metricsText(config: ResolvedConfig, db: DatabaseSync, nowMs: number): s
   // 多次重试仍失败的投递数：`outbox_oldest_pending_seconds` 改用 next_attempt_at 后，
   // 退避到几小时外的失败行在指标上会显示「不旧」—— 这个计数补上「投不出去」这个信号
   // （复审 T-1027-02d 观察 a 的漏报盲区）。
-  const failingRow = db
-    .prepare("SELECT COUNT(*) AS n FROM deliveries WHERE status = 'failed' AND attempts >= 3")
-    .get() as { n: number } | undefined;
   gauge(
     "life_assistant_outbox_failed_retrying",
     "已重试 >=3 次仍失败的投递数（换 next_attempt_at 口径后用来兜住「投不出去」的漏报）",
-    failingRow?.n ?? 0,
+    failedRetryingDeliveryCount(db),
   );
 
   // 通知总行数：保留策略会按天删行，因此不是单调递增的 counter，按 gauge 导出
   gauge(
     "life_assistant_notifications_total",
     "通知总行数（保留策略会删行，故为 gauge）",
-    count(db, "SELECT COUNT(*) AS n FROM notifications"),
+    notificationCount(db),
   );
 
   // 每个注册 job 一行（未运行的 job 也要有样本，否则「任务消失」看不出来）
@@ -228,26 +215,6 @@ function metricsText(config: ResolvedConfig, db: DatabaseSync, nowMs: number): s
 }
 
 /**
- * 可写探针：`BEGIN IMMEDIATE` 会真正申请写锁（`BEGIN` 只拿读事务，磁盘只读/库被别进程
- * 独占时照样"成功"），失败即「现在写不进去」。必须 ROLLBACK：留下一个开着的事务会让
- * 后续所有写请求撞上 "cannot start a transaction within a transaction"。
- */
-function probeWritable(db: DatabaseSync): boolean {
-  try {
-    db.exec("BEGIN IMMEDIATE");
-  } catch {
-    return false;
-  }
-  try {
-    db.exec("ROLLBACK");
-    return true;
-  } catch {
-    // BEGIN 成功但 ROLLBACK 失败说明连接已损坏：不能留下脏事务，直接判定不健康
-    return false;
-  }
-}
-
-/**
  * 最老 `queued` 投递的**到期时刻**（毫秒）；没有 queued 或时间戳不可解析返回 null（不误报卡住）。
  *
  * 用 `next_attempt_at` 而不是 `created_at`（P2-7）：静默时段的行会被 drain 推到窗口结束，
@@ -256,9 +223,7 @@ function probeWritable(db: DatabaseSync): boolean {
  */
 function oldestQueuedMs(db: DatabaseSync): number | null {
   try {
-    const row = db
-      .prepare("SELECT MIN(next_attempt_at) AS oldest FROM deliveries WHERE status = 'queued'")
-      .get() as { oldest: string | null } | undefined;
+    const row = oldestQueuedDeliveryAt(db);
     if (row?.oldest == null) return null;
     const at = Date.parse(row.oldest);
     return Number.isFinite(at) ? at : null;

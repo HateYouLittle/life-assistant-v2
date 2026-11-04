@@ -1,6 +1,10 @@
 import type { DatabaseSync } from "node:sqlite";
 import { DateTime } from "luxon";
-import { budgetStatus, getBudgets } from "../modules/bookkeeping/service.js";
+import {
+  budgetStatus,
+  getBudgets,
+  listActiveFamilyLedgers,
+} from "../modules/bookkeeping/service.js";
 import { TZ } from "../time.js";
 import { normalizeMonth } from "./details.js";
 
@@ -166,13 +170,7 @@ export function budgetPayload(
 ): BudgetPayload {
   const month = normalizeMonth(rawMonth);
   const { day, daysInMonth } = monthProgress(month, now);
-  const ledgers = db
-    .prepare(
-      `SELECT id, name FROM ledgers
-       WHERE owner_profile_id IS NULL AND archived_at IS NULL
-       ORDER BY name, id`,
-    )
-    .all() as { id: string; name: string }[];
+  const ledgers = listActiveFamilyLedgers(db);
 
   return {
     month,

@@ -24,7 +24,11 @@ import {
   summarizeExpenses,
   writableLedgers,
 } from "../modules/bookkeeping/service.js";
-import { getSchedule, type ScheduleRow } from "../modules/schedule/service.js";
+import {
+  countActiveSchedules,
+  getSchedule,
+  type ScheduleRow,
+} from "../modules/schedule/service.js";
 import { TZ, todayIso } from "../time.js";
 import { resolveToken } from "./page.js";
 
@@ -209,9 +213,6 @@ function bootstrapPayload(db: DatabaseSync, profileId: string): Record<string, u
   // 常用分类按默认账本取；没有确定默认账本时退到第一个可见账本 —— 这只是 chips 的
   // 展示来源，不替用户选账本（真正落库的账本仍由 add 的默认解析决定）。
   const chipLedger = resolved.ledger ?? ledgers[0];
-  const activeSchedules = db
-    .prepare("SELECT COUNT(*) AS n FROM schedules WHERE profile_id = ? AND status = 'active'")
-    .get(profileId) as { n: number };
   return {
     profile: profileId,
     ledgers: ledgers.map((row) => ({ id: row.id, name: row.name })),
@@ -223,7 +224,7 @@ function bootstrapPayload(db: DatabaseSync, profileId: string): Record<string, u
       (sum, ledger) => sum + summarizeExpenses(db, ledger.id, month).total_cents,
       0,
     ),
-    active_schedules: activeSchedules.n,
+    active_schedules: countActiveSchedules(db, profileId),
   };
 }
 

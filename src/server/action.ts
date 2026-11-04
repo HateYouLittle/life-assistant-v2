@@ -9,9 +9,10 @@ import {
   ACTION_LABEL,
   type ActionLinkClaims,
   actionTokenFingerprint,
+  loadActionLinkTarget,
   verifyActionToken,
 } from "../core/action-link.js";
-import { recordAudit } from "../core/audit.js";
+import { auditTokenUsed, recordAudit } from "../core/audit.js";
 import { logger, sanitizeLogText } from "../core/logger.js";
 import { incCounter } from "../core/metrics.js";
 import { envClientAddress } from "../core/ratelimit.js";
@@ -32,19 +33,6 @@ const AUDIT_ACTION: Record<ActionLinkClaims["action"], string> = {
   done: "link.schedule.done",
   snooze30: "link.schedule.snooze30",
 };
-
-interface ScheduleView {
-  id: string;
-  profile_id: string;
-  title: string;
-  status: string;
-}
-
-interface OccurrenceView {
-  event_at: string;
-  due_at: string;
-  status: string;
-}
 
 type PageState =
   | { kind: "confirm"; title: string; when: string; claims: ActionLinkClaims }
@@ -69,32 +57,14 @@ function esc(value: string): string {
     .replace(/'/g, "&#39;");
 }
 
-function loadTarget(
-  db: DatabaseSync,
-  claims: ActionLinkClaims,
-): { schedule?: ScheduleView; occurrence?: OccurrenceView } {
-  const schedule = db
-    .prepare("SELECT id, profile_id, title, status FROM schedules WHERE id = ?")
-    .get(claims.scheduleId) as ScheduleView | undefined;
-  const occurrence = db
-    .prepare(
-      "SELECT event_at, due_at, status FROM occurrences WHERE schedule_id = ? AND occurrence_key = ?",
-    )
-    .get(claims.scheduleId, claims.occurrenceKey) as OccurrenceView | undefined;
-  return { schedule, occurrence };
-}
-
 /** 该 token 是否已经成功执行过（只认审计里同一指纹的记录） */
 function alreadyExecuted(db: DatabaseSync, claims: ActionLinkClaims, fingerprint: string): boolean {
-  const row = db
-    .prepare(
-      `SELECT 1 FROM audit_log
-       WHERE profile_id = ? AND action = ? AND target_id = ?
-         AND json_extract(detail_json, '$.token') = ?
-       LIMIT 1`,
-    )
-    .get(claims.profileId, AUDIT_ACTION[claims.action], claims.scheduleId, fingerprint);
-  return row !== undefined;
+  return auditTokenUsed(db, {
+    profileId: claims.profileId,
+    action: AUDIT_ACTION[claims.action],
+    targetId: claims.scheduleId,
+    tokenFingerprint: fingerprint,
+  });
 }
 
 /**
@@ -106,7 +76,11 @@ function settledState(
   claims: ActionLinkClaims,
   fingerprint: string,
 ): { state: PageState; status: 200 | 403 | 410 } | { state: null; title: string; when: string } {
-  const { schedule, occurrence } = loadTarget(db, claims);
+  const { schedule, occurrence } = loadActionLinkTarget(
+    db,
+    claims.scheduleId,
+    claims.occurrenceKey,
+  );
   if (schedule === undefined) {
     return {
       state: { kind: "error", heading: "日程已不存在", detail: "该日程已被删除，无需再处理。" },

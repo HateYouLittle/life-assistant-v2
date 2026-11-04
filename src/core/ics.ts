@@ -1,4 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
+import type { DatabaseSync } from "node:sqlite";
 import { PROFILE_ID_RE, type ResolvedConfig } from "../config.js";
 
 /**
@@ -152,4 +153,32 @@ export function formatIcsUtc(date: Date): string {
     `${date.getUTCFullYear()}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}` +
     `T${pad(date.getUTCHours())}${pad(date.getUTCMinutes())}${pad(date.getUTCSeconds())}Z`
   );
+}
+
+export interface CalendarOccurrenceRow {
+  schedule_id: string;
+  occurrence_key: string;
+  event_at: string;
+  title: string;
+  note: string | null;
+  all_day: number;
+}
+
+/** 该 Profile 在 [fromIso, toIso] 内的 occurrence（按 event_at 升序） */
+export function calendarOccurrenceRows(
+  db: DatabaseSync,
+  profileId: string,
+  fromIso: string,
+  toIso: string,
+): CalendarOccurrenceRow[] {
+  return db
+    .prepare(
+      `SELECT o.schedule_id, o.occurrence_key, o.event_at, s.title, s.note, s.all_day
+       FROM occurrences o JOIN schedules s ON s.id = o.schedule_id
+       WHERE s.profile_id = ? AND s.status = 'active'
+         AND o.status IN ('pending','notified')
+         AND o.event_at >= ? AND o.event_at <= ?
+       ORDER BY o.event_at ASC, o.occurrence_key ASC`,
+    )
+    .all(profileId, fromIso, toIso) as unknown as CalendarOccurrenceRow[];
 }

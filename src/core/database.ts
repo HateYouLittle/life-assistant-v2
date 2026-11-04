@@ -569,3 +569,28 @@ export function withReadTransaction<T>(db: DatabaseSync, fn: () => T): T {
     throw e;
   }
 }
+
+/**
+ * 可写探针：`BEGIN IMMEDIATE` 会真正申请写锁（`BEGIN` 只拿读事务，磁盘只读/库被别进程
+ * 独占时照样"成功"），失败即「现在写不进去」。必须 ROLLBACK：留下一个开着的事务会让
+ * 后续所有写请求撞上 "cannot start a transaction within a transaction"。
+ */
+export function probeWritable(db: DatabaseSync): boolean {
+  try {
+    db.exec("BEGIN IMMEDIATE");
+  } catch {
+    return false;
+  }
+  try {
+    db.exec("ROLLBACK");
+    return true;
+  } catch {
+    // BEGIN 成功但 ROLLBACK 失败说明连接已损坏：不能留下脏事务，直接判定不健康
+    return false;
+  }
+}
+
+/** 最轻量的健康查询；查询抛错时**原样抛出**，由调用方决定如何处理 */
+export function pingDatabase(db: DatabaseSync): boolean {
+  return db.prepare("SELECT 1 AS ok").get() !== undefined;
+}

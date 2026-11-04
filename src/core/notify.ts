@@ -1215,3 +1215,43 @@ export function deliveryCountsOf(
     )
     .get(notificationId) as { total: number; sent: number | null };
 }
+
+/** 各状态的投递数（仅返回存在的状态） */
+export function deliveryStatusCounts(db: DatabaseSync): { status: string; n: number }[] {
+  return db.prepare("SELECT status, COUNT(*) AS n FROM deliveries GROUP BY status").all() as {
+    status: string;
+    n: number;
+  }[];
+}
+
+/** 最老的 queued/failed 投递的 next_attempt_at；没有则 null（或查询无行时 undefined） */
+export function oldestPendingDeliveryAt(db: DatabaseSync): { oldest: string | null } | undefined {
+  return db
+    .prepare(
+      "SELECT MIN(next_attempt_at) AS oldest FROM deliveries WHERE status IN ('queued','failed')",
+    )
+    .get() as { oldest: string | null } | undefined;
+}
+
+/** 最老 queued 投递的 next_attempt_at */
+export function oldestQueuedDeliveryAt(db: DatabaseSync): { oldest: string | null } | undefined {
+  return db
+    .prepare("SELECT MIN(next_attempt_at) AS oldest FROM deliveries WHERE status = 'queued'")
+    .get() as { oldest: string | null } | undefined;
+}
+
+/** 已重试 >=3 次仍 failed 的投递数 */
+export function failedRetryingDeliveryCount(db: DatabaseSync): number {
+  const row = db
+    .prepare("SELECT COUNT(*) AS n FROM deliveries WHERE status = 'failed' AND attempts >= 3")
+    .get() as { n: number } | undefined;
+  return row?.n ?? 0;
+}
+
+/** 通知总行数 */
+export function notificationCount(db: DatabaseSync): number {
+  const row = db.prepare("SELECT COUNT(*) AS n FROM notifications").get() as
+    | { n: number }
+    | undefined;
+  return row?.n ?? 0;
+}

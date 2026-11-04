@@ -1900,3 +1900,39 @@ export function expenseMonthAggregates(
     return { totals, categories, daily, ledgers, entries, prevCents: prev.cents };
   });
 }
+
+/**
+ * 账本计数（状态页用）：profileId 缺省 = 只数家庭账本；给定 = 家庭 + 该 Profile 的个人账本。
+ * archived=true 数已归档的，否则数活动的。
+ */
+export function countLedgers(
+  db: DatabaseSync,
+  opts: { archived: boolean; profileId?: string },
+): number {
+  const archivedCond = opts.archived ? "archived_at IS NOT NULL" : "archived_at IS NULL";
+  const row =
+    opts.profileId === undefined
+      ? (db
+          .prepare(
+            `SELECT COUNT(*) AS n FROM ledgers WHERE ${archivedCond} AND owner_profile_id IS NULL`,
+          )
+          .get() as { n: number } | undefined)
+      : (db
+          .prepare(
+            `SELECT COUNT(*) AS n FROM ledgers
+               WHERE ${archivedCond} AND (owner_profile_id IS NULL OR owner_profile_id = ?)`,
+          )
+          .get(opts.profileId) as { n: number } | undefined);
+  return row?.n ?? 0;
+}
+
+/** 活动的家庭账本（预算看板用），按名称、id 排序 */
+export function listActiveFamilyLedgers(db: DatabaseSync): { id: string; name: string }[] {
+  return db
+    .prepare(
+      `SELECT id, name FROM ledgers
+       WHERE owner_profile_id IS NULL AND archived_at IS NULL
+       ORDER BY name, id`,
+    )
+    .all() as { id: string; name: string }[];
+}

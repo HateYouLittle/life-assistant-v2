@@ -552,3 +552,25 @@ export function createJobRunStatsReader(
     return { lastOkStartedAt: lastOk?.started_at ?? null, failed24h: failed.n, recentFailures };
   };
 }
+
+/** 某 job 最近一次**成功**运行的起止时刻；从未成功返回 undefined */
+export function lastOkJobRun(
+  db: DatabaseSync,
+  jobName: string,
+): { started_at: string; finished_at: string | null } | undefined {
+  return db
+    .prepare(
+      `SELECT started_at, finished_at FROM job_runs
+       WHERE job_name = ? AND status = 'ok'
+       ORDER BY started_at DESC, id DESC LIMIT 1`,
+    )
+    .get(jobName) as { started_at: string; finished_at: string | null } | undefined;
+}
+
+/** 自 sinceIso 起（含）开始运行且失败的 job_runs 数 */
+export function countFailedJobRunsSince(db: DatabaseSync, sinceIso: string): number {
+  const row = db
+    .prepare("SELECT COUNT(*) AS n FROM job_runs WHERE status = 'failed' AND started_at >= ?")
+    .get(sinceIso) as { n: number } | undefined;
+  return row?.n ?? 0;
+}

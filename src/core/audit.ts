@@ -136,3 +136,19 @@ export function listAudit(db: DatabaseSync, opts: ListAuditOptions = {}): ListAu
   }[];
   return { items, total: totalRow.n };
 }
+
+/** 该 token 指纹是否已在审计里成功执行过（动作链接用；只认同一 Profile/动作/目标的同一指纹） */
+export function auditTokenUsed(
+  db: DatabaseSync,
+  input: { profileId: string; action: string; targetId: string; tokenFingerprint: string },
+): boolean {
+  const row = db
+    .prepare(
+      `SELECT 1 FROM audit_log
+       WHERE profile_id = ? AND action = ? AND target_id = ?
+         AND json_extract(detail_json, '$.token') = ?
+       LIMIT 1`,
+    )
+    .get(input.profileId, input.action, input.targetId, input.tokenFingerprint);
+  return row !== undefined;
+}

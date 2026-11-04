@@ -245,6 +245,24 @@ describe("registry 契约", () => {
     }
   });
 
+  it("server 层不直接写 SQL（业务查询走 service/core）", () => {
+    // 锚定 `db.`：details.ts 里的 /regex/.exec(minute) 不会误报
+    const directSql = /\bdb\s*\.\s*(prepare|exec)\s*\(/;
+    const serverDir = fileURLToPath(new URL("../src/server/", import.meta.url));
+    const files = readdirSync(serverDir).filter((f) => f.endsWith(".ts"));
+    assert.ok(files.length > 0, "应当读到 src/server 下的源文件");
+    const offenders = files.filter((f) => directSql.test(readFileSync(join(serverDir, f), "utf8")));
+    assert.deepEqual(
+      offenders,
+      [],
+      "server 层不得直接 db.prepare/db.exec；查询放进对应 service 或 core 函数",
+    );
+    // 变异自证：正则必须能命中直写 SQL 的写法，否则上面的断言只是恒绿摆设
+    assert.ok(directSql.test("const x = db.prepare('SELECT 1')"));
+    assert.ok(directSql.test('db\n  .exec("BEGIN")'));
+    assert.ok(!directSql.test("/^(\\d+)$/.exec(minute)"));
+  });
+
   it("契约扫描能抓住「server 直接 import 模块内部」的新违规（变异自证）", () => {
     // ① 在真实的 quick.ts 源码上插一行直调模块 index（handler 层，比 service 更深一层）：
     //    扫描必须把它判成违规，且白名单里不得有它 —— 否则这条测试只是恒绿摆设。
