@@ -168,6 +168,21 @@ describe("P2-20 action/view 兼容", () => {
     }
   });
 
+  it("冲突文案逐字：action=set 属 travel 组，与 view=current 冲突", async () => {
+    const env = makeTestEnv(ENV);
+    try {
+      await withMockFetch(async () => {
+        const result = await tool(env, { action: "set", view: "current" });
+        assert.equal(
+          textOf(result),
+          "错误：action 与 view 冲突: action=set（travel）, view=current",
+        );
+      });
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
   it("未知取值统一 `未知 action: …`；两者都不给明确报缺", async () => {
     const env = makeTestEnv(ENV);
     try {
