@@ -258,3 +258,20 @@ describe("notify 工具", () => {
     }
   });
 });
+
+describe("notify 工具：action 分发", () => {
+  it("未知 action、未知字段与 undefined 字段", () => {
+    const env = makeTestEnv();
+    try {
+      assert.equal(text(tool(env, { action: "bogus" })), "错误：未知 action: bogus");
+      assert.ok(
+        text(tool(env, { action: "test", limit: 1 })).endsWith(
+          "未知字段: limit（action=test 不接受）",
+        ),
+      );
+      assert.ok(!text(tool(env, { action: "test", limit: undefined })).includes("未知字段"));
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});

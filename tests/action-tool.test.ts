@@ -28,7 +28,8 @@ function simple(viewAlias: boolean) {
 }
 
 function grouped() {
-  return defineActionTool({
+  // 混合同步/异步 handler：TS 只取首个候选推断 R，需显式声明联合返回类型
+  return defineActionTool<"now" | "travel" | "set" | "clear", ToolResult | Promise<ToolResult>>({
     viewAlias: true,
     conflictShowsGroup: true,
     actions: {
@@ -176,5 +177,20 @@ describe("findUnknownField", () => {
     assert.equal(findUnknownField({ action: "x", a: 1, b: undefined }, ["a"]), null);
     assert.equal(findUnknownField({ view: "x", a: 1 }, ["a"], ["action", "view"]), null);
     assert.equal(findUnknownField({ view: "x" }, []), "view");
+  });
+});
+
+describe("defineActionTool 返回类型", () => {
+  it("全同步 handler 的 dispatcher 同步返回 ToolResult（类型层面，无需 await）", () => {
+    const tool = defineActionTool({
+      actions: {
+        a: { handler: () => ok("a") },
+        b: { handler: () => ok("b") },
+      },
+    });
+    const result: ToolResult = tool.handler({ action: "a" }, ctx);
+    assert.equal(result.content[0]?.text, "a");
+    const failed: ToolResult = tool.handler({ action: "zzz" }, ctx);
+    assert.ok(text(failed).includes(unknownActionMessage("zzz")));
   });
 });

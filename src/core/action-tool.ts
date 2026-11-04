@@ -34,25 +34,33 @@ export function findUnknownField(
   return null;
 }
 
-export interface ActionSpec {
+export interface ActionSpec<
+  R extends ToolResult | Promise<ToolResult> = ToolResult | Promise<ToolResult>,
+> {
   /** 该 action 接受的字段白名单；省略 = 不做未知字段校验 */
   fields?: readonly string[];
   /** 必填项：缺失或纯空白字符串时返回 message（空串等同缺失），按顺序取第一条 */
   requires?: readonly { field: string; message: string }[];
   /** 分组：view 别名按分组匹配；省略 = 自身名 */
   group?: string;
-  handler(args: Record<string, unknown>, ctx: ToolContext): ToolResult | Promise<ToolResult>;
+  handler(args: Record<string, unknown>, ctx: ToolContext): R;
 }
 
-export interface ActionToolOptions<A extends string> {
-  actions: Record<A, ActionSpec>;
+export interface ActionToolOptions<
+  A extends string,
+  R extends ToolResult | Promise<ToolResult> = ToolResult | Promise<ToolResult>,
+> {
+  actions: Record<A, ActionSpec<R>>;
   /** 开启 `view` 兼容别名 */
   viewAlias?: boolean;
   /** 冲突文案是否带 （group） 段 */
   conflictShowsGroup?: boolean;
 }
 
-export function defineActionTool<A extends string>(opts: ActionToolOptions<A>) {
+export function defineActionTool<
+  A extends string,
+  R extends ToolResult | Promise<ToolResult> = ToolResult | Promise<ToolResult>,
+>(opts: ActionToolOptions<A, R>) {
   const { actions, viewAlias = false, conflictShowsGroup = false } = opts;
   const actionNames = Object.keys(actions) as [A, ...A[]];
   const isAction = (value: string): value is A => Object.hasOwn(actions, value);
@@ -88,10 +96,7 @@ export function defineActionTool<A extends string>(opts: ActionToolOptions<A>) {
     return { error: viewAlias ? MISSING_ACTION_MESSAGE : unknownActionMessage(args.action) };
   }
 
-  function handler(
-    args: Record<string, unknown>,
-    ctx: ToolContext,
-  ): ToolResult | Promise<ToolResult> {
+  function handler(args: Record<string, unknown>, ctx: ToolContext): R | ToolResult {
     const resolved = resolve(args);
     if ("error" in resolved) return fail(resolved.error);
     const action = resolved.action;
