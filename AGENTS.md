@@ -37,7 +37,7 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
 - `src/core/` 是框架层：database/fingerprint/audit/registry/jobs/lock/security/auth/http/logger/
   logrotate/settings/notify/notify-prefs/channels/smtp/render/qweather/qweather-jwt/holiday/recurrence/
   retention/backup/ratelimit/metrics/ics。`src/modules/`
-  （weather/holiday/schedule/bookkeeping/notify/maintenance）通过 `src/modules/index.ts` 的
+  （weather/holiday/schedule/bookkeeping/bills/notify/maintenance）通过 `src/modules/index.ts` 的
   副作用 import 接入，遵循 `tools / jobs / tick / onStart` 四个契约扩展点。`maintenance`
   注册每日备份（与 `db:backup` CLI 共用 `src/core/backup.ts`）、每日 WAL checkpoint 与日志轮转三个 job。
 - `src/core/ratelimit.ts`：`FixedWindowLimiter` 双层固定窗口 —— 每个请求按来源 IP 计一层，
@@ -234,7 +234,7 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   `recheckCrossYearOccurrences` 复核该窗口 pending 行（误判作废、漏掉的回退重物化，每进程每个
   下一年度一次）。已知残留：`holiday {view:"month"}` 的未知文案仍只判「月份所属年份」，
   12 月的跨年几天可能少列而不报未知（下轮候选）。
-- **工具参数契约**（P2-20 / P2-21）：7 个 action 参数化工具的规范参数名是 `action`，`view` 是兼容
+- **工具参数契约**（P2-20 / P2-21）：8 个 action 参数化工具的规范参数名是 `action`，`view` 是兼容
   别名（两者都传且冲突要明确报错）；`air_quality` 与 `weather {action:"air"}` 共用同一个 `airView()`。
   与当前 action 无关的字段**显式拒绝**（`未知字段: X（action=Y 不接受）`，bookkeeping 与 notify
   两侧逐字一致），不再静默忽略；两条既有更具体文案（export 的 from/to、update 的 ledger_id）保留。
@@ -243,4 +243,4 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   用独立只读连接查（不升级 schema、不写库、不 fail）。
 - `npm run db:cleanup:preview` 是**零业务删除**预演（打开旧库时仍可能执行附加式 schema
   升级，因此不保证零写入）：occurrence 清理 job（每日 04:30）与保留策略
-  （通知/已取消日程，每日 04:50）会删掉哪些行——改清理规则前先用它。
+  （通知/已取消日程/审计日志，每日 04:50）会删掉哪些行——改清理规则前先用它。
