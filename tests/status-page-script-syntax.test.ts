@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { statusPage } from "../src/server/page.js";
 import { SCRIPT, STYLE } from "../src/server/page-script.js";
+import { quickPage } from "../src/server/quick.js";
 
 /**
  * 状态页内联脚本的语法闸门（P2-23）。
@@ -109,5 +110,23 @@ describe("状态页内联脚本语法（node --check）", () => {
     assert.ok(bracesBalanced(STYLE), "STYLE 花括号不配平");
     assert.equal(bracesBalanced(`${STYLE}\n.x { color: red;`), false, "配平检查抓不出缺失的右括号");
     assert.equal(bracesBalanced(`${STYLE}\n}`), false, "配平检查抓不出多余的右括号");
+  });
+});
+
+describe("内联脚本不含第二份共享函数", () => {
+  const count = (source: string, needle: string): number => source.split(needle).length - 1;
+
+  it("快捷页内联脚本：node --check 通过，且 esc/yuan/el 只有 shared.js 一份", () => {
+    const quickScript = inlineOf(quickPage(), "script");
+    const checked = checkSyntax(quickScript);
+    assert.ok(checked.ok, `快捷页内联脚本语法错误：\n${checked.stderr}`);
+    assert.equal(count(quickScript, "function esc("), 1);
+    assert.equal(count(quickScript, "function yuan("), 1);
+    assert.equal(count(quickScript, "function el("), 1);
+  });
+
+  it("状态页 SCRIPT：esc/yuan 各只出现一次", () => {
+    assert.equal(count(SCRIPT, "function esc("), 1);
+    assert.equal(count(SCRIPT, "function yuan("), 1);
   });
 });

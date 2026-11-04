@@ -274,7 +274,7 @@ export function resolveToken(
 }
 
 /** 浏览器端脚本源文件在 assets/ 下（tsc checkJs 与 biome 覆盖）；构建时 cp 到 dist/server/assets/。 */
-const readAsset = (name: string): string =>
+export const readAsset = (name: string): string =>
   readFileSync(new URL(`./assets/${name}`, import.meta.url), "utf8");
 
 /** 前导：服务端值与 resolveToken 函数体以全局声明注入，status-page.js 直接引用。 */

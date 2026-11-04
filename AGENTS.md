@@ -109,10 +109,18 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   `default`，并把 `publishProfile`/`publishGlobal` 的调用记录到 `env.published`。
   务必在 `finally` 里 `cleanupTestEnv(env)`。
 - 状态页内联 JS 在 `node:vm` + DOM 桩里做端到端测试（`tests/status-page-script.test.ts`），
-  因为纯字符串断言看不出整页渲染故障。内联 `STYLE`/`SCRIPT`/`resolveToken` 已搬到
-  `src/server/page-script.ts`（`page.ts` 只留页面骨架，1108 → 114 行），并由
-  `tests/status-page-script-syntax.test.ts` 把脚本写进临时 `.mjs` 跑 `node --check` 兜住
-  字符串内的语法错误（P2-23）。仍是字符串，字符串内的未定义变量/`esc` 漏用只能靠 vm 端到端。
+  因为纯字符串断言看不出整页渲染故障。浏览器脚本是 `src/server/assets/` 下的真实 `.js`：
+  `shared.js`（`el`/`esc`/`yuan`，两页共用、只此一份）+ `status-page.js`（看板）/
+  `quick-page.js`（`/quick`）。`page-script.ts` 与 `quick.ts` 在模块加载时 `readAsset` 读入，
+  前面拼一段前导（`var token = (resolveToken)(...)` 等服务端注入的全局），`SCRIPT` /
+  `QUICK_SCRIPT` = 前导 + shared + 页面脚本。每页一个 `tsconfig.<页>.json`（checkJs，
+  `strict:false`，两页在全局作用域有同名函数，不能放进同一个程序）由 `npm run typecheck` 覆盖，
+  前导注入的全局在 `*globals.d.ts` 声明；biome 对 `src/server/assets/**` 用单引号并关闭
+  `noInnerDeclarations`（块内 `var` 改 `let` 会改作用域）。`npm run build` 把 `assets/*.js`
+  拷到 `dist/server/assets/`，漏拷会让 dist 启动时读文件失败。
+  `tests/status-page-script-syntax.test.ts` 对两页脚本跑 `node --check`（P2-23），并断言
+  `esc`/`yuan` 不出现第二份。部分测试按单行文本断言脚本片段（如 `tests/expense-export.test.ts`），
+  被 biome 折行时用 `// biome-ignore format:` 保留整句，不要改断言。
 - 走 `createHttpHandler` 的测试会经过 Host/Origin 守卫：用 `http.request` 指向 `127.0.0.1`
   时 Host 自动放行（回环主机名不限端口）；要测拒绝路径就直接构造 `IncomingMessage` 风格的
   `{ headers }` 调 `createRequestGuard(config)`。

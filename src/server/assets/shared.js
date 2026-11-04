@@ -1,3 +1,4 @@
+/** @param {string} id @returns {any} */
 function el(id) {
   return document.getElementById(id);
 }

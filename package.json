@@ -9,7 +9,7 @@
   "main": "dist/daemon.js",
   "scripts": {
     "build": "tsc -p tsconfig.json && mkdir -p dist/server/assets && cp src/server/assets/*.js dist/server/assets/",
-    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit && tsc -p src/server/assets/tsconfig.status.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit && tsc -p src/server/assets/tsconfig.status.json && tsc -p src/server/assets/tsconfig.quick.json",
     "lint": "biome lint src tests",
     "lint:fix": "biome lint --write src tests",
     "format": "biome format --write src tests",
