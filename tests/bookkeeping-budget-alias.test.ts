@@ -7,7 +7,7 @@ import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
 /**
  * B2 回归：`ledger {action:"budget"}` 的分类必须与 `expense add/update` 走同一份分类字典
  * 归一。否则用户用别名（「吃饭」）设的预算会落在别名文本下、而归一后的支出记在标准名
- * （「餐饮」）下：已用恒为 0、80%/100% 阈值提醒永不触发，且没有任何提示。
+ * （「餐饮」）下：已用恒为 0，且没有任何提示。
  */
 
 function text(result: { content: { text: string }[] }): string {
@@ -34,7 +34,6 @@ function makeTools(env: TestEnv) {
   return {
     ledger: (args: Record<string, unknown>) => bookkeepingLedgerTool(args, ctx),
     expense: (args: Record<string, unknown>) => bookkeepingExpenseTool(args, ctx),
-    budgetAlerts: () => env.published.filter((p) => p.input.kind === "bookkeeping.budget"),
   };
 }
 
@@ -59,7 +58,7 @@ function insertLegacyBudget(
 }
 
 describe("ledger budget：分类别名归一（B2）", () => {
-  it("别名设预算 + 别名记账：预算命中标准名，已用正确并能触发 100% 提醒", () => {
+  it("别名设预算 + 别名记账：预算命中标准名，已用正确", () => {
     const env = makeTestEnv();
     const tool = makeTools(env);
     try {
@@ -81,7 +80,7 @@ describe("ledger budget：分类别名归一（B2）", () => {
         "库里不得留下别名文本的预算",
       );
 
-      // 记账写别名（会被归一成「餐饮」），金额超过 ¥10 预算 → 跨 100%
+      // 记账写别名（会被归一成「餐饮」）
       const added = payload<{ 已记账: { 分类: string } }>(
         tool.expense({ action: "add", ledger_id: ledgerId, amount: 12, category: "吃饭" }),
       );
@@ -92,11 +91,6 @@ describe("ledger budget：分类别名归一（B2）", () => {
       }>(tool.ledger({ action: "budget", ledger_id: ledgerId }));
       assert.equal(status.本月对照.分类[0]?.分类, "餐饮");
       assert.equal(status.本月对照.分类[0]?.已用, "¥12.00", "已用必须包含这笔归一到「餐饮」的支出");
-
-      const alerts = tool.budgetAlerts();
-      assert.equal(alerts.length, 1, "跨越 100% 必须触发预算提醒");
-      assert.match(alerts[0]?.input.dedupeKey ?? "", /:餐饮:\d{4}-\d{2}:100$/);
-      assert.match(alerts[0]?.input.title ?? "", /分类「餐饮」/);
     } finally {
       cleanupTestEnv(env);
     }

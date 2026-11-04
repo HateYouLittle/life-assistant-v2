@@ -155,10 +155,6 @@ export const CATCHUP_POLICY: Record<string, number> = {
   "weather.daily_brief": 6,
   // 晚报（21:00）：睡前 6 小时内仍可补
   "weather.evening_brief": 6,
-  // 每日记账摘要（bookkeeping.ledger_digest，默认 21:30）：当天错过仍可补
-  "bookkeeping.ledger_digest": 12,
-  // 周报（bookkeeping.weekly_report，默认周日 20:00）：停机错过一天内仍可补
-  "bookkeeping.weekly_report": 24,
   // 日志轮转（maintenance.log_rotate，默认 04:55）：错过一天仍可补，幂等
   "maintenance.log_rotate": 24,
   // 预警巡检每 20 分钟一次：只补最近 1 小时内的那次，更早的预警已过时
@@ -260,8 +256,8 @@ function parseCronField(raw: string, min: number, max: number): Set<number> | nu
  * 上一次（含当前分钟）触发的时刻。
  *
  * 支持的表达式：**日与月必须为 `*`**；分钟、小时、星期可任意组合（星期含 `7` 的
- * 范围/步长除外，见下）——启动补发需要覆盖 `0 20 * * 0` 这类周任务，否则
- * CATCHUP_POLICY 里的周报窗口只是一条永远算不出触发时刻的死配置。日/月非 `*` 的
+ * 范围/步长除外，见下）——启动补发需要覆盖 `0 20 * * 0` 这类周任务（cron 来自
+ * 环境变量时可被配置成按周触发）。日/月非 `*` 的
  * 表达式（如 `0 9 1 * *`）仍直接返回 null 并 debug 一行：补发要的是「每天/每周这个点」
  * 的语义，遇到带月份日限制的表达式，宁可漏补，也不要把误判成「今天该跑」的通知推给用户。
  *

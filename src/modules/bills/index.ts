@@ -228,7 +228,7 @@ function billToolInner(args: Record<string, unknown>, ctx: ToolContext) {
   }
 }
 
-/** 到期提醒装饰：标题「该交话费了 ¥50（通讯）」，表格补金额/分类/账本，回复提示改成「交了」 */
+/** 到期提醒装饰：标题「该交话费了 ¥50（通讯）」，正文补一行记到哪个账本，回复提示改成「交了」 */
 function decorate(db: DatabaseSync, schedule: ScheduleRow) {
   const bill = billBySchedule(db, schedule.id);
   if (bill === undefined || bill.profile_id !== schedule.profile_id) return null;
@@ -236,12 +236,8 @@ function decorate(db: DatabaseSync, schedule: ScheduleRow) {
   const ledgerName = ledger?.name ?? bill.ledger_id;
   return {
     title: dueTitle(bill),
-    rows: [
-      ["金额", yuanText(bill.amount_cents)],
-      ["分类", bill.category],
-      ["账本", ledgerName],
-    ],
-    hint: `交完直接回复「交了」，会标记完成并按 ${yuanText(bill.amount_cents)}（${bill.category}）记到「${ledgerName}」；要晚点再提醒就回复「推迟半小时」`,
+    lines: [`💰 ${yuanText(bill.amount_cents)} · ${bill.category} · 记到「${ledgerName}」`],
+    hint: "交完回一句「交了」，会自动入账；要晚点再提醒就说「推迟半小时」",
   };
 }
 

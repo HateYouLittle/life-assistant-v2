@@ -197,12 +197,12 @@ describe("notify history", () => {
   it("kind 精确过滤与 unread 过滤", () => {
     const env = makeTestEnv();
     try {
-      seedNotification(env, { id: "a1", kind: "bookkeeping.entry", createdAt: at(1) });
-      seedNotification(env, { id: "a2", kind: "bookkeeping.entry", read: 1, createdAt: at(2) });
+      seedNotification(env, { id: "a1", kind: "schedule.reminder", createdAt: at(1) });
+      seedNotification(env, { id: "a2", kind: "schedule.reminder", read: 1, createdAt: at(2) });
       seedNotification(env, { id: "b1", kind: "weather.daily_brief", createdAt: at(3) });
 
       const byKind = payload<HistoryPayload>(
-        tool(env, { action: "history", kind: "bookkeeping.entry" }),
+        tool(env, { action: "history", kind: "schedule.reminder" }),
       );
       assert.equal(byKind.总数, 2);
       assert.deepEqual(
@@ -218,7 +218,7 @@ describe("notify history", () => {
       );
 
       const both = payload<HistoryPayload>(
-        tool(env, { action: "history", kind: "bookkeeping.entry", unread: true }),
+        tool(env, { action: "history", kind: "schedule.reminder", unread: true }),
       );
       assert.deepEqual(
         both.记录.map((r) => r.id),

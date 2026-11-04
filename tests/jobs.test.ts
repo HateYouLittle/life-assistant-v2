@@ -553,11 +553,11 @@ describe("planCatchups（停机补发判定）", () => {
       assert.deepEqual(
         planCatchups(
           env.db,
-          [{ module: "bookkeeping", def: def("monthly_report", "0 9 1 * *") }],
+          [{ module: "bookkeeping", def: def("not_whitelisted", "0 9 1 * *") }],
           now,
         ),
         [],
-        "月报不在白名单（它有自己 6 个月回看的补发逻辑）",
+        "不在白名单的 job 不补发",
       );
       assert.deepEqual(
         planCatchups(env.db, [{ module: "weather", def: def("daily_brief", "0 9 1 * *") }], now),
@@ -575,10 +575,10 @@ describe("planCatchups（停机补发判定）", () => {
       const now = atLocal("2026-10-19T09:00:00"); // 周一 09:00
       const plans = planCatchups(
         env.db,
-        [{ module: "bookkeeping", def: def("weekly_report", "0 20 * * 0") }],
+        [{ module: "maintenance", def: def("log_rotate", "0 20 * * 0") }],
         now,
       );
-      assert.equal(plans.length, 1, "周报 cron 的星期字段已支持反向求值");
+      assert.equal(plans.length, 1, "周任务 cron 的星期字段已支持反向求值");
       assert.equal(
         plans[0]?.scheduledFor,
         "2026-10-18T12:00:00.000Z",

@@ -54,8 +54,8 @@ describe("notify prefs：读", () => {
     try {
       const data = json(tool(env, { action: "prefs" }));
       assert.deepEqual(data.已保存, {}, "还没配置过");
-      assert.deepEqual(data.内置默认, { "bookkeeping.entry": { push: false } });
-      assert.deepEqual(data.生效?.["bookkeeping.entry"], { push: false, channels: null });
+      assert.deepEqual(data.内置默认, {});
+      assert.deepEqual(data.生效, {}, "没有内置默认也没有已保存时，生效为空");
       assert.match(String(data.说明), /不主动推送/);
     } finally {
       cleanupTestEnv(env);
@@ -75,7 +75,7 @@ describe("notify prefs：读", () => {
       assert.equal(result.isError, undefined);
       const data = json(result);
       assert.deepEqual(data.已保存, {});
-      assert.deepEqual(data.生效?.["bookkeeping.entry"], { push: false, channels: null });
+      assert.deepEqual(data.生效, {});
       assert.deepEqual(getNotifyPrefs(env.db, "default"), {});
     } finally {
       cleanupTestEnv(env);
@@ -87,16 +87,16 @@ describe("notify prefs：写", () => {
   it("kind + push：写入后回显最终生效值，并能在下一次读里看到", () => {
     const env = makeTestEnv();
     try {
-      const written = json(tool(env, { action: "prefs", kind: "bookkeeping.entry", push: true }));
-      assert.deepEqual(written.已保存, { "bookkeeping.entry": { push: true } });
-      assert.deepEqual(written.生效, { push: true, channels: null }, "覆盖默认的 push=false");
-      assert.deepEqual(written.内置默认, { push: false });
+      const written = json(tool(env, { action: "prefs", kind: "weather.brief", push: true }));
+      assert.deepEqual(written.已保存, { "weather.brief": { push: true } });
+      assert.deepEqual(written.生效, { push: true, channels: null });
+      assert.equal(written.内置默认, null, "该 kind 没有内置默认");
 
       const reread = json(tool(env, { action: "prefs" }));
-      assert.deepEqual(reread.已保存, { "bookkeeping.entry": { push: true } });
-      assert.deepEqual(reread.生效?.["bookkeeping.entry"], { push: true, channels: null });
+      assert.deepEqual(reread.已保存, { "weather.brief": { push: true } });
+      assert.deepEqual(reread.生效?.["weather.brief"], { push: true, channels: null });
 
-      // 关掉推送（默认已关，显式写 false 也应落库）
+      // 关掉推送
       const off = json(tool(env, { action: "prefs", kind: "schedule.reminder", push: false }));
       assert.deepEqual(off.生效, { push: false, channels: null });
       assert.deepEqual(getNotifyPrefs(env.db, "default")["schedule.reminder"], { push: false });
@@ -137,7 +137,7 @@ describe("notify prefs：写", () => {
   it("参数校验：kind 不带 push/channels、非法 kind、非布尔 push 都拒绝", () => {
     const env = makeTestEnv();
     try {
-      const noTarget = tool(env, { action: "prefs", kind: "bookkeeping.entry" });
+      const noTarget = tool(env, { action: "prefs", kind: "schedule.reminder" });
       assert.equal(noTarget.isError, true);
       assert.match(errorText(noTarget), /push/);
 
@@ -145,13 +145,13 @@ describe("notify prefs：写", () => {
       assert.equal(badKind.isError, true);
       assert.match(errorText(badKind), /kind 不合法/);
 
-      const badPush = tool(env, { action: "prefs", kind: "bookkeeping.entry", push: "yes" });
+      const badPush = tool(env, { action: "prefs", kind: "schedule.reminder", push: "yes" });
       assert.equal(badPush.isError, true);
       assert.match(errorText(badPush), /push 需要布尔值/);
 
       const badChannels = tool(env, {
         action: "prefs",
-        kind: "bookkeeping.entry",
+        kind: "schedule.reminder",
         channels: "log",
       });
       assert.equal(badChannels.isError, true);

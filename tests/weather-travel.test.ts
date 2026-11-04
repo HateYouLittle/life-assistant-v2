@@ -116,10 +116,6 @@ function dayOffset(n: number): string {
   return DateTime.fromISO(todayIso(), { zone: TZ }).plus({ days: n }).toISODate() ?? "";
 }
 
-function mmdd(date: string): string {
-  return date.slice(5);
-}
-
 function ctxOf(env: TestEnv): ToolContext {
   return {
     profileId: "default",
@@ -348,8 +344,8 @@ describe("weather 出行模式：位置解析", () => {
 
         await runDailyBrief();
         const brief = briefRow(env);
-        assert.equal(brief.title, "北京 每日简报");
-        assert.doesNotMatch(brief.body_md, /出行模式/);
+        assert.match(brief.body_md, /^☀ 北京 /m);
+        assert.doesNotMatch(brief.body_md, /出行中/);
       });
     } finally {
       cleanupTestEnv(env);
@@ -509,15 +505,11 @@ describe("weather 出行模式：简报与预警巡检", () => {
         await setTravel(env, "上海", -1, 2);
         await runDailyBrief();
         const brief = briefRow(env);
-        assert.equal(brief.title, "上海 每日简报", "简报标题应使用目的地城市");
-        assert.ok(
-          brief.body_md.includes(
-            `| 出行模式 | 上海（${mmdd(dayOffset(-1))}–${mmdd(dayOffset(2))}） |`,
-          ),
-          `简报应显式标注出行模式，实际正文：\n${brief.body_md}`,
+        assert.match(
+          brief.body_md,
+          /^\S+ 上海（出行中） /m,
+          `简报天气行应显式标注出行中，实际正文：\n${brief.body_md}`,
         );
-        // 功能1 联动：无节假日数据时也要有「下个假期」行且不崩
-        assert.ok(brief.body_md.includes("| 下个假期 |"), "简报应含下个假期行");
         assert.ok(calls.some((c) => c.url.includes("/weather/v1/current/31.23/121.47")));
         assert.ok(
           calls.every((c) => !c.url.includes("39.90")),
@@ -545,8 +537,7 @@ describe("weather 出行模式：简报与预警巡检", () => {
             .get() as { title: string; body_md: string } | undefined;
           assert.ok(row !== undefined, "目的地的预警应推送一条通知");
           assert.match(row.title, /暴雨/);
-          assert.match(row.body_md, /100mm/);
-          assert.match(row.body_md, /出行模式：上海/);
+          assert.match(row.body_md, /^上海（出行中）暴雨/);
           const alertCalls = calls.filter((c) => c.url.includes("/weatheralert/v1/current"));
           assert.ok(alertCalls.length > 0);
           assert.ok(
@@ -583,8 +574,8 @@ describe("weather 出行模式：脏数据", () => {
 
         await runDailyBrief();
         const brief = briefRow(env);
-        assert.equal(brief.title, "北京 每日简报");
-        assert.doesNotMatch(brief.body_md, /出行模式/);
+        assert.match(brief.body_md, /^☀ 北京 /m);
+        assert.doesNotMatch(brief.body_md, /出行中/);
 
         await runAlertWatch(); // 不应抛错
         assert.ok(calls.length > 0);

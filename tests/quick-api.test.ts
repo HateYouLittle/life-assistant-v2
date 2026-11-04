@@ -287,11 +287,6 @@ describe("/api/quick/expenses", () => {
       };
       assert.equal(row.created_by_profile, "bestie", "记账人必须是 token 对应的 Profile");
       assert.equal(row.amount_cents, 2000);
-      // 家庭账本的回执由工具层发布：证明写路径复用的是 expense add 而不是另起一套
-      assert.ok(
-        env.published.some((p) => p.input.kind === "bookkeeping.entry"),
-        "家庭账本记账应发出回执",
-      );
     } finally {
       cleanupTestEnv(env);
     }

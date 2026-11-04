@@ -487,7 +487,7 @@ export function scheduleJobCron(
       // 也按普通触发处理，语义与开启本特性前完全一致。
       const slot = recover ? matchedFireSlot(matched, firedAt) : null;
       // 补跑把**原定时刻**交给 handler 与 job_runs，与启动补发（runStartupCatchups）同口径：
-      // 早报/晚报/摘要/周报/调休都按这个时刻取业务日期，晚了 2 分钟不该换成另一天的数据。
+      // 早报/晚报/调休都按这个时刻取业务日期，晚了 2 分钟不该换成另一天的数据。
       const at = slot ?? firedAt;
       const slotKey = at.startOf("minute").toMillis();
       if (lastSlotMs !== null && slotKey === lastSlotMs) {
@@ -681,7 +681,7 @@ export async function startDaemon(env: NodeJS.ProcessEnv = process.env): Promise
       jobs: allJobs(),
       runJob: (module, def, trigger, scheduledFor) =>
         // 补发时把该次「原本应触发」的时刻传给 handler（而不是 now()）：
-        // 晚报/摘要/周报等按时刻取业务日期的 job 才能补对那一天的班。
+        // 早报/晚报等按时刻取业务日期的 job 才能补对那一天的班。
         jobRunner.run(
           `job:${def.name}`,
           () => {

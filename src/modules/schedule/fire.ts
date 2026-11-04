@@ -2,14 +2,11 @@ import { DateTime } from "luxon";
 import type { DatabaseSync } from "node:sqlite";
 import { now, nowIso, instantToLocalDate, localToInstant, TZ } from "../../time.js";
 import { ensureYears } from "../../core/holiday.js";
-import { describeRecurrence } from "../../core/recurrence.js";
 import { errorMessage, type NotifyBlock, type Services } from "../../core/registry.js";
 import { logger } from "../../core/logger.js";
-import type { ResolvedConfig } from "../../config.js";
 import { anniversaryMilestoneText, countdownText } from "./anniversary.js";
 import {
   ESCALATION_SUFFIX,
-  KIND_LABEL,
   RESEND_SUFFIX,
   type ScheduleRow,
   escalationStepOf,
@@ -17,7 +14,6 @@ import {
   formatElapsed,
   parseEscalation,
   parseOffsets,
-  sourceOf,
 } from "./validate.js";
 import {
   isNormalReminderKey,
@@ -30,7 +26,7 @@ import {
 
 const CATCHUP_GRACE_MINUTES = 10;
 
-export const REMINDER_REPLY_HINT = "做完了直接回复「完成」，要晚点再提醒就回复「推迟半小时」";
+export const REMINDER_REPLY_HINT = "做完回一句「好了」；要晚点再提醒就说「推迟半小时」";
 
 /**
  * 提醒装饰：其它模块（如周期账 bills）给「挂在某条日程上」的提醒改标题、补表格行、换回复提示。
@@ -39,7 +35,8 @@ export const REMINDER_REPLY_HINT = "做完了直接回复「完成」，要晚�
  */
 export interface ReminderDecoration {
   title?: string;
-  rows?: string[][];
+  /** 追加在时间行之后的正文行（如周期账的「¥50 · 通讯 · 记到家庭」） */
+  lines?: string[];
   /** 替换默认的 REMINDER_REPLY_HINT */
   hint?: string;
 }
@@ -141,52 +138,26 @@ export function reminderBlocks(
    */
   today?: string,
 ): NotifyBlock {
-  let timeText: string;
-  if (row.all_day === 1) {
-    timeText = `${instantToLocalDate(displayAt ?? eventAt)} 全天`;
-  } else if (displayAt === undefined) {
-    timeText = `${instantToLocalDate(eventAt)} ${row.time}`;
-  } else {
-    const local = DateTime.fromISO(displayAt, { zone: TZ });
-    timeText = `${instantToLocalDate(displayAt)} ${local.toFormat("HH:mm")}`;
-  }
-  const rows: string[][] = [
-    ["时间", timeText],
-    ["类型", KIND_LABEL[row.kind]],
-    ["重复", repeatTextOf(row)],
-  ];
+  const at = DateTime.fromISO(displayAt ?? eventAt, { zone: TZ });
+  const eventDate = instantToLocalDate(eventAt);
+  // 手机上一眼能看完：只给「什么时候」+ 必要的补充，不再列类型/重复这类配置信息
+  const when = row.all_day === 1 ? `${at.toFormat("MM-dd")} 全天` : at.toFormat("MM-dd HH:mm");
+  const icon = row.kind === "todo" ? "⏰" : row.kind === "birthday" ? "🎂" : "💝";
+  const extras: string[] = [];
   if (row.kind !== "todo") {
-    const eventDate = instantToLocalDate(eventAt);
-    if (today !== undefined) {
-      const countdown = countdownText(today, eventDate);
-      if (countdown !== null) rows.push(["倒计时", countdown]);
-    }
+    const countdown = today === undefined ? null : countdownText(today, eventDate);
+    if (countdown !== null) extras.push(countdown);
     const milestone = anniversaryMilestoneText(row, eventDate);
-    if (milestone !== null) rows.push(["纪念", milestone]);
+    if (milestone !== null) extras.push(milestone);
   }
+  const lines = [`${icon} ${when}${extras.length > 0 ? `（${extras.join("，")}）` : ""}`];
   // 备注为空（NULL / 空串 / 纯空白）时整行省略，不输出空行
-  if (row.note !== null && row.note.trim() !== "") rows.push(["备注", row.note]);
-  const notes = note === null ? [] : [note];
+  if (row.note !== null && row.note.trim() !== "") lines.push(`📝 ${row.note.trim()}`);
+  if (note !== null) lines.push(note);
   // 待办提醒给一句回复提示：推送不一定进入对话上下文，提示语让用户的短回复带上明确意图，
   // agent 侧对应 complete {recent:true} / snooze（见 SKILL.md「完成回执」）
-  if (row.kind === "todo") notes.push(REMINDER_REPLY_HINT);
-  return {
-    table: { columns: ["项目", "内容"], rows },
-    notes: notes.length === 0 ? undefined : notes,
-  };
-}
-
-/**
- * 提醒里的循环描述：规则损坏时退化为占位文本。
- * 若在这里抛出，fireDue 的整批处理会被带走（一条脏数据冻结所有日程的提醒），
- * 而提醒本身仍然有效（时间/类型/备注都在），损失一次提醒毫无必要。
- */
-function repeatTextOf(row: ScheduleRow): string {
-  try {
-    return describeRecurrence(sourceOf(row), row.start_date);
-  } catch {
-    return "（循环规则损坏，需修复）";
-  }
+  if (row.kind === "todo") lines.push(REMINDER_REPLY_HINT);
+  return { notes: lines };
 }
 
 interface DueRow {
@@ -368,13 +339,7 @@ function hasDerivedRow(
 }
 
 /** 到点触发提醒；返回发布的条数 */
-export async function fireDue(
-  db: DatabaseSync,
-  services: Services,
-  at: DateTime,
-  /** 传入时（daemon）按配置给待办提醒追加一键操作链接；不传 = 不加链接（既有测试/CLI） */
-  config?: ResolvedConfig,
-): Promise<number> {
+export async function fireDue(db: DatabaseSync, services: Services, at: DateTime): Promise<number> {
   const cutoff = at.toUTC().toISO() ?? nowIso();
   const due = db
     .prepare(
@@ -447,8 +412,9 @@ export async function fireDue(
       );
       const deco = schedule.kind === "todo" ? decorationFor(db, schedule) : null;
       if (deco !== null) {
-        if (deco.rows !== undefined && blocks.table !== undefined) {
-          blocks.table.rows = [...blocks.table.rows, ...deco.rows];
+        if (deco.lines !== undefined && deco.lines.length > 0) {
+          const [first, ...rest] = blocks.notes ?? [];
+          blocks.notes = first === undefined ? deco.lines : [first, ...deco.lines, ...rest];
         }
         if (deco.hint !== undefined) {
           const hint = deco.hint;
@@ -519,12 +485,11 @@ export async function tickSchedules(
   services: Services,
   db: DatabaseSync,
   fetchYear?: (url: string) => Promise<unknown>,
-  config?: ResolvedConfig,
 ): Promise<void> {
   catchupSweep(db);
   const expired = expireStaleRecurringTodos(db, at);
   if (expired > 0) logger.info(`循环待办过期作废 ${expired} 条（前一天及更早未完成的发生）`);
-  await fireDue(db, services, at, config);
+  await fireDue(db, services, at);
   const active = db
     .prepare("SELECT * FROM schedules WHERE status = 'active'")
     .all() as unknown as ScheduleRow[];

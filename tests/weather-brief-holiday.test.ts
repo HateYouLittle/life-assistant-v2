@@ -104,79 +104,57 @@ async function briefBody(env: TestEnv): Promise<string> {
   return row.body_md;
 }
 
-describe("每日简报：下个假期倒计时", () => {
-  it("未开始的假期：名称 + MM-DD 起 + 还有 N 天（明天=1）+ 共 D 天", async () => {
+describe("每日简报：假期提示（只在 7 天内才说）", () => {
+  it("2–7 天后的假期：一行「🗓 中秋节还有 N 天」", async () => {
     const env = makeTestEnv(ENV);
     try {
       seedHoliday(env, "中秋节", 2, 4);
       const body = await briefBody(env);
-      const start = mmdd(dayOffset(2));
-      assert.ok(
-        body.includes(`| 下个假期 | 中秋节 ${start} 起，还有 2 天（共 4 天） |`),
-        `简报应含下个假期倒计时行，实际正文：\n${body}`,
-      );
+      assert.match(body, /^🗓 中秋节还有 2 天$/m, `实际正文：\n${body}`);
     } finally {
       cleanupTestEnv(env);
     }
   });
 
-  it("明天开始放假：倒计时 N=1，且既有「明天开始放假」提示行行为不变", async () => {
+  it("超过 7 天：不提", async () => {
+    const env = makeTestEnv(ENV);
+    try {
+      seedHoliday(env, "春节", 10, 7);
+      const body = await briefBody(env);
+      assert.doesNotMatch(body, /春节|🗓/, `实际正文：\n${body}`);
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("明天开始放假：只给「明天开始放假」一行（不重复倒计时）", async () => {
     const env = makeTestEnv(ENV);
     try {
       seedHoliday(env, "中秋节", 1, 3);
       const body = await briefBody(env);
-      const start = mmdd(dayOffset(1));
-      const end = mmdd(dayOffset(3));
-      assert.ok(
-        body.includes(`| 下个假期 | 中秋节 ${start} 起，还有 1 天（共 3 天） |`),
-        `明天开始应显示还有 1 天，实际正文：\n${body}`,
-      );
-      assert.match(body, new RegExp(`🎉 明天开始放假（中秋节，${start}[–-]${end}，共 3 天）`));
+      assert.match(body, /^🎉 明天开始放假：中秋节，共 3 天$/m, `实际正文：\n${body}`);
+      assert.doesNotMatch(body, /还有 1 天/);
     } finally {
       cleanupTestEnv(env);
     }
   });
 
-  it("进行中的假期：假期中，第 X/D 天，至 MM-DD", async () => {
+  it("进行中的假期：不提（用户自己知道在放假）", async () => {
     const env = makeTestEnv(ENV);
     try {
-      // 今天落在假期第 2 天：昨天开始、共 4 天
       seedHoliday(env, "国庆节", -1, 4);
       const body = await briefBody(env);
-      const end = mmdd(dayOffset(2));
-      assert.ok(
-        body.includes(`| 下个假期 | 国庆节（假期中，第 2/4 天，至 ${end}） |`),
-        `假期中应显示第 2/4 天，实际正文：\n${body}`,
-      );
+      assert.doesNotMatch(body, /国庆节/, `实际正文：\n${body}`);
     } finally {
       cleanupTestEnv(env);
     }
   });
 
-  it("节假日数据缺失：显示未知（节假日数据未就绪），简报本身照常发送", async () => {
+  it("节假日数据缺失：不写「未知」也不猜，简报照常发送", async () => {
     const env = makeTestEnv(ENV);
     try {
       const body = await briefBody(env);
-      assert.ok(
-        body.includes("| 下个假期 | 未知（节假日数据未就绪） |"),
-        `数据缺失时应明确未知而不是猜，实际正文：\n${body}`,
-      );
-      // 简报不应因为节假日数据缺失而整体失败：上面的 briefBody 已断言落了通知
-    } finally {
-      cleanupTestEnv(env);
-    }
-  });
-
-  it("当年数据已就绪但已无后续假期：下个假期同样显示未知", async () => {
-    const env = makeTestEnv(ENV);
-    try {
-      // 只种一段已结束的假期：nextHolidayPeriod 返回 null（未来无数据）
-      seedHoliday(env, "端午节", -10, 1);
-      const body = await briefBody(env);
-      assert.ok(
-        body.includes("| 下个假期 | 未知（节假日数据未就绪） |"),
-        `无后续假期时应显示未知，实际正文：\n${body}`,
-      );
+      assert.doesNotMatch(body, /未知|假期/, `实际正文：\n${body}`);
     } finally {
       cleanupTestEnv(env);
     }
@@ -227,8 +205,8 @@ describe("每日简报：启动补发按原定触发日（M2）", () => {
       );
       assert.match(
         briefBodies(env)[0] ?? "",
-        /10-23 起，还有 2 天/,
-        "「下个假期」倒计时也按原定触发日（10-21）算，而不是凌晨补跑的 10-22",
+        /测试节还有 2 天/,
+        "假期倒计时也按原定触发日（10-21）算，而不是凌晨补跑的 10-22",
       );
 
       // 当晚 22:00 正常触发：业务日 10-22 → 新键 → 新增一条，不被凌晨那次吞掉
@@ -241,7 +219,11 @@ describe("每日简报：启动补发按原定触发日（M2）", () => {
         ["brief:default:北京:2026-10-21", "brief:default:北京:2026-10-22"],
         "跨午夜补发与当晚正常触发必须是两个不同的 dedupe 键",
       );
-      assert.match(briefBodies(env)[1] ?? "", /10-23 起，还有 1 天/, "当晚简报按 10-22 算倒计时");
+      assert.match(
+        briefBodies(env)[1] ?? "",
+        /明天开始放假：测试节/,
+        "当晚简报按 10-22 算：明天就是假期",
+      );
     } finally {
       cleanupTestEnv(env);
     }

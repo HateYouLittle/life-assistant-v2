@@ -14,8 +14,7 @@ import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
  * 记账编辑（expense update）回归：
  * - service 层只改显式传入字段、校验口径与 add 完全一致；
  * - 工具层可见性与 delete 同口径（不可见账本一律「账本不存在」）；
- * - **编辑不触发任何主动推送**（回执/预算提醒）——这是与「删除重记」的关键差异，
- *   既有 add 的推送行为也必须保持不变。
+ * - 编辑不触发任何主动推送。
  */
 
 function tools(env: TestEnv, profileId = "default") {
@@ -24,8 +23,7 @@ function tools(env: TestEnv, profileId = "default") {
     db: env.db,
     config: env.config,
     services: {
-      // 回执走 publishProfile（只发记账人），预算/月报仍走 publishGlobal：
-      // 两个入口都记进 env.published，断言才看得到「谁收到了什么」
+      // 两个发布入口都记进 env.published，断言才能确认「没有任何推送」
       publishProfile: async (profileId: string, input: { kind: string; dedupeKey?: string }) => {
         env.published.push({ profileId, input: input as never });
         return { id: "x", deduped: false };
@@ -138,7 +136,7 @@ describe("bookkeeping 编辑：service.updateExpense", () => {
 });
 
 describe("bookkeeping 编辑：expense action=update", () => {
-  it("改金额/分类/备注/日期：回执包含新值，并说明不触发回执/预算提醒", () => {
+  it("改金额/分类/备注/日期：回执包含新值", () => {
     const env = makeTestEnv();
     const t = tools(env);
     try {
@@ -155,9 +153,7 @@ describe("bookkeeping 编辑：expense action=update", () => {
           }),
         ),
       ) as { 已记账: { id: string } };
-      assert.equal(env.published.length, 1, "add 仍应发布家庭账本回执");
-
-      env.published.length = 0;
+      assert.equal(env.published.length, 0, "记账不发推送通知");
       const updated = t.expense({
         action: "update",
         id: added.已记账.id,
@@ -186,9 +182,8 @@ describe("bookkeeping 编辑：expense action=update", () => {
       assert.equal(payload.已更新.日期, "2026-01-05");
       assert.equal(payload.已更新.备注, "打车");
       assert.equal(payload.已更新.记账人, "default");
-      assert.match(payload.说明, /不会重发记账回执/);
-      assert.match(payload.说明, /不会重新判定预算提醒/);
-      assert.equal(env.published.length, 0, "编辑不得推送回执/预算提醒");
+      assert.match(payload.说明, /仅更正该笔账目/);
+      assert.equal(env.published.length, 0, "编辑不得推送");
 
       // 备注传空串即清空
       const cleared = JSON.parse(
@@ -196,42 +191,6 @@ describe("bookkeeping 编辑：expense action=update", () => {
       ) as { 已更新: { 备注: string | null } };
       assert.equal(cleared.已更新.备注, null);
       assert.equal(env.published.length, 0);
-    } finally {
-      cleanupTestEnv(env);
-    }
-  });
-
-  it("编辑把金额改到远超预算也不推预算提醒；add 的跨阈值提醒行为保持不变", () => {
-    const env = makeTestEnv();
-    const t = tools(env);
-    try {
-      const budgetLedger = createLedgerId(t, "预算账本");
-      t.ledger({ action: "budget", ledger_id: budgetLedger, amount: 100 });
-      const added = JSON.parse(
-        text(t.expense({ action: "add", ledger_id: budgetLedger, amount: 10 })),
-      ) as { 已记账: { id: string } };
-      // 记账 10 元（10%）不跨阈值，只有回执
-      assert.equal(env.published.length, 1);
-      assert.equal(env.published[0]?.input.kind, "bookkeeping.entry");
-
-      env.published.length = 0;
-      const updated = t.expense({ action: "update", id: added.已记账.id, amount: 500 });
-      assert.equal(updated.isError, undefined, text(updated));
-      assert.equal(
-        env.published.length,
-        0,
-        "编辑改到 500%（远超 80%/100%）也不得触发任何预算提醒或回执",
-      );
-
-      // 既有 add 行为：一笔支出跨过 100% 时仍推预算提醒（本测试防止重构 service 时误伤）
-      const freshLedger = createLedgerId(t, "对照账本");
-      t.ledger({ action: "budget", ledger_id: freshLedger, amount: 100 });
-      env.published.length = 0;
-      t.expense({ action: "add", ledger_id: freshLedger, amount: 150 });
-      assert.ok(
-        env.published.some((p) => p.input.kind === "bookkeeping.budget"),
-        `add 跨阈值仍应推预算提醒，实际：${env.published.map((p) => p.input.kind).join(",")}`,
-      );
     } finally {
       cleanupTestEnv(env);
     }

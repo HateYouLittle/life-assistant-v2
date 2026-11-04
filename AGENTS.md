@@ -54,7 +54,7 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   `a-b` 范围与 `a-b/n` 步长（步长按 node-cron「展开后取模」语义）；星期 `7` 只允许单值/
   单值列表，含 `7` 的范围/步长与「列表+步长混用」等特殊写法保守放弃；日与月必须为 `*`）、
   `runStartupCatchups`（补发时把
-  「原定触发时刻」传给 handler，供早报/晚报/摘要/周报/调休提醒按该时刻取业务日期）；daemon 在 listen
+  「原定触发时刻」传给 handler，供早报/晚报/调休提醒按该时刻取业务日期）；daemon 在 listen
   之后非阻塞调用，停机时与 onStart 一起收敛。
   `src/core/lock.ts`：`daemon.lock` 单实例锁（写完整临时文件后 `link` 原子创建、
   失效锁 rename 原子接管并校验 inode/pid/内容身份；锁内容 = pid + 进程启动时间

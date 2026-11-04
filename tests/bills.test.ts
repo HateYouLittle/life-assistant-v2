@@ -110,15 +110,9 @@ describe("bill 周期账", () => {
       assert.equal(reminders.length, 1);
       const reminder = reminders[0]?.input;
       assert.equal(reminder?.title, "该交话费了 ¥50（通讯）");
-      const rows = reminder?.blocks?.table?.rows ?? [];
-      assert.deepEqual(
-        rows.find((r) => r[0] === "金额"),
-        ["金额", "¥50"],
-      );
-      assert.deepEqual(
-        rows.find((r) => r[0] === "账本"),
-        ["账本", "家庭"],
-      );
+      const lines = reminder?.blocks?.notes ?? [];
+      assert.ok(lines[0]?.startsWith("⏰ 11-10 09:00"), "首行是时间");
+      assert.equal(lines[1], "💰 ¥50 · 通讯 · 记到「家庭」");
       assert.ok(reminder?.blocks?.notes?.some((n) => n.includes("交了")));
       assert.equal(expenses(env).length, 0, "提醒本身不入账");
     } finally {

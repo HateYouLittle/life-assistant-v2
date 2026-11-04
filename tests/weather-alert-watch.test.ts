@@ -165,12 +165,13 @@ describe("weather alert_watch：命中与去重", () => {
       assert.equal(rows.length, 1);
       const row = rows[0] as NotifRow;
       assert.equal(row.kind, "weather.alert");
-      assert.equal(row.title, "⚠️ 气象预警：暴雨 红色");
+      assert.equal(row.title, "⚠️ 暴雨红色预警");
       assert.equal(row.dedupe_key, "weather.alert:a1:红色");
       // 标题只在 title 字段：body_md 不得再出现整条标题
-      assert.doesNotMatch(row.body_md, /⚠️ 气象预警：暴雨 红色/);
-      assert.match(row.body_md, /\| 级别 \| 类型 \| 生效 \| 失效 \| 说明 \|/);
-      assert.match(row.body_md, /100mm/);
+      assert.doesNotMatch(row.body_md, /⚠️/);
+      // 手机上一行看完：类型+级别+失效时刻，不附上游的长段说明
+      assert.equal(row.body_md.split("\n").length, 1, row.body_md);
+      assert.match(row.body_md, /^暴雨红色预警/);
     } finally {
       cleanupTestEnv(env);
     }
@@ -208,10 +209,7 @@ describe("weather alert_watch：命中与去重", () => {
       );
       const rows = notifications(env, "default");
       assert.equal(rows.length, 2, "级别升级应产生第 2 条通知");
-      assert.deepEqual(rows.map((r) => r.title).sort(), [
-        "⚠️ 气象预警：暴雨 橙色",
-        "⚠️ 气象预警：暴雨 黄色",
-      ]);
+      assert.deepEqual(rows.map((r) => r.title).sort(), ["⚠️ 暴雨橙色预警", "⚠️ 暴雨黄色预警"]);
       assert.deepEqual(rows.map((r) => r.dedupe_key).sort(), [
         "weather.alert:a1:橙色",
         "weather.alert:a1:黄色",
@@ -314,8 +312,8 @@ describe("weather alert_watch：级别与时效过滤", () => {
       const rows = notifications(env, "default");
       assert.equal(rows.length, 2);
       const byKey = new Map(rows.map((r) => [r.dedupe_key, r.title]));
-      assert.equal(byKey.get("weather.alert:u:紫色"), "⚠️ 气象预警：暴雨 紫色");
-      assert.equal(byKey.get("weather.alert:e:"), "⚠️ 气象预警：高温");
+      assert.equal(byKey.get("weather.alert:u:紫色"), "⚠️ 暴雨紫色预警");
+      assert.equal(byKey.get("weather.alert:e:"), "⚠️ 高温预警");
       for (const title of byKey.values()) assert.doesNotMatch(title, /（）|\s$/);
     } finally {
       cleanupTestEnv(env);

@@ -40,8 +40,8 @@ import { readAsset } from "./page-script.js";
  * - 身份只来自凭据：Profile token → 该 Profile；master → `?profile=` / body.profile（缺省
  *   default）。**绝不读 X-Hermes-Profile** —— 公网入口下自报身份等于没有鉴权。
  * - 写路径经 registry 的 `invokeTool` 复用 MCP 工具层（`expense add` / `schedule add`）：
- *   不 import 模块 handler，参数由模块自己的 zod raw shape 校验，因此幂等键、通知回执、
- *   预算提醒、occurrence 物化这些副作用只有一份实现；这里只做 HTTP 形状的校验与包装。
+ *   不 import 模块 handler，参数由模块自己的 zod raw shape 校验，因此幂等键、
+ *   occurrence 物化这些副作用只有一份实现；这里只做 HTTP 形状的校验与包装。
  * - 页面与状态页同款 nonce CSP、token 引导（localStorage + 抹地址栏），不引入任何外链。
  */
 
@@ -278,7 +278,7 @@ export function createQuickApp(config: ResolvedConfig, db: DatabaseSync): Hono {
     // 手机入口没有 MCP 会话的 ensureProfile：先登记 Profile，个人账本归属与审计外键都依赖它
     // （审计表 profile_id 有外键，未登记的 Profile 会让审计静默失败）。
     ensureProfile(db, who.profileId);
-    // 经 registry 调工具层：默认账本解析、可见性判定、client_token 幂等、回执与预算提醒都在那里。
+    // 经 registry 调工具层：默认账本解析、可见性判定、client_token 幂等都在那里。
     // 参数还会被模块自己的 zod raw shape 再校验一次（与 MCP 同一份 schema，不再是手写副本）。
     const args: Record<string, unknown> = { action: "add", amount };
     if (ledgerId.value !== undefined) args.ledger_id = ledgerId.value;

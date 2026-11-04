@@ -5,18 +5,14 @@ import { bookkeepingExpenseTool, bookkeepingLedgerTool } from "../src/modules/bo
 import {
   addExpense,
   createLedger,
-  findMissingMonthlyReports,
   listExpenses,
   listLedgers,
-  monthlyReportPublished,
   monthRange,
-  previousMonth,
-  pushMonthlyReports,
   setLedgerArchived,
   summarizeExpenses,
 } from "../src/modules/bookkeeping/service.js";
 import { TZ, todayIso } from "../src/time.js";
-import { cleanupTestEnv, makeTestEnv, type Published, type TestEnv } from "./helpers.js";
+import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
 
 function tools(env: TestEnv, profileId = "default") {
   const ctx = {
@@ -24,8 +20,7 @@ function tools(env: TestEnv, profileId = "default") {
     db: env.db,
     config: env.config,
     services: {
-      // 回执走 publishProfile（只发记账人），预算/月报仍走 publishGlobal：
-      // 两个入口都记进 env.published，断言才看得到「谁收到了什么」
+      // 两个发布入口都记进 env.published，断言才能确认「记账不推送」
       publishProfile: async (profileId: string, input: { kind: string; dedupeKey?: string }) => {
         env.published.push({ profileId, input: input as never });
         return { id: "x", deduped: false };
@@ -72,7 +67,7 @@ describe("bookkeeping：账本", () => {
 });
 
 describe("bookkeeping：支出", () => {
-  it("记账（元转分）+ 回执只发记账人 + 跨 Profile 可写", () => {
+  it("记账（元转分）+ 不推送 + 跨 Profile 可写", () => {
     const env = makeTestEnv();
     const t = tools(env);
     try {
@@ -93,17 +88,12 @@ describe("bookkeeping：支出", () => {
       ) as { 已记账: { id: string; 金额: string; 日期: string; 记账人: string } };
       assert.equal(entry.已记账.金额, "¥12.34");
       assert.equal(entry.已记账.记账人, "default");
-      assert.equal(env.published.length, 1);
-      const receipt = env.published[0] as Published;
-      assert.equal(receipt.input.kind, "bookkeeping.entry");
-      assert.equal(receipt.profileId, "default", "家庭账本回执只发给记账人，不再全局推送");
-      assert.match((receipt.input as { dedupeKey?: string }).dedupeKey ?? "", /^entry:/);
+      assert.equal(env.published.length, 0, "记账不发推送通知");
 
-      // 另一个 Profile 直接记账（无授权限制）：回执同样只发给他
+      // 另一个 Profile 直接记账（无授权限制）
       const t2 = tools(env, "partner");
       t2.expense({ action: "add", ledger_id: ledgerId, amount: 30, category: "交通" });
-      assert.equal(env.published.length, 2);
-      assert.equal(env.published[1]?.profileId, "partner");
+      assert.equal(env.published.length, 0);
       // 用本地（Asia/Shanghai）月份：addExpense 默认 spent_on 走 todayIso()，
       // 若这里取 UTC 月份，每月 1 号 00:00–08:00 的 8 小时窗口内断言必然失败。
       const month = todayIso().slice(0, 7);
@@ -389,46 +379,9 @@ describe("bookkeeping：支出", () => {
     }
   });
 
-  it("月报推送：有账目的账本全局推送并去重", async () => {
-    const env = makeTestEnv();
-    const t = tools(env);
-    try {
-      const ledger = JSON.parse(text(t.ledger({ action: "create", name: "月报账本" }))) as {
-        已创建: { id: string };
-      };
-      const _empty = JSON.parse(text(t.ledger({ action: "create", name: "空账本" }))) as {
-        已创建: { id: string };
-      };
-      addExpense(env.db, "default", {
-        ledgerId: ledger.已创建.id,
-        amountCents: 5000,
-        category: "购物",
-        spentOn: `${previousMonth(new Date("2026-09-15"))}-15`,
-      });
-      const ym = previousMonth(new Date("2026-09-15"));
-      const pushed = await pushMonthlyReports(env.db, t.ctx.services, ym);
-      assert.equal(pushed, 1, "空账本不推送");
-      assert.equal(env.published.length, 1);
-      const report = env.published[0] as Published;
-      assert.equal(report.input.kind, "bookkeeping.monthly");
-      assert.match(
-        (report.input as { dedupeKey?: string }).dedupeKey ?? "",
-        new RegExp(`report:${ledger.已创建.id}:${ym}`),
-      );
-      const blocks = report.input.blocks as { table: { rows: string[][] } };
-      assert.deepEqual(blocks.table.rows[blocks.table.rows.length - 1], ["合计", "¥50.00", "100%"]);
-    } finally {
-      cleanupTestEnv(env);
-    }
-  });
-
-  it("monthRange 与 previousMonth", () => {
+  it("monthRange", () => {
     assert.deepEqual(monthRange("2026-09"), { from: "2026-09-01", to: "2026-09-30" });
     assert.deepEqual(monthRange("2024-02"), { from: "2024-02-01", to: "2024-02-29" });
-    assert.equal(previousMonth(new Date("2026-01-05")), "2025-12");
-    assert.equal(previousMonth(new Date("2026-09-15")), "2026-08");
-    // 本地已是 9 月 1 日凌晨，UTC 仍是 8 月 31 日：必须按 Asia/Shanghai 取月
-    assert.equal(previousMonth(new Date("2026-08-31T20:00:00Z")), "2026-08");
   });
 
   it("delete 删除记错的一笔，汇总随之变化", () => {
@@ -470,94 +423,7 @@ describe("bookkeeping：支出", () => {
   });
 });
 
-describe("bookkeeping：月报覆盖与分页语义", () => {
-  it("已归档账本仍会推送其有支出的月份账单", async () => {
-    const env = makeTestEnv();
-    try {
-      const ledger = createLedger(env.db, "家庭");
-      addExpense(env.db, "default", {
-        ledgerId: ledger.id,
-        amountCents: 2500,
-        spentOn: "2026-09-05",
-      });
-      setLedgerArchived(env.db, ledger.id, true);
-
-      const pushed = await pushMonthlyReports(env.db, makeServices(env), "2026-09");
-      assert.ok(pushed >= 1, "归档账本的当月账单不应被漏发");
-      assert.ok(
-        env.published.some((p) => (p.input as { title?: string }).title?.includes("家庭")),
-        "应推送归档账本的月报",
-      );
-    } finally {
-      cleanupTestEnv(env);
-    }
-  });
-
-  it("月报幂等：同月重复推送不产生第二条", async () => {
-    const env = makeTestEnv();
-    try {
-      const ledger = createLedger(env.db, "幂等");
-      addExpense(env.db, "default", {
-        ledgerId: ledger.id,
-        amountCents: 100,
-        spentOn: "2026-09-05",
-      });
-      const services = makeServices(env);
-      await pushMonthlyReports(env.db, services, "2026-09");
-      const first = env.published.length;
-      await pushMonthlyReports(env.db, services, "2026-09");
-      assert.equal(env.published.length, first, "同月同账本应被 dedupeKey 去重");
-    } finally {
-      cleanupTestEnv(env);
-    }
-  });
-
-  it("能识别并补发错过的历史月报", async () => {
-    const env = makeTestEnv();
-    try {
-      const ledger = createLedger(env.db, "补发");
-      addExpense(env.db, "default", {
-        ledgerId: ledger.id,
-        amountCents: 500,
-        spentOn: "2026-08-10",
-      });
-      const missing = findMissingMonthlyReports(env.db, 6, "2026-10-05");
-      assert.ok(
-        missing.missing.some((m) => m.ym === "2026-08"),
-        `未推送的 8 月账单应被识别：${JSON.stringify(missing.missing)}`,
-      );
-      await pushMonthlyReports(env.db, makeServices(env), "2026-08");
-      assert.ok(monthlyReportPublished(env.db, ledger.id, "2026-08"));
-      const after = findMissingMonthlyReports(env.db, 6, "2026-10-05");
-      assert.ok(!after.missing.some((m) => m.ym === "2026-08"), "补发后不再缺失");
-    } finally {
-      cleanupTestEnv(env);
-    }
-  });
-
-  it("早于回看窗口的未推送月报记入 tooOld（不自动补发，但可告警）", () => {
-    const env = makeTestEnv();
-    try {
-      const ledger = createLedger(env.db, "太久远");
-      addExpense(env.db, "default", {
-        ledgerId: ledger.id,
-        amountCents: 900,
-        spentOn: "2026-01-10",
-      });
-      const found = findMissingMonthlyReports(env.db, 6, "2026-10-05");
-      assert.ok(
-        !found.missing.some((m) => m.ym === "2026-01"),
-        "窗口外的月份不进入补发清单（只告警）",
-      );
-      assert.ok(
-        found.tooOld.some((m) => m.ym === "2026-01"),
-        `窗口外未推送的月份应记入 tooOld：${JSON.stringify(found.tooOld)}`,
-      );
-    } finally {
-      cleanupTestEnv(env);
-    }
-  });
-
+describe("bookkeeping：分页与归档语义", () => {
   it("expense list 报告真实总数与截断标志，且负数 limit 不变成不限量", () => {
     const env = makeTestEnv();
     try {
@@ -598,51 +464,3 @@ describe("bookkeeping：月报覆盖与分页语义", () => {
     }
   });
 });
-
-/** 用真实 notifications 表模拟 publishGlobal/publishProfile 的 Profile 内去重 */
-function makeServices(env: TestEnv) {
-  return {
-    publishProfile: async (
-      profileId: string,
-      input: { kind: string; title: string; dedupeKey?: string },
-    ) => {
-      const existing = env.db
-        .prepare("SELECT 1 FROM notifications WHERE profile_id = ? AND dedupe_key = ?")
-        .get(profileId, input.dedupeKey ?? null);
-      if (existing !== undefined) return { deduped: true };
-      env.db
-        .prepare(
-          "INSERT INTO notifications (id, profile_id, kind, title, body_md, dedupe_key, read, created_at) VALUES (?, ?, ?, ?, '', ?, 0, ?)",
-        )
-        .run(
-          `n-${env.published.length + 1}`,
-          profileId,
-          input.kind,
-          input.title,
-          input.dedupeKey ?? null,
-          new Date().toISOString(),
-        );
-      env.published.push({ profileId, input: input as never });
-      return { deduped: false };
-    },
-    publishGlobal: async (input: { kind: string; title: string; dedupeKey?: string }) => {
-      const existing = env.db
-        .prepare("SELECT 1 FROM notifications WHERE profile_id = 'default' AND dedupe_key = ?")
-        .get(input.dedupeKey ?? null);
-      if (existing !== undefined) return { materialized: 0 };
-      env.db
-        .prepare(
-          "INSERT INTO notifications (id, profile_id, kind, title, body_md, dedupe_key, read, created_at) VALUES (?, 'default', ?, ?, '', ?, 0, ?)",
-        )
-        .run(
-          `n-${env.published.length + 1}`,
-          input.kind,
-          input.title,
-          input.dedupeKey ?? null,
-          new Date().toISOString(),
-        );
-      env.published.push({ profileId: "*", input: input as never });
-      return { materialized: 1 };
-    },
-  };
-}

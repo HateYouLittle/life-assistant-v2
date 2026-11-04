@@ -1,10 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { runtime } from "../src/core/registry.js";
 import { ensureProfile } from "../src/core/settings.js";
 import { bookkeepingExpenseTool, bookkeepingLedgerTool } from "../src/modules/bookkeeping/index.js";
-import { getLedger, pushMonthlyReports } from "../src/modules/bookkeeping/service.js";
-import { todayIso } from "../src/time.js";
+import { getLedger } from "../src/modules/bookkeeping/service.js";
 import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
 
 /**
@@ -111,29 +109,6 @@ describe("bookkeeping：个人账本", () => {
       const added = owner.expense({ action: "add", ledger_id: id, amount: 200 });
       assert.equal(added.isError, undefined, "个人账本记账应成功");
       assert.equal(env.published.length, 0, "个人账本不应有任何回执或预算提醒推送");
-    } finally {
-      cleanupTestEnv(env);
-    }
-  });
-
-  it("个人账本月报只发给归属人", async () => {
-    const env = makeTestEnv();
-    const owner = tools(env);
-    try {
-      ensureProfile(env.db, "partner");
-      const id = createLedgerId(owner, "私房钱", true);
-      const ym = todayIso().slice(0, 7);
-      owner.expense({ action: "add", ledger_id: id, amount: 50, date: `${ym}-05` });
-
-      env.published.length = 0;
-      await pushMonthlyReports(env.db, runtime().services, ym);
-
-      assert.ok(env.published.length >= 1, "归属人应收到月报");
-      assert.ok(
-        env.published.every((p) => p.profileId === "default"),
-        "只有归属人收到月报，不得全局推送",
-      );
-      assert.ok(env.published.some((p) => p.input.kind === "bookkeeping.monthly"));
     } finally {
       cleanupTestEnv(env);
     }

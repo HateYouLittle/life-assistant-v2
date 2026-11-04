@@ -536,8 +536,12 @@ describe("schedule snooze：推迟单次提醒", () => {
       await tickSchedules(T(`${D}T18:10:05+08:00`), envServices(env), env.db);
       assert.equal(reminders(env).length, 2, "新 due_at 到点必须重新提醒");
       const second = reminders(env)[1];
-      const timeRow = (second?.input.blocks?.table?.rows ?? []).find((r) => r[0] === "时间");
-      assert.equal(timeRow?.[1], `${D} 18:10`, "通知里的时间必须来自 due_at，而不是旧的快照");
+      const timeLine = second?.input.blocks?.notes?.[0] ?? "";
+      assert.equal(
+        timeLine,
+        `⏰ ${D.slice(5)} 18:10`,
+        "通知里的时间必须来自 due_at，而不是旧的快照",
+      );
       assert.notEqual(
         second?.input.dedupeKey,
         firstDedupe,

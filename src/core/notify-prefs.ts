@@ -19,14 +19,11 @@ export interface NotifyKindPref {
 export type NotifyPrefs = Record<string, NotifyKindPref>;
 
 /**
- * 内置默认偏好：
- * - `bookkeeping.entry`（逐笔回执）默认不推 —— 家庭账本下「一笔 × 每人」是最大噪声源，
- *   改由每日摘要（bookkeeping.digest）汇总；用户想恢复逐笔推送可在 prefs 里显式开 true。
- * - 其余 kind 保持推送（与历史行为一致，升级不改变既有用户体感）。
+ * 内置默认偏好：当前为空，所有 kind 默认推送（与历史行为一致）。
+ * 用户可在 prefs 里按 kind 显式关闭推送或限定通道。
  */
-export const DEFAULT_KIND_PREFS: NotifyPrefs = {
-  "bookkeeping.entry": { push: false },
-};
+// 暂无内置默认：保留该表作为按 kind 下发默认偏好的扩展点
+export const DEFAULT_KIND_PREFS: NotifyPrefs = {};
 
 /** settings 里的键名（按 Profile 存储） */
 export const NOTIFY_PREFS_KEY = "notify_prefs";

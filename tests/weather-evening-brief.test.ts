@@ -152,7 +152,7 @@ describe("weather evening_brief：job 注册", () => {
 });
 
 describe("weather evening_brief：内容", () => {
-  it("含明日天气/明日日程/今日未完成/补班提示，标题只在 title 字段", async () => {
+  it("含明日天气/明日日程/补班提示；昨天没做完的不再列出；标题只在 title 字段", async () => {
     const env = makeTestEnv(ENV);
     try {
       const tomorrow = dayOffset(1);
@@ -179,21 +179,22 @@ describe("weather evening_brief：内容", () => {
       const rows = eveningRows(env);
       assert.equal(rows.length, 1, "晚报应落一条通知");
       const row = rows[0] as EveningRow;
-      assert.equal(row.title, "🌙 明日安排");
+      assert.equal(row.title, "🌙 明天");
       assert.equal(row.dedupe_key, `evening:default:${tomorrow}`);
       // 标题只走 title 字段：正文再出现一次会让推送与 pull 各多一行
-      assert.doesNotMatch(row.body_md, /🌙 明日安排/);
-      assert.match(row.body_md, /\| 明日天气 \| 小雨 20~28°C \|/, `实际正文：\n${row.body_md}`);
-      assert.match(row.body_md, /\| 明日日程 \| 09:00 交房租 \|/);
-      assert.match(row.body_md, /\| 今日未完成 \| 18:00 买菜（逾期 1 天） \|/);
-      assert.match(row.body_md, /⚠️ 明天要补班（国庆节调休）/);
-      assert.match(row.body_md, /明天有降水，出门带伞/);
+      assert.doesNotMatch(row.body_md, /🌙/);
+      assert.deepEqual(
+        row.body_md.split("\n"),
+        ["🌧 明天 北京 小雨 20~28°C；带伞", "📌 明天：09:00 交房租", "🗓 明天要补班（国庆节调休）"],
+        `实际正文：\n${row.body_md}`,
+      );
+      assert.doesNotMatch(row.body_md, /买菜|逾期/);
     } finally {
       cleanupTestEnv(env);
     }
   });
 
-  it("明天是法定假日：措辞「明天休息（国庆节）」，数据未就绪时不猜", async () => {
+  it("明天开始放假：一行「明天开始放假：国庆节，共 N 天」", async () => {
     const env = makeTestEnv(ENV);
     try {
       const tomorrow = dayOffset(1);
@@ -208,7 +209,10 @@ describe("weather evening_brief：内容", () => {
       await withMockFetch(eveningHandler, async () => {
         await runEveningBrief();
       });
-      assert.match((eveningRows(env)[0] as EveningRow).body_md, /🎉 明天休息（国庆节）/);
+      assert.match(
+        (eveningRows(env)[0] as EveningRow).body_md,
+        /^🎉 明天开始放假：国庆节，共 1 天$/m,
+      );
     } finally {
       cleanupTestEnv(env);
     }
@@ -222,7 +226,7 @@ describe("weather evening_brief：内容", () => {
       });
       const rows = eveningRows(env);
       assert.equal(rows.length, 1);
-      assert.doesNotMatch(rows[0]?.body_md ?? "", /补班|明天休息/);
+      assert.doesNotMatch(rows[0]?.body_md ?? "", /补班|放假/);
     } finally {
       cleanupTestEnv(env);
     }
@@ -245,7 +249,7 @@ describe("weather evening_brief：内容", () => {
         await runEveningBrief();
       });
       const body = (eveningRows(env)[0] as EveningRow).body_md;
-      assert.match(body, /\| 出行模式 \| 上海（\d{2}-\d{2}[–-]\d{2}-\d{2}） \|/);
+      assert.match(body, /^🌧 明天 上海（出行中） 小雨/m);
     } finally {
       cleanupTestEnv(env);
     }
@@ -338,7 +342,7 @@ describe("weather evening_brief：去重、过期与降级", () => {
     }
   });
 
-  it("明日预报失败：天气写「未知」，日程照常发布", async () => {
+  it("明日预报失败：省略天气行，日程照常发布", async () => {
     const env = makeTestEnv(ENV);
     try {
       const tomorrow = dayOffset(1);
@@ -356,22 +360,43 @@ describe("weather evening_brief：去重、过期与降级", () => {
       );
       const rows = eveningRows(env);
       assert.equal(rows.length, 1, "预报失败也必须发布年报");
-      assert.match(rows[0]?.body_md ?? "", /\| 明日天气 \| 未知 \|/);
-      assert.match(rows[0]?.body_md ?? "", /\| 明日日程 \| 09:00 交房租 \|/);
+      assert.equal(rows[0]?.body_md, "📌 明天：09:00 交房租");
     } finally {
       cleanupTestEnv(env);
     }
   });
 
-  it("无日程：明日日程/今日未完成写「无」，不崩", async () => {
+  it("无日程：只有天气一行，不写「无」", async () => {
     const env = makeTestEnv(ENV);
     try {
       await withMockFetch(eveningHandler, async () => {
         await runEveningBrief();
       });
       const body = (eveningRows(env)[0] as EveningRow).body_md;
-      assert.match(body, /\| 明日日程 \| 无 \|/);
-      assert.match(body, /\| 今日未完成 \| 无 \|/);
+      assert.equal(body, "🌧 明天 北京 小雨 20~28°C；带伞");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("今天记过账：最后一行「今天记了 N 笔，共 ¥X」，只算本人记的账", async () => {
+    const env = makeTestEnv(ENV);
+    try {
+      const today = todayIso();
+      const ts = new Date().toISOString();
+      env.db.prepare("INSERT INTO ledgers (id, name, created_at) VALUES ('L1', '家庭', ?)").run(ts);
+      const insert = env.db.prepare(
+        `INSERT INTO expenses (id, ledger_id, amount_cents, category, spent_on, created_by_profile, created_at)
+         VALUES (?, 'L1', ?, '餐饮', ?, ?, ?)`,
+      );
+      insert.run("e1", 3550, today, "default", ts);
+      insert.run("e2", 9250, today, "default", ts);
+      insert.run("e3", 10000, today, "bestie", ts);
+      await withMockFetch(eveningHandler, async () => {
+        await runEveningBrief();
+      });
+      const body = (eveningRows(env)[0] as EveningRow).body_md;
+      assert.match(body, /^🧾 今天记了 2 笔，共 ¥128$/m, `实际正文：\n${body}`);
     } finally {
       cleanupTestEnv(env);
     }

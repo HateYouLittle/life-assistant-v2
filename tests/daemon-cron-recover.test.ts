@@ -56,15 +56,12 @@ describe("P2-14 cron 错过触发回放", () => {
     assert.equal(recoverMissedExecutionsFor("tick"), false);
     assert.equal(recoverMissedExecutionsFor("不存在的任务"), false);
 
-    // 真实注册表：白名单里的键必须对应真实 job；且确实存在不开启的 job（否则等于全开）
+    // 真实注册表：白名单里的键必须对应真实 job。当前注册的 job 恰好全部在白名单内，
+    // 「只对白名单开放」由上面 tick / 不存在任务返回 false 的断言保证。
     const jobs = allJobs().map(({ module, def }) => `${module}.${def.name}`);
     for (const key of Object.keys(CATCHUP_POLICY)) {
       assert.ok(jobs.includes(key), `CATCHUP_POLICY 的键 ${key} 没有对应的注册 job`);
     }
-    assert.ok(
-      jobs.some((key) => !recoverMissedExecutionsFor(key)),
-      "至少有一个 job 不开回放（如 tick），否则「只对白名单开放」形同虚设",
-    );
   });
 
   it("注册选项随白名单分叉：白名单 true、非白名单 false", () => {

@@ -84,39 +84,40 @@ function pull(env: TestEnv, profileId = "default"): string {
 }
 
 describe("按 kind 的通知偏好", () => {
-  it("bookkeeping.entry 默认不建 delivery，但通知仍入库、仍可 pull", () => {
+  it("push:false 不建 delivery，但通知仍入库、仍可 pull", () => {
     const env = makeTestEnv();
     try {
       configureLogRoute(env);
-      const result = publish(env, { kind: "bookkeeping.entry", title: "记了一笔" });
+      setNotifyPrefs(env.db, "default", { "schedule.reminder": { push: false } });
+      const result = publish(env, { kind: "schedule.reminder", title: "记了一笔" });
       assert.equal(result.deduped, false);
 
       const after = counts(env);
       assert.equal(after.notifications, 1, "关闭推送不等于不记录：通知必须照常入库");
-      assert.equal(after.deliveries, 0, "DEFAULT_KIND_PREFS 里 bookkeeping.entry 默认 push:false");
+      assert.equal(after.deliveries, 0, "显式 push:false 后不建投递");
 
       const row = env.db
         .prepare("SELECT kind, read FROM notifications WHERE id = ?")
         .get(result.id) as { kind: string; read: number } | undefined;
-      assert.equal(row?.kind, "bookkeeping.entry");
+      assert.equal(row?.kind, "schedule.reminder");
       assert.equal(row?.read, 0, "未读才可能被 pull 取到（不能被误标已读）");
 
       // 端到端：pull 走的是真实工具，能取到标题才算「记录还在」
       const pulled = pull(env);
       assert.match(pulled, /记了一笔/);
-      assert.match(pulled, /bookkeeping\.entry/);
+      assert.match(pulled, /schedule\.reminder/);
       assert.equal(counts(env).deliveries, 0, "pull 不该凭空造出投递行");
     } finally {
       cleanupTestEnv(env);
     }
   });
 
-  it("显式 push:true 恢复建 delivery（默认值可被覆盖）", () => {
+  it("显式 push:true 建 delivery", () => {
     const env = makeTestEnv();
     try {
       configureLogRoute(env);
-      setNotifyPrefs(env.db, "default", { "bookkeeping.entry": { push: true } });
-      const result = publish(env, { kind: "bookkeeping.entry" });
+      setNotifyPrefs(env.db, "default", { "schedule.reminder": { push: true } });
+      const result = publish(env, { kind: "schedule.reminder" });
       const after = counts(env);
       assert.equal(after.notifications, 1);
       assert.equal(after.deliveries, 1, "显式开启后必须回到历史行为（建 delivery）");
@@ -159,12 +160,10 @@ describe("按 kind 的通知偏好", () => {
         )
         .run();
 
-      publish(env, { kind: "bookkeeping.entry" });
-      assert.equal(counts(env).deliveries, 0, "坏配置不能让默认 push:false 变成推送");
       publish(env, { kind: "weather.brief" });
       const after = counts(env);
-      assert.equal(after.notifications, 2);
-      assert.equal(after.deliveries, 1, "未配置偏好的 kind 仍按默认推送");
+      assert.equal(after.notifications, 1);
+      assert.equal(after.deliveries, 1, "坏配置按「没有偏好」处理，仍按默认推送");
     } finally {
       cleanupTestEnv(env);
     }
@@ -223,9 +222,10 @@ describe("按 kind 的通知偏好", () => {
     const env = makeTestEnv();
     try {
       configureLogRoute(env);
+      setNotifyPrefs(env.db, "default", { "schedule.reminder": { push: false } });
       const expiresAt = new Date(Date.now() + 3600_000).toISOString();
-      const first = publish(env, { kind: "bookkeeping.entry", dedupeKey: "k1", expiresAt });
-      const second = publish(env, { kind: "bookkeeping.entry", dedupeKey: "k1", expiresAt });
+      const first = publish(env, { kind: "schedule.reminder", dedupeKey: "k1", expiresAt });
+      const second = publish(env, { kind: "schedule.reminder", dedupeKey: "k1", expiresAt });
       assert.equal(first.deduped, false);
       assert.equal(second.deduped, true);
       assert.equal(second.id, first.id, "命中去重键时返回原通知 id");
@@ -244,10 +244,11 @@ describe("按 kind 的通知偏好", () => {
     setLogLevel("debug");
     try {
       configureLogRoute(env);
-      publish(env, { kind: "bookkeeping.entry" });
+      setNotifyPrefs(env.db, "default", { "schedule.reminder": { push: false } });
+      publish(env, { kind: "schedule.reminder" });
       const lines = spy.mock.calls.map((call) => String(call.arguments[0]));
       assert.ok(
-        lines.some((line) => line.includes("bookkeeping.entry") && line.includes("不主动推送")),
+        lines.some((line) => line.includes("schedule.reminder") && line.includes("不主动推送")),
         `应有包含 kind 与原因的 debug 行，实际：\n${lines.join("\n")}`,
       );
     } finally {

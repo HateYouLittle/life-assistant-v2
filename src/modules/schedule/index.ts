@@ -640,6 +640,6 @@ registerModule({
   ],
   tick: async (at) => {
     const rt = runtime();
-    await tickSchedules(at, rt.services, rt.db, undefined, rt.config);
+    await tickSchedules(at, rt.services, rt.db);
   },
 });

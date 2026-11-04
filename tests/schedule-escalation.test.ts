@@ -105,8 +105,11 @@ function publishedKeys(env: TestEnv): string[] {
   return reminders(env).map((p) => p.input.dedupeKey ?? "");
 }
 
+/** 提醒正文里的状态说明行（首行是时间行，状态说明在其后） */
 function noteOf(pub: { input: { blocks?: { notes?: string[] } } }): string | null {
-  return pub.input.blocks?.notes?.[0] ?? null;
+  return (
+    pub.input.blocks?.notes?.find((line) => /（.*）/.test(line) && !line.startsWith("⏰")) ?? null
+  );
 }
 
 function scheduleStatus(env: TestEnv, id: string): ScheduleRow["status"] | undefined {

@@ -58,8 +58,9 @@ function input(over: Partial<ScheduleInput>): ScheduleInput {
   };
 }
 
-function rowsOf(blocks: { table?: { rows: string[][] } }): Record<string, string> {
-  return Object.fromEntries((blocks.table?.rows ?? []).map((r) => [r[0], r[1]]));
+/** 提醒正文是几行纯文本：首行「🎂 06-07 全天（还有 7 天，2 周年 · 第 731 天）」，备注行以 📝 开头 */
+function textOf(blocks: { notes?: string[] }): string {
+  return (blocks.notes ?? []).join("\n");
 }
 
 describe("纪念日纯函数", () => {
@@ -208,10 +209,9 @@ describe("提醒正文：倒计时 / 纪念 / 备注", () => {
       createSchedule(env.db, "default", input({ title: "在一起纪念日", note: "订餐厅" }));
       await fireDue(env.db, services(env), DateTime.fromISO("2026-05-25T09:00", { zone: TZ }));
       assert.equal(env.published.length, 1);
-      const rows = rowsOf(env.published[0]?.input.blocks ?? {});
-      assert.equal(rows.倒计时, "还有 7 天");
-      assert.equal(rows.纪念, "2 周年 · 第 731 天");
-      assert.equal(rows.备注, "订餐厅");
+      const text = textOf(env.published[0]?.input.blocks ?? {});
+      assert.match(text, /还有 7 天，2 周年 · 第 731 天/);
+      assert.match(text, /📝 订餐厅/);
     } finally {
       cleanupTestEnv(env);
     }
@@ -225,7 +225,7 @@ describe("提醒正文：倒计时 / 纪念 / 备注", () => {
       await fireDue(env.db, services(env), DateTime.fromISO("2026-06-01T09:00", { zone: TZ }));
       // 三档提醒都已到点：取当天那条（最后一条）
       const last = env.published[env.published.length - 1];
-      assert.equal(rowsOf(last?.input.blocks ?? {}).倒计时, "今天");
+      assert.match(textOf(last?.input.blocks ?? {}), /（今天/);
     } finally {
       cleanupTestEnv(env);
     }
@@ -262,16 +262,16 @@ describe("提醒正文：倒计时 / 纪念 / 备注", () => {
 
   it("生日：有备注带「备注」行；备注为空/空白时整行省略；生日不给纪念文案", () => {
     const eventAt = "2027-06-07T01:00:00.000Z";
-    const withNote = rowsOf(
+    const withNote = textOf(
       reminderBlocks(row({ note: "礼物：香水" }), eventAt, null, undefined, "2027-06-06"),
     );
-    assert.equal(withNote.备注, "礼物：香水");
-    assert.equal(withNote.倒计时, "还有 1 天");
-    assert.equal(withNote.纪念, undefined);
+    assert.match(withNote, /📝 礼物：香水/);
+    assert.match(withNote, /（还有 1 天）/);
+    assert.doesNotMatch(withNote, /周年/);
     for (const note of [null, "", "   "]) {
       const blocks = reminderBlocks(row({ note }), eventAt, null, undefined, "2027-06-06");
       assert.ok(
-        !(blocks.table?.rows ?? []).some((r) => r[0] === "备注"),
+        !(blocks.notes ?? []).some((line) => line.startsWith("📝")),
         `note=${JSON.stringify(note)} 不应输出备注行`,
       );
     }
@@ -279,8 +279,8 @@ describe("提醒正文：倒计时 / 纪念 / 备注", () => {
 
   it("不传 today 时不输出倒计时（既有调用方形状不变）；待办不带纪念/倒计时", () => {
     const eventAt = "2027-06-07T01:00:00.000Z";
-    assert.equal(rowsOf(reminderBlocks(row({}), eventAt, null)).倒计时, undefined);
-    const todo = rowsOf(
+    assert.doesNotMatch(textOf(reminderBlocks(row({}), eventAt, null)), /还有|今天/);
+    const todo = textOf(
       reminderBlocks(
         row({ kind: "todo", calendar: "solar", start_date: "2020-01-01" }),
         eventAt,
@@ -289,8 +289,7 @@ describe("提醒正文：倒计时 / 纪念 / 备注", () => {
         "2027-06-06",
       ),
     );
-    assert.equal(todo.倒计时, undefined);
-    assert.equal(todo.纪念, undefined);
+    assert.doesNotMatch(todo, /还有|周年/);
   });
 });
 
@@ -343,7 +342,7 @@ describe("近 14 天生日/纪念日（早报栏数据）", () => {
       );
       assert.equal(
         specialDayNotes(items)[0],
-        "近期生日/纪念日：11-04 妹妹生日（今天）；11-08 认识纪念日（还有 4 天，5 周年 · 第 1827 天）；11-18 第 14 天（还有 14 天）",
+        "🎂 妹妹生日（今天）；认识纪念日（还有 4 天，5 周年 · 第 1827 天）；第 14 天（还有 14 天）",
       );
     } finally {
       cleanupTestEnv(env);

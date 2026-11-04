@@ -125,10 +125,6 @@ export interface ResolvedConfig {
   workdayRemindDaysBefore: number;
   /** 每日晚报 cron（EVENING_BRIEF_CRON，默认 "0 21 * * *"，Asia/Shanghai） */
   eveningBriefCron: string;
-  /** 每日记账摘要 cron（LEDGER_DIGEST_CRON，默认 "30 21 * * *"，Asia/Shanghai） */
-  ledgerDigestCron: string;
-  /** 周报 cron（WEEKLY_REPORT_CRON，默认 "0 20 * * 0" 即周日 20:00，Asia/Shanghai） */
-  weeklyReportCron: string;
   /**
    * 日志目录（LOG_DIR）：daemon 的 stdout/stderr 由 launchd 重定向到这里，
    * 维护任务按月/按大小轮转。缺省 macOS 的 ~/Library/Logs/life-assistant。
@@ -654,16 +650,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
     throw new Error(`LOG_KEEP 必须是 1..100 的整数: ${logKeepRaw}`);
   }
 
-  const weeklyReportCron = fiveFieldCron(
-    "WEEKLY_REPORT_CRON",
-    env.WEEKLY_REPORT_CRON?.trim() || "0 20 * * 0",
-  );
-
-  const ledgerDigestCron = fiveFieldCron(
-    "LEDGER_DIGEST_CRON",
-    env.LEDGER_DIGEST_CRON?.trim() || "30 21 * * *",
-  );
-
   const alertWatchCron = fiveFieldCron(
     "ALERT_WATCH_CRON",
     env.ALERT_WATCH_CRON?.trim() || "*/20 * * * *",
@@ -752,8 +738,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
     workdayWatchCron,
     workdayRemindDaysBefore,
     eveningBriefCron,
-    ledgerDigestCron,
-    weeklyReportCron,
     logDir: logDirRaw,
     logMaxBytes: logMaxMb * 1024 * 1024,
     logKeep,

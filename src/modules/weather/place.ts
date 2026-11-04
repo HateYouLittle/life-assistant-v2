@@ -98,11 +98,6 @@ export function travelModeText(plan: TravelPlan): string {
   return `出行模式：${plan.city} ${shortDate(plan.start)}–${shortDate(plan.end)}`;
 }
 
-/** 简报表格行里的出行模式内容：城市（起–止） */
-export function travelModeBrief(plan: TravelPlan): string {
-  return `${plan.city}（${shortDate(plan.start)}–${shortDate(plan.end)}）`;
-}
-
 interface ResolvedPlace {
   loc: LocationInfo;
   /** 生效中的出行计划；非 null 表示本次查询使用目的地（而不是家/默认城市） */

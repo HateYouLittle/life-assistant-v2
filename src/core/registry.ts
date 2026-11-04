@@ -16,7 +16,7 @@ export interface NotifyBlock {
 }
 
 export interface PublishInput {
-  /** 通知种类，如 schedule.reminder / weather.brief / bookkeeping.monthly */
+  /** 通知种类，如 schedule.reminder / weather.brief / notify.test */
   kind: string;
   title: string;
   blocks: NotifyBlock;

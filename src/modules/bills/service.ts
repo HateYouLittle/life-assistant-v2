@@ -3,10 +3,8 @@ import { DATE_RE, TIME_RE, instantToLocalDate, nowIso, todayIso } from "../../ti
 import type { Recurrence } from "../../core/recurrence.js";
 import { newId } from "../../core/settings.js";
 import { errorMessage, type ToolContext } from "../../core/registry.js";
-import { logger } from "../../core/logger.js";
 import {
   addExpenseChecked,
-  budgetAlertsForEntry,
   centsToYuan,
   getVisibleLedger,
   normalizeCategory,
@@ -365,13 +363,12 @@ export interface RecordOutcome {
  * 按模板为某一期入账（幂等）：request_id = bill:<id>:<期次日期>，spent_on = 期次日期。
  *
  * spent_on 取期次而不是「今天」：迟交（11-30 那期 12-01 才交）也记在 11 月，保证每期
- * 落在自己的月份、月报不出现「一个月两笔话费」；期次日期本身就是幂等键的一部分。
- * 新增入账时对家庭账本照常判定预算阈值提醒（与 expense add 同口径）；逐笔回执不推，
- * 由每晚记账摘要覆盖。
+ * 落在自己的月份、月度统计不出现「一个月两笔话费」；期次日期本身就是幂等键的一部分。
+ * 入账不发推送通知（与 expense add 同口径）。
  */
 export function recordBillPayment(
   db: DatabaseSync,
-  ctx: ToolContext,
+  _ctx: ToolContext,
   bill: BillRow,
   period: string,
 ): RecordOutcome {
@@ -386,17 +383,6 @@ export function recordBillPayment(
     spentOn: period,
     clientToken: billRequestId(bill.id, period),
   });
-  if (!result.reused && ledger.owner_profile_id === null) {
-    try {
-      for (const alert of budgetAlertsForEntry(db, ledger, result.entry)) {
-        void ctx.services
-          .publishGlobal(alert)
-          .catch((e) => logger.error(`预算提醒发布失败（入账已成功）: ${errorMessage(e)}`));
-      }
-    } catch (e) {
-      logger.error(`预算提醒判定失败（入账已成功）: ${errorMessage(e)}`);
-    }
-  }
   return { entry: result.entry, reused: result.reused, ledger, period };
 }
 

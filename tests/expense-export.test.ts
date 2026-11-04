@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { DateTime } from "luxon";
 import { bookkeepingExpenseTool } from "../src/modules/bookkeeping/index.js";
 import {
   createLedger,
@@ -8,11 +9,10 @@ import {
   EXPENSE_CSV_MAX_ROWS,
   expenseCsv,
   expenseCsvFilename,
-  previousMonth,
 } from "../src/modules/bookkeeping/service.js";
 import { statusPage } from "../src/server/page.js";
 import { createStatusApp } from "../src/server/status.js";
-import { todayIso } from "../src/time.js";
+import { TZ, todayIso } from "../src/time.js";
 import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
 
 /**
@@ -21,7 +21,7 @@ import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
  */
 
 const CURRENT_YM = todayIso().slice(0, 7);
-const PREV_YM = previousMonth();
+const PREV_YM = DateTime.now().setZone(TZ).minus({ months: 1 }).toFormat("yyyy-MM");
 
 function app(env: TestEnv) {
   return createStatusApp(env.config, env.db);

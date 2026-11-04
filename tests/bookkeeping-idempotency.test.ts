@@ -7,16 +7,15 @@ import {
   findExpenseByClientToken,
   getExpense,
   listExpenses,
-  setBudget,
   setDefaultLedgerId,
 } from "../src/modules/bookkeeping/service.js";
-import { cleanupTestEnv, makeTestEnv, type Published, type TestEnv } from "./helpers.js";
+import { cleanupTestEnv, makeTestEnv, type TestEnv } from "./helpers.js";
 
 /**
  * 写路径幂等键（P1-12c）：`expense add` 的 request_id → expenses.client_token。
  *
  * 语义：同一 Profile 用同一个 request_id 重试，永远不会落第二行；第二次返回首次记录
- * 并附「已存在: true」，且**不重复发回执/预算提醒**（重复推送是这类重试最烦人的后果）。
+ * 并附「已存在: true」。
  * 幂等范围是 (created_by_profile, client_token)，不同人的同名 request_id 互不影响。
  */
 
@@ -26,8 +25,8 @@ function tools(env: TestEnv, profileId = "default") {
     db: env.db,
     config: env.config,
     services: {
-      // 回执走 publishProfile（只发记账人），预算/月报仍走 publishGlobal：
-      // 两个入口都记进 env.published，断言才看得到「谁收到了什么」
+      // 记账不推送；两个发布入口仍记进 env.published，便于断言「没有任何推送」
+      // （请求失败/成功都不应出现发布记录）
       publishProfile: async (profileId: string, input: { kind: string; dedupeKey?: string }) => {
         env.published.push({ profileId, input: input as never });
         return { id: "x", deduped: false };
@@ -112,40 +111,6 @@ describe("bookkeeping 幂等：request_id → client_token", () => {
     }
   });
 
-  it("重试不重复发通知：回执与预算提醒各只发一次", () => {
-    const env = makeTestEnv();
-    const t = tools(env);
-    try {
-      const ledgerId = createLedgerId(t, "幂等预算");
-      t.ledger({ action: "budget", ledger_id: ledgerId, amount: 100 });
-      // 第一笔 500 元：一笔从 0 跨到 500%，只推最高阈值 100%，同时发一条回执
-      t.expense({ action: "add", ledger_id: ledgerId, amount: 500, request_id: "req-budget" });
-      const kindsAfterFirst = env.published.map((p) => p.input.kind);
-      assert.deepEqual(
-        kindsAfterFirst.sort(),
-        ["bookkeeping.budget", "bookkeeping.entry"],
-        "首次成功应发回执与预算超支提醒各一条",
-      );
-
-      env.published.length = 0;
-      const retry = JSON.parse(
-        text(
-          t.expense({
-            action: "add",
-            ledger_id: ledgerId,
-            amount: 500,
-            request_id: "req-budget",
-          }),
-        ),
-      ) as AddReceipt;
-      assert.equal(retry.已存在, true);
-      assert.equal(env.published.length, 0, "幂等命中不得重发回执或预算提醒");
-      assert.equal(rowCount(env), 1);
-    } finally {
-      cleanupTestEnv(env);
-    }
-  });
-
   it("不同人用同一个 request_id 互不影响（幂等范围按创建人隔离）", () => {
     const env = makeTestEnv();
     const owner = tools(env);
@@ -178,11 +143,6 @@ describe("bookkeeping 幂等：request_id → client_token", () => {
       assert.equal(mine.已记账.记账人, "default");
       assert.equal(theirs.已记账.记账人, "partner");
       assert.equal(rowCount(env), 2);
-      assert.equal(
-        env.published.filter((p) => p.input.kind === "bookkeeping.entry").length,
-        2,
-        "两笔都是真实新增，各发一条回执",
-      );
     } finally {
       cleanupTestEnv(env);
     }
@@ -226,25 +186,6 @@ describe("bookkeeping 幂等：request_id → client_token", () => {
     }
   });
 
-  it("回执 dedupeKey 由 request_id 派生（不含随机 id），重试得到同一个键", () => {
-    const env = makeTestEnv();
-    const t = tools(env);
-    try {
-      const ledgerId = createLedgerId(t, "去重键");
-      const first = JSON.parse(
-        text(t.expense({ action: "add", ledger_id: ledgerId, amount: 9, request_id: "req-key" })),
-      ) as AddReceipt;
-      const receipt = env.published.find((p) => p.input.kind === "bookkeeping.entry") as Published;
-      assert.equal(receipt.input.dedupeKey, "entry:req:default:req-key");
-      assert.ok(
-        !(receipt.input.dedupeKey ?? "").includes(first.已记账.id),
-        "键里不应含随机生成的账目 id",
-      );
-    } finally {
-      cleanupTestEnv(env);
-    }
-  });
-
   it("重试时即使传了不同的金额/账本，也返回首次那一行（同一请求只执行一次）", () => {
     const env = makeTestEnv();
     try {
@@ -270,39 +211,6 @@ describe("bookkeeping 幂等：request_id → client_token", () => {
       assert.equal(findExpenseByClientToken(env.db, "default", "svc-token")?.id, first.entry.id);
       assert.equal(findExpenseByClientToken(env.db, "partner", "svc-token"), undefined);
       assert.equal(getExpense(env.db, first.entry.id)?.amount_cents, 1000);
-    } finally {
-      cleanupTestEnv(env);
-    }
-  });
-
-  it("预算提醒按「这笔支出所属月份」判定（幂等重试不影响跨月口径）", () => {
-    const env = makeTestEnv();
-    const t = tools(env);
-    try {
-      const ledgerId = createLedgerId(t, "跨月幂等");
-      setBudget(env.db, ledgerId, "", 100_00);
-      // 补记两个月前的支出：提醒必须按 2026-08 口径，而不是今天所在月份
-      const result = t.expense({
-        action: "add",
-        ledger_id: ledgerId,
-        amount: 120,
-        date: "2026-08-10",
-        request_id: "past-month",
-      });
-      assert.notEqual(result.isError, true, text(result));
-      const alert = env.published.find((p) => p.input.kind === "bookkeeping.budget");
-      assert.ok(alert !== undefined, "补记历史月份跨越阈值仍应提醒（标题带月份）");
-      assert.match(alert.input.title, /2026-08/);
-
-      env.published.length = 0;
-      t.expense({
-        action: "add",
-        ledger_id: ledgerId,
-        amount: 120,
-        date: "2026-08-10",
-        request_id: "past-month",
-      });
-      assert.equal(env.published.length, 0, "幂等重试不得再次告警");
     } finally {
       cleanupTestEnv(env);
     }

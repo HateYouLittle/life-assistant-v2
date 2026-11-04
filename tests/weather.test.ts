@@ -232,9 +232,9 @@ describe("weather / air_quality", () => {
         assert.equal(rows[0]?.kind, "weather.brief");
         assert.match(rows[0]?.dedupe_key ?? "", /^brief:default:北京:\d{4}-\d{2}-\d{2}$/);
         // 标题只在 title 字段：body_md 里不得再出现，否则推送与拉取都会重复一行
-        assert.equal(rows[0]?.title, "北京 每日简报");
-        assert.doesNotMatch(rows[0]?.body_md ?? "", /北京 每日简报/);
-        assert.match(rows[0]?.body_md ?? "", /AQI 42（优）/);
+        assert.equal(rows[0]?.title, "☀️ 早安");
+        assert.doesNotMatch(rows[0]?.body_md ?? "", /早安/);
+        assert.match(rows[0]?.body_md ?? "", /^☀ 北京 晴 24~30°C，空气优$/m);
 
         await runDailyBrief();
         const after = env.db
@@ -269,7 +269,11 @@ describe("weather / air_quality", () => {
         const row = env.db
           .prepare("SELECT title FROM notifications WHERE profile_id = 'default'")
           .get() as { title: string };
-        assert.equal(row.title, "自选位置 每日简报");
+        const body = env.db
+          .prepare("SELECT body_md FROM notifications WHERE profile_id = 'default'")
+          .get() as { body_md: string };
+        assert.equal(row.title, "☀️ 早安");
+        assert.match(body.body_md, /自选位置/);
       });
     } finally {
       cleanupTestEnv(env);
@@ -356,8 +360,7 @@ describe("weather：v1 预警字段映射", () => {
         const row = env.db
           .prepare("SELECT body_md FROM notifications WHERE profile_id = 'default'")
           .get() as { body_md: string };
-        assert.match(row.body_md, /红色大风/);
-        assert.match(row.body_md, /有气象预警，注意防范/);
+        assert.match(row.body_md, /有大风红色预警/, "预警必须带级别");
         assert.doesNotMatch(row.body_md, /适宜出行/, "有生效预警时不得给出相反结论");
       });
     } finally {
@@ -583,8 +586,8 @@ describe("weather 每日简报：补班/放假提示行", () => {
       const body = await briefBodyAt(t, "2026-09-20", env);
       // 当天补班交给 holiday 模块的 workday_watch：早报再写一行会与它双推
       assert.doesNotMatch(body, /今天要补班/);
-      // 简报本身照常发布（briefBodyAt 已断言通知落库），且既有天气结论仍在
-      assert.match(body, /适宜出行/);
+      // 简报本身照常发布（briefBodyAt 已断言通知落库），天气行仍在
+      assert.match(body, /北京 晴/);
     } finally {
       cleanupTestEnv(env);
     }
@@ -595,7 +598,7 @@ describe("weather 每日简报：补班/放假提示行", () => {
     try {
       seedHoliday(env);
       const body = await briefBodyAt(t, "2026-09-19", env);
-      assert.match(body, /⚠️ 明天要补班（国庆节调休）/);
+      assert.match(body, /^🗓 明天要补班（国庆节调休）$/m);
     } finally {
       cleanupTestEnv(env);
     }
@@ -606,7 +609,7 @@ describe("weather 每日简报：补班/放假提示行", () => {
     try {
       seedHoliday(env);
       const body = await briefBodyAt(t, "2026-09-30", env);
-      assert.match(body, /🎉 明天开始放假（国庆节，10-01–10-07，共 7 天）/);
+      assert.match(body, /^🎉 明天开始放假：国庆节，共 7 天$/m);
     } finally {
       cleanupTestEnv(env);
     }

@@ -1,22 +1,18 @@
-import type { DateTime } from "luxon";
 import { z } from "zod";
 import { defineActionTool } from "../../core/action-tool.js";
 import { logger } from "../../core/logger.js";
 import {
-  errorMessage,
   fail,
   okJson,
   registerModule,
-  runtime,
   type ToolContext,
   type ToolResult,
 } from "../../core/registry.js";
 import { ensureProfile } from "../../core/settings.js";
-import { DATE_RE, TZ, todayIso } from "../../time.js";
+import { DATE_RE, todayIso } from "../../time.js";
 import {
   addExpenseChecked,
   type BudgetStatus,
-  budgetAlertsForEntry,
   budgetComparison,
   budgetScopeLabel,
   budgetStatus,
@@ -29,10 +25,8 @@ import {
   deleteExpense,
   EXPENSE_CSV_MAX_ROWS,
   type ExpensePatch,
-  entryReceiptBlocks,
   expenseCsv,
   expenseCsvFilename,
-  findMissingMonthlyReports,
   getBudgets,
   getCategoryDictionary,
   getExpense,
@@ -44,10 +38,6 @@ import {
   listLedgers,
   monthRange,
   normalizeCategory,
-  previousMonth,
-  pushDailyDigests,
-  pushMonthlyReports,
-  pushWeeklyReports,
   recentCategories,
   renameLedger,
   resolveAddLedger,
@@ -353,39 +343,10 @@ function expenseAdd(args: Record<string, unknown>, ctx: ToolContext): ToolResult
   // 用它回显会让「账本」与金额/分类/日期（都来自 entry）自相矛盾，误导人工对账，
   // 也会把错误的账本写进 quick 的 audit_log.detail。
   const entryLedger = result.reused ? (getLedger(db, entry.ledger_id) ?? ledger) : ledger;
-  // 幂等命中：行是首次写入的那一条，本次不再发回执/预算提醒（否则重试会重复打扰用户）
   if (result.reused) {
     logger.debug(
       `记账幂等命中，返回原记录: profile=${ctx.profileId} request_id=${requestId ?? ""} expense=${entry.id}`,
     );
-  } else if (ledger.owner_profile_id === null) {
-    // 家庭账本逐笔回执**只发记账人**（publishProfile，不再 publishGlobal）：
-    // 真实库里 172 条回执 = 86 笔 × 2 人，同一笔钱把不相关的人也打扰了一遍。
-    // 逐笔回执本身已由每晚 21:30 的 bookkeeping.digest 摘要取代；想恢复逐笔推送的人
-    // 可以用 notify prefs 把 bookkeeping.entry 的 push 打开。
-    // 个人账本依旧不回执、不推预算提醒（连归属人也不推，保持记账私密）。
-    // 回执的 dedupeKey 用 request_id 派生（同一次请求重试得到同一个键，不含随机 id）；
-    // 未带 request_id 时只能退回 entry:<id> —— 那个 id 是首次写入时生成的，重试返回的也是它。
-    const receiptDedupeKey =
-      requestId === undefined ? `entry:${entry.id}` : `entry:req:${ctx.profileId}:${requestId}`;
-    void ctx.services
-      .publishProfile(ctx.profileId, {
-        kind: "bookkeeping.entry",
-        title: `记账：¥${centsToYuan(entry.amount_cents)}（${ledger.name}）`,
-        blocks: entryReceiptBlocks(ledger, entry),
-        dedupeKey: receiptDedupeKey,
-      })
-      .catch((e) => logger.error(`记账回执发布失败（记账已成功）: ${errorMessage(e)}`));
-    // 预算阈值提醒：只在本笔「跨越」80%/100% 时推；失败绝不影响记账成功。
-    try {
-      for (const alert of budgetAlertsForEntry(db, ledger, entry)) {
-        void ctx.services
-          .publishGlobal(alert)
-          .catch((e) => logger.error(`预算提醒发布失败（记账已成功）: ${errorMessage(e)}`));
-      }
-    } catch (e) {
-      logger.error(`预算提醒判定失败（记账已成功）: ${errorMessage(e)}`);
-    }
   }
   return okJson({
     已记账: {
@@ -522,7 +483,7 @@ function expenseSummary(args: Record<string, unknown>, ctx: ToolContext): ToolRe
   }
   if (getVisibleLedger(db, ledgerId, ctx.profileId) === undefined)
     return fail(`账本不存在: ${ledgerId}`);
-  // 未指定区间时默认「月初 → 今天」（本月至今）；看板/月报的「本月」是自然月全月，
+  // 未指定区间时默认「月初 → 今天」（本月至今）；看板的「本月」是自然月全月，
   // 口径差异见 service.ts 的 monthRange 注释
   const range = expenseRange(args, {
     from: `${todayIso().slice(0, 7)}-01`,
@@ -591,7 +552,7 @@ function expenseUpdate(args: Record<string, unknown>, ctx: ToolContext): ToolRes
       备注: entry.note,
       记账人: entry.created_by_profile,
     },
-    说明: "仅更正该笔账目，不会重发记账回执、也不会重新判定预算提醒（记账人与创建时间不变）",
+    说明: "仅更正该笔账目（记账人与创建时间不变）",
   });
 }
 
@@ -693,7 +654,7 @@ registerModule({
     {
       name: "ledger",
       description:
-        "账本管理：create 创建（personal=true 建个人账本，仅归属人可见可写；缺省建家庭账本，所有 Profile 共享）、list 列出当前 Profile 可见的账本（家庭账本 + 自己的个人账本；含归档需 include_archived）、rename 重命名、archive 归档/恢复（unarchive=true）、transfer 转移个人账本归属（带 profile 转给该 Profile，缺省转回家庭且不可逆；仅当前归属人可操作）、budget 月度预算（传 ledger_id 查看全部预算与本月对照；带 amount 设置/覆盖，单位元，带 category 为分类预算、缺省为账本总额；clear=true 删除该范围）。家庭账本逐笔回执只发记账人（不再全局推送，其他人改由每晚 21:30 的每日摘要汇总），预算提醒仍全局推送（跨越 80%/100% 时，同一预算一笔只推跨过的最高阈值那一条）；个人账本不回执、不推送预算提醒，月报只发给归属人。各 action 只接受自己的参数：传其它 action 的字段（如 create 传 amount）会明确报错，不静默忽略。",
+        "账本管理：create 创建（personal=true 建个人账本，仅归属人可见可写；缺省建家庭账本，所有 Profile 共享）、list 列出当前 Profile 可见的账本（家庭账本 + 自己的个人账本；含归档需 include_archived）、rename 重命名、archive 归档/恢复（unarchive=true）、transfer 转移个人账本归属（带 profile 转给该 Profile，缺省转回家庭且不可逆；仅当前归属人可操作）、budget 月度预算（传 ledger_id 查看全部预算与本月对照；带 amount 设置/覆盖，单位元，带 category 为分类预算、缺省为账本总额；clear=true 删除该范围）。记账与预算不发推送通知。各 action 只接受自己的参数：传其它 action 的字段（如 create 传 amount）会明确报错，不静默忽略。",
       inputSchema: {
         action: ledgerDispatch.actionEnum(),
         name: z.string().min(1).max(40).optional(),
@@ -726,7 +687,7 @@ registerModule({
     {
       name: "expense",
       description:
-        "支出记账：add 记一笔（amount 元必填；ledger_id 可选，缺省按「默认账本 → 唯一可写账本」解析；可选 category/note/date/request_id；家庭账本逐笔回执只发记账人（想恢复逐笔推送可用 notify prefs 打开 bookkeeping.entry），个人账本不回执不提醒；未显式传 category 时回执附「常用分类」）；list 明细（可按 month/from/to/by 过滤）；summary 汇总（按分类与记账人）；update 更正一笔（id + amount/category/note/date 至少一个，只改显式传入的字段，不触发回执与预算提醒）；delete 删除记错的一笔（id 从 list 获取）；export 导出 CSV（ledger_id + 可选 month，默认当月；表头「日期,账本,分类,金额(元),备注,记账人」，UTF-8 BOM；单次上限 2000 行，超出时 已截断=true 并给出总行数）；set_default_ledger 设置/查看默认账本（传 ledger_id 设置，不传则返回当前默认账本）；categories 列出分类字典（标准名+别名+近 90 天笔数/金额，字典为空时即近 90 天实际用过的分类）；category_alias 维护别名（category + alias 添加，remove=true 删除；别名命中后 add/update 会自动归一成标准名，未知分类仍按自由文本保存）。list 支持 offset 分页（回执带 已返回/偏移/匹配总数/还有更多）。仅能操作当前 Profile 可见的账本（家庭账本或自己的个人账本）。幂等：add 传 request_id 后，同一人用同一个 request_id 重试不会重复记账，返回原记录并附「已存在: true」（不重复发通知）。CSV 导出对以 = + - @ 或制表符/回车开头的文本单元格做公式注入中和。month 与 from/to 互斥（同时传会报错）；from/to 只给一边就是半边区间（只给 from = [from, 将来)，只给 to = (过去, to]），两个 action 口径一致；默认区间只在 month/from/to **都不传**时生效（summary 默认「月初→今天」，list 不传时不限区间）。金额只支持支出，单位为元。各 action 只接受自己的参数：传其它 action 的字段（如 export 传 by/limit、add 传 ledger 简写）会明确报错，不静默忽略。",
+        "支出记账：add 记一笔（amount 元必填；ledger_id 可选，缺省按「默认账本 → 唯一可写账本」解析；可选 category/note/date/request_id；记账不发推送通知；未显式传 category 时回执附「常用分类」）；list 明细（可按 month/from/to/by 过滤）；summary 汇总（按分类与记账人）；update 更正一笔（id + amount/category/note/date 至少一个，只改显式传入的字段）；delete 删除记错的一笔（id 从 list 获取）；export 导出 CSV（ledger_id + 可选 month，默认当月；表头「日期,账本,分类,金额(元),备注,记账人」，UTF-8 BOM；单次上限 2000 行，超出时 已截断=true 并给出总行数）；set_default_ledger 设置/查看默认账本（传 ledger_id 设置，不传则返回当前默认账本）；categories 列出分类字典（标准名+别名+近 90 天笔数/金额，字典为空时即近 90 天实际用过的分类）；category_alias 维护别名（category + alias 添加，remove=true 删除；别名命中后 add/update 会自动归一成标准名，未知分类仍按自由文本保存）。list 支持 offset 分页（回执带 已返回/偏移/匹配总数/还有更多）。仅能操作当前 Profile 可见的账本（家庭账本或自己的个人账本）。幂等：add 传 request_id 后，同一人用同一个 request_id 重试不会重复记账，返回原记录并附「已存在: true」。CSV 导出对以 = + - @ 或制表符/回车开头的文本单元格做公式注入中和。month 与 from/to 互斥（同时传会报错）；from/to 只给一边就是半边区间（只给 from = [from, 将来)，只给 to = (过去, to]），两个 action 口径一致；默认区间只在 month/from/to **都不传**时生效（summary 默认「月初→今天」，list 不传时不限区间）。金额只支持支出，单位为元。各 action 只接受自己的参数：传其它 action 的字段（如 export 传 by/limit、add 传 ledger 简写）会明确报错，不静默忽略。",
       inputSchema: {
         action: expenseDispatch.actionEnum(),
         id: z.string().optional().describe("update/delete 时的账目 id（从 list 获取）"),
@@ -800,79 +761,6 @@ registerModule({
           .describe("category_alias remove=true 删除别名（不存在时幂等成功）"),
       },
       handler: bookkeepingExpenseTool,
-    },
-  ],
-  jobs: [
-    {
-      name: "ledger_digest",
-      // cron 从 config 惰性读取（LEDGER_DIGEST_CRON，默认 21:30）。
-      // `at` = 这次运行对应的参考时刻：cron/手动调用是当前时刻，启动补发是「错过的那次
-      // 原定触发时刻」。跨午夜补发（21:30 的触发在次日 00:00–09:30 才补跑）若仍按 now()
-      // 取「今天」，会汇总到新的一天：前一天的摘要永久丢失；若新一天已有（提前录入的）
-      // 支出，还会生成错误日期的摘要并占住 dedupe 键，把当晚的真实摘要吞掉。
-      cron: () => runtime().config.ledgerDigestCron,
-      handler: async (at?: DateTime) => {
-        const rt = runtime();
-        try {
-          // 参考时刻必须先换算到业务时区再取日期：cron/启动补发给的是 TZ 时区的 DateTime，
-          // 但手动调用或测试可能传系统时区（如 UTC）的 DateTime，直接 toISODate() 会在
-          // 跨午夜时汇总成错误的一天（CI 跑 UTC 时 21:30 的摘要会落到前一天）。
-          const pushed = await pushDailyDigests(
-            rt.db,
-            rt.services,
-            at?.setZone(TZ).toISODate() ?? todayIso(),
-          );
-          logger.info(`每日记账摘要：发布 ${pushed} 条`);
-        } catch (e) {
-          // 摘要失败不影响记账本身（账已落库），但必须让运维看得见：rethrow 交给 job_runs
-          // 记 failed（状态页/doctor --live 可见），否则「摘要静默不推」会被当成一切正常。
-          logger.error(`每日记账摘要发布失败: ${errorMessage(e)}`);
-          throw e;
-        }
-      },
-    },
-    {
-      name: "weekly_report",
-      // cron 从 config 惰性读取（WEEKLY_REPORT_CRON，默认 "0 20 * * 0" 即周日 20:00）。
-      // 与其他报表 job 一样，失败必须 rethrow 让 job_runs 记 failed：静默不推的报表
-      // 比推错更糟（用户会以为这周没有记账）。
-      cron: () => runtime().config.weeklyReportCron,
-      handler: async (at?: DateTime) => {
-        const rt = runtime();
-        try {
-          // weekStart 用参考时刻的日期：cron 正常触发（周日 20:00）时它就是本周周一；
-          // 启动补发在周一早上补跑时传的是周日 20:00，归一后仍是刚结束那一周的周一，
-          // 不会把「刚开始的新一周」当成本周（那样会统计出 0 笔、静默不发）。
-          const pushed = await pushWeeklyReports(rt.db, rt.services, at?.toISODate() ?? todayIso());
-          logger.info(`周报：发布 ${pushed} 条`);
-        } catch (e) {
-          logger.error(`周报发布失败: ${errorMessage(e)}`);
-          throw e;
-        }
-      },
-    },
-    {
-      name: "monthly_report",
-      cron: "0 9 1 * *",
-      handler: async () => {
-        const rt = runtime();
-        // 上月账单必须按时发，但 node-cron 不补发错过的触发（1 号 09:00 停机即永久丢失）。
-        // 每次触发时先补齐最近几个月缺失的账单；dedupeKey 保证幂等（每月只物化一次）。
-        const catchup = findMissingMonthlyReports(rt.db);
-        if (catchup.tooOld.length > 0) {
-          // 回看窗口外的月报不会自动补发：停机超窗口时这些账单永久丢失，必须留痕
-          const detail = catchup.tooOld.map((m) => `${m.ledger_name}/${m.ym}`).join("、");
-          logger.warn(
-            `有早于回看窗口、从未推送过的月报，不会自动补发（如需补发请人工处理）：${detail}`,
-          );
-        }
-        const months = [...new Set(catchup.missing.map((m) => m.ym))].sort();
-        for (const ym of months) {
-          logger.warn(`补发缺失的月报：${ym}`);
-          await pushMonthlyReports(rt.db, rt.services, ym);
-        }
-        await pushMonthlyReports(rt.db, rt.services, previousMonth());
-      },
     },
   ],
 });

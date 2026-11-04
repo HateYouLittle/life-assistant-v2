@@ -15,74 +15,140 @@ import {
   type UpcomingSpecialDay,
   upcomingSpecialDays,
 } from "../schedule/service.js";
-import {
-  addDays,
-  alertLocalTime,
-  calendarDaysBetween,
-  resolveProfilePlace,
-  shortDate,
-  type TravelPlan,
-  travelModeBrief,
-  travelModeText,
-} from "./place.js";
-
-/** 简报里的紧凑时刻；无法解析时返回空串，由调用方决定省略 */
-function compactInstant(iso: string | undefined): string {
-  if (iso === undefined) return "";
-  const dt = DateTime.fromISO(iso, { zone: TZ });
-  return dt.isValid ? dt.toFormat("MM-dd HH:mm") : "";
-}
-
-/** 简报预警描述：级别 + 类型 + 起止时间（时间缺失时省略括号，避免出现空括号） */
-function briefAlertText(alert: WeatherAlert): string {
-  const start = compactInstant(alert.startsAt);
-  const end = compactInstant(alert.endsAt);
-  if (start === "" && end === "") return `${alert.level}${alert.type}`;
-  return `${alert.level}${alert.type}（${start || "?"}–${end || "?"}）`;
-}
+import { addDays, calendarDaysBetween, resolveProfilePlace, type TravelPlan } from "./place.js";
 
 /**
- * 简报的「补班/放假」提示行：明天补班 → 明天开始放假，按序取首个命中。
- * 都不命中返回 null（保持简报简洁）；节假日数据 unknown 时同样返回 null，绝不猜测。
- *
- * **当天的补班不在这里提示**：补班提醒的单一来源是 holiday 模块的 `holiday.workday`
- * 独立推送（`workday_watch`）。两个 job 默认同为 07:00，触发先后由注册顺序决定 ——
- * 如果早报也写一行，用户就会收到「早报里一行 + 独立通知」的两条同义推送（真实库
- * 2026-09-19、2026-10-09 各出现过）。把当天补班交给 holiday 模块后，无论两个 cron
- * 谁先跑都不会重复。这里保留的「明天」前瞻提醒时间上不与当天独立通知重叠。
+ * 推送面向手机：早报/晚报都是 3–4 行纯文本，没有内容的行整行省略（不写「无」「未知」）。
+ * 只在真正需要行动时才多说一句（带伞、补班、预警），平常日子不加废话。
  */
-function holidayNote(db: DatabaseSync, today: string): string | null {
-  // 今天的数据未知时不猜：连「明天是否补班」也宁可不说，避免在不可信的年份数据上给结论
-  if (dayType(db, today) === "unknown") return null;
-  const tomorrow = DateTime.fromISO(today, { zone: TZ }).plus({ days: 1 }).toISODate();
-  if (tomorrow === null) return null;
-  const tomorrowType = dayType(db, tomorrow);
-  if (tomorrowType === "workday") {
-    const name = holidayDayName(db, tomorrow);
-    if (name !== null) return `⚠️ 明天要补班（${name}调休）`;
+
+/** 简报里预警的极简描述：`大风蓝色预警` */
+function briefAlertText(alert: WeatherAlert): string {
+  return `${alert.type}${alert.level.trim()}预警`;
+}
+
+/** 今天/明天是否要补班或放假（数据 unknown 时不猜，返回 null） */
+function holidayLine(db: DatabaseSync, date: string, label: "今天" | "明天"): string | null {
+  const type = dayType(db, date);
+  if (type === "workday") {
+    const name = holidayDayName(db, date);
+    return name === null ? null : `🗓 ${label}要补班（${name}调休）`;
   }
-  if (tomorrowType === "holiday") {
-    const period = holidayPeriods(db).find((candidate) => candidate.start === tomorrow);
+  if (type === "holiday") {
+    const period = holidayPeriods(db).find((candidate) => candidate.start === date);
     if (period !== undefined) {
-      return `🎉 明天开始放假（${period.name}，${shortDate(period.start)}–${shortDate(period.end)}，共 ${period.days} 天）`;
+      return `🎉 ${label}开始放假：${period.name}，共 ${period.days} 天`;
     }
   }
   return null;
 }
 
-/**
- * 简报「下个假期」行：未开始 → 倒计时；进行中 → 第几天；无数据 → 明确未知。
- * 口径完全来自 nextHolidayPeriod（与 holiday 工具同一套区间），不猜调休/假期。
- */
-function nextHolidayText(db: DatabaseSync, today: string): string {
+/** 下个假期在 7 天内才提一句；进行中的假期不提（用户自己知道在放假） */
+const HOLIDAY_COUNTDOWN_DAYS = 7;
+
+function holidayCountdownLine(db: DatabaseSync, today: string): string | null {
   const period = nextHolidayPeriod(db, today);
-  if (period === null) return "未知（节假日数据未就绪）";
-  if (period.inProgress) {
-    const day = calendarDaysBetween(period.start, today) + 1;
-    return `${period.name}（假期中，第 ${day}/${period.days} 天，至 ${shortDate(period.end)}）`;
-  }
+  if (period === null || period.inProgress) return null;
   const daysLeft = calendarDaysBetween(today, period.start);
-  return `${period.name} ${shortDate(period.start)} 起，还有 ${daysLeft} 天（共 ${period.days} 天）`;
+  if (daysLeft <= 1 || daysLeft > HOLIDAY_COUNTDOWN_DAYS) return null;
+  return `🗓 ${period.name}还有 ${daysLeft} 天`;
+}
+
+/** 日程行最多列出的条数；超出只报「等 N 项」，避免一条通知被日程撑爆 */
+const AGENDA_LIMIT = 4;
+
+/** 日程条目的紧凑文本：全天日程不给时刻 */
+function agendaItemText(item: AgendaItem): string {
+  return item.all_day ? item.title : `${item.time} ${item.title}`;
+}
+
+function agendaLine(prefix: string, items: AgendaItem[]): string | null {
+  if (items.length === 0) return null;
+  const shown = items.slice(0, AGENDA_LIMIT).map(agendaItemText);
+  const more = items.length > AGENDA_LIMIT ? ` 等 ${items.length} 项` : "";
+  return `${prefix}${shown.join("、")}${more}`;
+}
+
+/**
+ * 日程行：只列「这一天」的待办与提醒，不列逾期 —— 循环待办过了当天已自动作废，
+ * 剩下的逾期只有一次性/截止型待办，那些由各自的提醒与升级链负责追，不在简报里重复。
+ * 查询失败只跳过该行，绝不让整份简报失败。
+ */
+function agendaLineFor(
+  db: DatabaseSync,
+  profileId: string,
+  date: string,
+  prefix: string,
+): string | null {
+  try {
+    const items = agendaForDate(db, profileId, date).filter(
+      (item) => item.event_date === date && item.kind === "todo",
+    );
+    return agendaLine(prefix, items);
+  } catch (e) {
+    logger.warn(`简报：日程行已跳过（${profileId}）: ${errorMessage(e)}`);
+    return null;
+  }
+}
+
+/** 近期纪念日单条：`周六 妈妈生日（还有 3 天）`；今天的写「今天」 */
+function specialDayLabel(item: UpcomingSpecialDay): string {
+  const when = item.days_left === 0 ? "今天" : `还有 ${item.days_left} 天`;
+  const extra = item.milestone === null ? "" : `，${item.milestone}`;
+  return `${item.title}（${when}${extra}）`;
+}
+
+/** 早报只提 7 天内的生日/纪念日；14 天的窗口在手机上太远，说了也记不住 */
+const SPECIAL_DAY_BRIEF_DAYS = 7;
+
+/** 生日/纪念日行：窗口内没有就整行省略 */
+export function specialDayNotes(items: UpcomingSpecialDay[]): string[] {
+  if (items.length === 0) return [];
+  return [`🎂 ${items.map(specialDayLabel).join("；")}`];
+}
+
+function specialDayLineFor(db: DatabaseSync, profileId: string, today: string): string[] {
+  try {
+    return specialDayNotes(
+      upcomingSpecialDays(db, profileId, today).filter(
+        (item) => item.days_left <= SPECIAL_DAY_BRIEF_DAYS,
+      ),
+    );
+  } catch (e) {
+    logger.warn(`每日简报：生日/纪念日行已跳过（${profileId}）: ${errorMessage(e)}`);
+    return [];
+  }
+}
+
+/** 天气一行：`☀ 北京 晴 3~14°C，空气良`，后面按需追加带伞/温差/预警/污染提醒 */
+function weatherLine(opts: {
+  city: string;
+  travel: TravelPlan | null;
+  text: string | null;
+  tMin: number | null;
+  tMax: number | null;
+  aqiCategory: string | null;
+  tips: string[];
+}): string {
+  const parts: string[] = [];
+  const where = opts.travel === null ? opts.city : `${opts.city}（出行中）`;
+  const temp = opts.tMin === null || opts.tMax === null ? "" : ` ${opts.tMin}~${opts.tMax}°C`;
+  parts.push(`${where} ${opts.text ?? ""}${temp}`.replace(/\s+/g, " ").trim());
+  if (opts.aqiCategory !== null) parts.push(`空气${opts.aqiCategory}`);
+  const tips = opts.tips.length > 0 ? `；${opts.tips.join("，")}` : "";
+  return `${weatherIcon(opts.text)} ${parts.join("，")}${tips}`;
+}
+
+function weatherIcon(text: string | null): string {
+  if (text === null) return "🌤";
+  if (/雷/.test(text)) return "⛈";
+  if (/雪/.test(text)) return "🌨";
+  if (/雨/.test(text)) return "🌧";
+  if (/雾|霾|沙|尘/.test(text)) return "🌫";
+  if (/阴/.test(text)) return "☁";
+  if (/云/.test(text)) return "⛅";
+  if (/晴/.test(text)) return "☀";
+  return "🌤";
 }
 
 /**
@@ -110,122 +176,6 @@ export function alertCacheTtlMs(config: Pick<ResolvedConfig, "alertWatchCron">):
     if (Number.isInteger(n) && n >= 1 && n <= 59) return n * 60_000 + 30_000;
   }
   return 15 * 60_000;
-}
-
-/** 日程块最多列出的条数；超出只报「另有 N 项」，避免一条通知被日程撑爆 */
-const AGENDA_LIMIT = 6;
-
-/** 日程条目的紧凑文本：全天日程不给时刻，其余给本地时刻（与日程工具口径一致） */
-function agendaItemText(item: AgendaItem): string {
-  return item.all_day ? `全天 ${item.title}` : `${item.time} ${item.title}`;
-}
-
-/**
- * 逾期标注（按本地日历日）。event_date 是「该次发生的日期」；今天到期但已过时刻的
- * 待办会算出 0 天，此时不写「逾期 0 天」这种没有信息量的文案。
- */
-function overdueLabel(item: AgendaItem, today: string): string {
-  const days = calendarDaysBetween(item.event_date, today);
-  return days >= 1 ? `（逾期 ${days} 天）` : "（已逾期）";
-}
-
-/** 单条日程文本（逾期项带标注） */
-function agendaItemLabel(item: AgendaItem, today: string): string {
-  return `${agendaItemText(item)}${item.overdue ? overdueLabel(item, today) : ""}`;
-}
-
-/**
- * 日程排序：逾期项一律在前 —— 早报的价值是「今天做什么 + 欠了什么」，
- * 逾期项被截断在 6 条之外会让人误以为没有欠账。组内保持 agendaForDate 的
- * 时间升序（Array#sort 稳定）；逾期组再按发生日期从早到晚，最久的欠账先亮相。
- */
-function compareAgendaItems(a: AgendaItem, b: AgendaItem): number {
-  if (a.overdue !== b.overdue) return a.overdue ? -1 : 1;
-  if (a.overdue && a.event_date !== b.event_date) return a.event_date < b.event_date ? -1 : 1;
-  return 0;
-}
-
-/** 日程条目拼成一段文本：最多 limit 条，超出附「…另有 N 项」 */
-function agendaListText(
-  items: AgendaItem[],
-  label: (item: AgendaItem) => string,
-  limit = AGENDA_LIMIT,
-): string {
-  const sorted = [...items].sort(compareAgendaItems);
-  const shown = sorted.slice(0, limit);
-  const hidden = sorted.length - shown.length;
-  const parts = shown.map((item) => label(item));
-  if (hidden > 0) parts.push(`…另有 ${hidden} 项`);
-  return parts.join("；");
-}
-
-/**
- * 「今日未完成」条目文本（晚报用）：今天到期的项只列时刻/标题 —— 21:00 的晚报里
- * 今天 23:00 的事还没到期，标「已逾期」是错的；更早的欠账才标逾期天数。
- */
-function incompleteItemLabel(item: AgendaItem, today: string): string {
-  const days = calendarDaysBetween(item.event_date, today);
-  return days >= 1 ? `${agendaItemText(item)}（逾期 ${days} 天）` : agendaItemText(item);
-}
-
-/**
- * 早报日程块的 notes 行：一条 `今日日程：…` + 有逾期时的数量行。
- * 没有任何条目时仍给 `今日日程：无`（明确「今天没事」，而不是让用户以为简报漏了）。
- */
-function agendaNotes(items: AgendaItem[], today: string, emptyText: string): string[] {
-  if (items.length === 0) return [emptyText];
-  const lines = [`今日日程：${agendaListText(items, (item) => agendaItemLabel(item, today))}`];
-  // 逾期数量单独一行：即使逾期项本身被 6 条上限截掉，用户也能看到欠了多少；
-  // 也覆盖「今天没有日程、但仍有逾期」的情况（上面那行此时全是逾期项）。
-  const overdueCount = items.filter((item) => item.overdue).length;
-  if (overdueCount > 0) lines.push(`逾期未完成：${overdueCount} 项`);
-  return lines;
-}
-
-/**
- * 早报日程块：schedule 模块的只读查询失败时只跳过该块（logger.warn），
- * 绝不让整份早报失败 —— 气象是主内容，日程是增强，缺一块也不能让用户早上收不到简报。
- */
-function appendAgendaNotes(
-  notes: string[],
-  db: DatabaseSync,
-  profileId: string,
-  today: string,
-): void {
-  try {
-    notes.push(...agendaNotes(agendaForDate(db, profileId, today), today, "今日日程：无"));
-  } catch (e) {
-    logger.warn(`每日简报：今日日程块已跳过（${profileId}）: ${errorMessage(e)}`);
-  }
-}
-
-/** 近期纪念日单条：`11-08 和对象认识纪念日（还有 4 天，5 周年 · 第 1827 天）` */
-function specialDayLabel(item: UpcomingSpecialDay): string {
-  const when = item.days_left === 0 ? "今天" : `还有 ${item.days_left} 天`;
-  const extra = item.milestone === null ? "" : `，${item.milestone}`;
-  return `${shortDate(item.event_date)} ${item.title}（${when}${extra}）`;
-}
-
-/**
- * 早报「近期生日/纪念日」行：14 天内没有就整行省略（不输出「无」）；
- * 查询失败与日程块同口径，只跳过该行，不影响早报。
- */
-export function specialDayNotes(items: UpcomingSpecialDay[]): string[] {
-  if (items.length === 0) return [];
-  return [`近期生日/纪念日：${items.map(specialDayLabel).join("；")}`];
-}
-
-function appendSpecialDayNotes(
-  notes: string[],
-  db: DatabaseSync,
-  profileId: string,
-  today: string,
-): void {
-  try {
-    notes.push(...specialDayNotes(upcomingSpecialDays(db, profileId, today)));
-  } catch (e) {
-    logger.warn(`每日简报：近期生日/纪念日块已跳过（${profileId}）: ${errorMessage(e)}`);
-  }
 }
 
 type Runtime = ReturnType<typeof runtime>;
@@ -314,47 +264,40 @@ export async function runDailyBrief(at?: DateTime): Promise<void> {
         logger.warn(`每日简报跳过 ${profileId}(${loc.city})：天气与预报均失败`);
         return;
       }
-      const rows: string[][] = [];
-      // 出行模式显式标注（标题已用目的地城市，但必须让用户知道这不是「家」的天气）
-      if (place.travel !== null) rows.push(["出行模式", travelModeBrief(place.travel)]);
-      if (cur !== null) {
-        rows.push(["天气", `${cur.text} ${cur.temp}°C（体感 ${cur.feelsLike}°C）`]);
-        rows.push(["湿度/风速", `${cur.humidity}% / ${cur.windSpeed} km/h`]);
-      }
       const today = fc?.[0];
-      if (today !== undefined)
-        rows.push(["今日气温", `${today.tMin}~${today.tMax}°C ${today.textDay}`]);
-      if (air !== null) rows.push(["空气质量", `AQI ${air.aqi}（${air.category}）`]);
-      rows.push(["下个假期", nextHolidayText(rt.db, calendarToday)]);
-      rows.push([
-        "预警",
-        alertList === null
-          ? "未知"
-          : alertList.length === 0
-            ? "无"
-            : alertList.map(briefAlertText).join("；"),
-      ]);
-
-      const notes: string[] = [];
-      const calendarNote = holidayNote(rt.db, calendarToday);
-      if (calendarNote !== null) notes.push(calendarNote);
-      // 有生效预警时绝不能落到「适宜出行」（预警在表格里、默认 note 却给出相反结论）。
-      if (alertList !== null && alertList.length > 0) notes.push("有气象预警，注意防范");
-      if (today !== undefined && today.precipMm !== undefined && today.precipMm > 0)
-        notes.push("今日有降水，出门带伞");
-      if (today !== undefined && today.tMax - today.tMin >= 10)
-        notes.push("昼夜温差较大，注意增减衣物");
-      if (air !== null && air.aqi > 100) notes.push("空气质量较差，敏感人群减少户外活动");
-      if (notes.length === 0) notes.push("适宜出行");
-      // 日程块放在天气结论之后：既不能挤掉「适宜出行」的兜底 note，
-      // 也保证日程查询失败时早报只剩天气、照常发送。
-      appendAgendaNotes(notes, rt.db, profileId, calendarToday);
-      appendSpecialDayNotes(notes, rt.db, profileId, calendarToday);
+      const tips: string[] = [];
+      if (alertList !== null && alertList.length > 0) {
+        tips.push(`有${alertList.map(briefAlertText).join("、")}`);
+      }
+      if (today?.precipMm !== undefined && today.precipMm > 0) tips.push("带伞");
+      if (today !== undefined && today.tMax - today.tMin >= 10) tips.push("温差大");
+      if (air !== null && air.aqi > 150) tips.push("少出门");
+      const notes: string[] = [
+        weatherLine({
+          city: loc.city,
+          travel: place.travel,
+          text: today?.textDay ?? cur?.text ?? null,
+          tMin: today?.tMin ?? null,
+          tMax: today?.tMax ?? null,
+          aqiCategory: air?.category ?? null,
+          tips,
+        }),
+      ];
+      const agenda = agendaLineFor(rt.db, profileId, calendarToday, "📌 今天：");
+      if (agenda !== null) notes.push(agenda);
+      notes.push(...specialDayLineFor(rt.db, profileId, calendarToday));
+      // 今天补班由 holiday.workday 独立通知承载（单一来源，避免重复）；这里只说「明天」与倒计时
+      const tomorrow = addDays(calendarToday, 1);
+      const holiday =
+        dayType(rt.db, calendarToday) === "unknown" || tomorrow === null
+          ? null
+          : (holidayLine(rt.db, tomorrow, "明天") ?? holidayCountdownLine(rt.db, calendarToday));
+      if (holiday !== null) notes.push(holiday);
 
       await publishProfile(rt.db, rt.config, profileId, {
         kind: "weather.brief",
-        title: `${loc.city} 每日简报`,
-        blocks: { table: { columns: ["项目", "内容"], rows }, notes },
+        title: "☀️ 早安",
+        blocks: { notes },
         dedupeKey: `brief:${profileId}:${loc.city}:${calendarToday}`,
       });
     },
@@ -456,26 +399,14 @@ function notifiedAlertRanks(db: DatabaseSync, profileId: string): Map<string, nu
 
 function alertTitle(alert: WeatherAlert): string {
   const level = alert.level.trim();
-  return level === "" ? `⚠️ 气象预警：${alert.type}` : `⚠️ 气象预警：${alert.type} ${level}`;
+  return level === "" ? `⚠️ ${alert.type}预警` : `⚠️ ${alert.type}${level}预警`;
 }
 
 function alertBlocks(alert: WeatherAlert, travel: TravelPlan | null): NotifyBlock {
-  return {
-    table: {
-      columns: ["级别", "类型", "生效", "失效", "说明"],
-      rows: [
-        [
-          alert.level.trim() || "—",
-          alert.type,
-          alertLocalTime(alert.startsAt),
-          alertLocalTime(alert.endsAt),
-          alert.description,
-        ],
-      ],
-    },
-    // 出行模式生效时预警来自目的地，通知必须标注，避免用户误以为是在家乡
-    ...(travel === null ? {} : { notes: [travelModeText(travel)] }),
-  };
+  const end = alert.endsAt === undefined ? null : DateTime.fromISO(alert.endsAt, { zone: TZ });
+  const where = travel === null ? "" : `${travel.city}（出行中）`;
+  const until = end?.isValid === true ? `，至 ${end.toFormat("MM-dd HH:mm")}` : "";
+  return { notes: [`${where}${briefAlertText(alert)}${until}`.trim()] };
 }
 
 /**
@@ -537,28 +468,9 @@ export async function runAlertWatch(): Promise<void> {
 }
 
 /**
- * 晚报「明天」提示：补班/法定假日，措辞与早报一致（`明天要补班（X调休）` /
- * `明天休息（国庆节）`）。节假日数据 unknown 时不猜 —— 宁可不说，也不能凭星期猜调休。
- */
-function eveningHolidayNote(db: DatabaseSync, tomorrow: string): string | null {
-  const type = dayType(db, tomorrow);
-  if (type === "unknown") return null;
-  if (type === "workday") {
-    const name = holidayDayName(db, tomorrow);
-    return name === null ? null : `⚠️ 明天要补班（${name}调休）`;
-  }
-  if (type === "holiday") {
-    const name = holidayDayName(db, tomorrow);
-    return name === null ? "🎉 明天休息" : `🎉 明天休息（${name}）`;
-  }
-  // weekend / weekday 不额外提示：不是异常安排，加进晚报只会变成噪音
-  return null;
-}
-
-/**
- * 晚报内容：明日天气 + 明日日程 + 今天没做完的事 + 明天是否补班/假期。
- * 天气与日程各自隔离：任一取数失败只把对应内容写成「未知」，另一侧照常送达 ——
- * 睡前信息里日程和补班同样重要，不能因为 QWeather 抖动就把整条晚报丢掉。
+ * 晚报内容：明日天气一行 + 明日日程一行 + 明天补班/放假一行 + 今天记账一句话。
+ * 天气与日程各自隔离：任一取数失败只省略对应行，另一侧照常送达。
+ * 今天没做完的事不在这里列：循环待办 20:00 已追提醒过一次，过了今天自动作废。
  */
 async function eveningBriefBlocks(
   db: DatabaseSync,
@@ -570,12 +482,9 @@ async function eveningBriefBlocks(
   tomorrow: string,
   cityCache: Map<string, LocationInfo>,
 ): Promise<NotifyBlock> {
-  const rows: string[][] = [];
   const notes: string[] = [];
-  let travel: TravelPlan | null = null;
-  let weatherText = "未知";
   try {
-    // 与早报同一解析口径：窗口内出行计划 > 已保存位置 > DEFAULT_CITY（含出行模式标注）。
+    // 与早报同一解析口径：窗口内出行计划 > 已保存位置 > DEFAULT_CITY。
     // 出行计划的生效判定同样用本次运行的业务日（补发跨午夜时按原定触发那天算）。
     const place = await resolveProfilePlace(
       db,
@@ -586,55 +495,57 @@ async function eveningBriefBlocks(
       cityCache,
       today,
     );
-    travel = place.travel;
     const list = await forecast(db, host, key, place.loc, 7);
     // 「第 2 天」按日期匹配而不是按下标取：上游跨零点/少返回一天时下标会错位；
     // 匹配不到再退回下标 1（QWeather 首行固定是今天）。
     const day = list.find((candidate) => candidate.date === tomorrow) ?? list[1];
     if (day !== undefined) {
-      weatherText = `${day.textDay} ${day.tMin}~${day.tMax}°C`;
-      if (day.precipMm !== undefined && day.precipMm > 0) notes.push("明天有降水，出门带伞");
-      if (day.tMax - day.tMin >= 10) notes.push("明天昼夜温差较大，注意增减衣物");
+      const tips: string[] = [];
+      if (day.precipMm !== undefined && day.precipMm > 0) tips.push("带伞");
+      if (day.tMax - day.tMin >= 10) tips.push("温差大");
+      notes.push(
+        weatherLine({
+          city: `明天 ${place.loc.city}`,
+          travel: place.travel,
+          text: day.textDay,
+          tMin: day.tMin,
+          tMax: day.tMax,
+          aqiCategory: null,
+          tips,
+        }),
+      );
     }
   } catch (e) {
-    logger.warn(`晚报：明日天气获取失败（${profileId}），写未知: ${errorMessage(e)}`);
+    logger.warn(`晚报：明日天气获取失败（${profileId}），省略该行: ${errorMessage(e)}`);
   }
-  // 出行模式放第一行：标题不带城市，用户必须知道明天看到的是目的地还是家
-  if (travel !== null) rows.push(["出行模式", travelModeBrief(travel)]);
-  rows.push(["明日天气", weatherText]);
-
-  let tomorrowItems: AgendaItem[] | null = null;
-  let incompleteItems: AgendaItem[] | null = null;
-  try {
-    // agendaForDate(明天) 同时给出明天的日程与「今天及更早没做完」的条目：
-    // 明天日程按 event_date 命中，逾期项单独成行（晚报告诉用户「还欠什么」）。
-    const items = agendaForDate(db, profileId, tomorrow);
-    tomorrowItems = items.filter((item) => item.event_date === tomorrow);
-    incompleteItems = items.filter((item) => item.overdue);
-  } catch (e) {
-    // 日程只是增强内容：查询失败就明确写「未知」，不猜也不让整条晚报失败
-    logger.warn(`晚报：日程块已跳过（${profileId}）: ${errorMessage(e)}`);
-  }
-  rows.push([
-    "明日日程",
-    tomorrowItems === null
-      ? "未知"
-      : tomorrowItems.length === 0
-        ? "无"
-        : agendaListText(tomorrowItems, (item) => agendaItemLabel(item, tomorrow)),
-  ]);
-  rows.push([
-    "今日未完成",
-    incompleteItems === null
-      ? "未知"
-      : incompleteItems.length === 0
-        ? "无"
-        : agendaListText(incompleteItems, (item) => incompleteItemLabel(item, today)),
-  ]);
-
-  const holiday = eveningHolidayNote(db, tomorrow);
+  const agenda = agendaLineFor(db, profileId, tomorrow, "📌 明天：");
+  if (agenda !== null) notes.push(agenda);
+  const holiday = holidayLine(db, tomorrow, "明天");
   if (holiday !== null) notes.push(holiday);
-  return { table: { columns: ["项目", "内容"], rows }, notes };
+  const spent = todaySpendingLine(db, profileId, today);
+  if (spent !== null) notes.push(spent);
+  return { notes };
+}
+
+/**
+ * 「今天记了 3 笔共 ¥128」：只算本人记的账（与原每日记账摘要同口径），没记账整行省略。
+ * 直接读 expenses 表而不 import 记账模块内部（模块间只走只读 SQL，避免反向依赖）。
+ */
+function todaySpendingLine(db: DatabaseSync, profileId: string, today: string): string | null {
+  try {
+    const row = db
+      .prepare(
+        `SELECT COUNT(*) AS n, COALESCE(SUM(amount_cents), 0) AS cents FROM expenses
+         WHERE spent_on = ? AND created_by_profile = ?`,
+      )
+      .get(today, profileId) as { n: number; cents: number };
+    if (row.n === 0) return null;
+    const yuan = (row.cents / 100).toFixed(2).replace(/\.?0+$/, "");
+    return `🧾 今天记了 ${row.n} 笔，共 ¥${yuan}`;
+  } catch (e) {
+    logger.warn(`晚报：记账行已跳过（${profileId}）: ${errorMessage(e)}`);
+    return null;
+  }
 }
 
 /**
@@ -674,7 +585,7 @@ export async function runEveningBrief(at?: DateTime): Promise<void> {
       );
       await publishProfile(rt.db, rt.config, profileId, {
         kind: "weather.evening",
-        title: "🌙 明日安排",
+        title: "🌙 明天",
         blocks,
         dedupeKey: `evening:${profileId}:${tomorrow}`,
         expiresAt,

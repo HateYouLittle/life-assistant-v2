@@ -70,7 +70,7 @@ function localTimeText(iso: string): string {
 const PREFS_NOTE =
   "push=false 表示不主动推送（通知仍入库，可 notify.pull 取回）；channels=null 表示不限通道";
 
-/** 通知 kind 的合法形状（如 bookkeeping.entry / notify.test）；拒绝乱写的键，避免偏好表变垃圾场 */
+/** 通知 kind 的合法形状（如 schedule.reminder / notify.test）；拒绝乱写的键，避免偏好表变垃圾场 */
 const KIND_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 
 /**
@@ -333,7 +333,7 @@ function prefsAction(args: Record<string, unknown>, ctx: ToolContext): ToolResul
   // 写：带 kind + push 或 kind + channels，写入后立刻回显合并默认后的生效值。
   const kindRaw = args.kind;
   if (kindRaw !== undefined && (typeof kindRaw !== "string" || !KIND_RE.test(kindRaw))) {
-    return fail(`kind 不合法: ${String(kindRaw)}（形如 bookkeeping.entry）`);
+    return fail(`kind 不合法: ${String(kindRaw)}（形如 schedule.reminder）`);
   }
   const stored = getNotifyPrefs(db, profileId);
   if (kindRaw === undefined) {
@@ -442,7 +442,7 @@ function historyAction(args: Record<string, unknown>, ctx: ToolContext): ToolRes
   const offset = clampInt(args.offset, 0, 0, Number.MAX_SAFE_INTEGER);
   const kindRaw = args.kind;
   if (kindRaw !== undefined && (typeof kindRaw !== "string" || kindRaw.trim() === "")) {
-    return fail("kind 需要非空字符串（如 bookkeeping.entry）");
+    return fail("kind 需要非空字符串（如 schedule.reminder）");
   }
   const unreadRaw = args.unread;
   if (unreadRaw !== undefined && typeof unreadRaw !== "boolean") {
@@ -637,7 +637,7 @@ registerModule({
   tools: [
     {
       name: "notify",
-      description: `通知管理：action=pull 拉取未读通知（会话开始时调用一次，作为主动推送失败的兜底，会标记已读并取消待投递）；history 查看通知历史（limit/offset 分页，可按 kind 精确过滤、unread=true 只看未读；**不改变已读状态**，每条带最近一条投递的状态/尝试次数/最后错误，用于回答「哪条没发出去、为什么」）；retry 手动重试投递（notification_id 一条通知的全部投递 / delivery_id 单条投递 / all=true 批量重试该 Profile 所有 failed+fallback；重新入队后立即触发一轮投递）；quiet_hours 设置/查看/清除静默时段（HH:MM，支持跨午夜）；route 配置/查看主动推送通道（${CHANNEL_DESCRIPTION}）；prefs 查看/设置按类型的推送偏好（不带 kind 返回已保存+内置默认+最终生效值；带 kind+push 或 kind+channels 写入，push=false 表示不主动推送但通知仍入库、可用 pull 取回；bookkeeping.entry 默认不推，由每日摘要取代）；test 发一条测试通知验证通道（返回是否建立投递与所用通道，无路由时仅入库）；cancel 取消某条通知的待投递。`,
+      description: `通知管理：action=pull 拉取未读通知（会话开始时调用一次，作为主动推送失败的兜底，会标记已读并取消待投递）；history 查看通知历史（limit/offset 分页，可按 kind 精确过滤、unread=true 只看未读；**不改变已读状态**，每条带最近一条投递的状态/尝试次数/最后错误，用于回答「哪条没发出去、为什么」）；retry 手动重试投递（notification_id 一条通知的全部投递 / delivery_id 单条投递 / all=true 批量重试该 Profile 所有 failed+fallback；重新入队后立即触发一轮投递）；quiet_hours 设置/查看/清除静默时段（HH:MM，支持跨午夜）；route 配置/查看主动推送通道（${CHANNEL_DESCRIPTION}）；prefs 查看/设置按类型的推送偏好（不带 kind 返回已保存+内置默认+最终生效值；带 kind+push 或 kind+channels 写入，push=false 表示不主动推送但通知仍入库、可用 pull 取回）；test 发一条测试通知验证通道（返回是否建立投递与所用通道，无路由时仅入库）；cancel 取消某条通知的待投递。`,
       inputSchema: {
         action: notifyDispatch.actionEnum(),
         limit: z
@@ -680,7 +680,7 @@ registerModule({
           .max(64)
           .optional()
           .describe(
-            "prefs 的通知类型（如 bookkeeping.entry / schedule.reminder）；history 时作为精确过滤条件",
+            "prefs 的通知类型（如 schedule.reminder / weather.brief）；history 时作为精确过滤条件",
           ),
         push: z
           .boolean()

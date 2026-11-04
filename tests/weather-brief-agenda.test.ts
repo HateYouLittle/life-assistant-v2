@@ -14,7 +14,8 @@ import {
 } from "./helpers.js";
 
 /**
- * A1 回归：早报在天气表之后追加「今日日程 / 逾期未完成」notes 行。
+ * 早报（手机精简版）：天气一行 + 今天的待办一行 + 7 天内生日/纪念日一行 + 补班/假期一行，
+ * 没有内容的行整行省略。
  *
  * 夹具直接向 schedules / occurrences 写行（与 schedule 服务物化后的形态一致：
  * occurrence_key = `<本地日期>T<时刻>#<偏移下标>`、event_at = 该时刻的 UTC 瞬间），
@@ -126,8 +127,8 @@ function briefBody(env: TestEnv): string {
   return row.body_md;
 }
 
-describe("每日简报：今日日程（A1）", () => {
-  it("有条目：在天气表之后追加「今日日程」notes，时刻/全天两种格式", async () => {
+describe("每日简报：今日日程（手机精简版）", () => {
+  it("有条目：一行「📌 今天：…」，时刻/全天两种格式；平常日子不加「适宜出行」之类的废话", async () => {
     const env = makeTestEnv(ENV);
     try {
       seedItem(env, { title: "喝水", date: todayIso(), time: "09:00" });
@@ -136,30 +137,29 @@ describe("每日简报：今日日程（A1）", () => {
         await runDailyBrief();
       });
       const body = briefBody(env);
-      assert.match(body, /^今日日程：全天 交房租；09:00 喝水$/m);
-      // 日程块是增强内容，不能挤掉既有的天气结论兜底行
-      assert.match(body, /^适宜出行$/m);
-      assert.doesNotMatch(body, /逾期未完成/);
+      assert.match(body, /^📌 今天：交房租、09:00 喝水$/m);
+      assert.doesNotMatch(body, /适宜出行|逾期/);
+      assert.ok(body.split("\n").length <= 4, `早报最多 4 行：\n${body}`);
     } finally {
       cleanupTestEnv(env);
     }
   });
 
-  it("无条目：明确写「今日日程：无」而不是省略", async () => {
+  it("无条目：整行省略，不写「无」", async () => {
     const env = makeTestEnv(ENV);
     try {
       await withMockFetch(async () => {
         await runDailyBrief();
       });
       const body = briefBody(env);
-      assert.match(body, /^今日日程：无$/m);
-      assert.doesNotMatch(body, /逾期未完成/);
+      assert.doesNotMatch(body, /今天：|无/);
+      assert.equal(body.split("\n").length, 1, `只剩天气一行：\n${body}`);
     } finally {
       cleanupTestEnv(env);
     }
   });
 
-  it("逾期条目：排在最前并标（逾期 N 天），另给出逾期数量", async () => {
+  it("逾期条目不进早报（循环待办已作废，一次性/截止型由各自的提醒追）", async () => {
     const env = makeTestEnv(ENV);
     try {
       seedItem(env, {
@@ -173,39 +173,17 @@ describe("每日简报：今日日程（A1）", () => {
         await runDailyBrief();
       });
       const body = briefBody(env);
-      assert.match(body, /^今日日程：09:00 交房租（逾期 3 天）；09:00 喝水$/m);
-      assert.match(body, /^逾期未完成：1 项$/m);
+      assert.match(body, /^📌 今天：09:00 喝水$/m);
+      assert.doesNotMatch(body, /交房租|逾期/);
     } finally {
       cleanupTestEnv(env);
     }
   });
 
-  it("只有逾期、今天没有日程：仍给出逾期数量（不是只写「无」）", async () => {
+  it("超过 4 条：只列前 4 条并写「等 N 项」", async () => {
     const env = makeTestEnv(ENV);
     try {
-      seedItem(env, { title: "交房租", date: dayOffset(-2), time: "09:00" });
-      seedItem(env, {
-        title: "买菜",
-        date: dayOffset(-1),
-        time: "18:00",
-        occurrenceStatus: "notified",
-      });
-      await withMockFetch(async () => {
-        await runDailyBrief();
-      });
-      const body = briefBody(env);
-      assert.match(body, /^今日日程：09:00 交房租（逾期 2 天）；18:00 买菜（逾期 1 天）$/m);
-      assert.match(body, /^逾期未完成：2 项$/m);
-      assert.doesNotMatch(body, /^今日日程：无$/m);
-    } finally {
-      cleanupTestEnv(env);
-    }
-  });
-
-  it("超过 6 条：只列前 6 条并追加「…另有 N 项」", async () => {
-    const env = makeTestEnv(ENV);
-    try {
-      for (let i = 1; i <= 8; i += 1) {
+      for (let i = 1; i <= 6; i += 1) {
         seedItem(env, {
           title: `事项${i}`,
           date: todayIso(),
@@ -216,15 +194,14 @@ describe("每日简报：今日日程（A1）", () => {
         await runDailyBrief();
       });
       const body = briefBody(env);
-      assert.match(body, /…另有 2 项/m);
-      assert.match(body, /事项6/);
-      assert.doesNotMatch(body, /事项7|事项8/, "超出 6 条的条目不应出现在正文里");
+      assert.match(body, /事项4 等 6 项$/m);
+      assert.doesNotMatch(body, /事项5|事项6/, "超出 4 条的条目不应出现在正文里");
     } finally {
       cleanupTestEnv(env);
     }
   });
 
-  it("schedule 查询抛错：只跳过日程块，早报仍然发布", async () => {
+  it("schedule 查询抛错：只跳过日程行，早报仍然发布", async () => {
     const env = makeTestEnv(ENV);
     try {
       // 直接删表模拟 schedule 模块的只读查询故障：agendaForDate 会抛「no such table」
@@ -233,9 +210,8 @@ describe("每日简报：今日日程（A1）", () => {
         await runDailyBrief();
       });
       const body = briefBody(env);
-      assert.match(body, /AQI 42（优）/, "天气内容应照常送达");
-      assert.doesNotMatch(body, /今日日程/);
-      assert.doesNotMatch(body, /逾期未完成/);
+      assert.match(body, /空气优/, "天气内容应照常送达");
+      assert.doesNotMatch(body, /今天：/);
     } finally {
       cleanupTestEnv(env);
     }
@@ -243,33 +219,34 @@ describe("每日简报：今日日程（A1）", () => {
 });
 
 describe("每日简报：近期生日/纪念日", () => {
-  it("14 天内有生日：追加「近期生日/纪念日」行（含当天、按日期升序）", async () => {
+  it("7 天内有生日：追加「🎂 …」行（含当天、按日期升序），更远的不提", async () => {
     const env = makeTestEnv(ENV);
     try {
       seedItem(env, { title: "妈妈生日", date: dayOffset(5), allDay: true, kind: "birthday" });
       seedItem(env, { title: "妹妹生日", date: todayIso(), allDay: true, kind: "birthday" });
-      seedItem(env, { title: "太远的生日", date: dayOffset(20), allDay: true, kind: "birthday" });
+      seedItem(env, { title: "下周末生日", date: dayOffset(10), allDay: true, kind: "birthday" });
       await withMockFetch(async () => {
         await runDailyBrief();
       });
       const body = briefBody(env);
-      const line = body.split("\n").find((l) => l.includes("近期生日/纪念日"));
+      const line = body.split("\n").find((l) => l.startsWith("🎂"));
       assert.ok(line !== undefined, body);
       assert.match(line, /妹妹生日（今天）.*妈妈生日（还有 5 天）/);
-      assert.ok(!line.includes("太远的生日"));
+      assert.ok(!line.includes("下周末生日"));
+      assert.doesNotMatch(body, /📌/, "生日不算「今天的待办」");
     } finally {
       cleanupTestEnv(env);
     }
   });
 
-  it("14 天内没有：整栏省略，不出现「无」", async () => {
+  it("7 天内没有：整行省略", async () => {
     const env = makeTestEnv(ENV);
     try {
       seedItem(env, { title: "喝水", date: todayIso(), time: "09:00" });
       await withMockFetch(async () => {
         await runDailyBrief();
       });
-      assert.ok(!briefBody(env).includes("近期生日/纪念日"));
+      assert.ok(!briefBody(env).includes("🎂"));
     } finally {
       cleanupTestEnv(env);
     }
