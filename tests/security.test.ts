@@ -21,8 +21,11 @@ import { SECRET } from "./helpers.js";
 
 const BASE = { DATA_DIR: "/tmp/la-security-test" };
 
-function request(headers: Record<string, string | undefined>): IncomingMessage {
-  return { headers } as unknown as IncomingMessage;
+function request(
+  headers: Record<string, string | undefined>,
+  url = "/api/status",
+): IncomingMessage {
+  return { headers, url } as unknown as IncomingMessage;
 }
 
 function guardFor(extraEnv: Record<string, string> = {}) {
@@ -67,6 +70,25 @@ describe("Host/Origin 请求守卫", () => {
   it("没有 Origin 头一律放行（CLI/agent 非浏览器请求）", () => {
     const { guard } = guardFor();
     assert.deepEqual(guard(request({ host: "127.0.0.1:3080" })), { ok: true });
+  });
+
+  it("自带签名的路径（/a/*、/calendar.ics）忽略 Origin：IM 内置浏览器会带 Origin: null", () => {
+    const { guard } = guardFor({ HOST: "127.0.0.1", WEB_ALLOWED_HOSTS: "life.example.com:30301" });
+    const headers = { host: "life.example.com:30301", origin: "null" };
+    for (const url of ["/a/MXxkZWZhdWx0fDE", "/calendar.ics?p=x&exp=1&sig=y"]) {
+      assert.deepEqual(guard(request(headers, url)), { ok: true }, url);
+    }
+    // 只豁免 Origin：Host 仍是必过的一道门
+    assert.equal(
+      guard(request({ host: "attacker.com:30301", origin: "null" }, "/a/MXxkZWZhdWx0fDE")).ok,
+      false,
+      "签名路径也必须过 Host 检查（DNS rebinding）",
+    );
+    // 其它路径照旧拒绝 null：跨站防护不能被顺带削弱
+    assert.equal(guard(request(headers, "/api/status")).ok, false);
+    assert.equal(guard(request(headers, "/quick")).ok, false);
+    // 前缀必须精确：/abc 不是 /a/ 下的链接
+    assert.equal(guard(request(headers, "/abc")).ok, false);
   });
 
   it("同源 Origin 放行；跨站 Origin 403；file:// 与 null 也拒绝", () => {

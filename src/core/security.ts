@@ -159,6 +159,19 @@ export type RequestGuardResult = { ok: true } | { ok: false; status: 403; body: 
  * Origin 只在**存在时**校验：CLI / agent / curl 通常不带 Origin，浏览器跨站请求一定带。
  * 没有 Origin 一律放行（否则 MCP stdio 壳、systemd 探针都会被误杀）。
  */
+/**
+ * 自带签名凭据的路径：凭据就在 URL 里（HMAC 签名），没有 cookie/session 可被跨站带走，
+ * 因此 CSRF 防护对它们没有意义。而 IM（QQ/微信）内置浏览器从消息里打开链接时经常带
+ * `Origin: null`（不透明来源），若照常校验会把用户挡在门外——2026-11-04 实测 QQ 内打开
+ * `/a/<token>` 就是被这一条拦下（Origin 不被允许：null）。
+ *
+ * 只豁免 Origin，**Host 检查保留**（DNS rebinding 仍须防）；这两个路径本身的鉴权强度不变。
+ */
+function hasOwnSignature(url: string | undefined): boolean {
+  const path = (url ?? "/").split("?")[0] ?? "/";
+  return path.startsWith("/a/") || path === "/calendar.ics";
+}
+
 export function createRequestGuard(
   config: ResolvedConfig,
 ): (req: IncomingMessage) => RequestGuardResult {
@@ -188,6 +201,8 @@ export function createRequestGuard(
 
     const rawOrigin = req.headers.origin;
     if (rawOrigin === undefined) return { ok: true };
+    // 自带签名的路径（一键操作链接 / 日历订阅）跳过 Origin 校验，见 hasOwnSignature
+    if (hasOwnSignature(req.url)) return { ok: true };
     if (typeof rawOrigin !== "string" || rawOrigin === "") {
       return { ok: false, status: 403, body: `Origin 不被允许：${String(rawOrigin)}` };
     }
