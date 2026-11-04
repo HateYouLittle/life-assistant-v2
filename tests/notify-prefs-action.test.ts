@@ -98,8 +98,7 @@ describe("notify prefs：写", () => {
 
       // 关掉推送（默认已关，显式写 false 也应落库）
       const off = json(tool(env, { action: "prefs", kind: "schedule.reminder", push: false }));
-      // schedule.reminder 的回显里带 links（一键操作链接开关，默认开），见 core/notify-prefs.ts
-      assert.deepEqual(off.生效, { push: false, channels: null, links: true });
+      assert.deepEqual(off.生效, { push: false, channels: null });
       assert.deepEqual(getNotifyPrefs(env.db, "default")["schedule.reminder"], { push: false });
     } finally {
       cleanupTestEnv(env);
@@ -112,7 +111,7 @@ describe("notify prefs：写", () => {
       const limited = json(
         tool(env, { action: "prefs", kind: "schedule.reminder", channels: ["log"] }),
       );
-      assert.deepEqual(limited.生效, { push: true, channels: ["log"], links: true });
+      assert.deepEqual(limited.生效, { push: true, channels: ["log"] });
 
       const unknown = tool(env, {
         action: "prefs",
@@ -128,11 +127,7 @@ describe("notify prefs：写", () => {
       );
 
       const cleared = json(tool(env, { action: "prefs", kind: "schedule.reminder", channels: [] }));
-      assert.deepEqual(
-        cleared.生效,
-        { push: true, channels: null, links: true },
-        "空数组 = 清除通道限制",
-      );
+      assert.deepEqual(cleared.生效, { push: true, channels: null }, "空数组 = 清除通道限制");
       assert.deepEqual(getNotifyPrefs(env.db, "default")["schedule.reminder"], {});
     } finally {
       cleanupTestEnv(env);

@@ -221,25 +221,22 @@ describe("schedule complete {recent:true}", () => {
     }
   });
 
-  it("两条都推过：返回候选；超出 12 小时窗口的不算", async (t) => {
+  it("两条都推过：返回候选；昨天的提醒不算（已作废，也不在今天的窗口里）", async (t) => {
     freeze(t, `${D}T19:00:00+08:00`);
     const env = makeTestEnv();
     try {
-      const old = add(env, { title: "早晨吃药", date: D, time: "06:00" });
       const a = daily(env, "每日巡检", "17:00");
       const b = daily(env, "打下班卡", "18:00");
-      await fireDue(env.db, envServices(env), T(`${D}T06:00:30+08:00`));
+      await fireDue(env.db, envServices(env), T(`${D}T17:00:30+08:00`));
       await fireDue(env.db, envServices(env), T(`${D}T18:00:30+08:00`));
       const reply = payload<Reply>(tool(env, { action: "complete", recent: true }));
       assert.equal(reply.结果, "多个候选");
       assert.deepEqual(new Set(reply.候选?.map((c) => c.id)), new Set([a, b]));
-      // 把时钟推到窗口外后，早晨那条仍不会被拿来凑数
-      t.mock.timers.setTime(Date.parse(`${D}T19:30:00+08:00`));
-      tool(env, { action: "complete", id: a, occurrence_key: `${D}T17:00#0` });
-      tool(env, { action: "complete", id: b, occurrence_key: `${D}T18:00#0` });
+
+      // 第二天早上：昨天没回的提醒不再算（只认今天的推送）
+      t.mock.timers.setTime(Date.parse("2026-10-21T08:00:00+08:00"));
       const none = payload<Reply>(tool(env, { action: "complete", recent: true }));
       assert.equal(none.结果, "未找到");
-      assert.equal(getSchedule(env.db, "default", old)?.status, "active");
     } finally {
       cleanupTestEnv(env);
     }

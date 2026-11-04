@@ -702,8 +702,8 @@ export interface CompletionQuery {
   match?: string | null;
   /** match 模式的目标本地日期，缺省今天 */
   date?: string | null;
-  /** recent 模式：最近 N 小时内已推送、尚未处理的提醒 */
-  recentHours?: number | null;
+  /** recent 模式：今天（本地日）已推送、尚未处理的提醒 */
+  recent?: boolean | null;
 }
 
 const MAX_COMPLETION_CANDIDATES = 10;
@@ -732,7 +732,8 @@ function groupByEvent(
  * - match：在该 Profile 的 active 日程里按标题/备注子串匹配，取**本地日期 = date（缺省今天）**
  *   的未完成发生；一次性日程在未显式给 date 时不限日期（「取消酒店订单搞定了」的事件可能在未来）。
  *   匹配到日程但当天那次已完成 → already（如实告知，不重复操作）。
- * - recentHours：不需要任何关键词，取最近 N 小时内**已推送（notified）且未处理**的提醒。
+ * - recent：不需要任何关键词，取**今天**（本地零点起）**已推送（notified）且未处理**的提醒。
+ *   昨天及更早的循环待办已被 expireStaleRecurringTodos 作废，不会被拿来凑数。
  *   用于推送没有进入对话上下文、用户只回一句「交了 / 巡检过了」的场景。
  *
  * 只读：真正的完成仍由调用方走 completeSchedule（同一套事件前缀收敛与一次性收尾语义）。
@@ -744,13 +745,11 @@ export function resolveCompletionTarget(
 ): CompletionResolution {
   const match = query.match?.trim() ?? "";
   const hasMatch = match !== "";
-  const hasRecent = query.recentHours !== null && query.recentHours !== undefined;
+  const hasRecent = query.recent === true;
   if (hasMatch === hasRecent) throw new Error("按描述完成需要且只能提供 match 或 recent 之一");
 
   if (hasRecent) {
-    const hours = query.recentHours as number;
-    const nowAt = now();
-    const since = nowAt.minus({ hours }).toUTC().toISO() as string;
+    const since = now().startOf("day").toUTC().toISO() as string;
     const rows = db
       .prepare(
         `SELECT o.schedule_id, o.occurrence_key, o.event_at, o.due_at, o.status
@@ -764,7 +763,7 @@ export function resolveCompletionTarget(
     // 不会出现在 notified 里（completeSchedule 按前缀整体收敛）。
     const candidates = toCandidates(db, profileId, groupByEvent(rows));
     if (candidates.length === 0) {
-      return { kind: "none", reason: `最近 ${hours} 小时没有已推送且未处理的提醒` };
+      return { kind: "none", reason: "今天没有已推送且未处理的提醒" };
     }
     return candidates.length === 1
       ? { kind: "single", candidate: candidates[0] as CompletionCandidate }

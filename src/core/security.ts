@@ -169,7 +169,7 @@ export type RequestGuardResult = { ok: true } | { ok: false; status: 403; body: 
  */
 function hasOwnSignature(url: string | undefined): boolean {
   const path = (url ?? "/").split("?")[0] ?? "/";
-  return path.startsWith("/a/") || path === "/calendar.ics";
+  return path === "/calendar.ics";
 }
 
 export function createRequestGuard(

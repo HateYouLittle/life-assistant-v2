@@ -219,8 +219,6 @@ function candidateToPublic(c: CompletionCandidate): Record<string, unknown> {
   };
 }
 
-const RECENT_COMPLETION_HOURS = 12;
-
 /**
  * 单次完成后的模块回调（如周期账自动入账）：只在「完成了某一次发生」时触发，
  * all=true 结束系列不算交了某一期。回调字段并进回执。
@@ -241,7 +239,7 @@ function completeByDescription(ctx: ToolContext, args: Record<string, unknown>) 
   const resolution = resolveCompletionTarget(db, profileId, {
     match: args.match === undefined || args.match === null ? null : String(args.match),
     date: args.date === undefined || args.date === null ? null : String(args.date),
-    recentHours: args.recent === true ? RECENT_COMPLETION_HOURS : null,
+    recent: args.recent === true,
   });
   switch (resolution.kind) {
     case "single": {
@@ -602,7 +600,7 @@ registerModule({
           .boolean()
           .optional()
           .describe(
-            "complete 按最近推送完成（不传 id/match）：用户只说「交了/做完了/打了」而对话里没有对应提醒时用；取最近 12 小时内已推送且未处理的提醒，唯一则直接完成，多个返回候选",
+            "complete 按最近推送完成（不传 id/match）：用户只说「交了/做完了/打了」而对话里没有对应提醒时用；取今天已推送且未处理的提醒，唯一则直接完成，多个返回候选",
           ),
         minutes: z
           .number()

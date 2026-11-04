@@ -7,7 +7,6 @@ import {
   loadConfig,
   MIN_TOKEN_LENGTH,
   type ResolvedConfig,
-  resolvePublicBaseUrl,
   urlHost,
 } from "./config.js";
 import { BACKUP_STALE_HOURS, backupStatus } from "./core/backup.js";
@@ -161,35 +160,6 @@ function checkAuth(config: ResolvedConfig): CheckResult {
       : fail(name, `token 只有 ${length} 字符，绑定了非回环地址`);
   }
   return ok(name, `token ${length} 字符，绑定 ${config.host}`);
-}
-
-/**
- * 一键操作链接的基址：没有基址就不加链接（ok，仅说明）；有基址但 daemon 只绑回环时，
- * 手机直连一定打不开 —— 必须由反代转发进来，或把 HOST 改成 0.0.0.0 / 局域网 IP。
- */
-export function checkActionLinks(config: ResolvedConfig): CheckResult {
-  const name = "操作链接";
-  const base = resolvePublicBaseUrl(config);
-  if (base === null) {
-    return ok(
-      name,
-      "未配置 PUBLIC_BASE_URL，WEB_ALLOWED_HOSTS 也没有非回环条目：提醒不追加操作链接",
-    );
-  }
-  const source = config.publicBaseUrl === undefined ? "WEB_ALLOWED_HOSTS 回退" : "PUBLIC_BASE_URL";
-  if (config.webApiToken === undefined) {
-    return warn(
-      name,
-      `基址 ${base}（${source}），但未设 WEB_API_TOKEN，无法签名，提醒不会追加链接`,
-    );
-  }
-  if (isLoopbackHost(config.host)) {
-    return warn(
-      name,
-      `基址 ${base}（${source}），但 HOST=${config.host} 只绑回环：链接需要反代或 HOST=0.0.0.0 才可达`,
-    );
-  }
-  return ok(name, `基址 ${base}（${source}）`);
 }
 
 function checkQweather(config: ResolvedConfig, env: NodeJS.ProcessEnv): CheckResult {
@@ -646,7 +616,6 @@ export async function runDoctor(
   checks.push(...checkDatabase(config));
   // 鉴权与私钥检查都必须基于「实际会被 daemon 读取的那份 env」，不能偷看 process.env
   checks.push(checkAuth(config));
-  checks.push(checkActionLinks(config));
   checks.push(checkQweather(config, env));
   checks.push(checkBackups(config));
   // 默认不碰网络：`--live` 才会连本机 daemon（未启动/内网环境下自检不能卡住）

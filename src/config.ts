@@ -82,11 +82,6 @@ export interface ResolvedConfig {
    */
   allowedHosts: string[];
   /**
-   * 推送里一键操作链接的基址（PUBLIC_BASE_URL）：http(s) origin，可带路径前缀，无尾 `/`。
-   * 未设置时由 resolvePublicBaseUrl 回退到 WEB_ALLOWED_HOSTS 的第一个非回环条目。
-   */
-  publicBaseUrl?: string;
-  /**
    * 每人一个 token（PROFILE_TOKENS_JSON：{"profileId":"<token>"}）。
    * 非空时 MCP/写接口按 token 反查 Profile，不再信任 X-Hermes-Profile 自报身份；
    * master WEB_API_TOKEN 仍可访问看板/运维接口。
@@ -375,73 +370,6 @@ function parseAllowedHosts(raw: string | undefined): string[] {
     .filter((entry) => entry !== "");
 }
 
-/** 回环或通配绑定地址：手机点不开，绝不能拿来拼链接 */
-function isUnreachableLinkHost(hostname: string): boolean {
-  const h = hostname.toLowerCase().replace(/^\[/, "").replace(/\]$/, "");
-  return (
-    isLoopbackHost(h) ||
-    h.startsWith("127.") ||
-    h.endsWith(".localhost") ||
-    h === "0.0.0.0" ||
-    h === "::" ||
-    h === "::0"
-  );
-}
-
-/**
- * PUBLIC_BASE_URL：一键操作链接的基址。必须是 http(s)，可带路径前缀（反代挂在子路径时），
- * 不允许 query/hash/用户名密码；去掉尾部 `/`。回环/通配地址直接拒绝启动 ——
- * 生成出来的链接在手机上一定打不开，比静默不加链接更难排查。
- */
-function parsePublicBaseUrl(raw: string | undefined): string | undefined {
-  const value = raw?.trim() ?? "";
-  if (value === "") return undefined;
-  let parsed: URL;
-  try {
-    parsed = new URL(value);
-  } catch {
-    throw new Error(`PUBLIC_BASE_URL 不是合法 URL: ${value}`);
-  }
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw new Error(`PUBLIC_BASE_URL 仅支持 http/https: ${value}`);
-  }
-  if (parsed.username !== "" || parsed.password !== "") {
-    throw new Error(`PUBLIC_BASE_URL 不允许包含用户名/密码: ${value}`);
-  }
-  if (parsed.search !== "" || parsed.hash !== "" || value.includes("?") || value.includes("#")) {
-    throw new Error(`PUBLIC_BASE_URL 不能带 query/hash: ${value}`);
-  }
-  if (isUnreachableLinkHost(parsed.hostname)) {
-    throw new Error(
-      `PUBLIC_BASE_URL 不能是回环/通配地址（手机打不开）: ${value}；请填局域网 IP 或公网域名`,
-    );
-  }
-  const path = parsed.pathname.replace(/\/+$/, "");
-  return `${parsed.origin}${path}`;
-}
-
-/**
- * 一键操作链接的实际基址：PUBLIC_BASE_URL → WEB_ALLOWED_HOSTS 第一个非回环条目
- * （拼成 `http://<条目>`）→ 都没有返回 null（调用方不追加链接）。
- */
-export function resolvePublicBaseUrl(config: ResolvedConfig): string | null {
-  if (config.publicBaseUrl !== undefined) return config.publicBaseUrl;
-  for (const entry of config.allowedHosts) {
-    // 裸 IPv6（配置里允许写 `fe80::1`）补方括号，否则不是合法 URL
-    const host =
-      !entry.startsWith("[") && (entry.match(/:/g)?.length ?? 0) > 1 ? `[${entry}]` : entry;
-    let parsed: URL;
-    try {
-      parsed = new URL(`http://${host}`);
-    } catch {
-      continue;
-    }
-    if (parsed.pathname !== "/" || isUnreachableLinkHost(parsed.hostname)) continue;
-    return parsed.origin;
-  }
-  return null;
-}
-
 /**
  * 每人一个 token。校验从严：Profile 名合法、token ≥ MIN_TOKEN_LENGTH、
  * 同一 token 不能绑定两个 Profile、也不能与 master token 相同（否则身份二义）。
@@ -654,7 +582,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
     throw new Error("REQUIRE_AUTH=1 但未设置 WEB_API_TOKEN（严格模式拒绝无鉴权启动）");
   }
   const allowedHosts = parseAllowedHosts(env.WEB_ALLOWED_HOSTS);
-  const publicBaseUrl = parsePublicBaseUrl(env.PUBLIC_BASE_URL);
   const profileTokens = parseProfileTokens(env.PROFILE_TOKENS_JSON, webApiToken);
   if (Object.keys(profileTokens).length > 0 && webApiToken === undefined) {
     logger.warn(
@@ -806,7 +733,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig
     webApiToken,
     requireAuth,
     allowedHosts,
-    publicBaseUrl,
     profileTokens,
     rateLimitPerMinute,
     trustProxy,

@@ -41,7 +41,6 @@ import {
 } from "../../core/notify.js";
 import {
   DEFAULT_KIND_PREFS,
-  LINK_KINDS,
   getNotifyPrefs,
   type NotifyKindPref,
   type NotifyPrefs,
@@ -69,8 +68,7 @@ function localTimeText(iso: string): string {
 }
 
 const PREFS_NOTE =
-  "push=false 表示不主动推送（通知仍入库，可 notify.pull 取回）；channels=null 表示不限通道；" +
-  "links=false 表示日程提醒正文不追加「完成 / 推迟 30 分钟」链接（与 push、静默时段互不影响）";
+  "push=false 表示不主动推送（通知仍入库，可 notify.pull 取回）；channels=null 表示不限通道";
 
 /** 通知 kind 的合法形状（如 bookkeeping.entry / notify.test）；拒绝乱写的键，避免偏好表变垃圾场 */
 const KIND_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
@@ -82,21 +80,17 @@ const KIND_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 interface EffectivePref {
   push: boolean;
   channels: string[] | null;
-  /** 仅支持链接的 kind（schedule.reminder）才有这个键 */
-  links?: boolean;
 }
 
-function effectivePref(kind: string, merged: NotifyKindPref): EffectivePref {
-  const out: EffectivePref = { push: merged.push !== false, channels: merged.channels ?? null };
-  if ((LINK_KINDS as readonly string[]).includes(kind)) out.links = merged.links !== false;
-  return out;
+function effectivePref(merged: NotifyKindPref): EffectivePref {
+  return { push: merged.push !== false, channels: merged.channels ?? null };
 }
 
 function prefsView(prefs: NotifyPrefs): Record<string, EffectivePref> {
   const kinds = [...new Set([...Object.keys(DEFAULT_KIND_PREFS), ...Object.keys(prefs)])].sort();
   const out: Record<string, EffectivePref> = {};
   for (const kind of kinds) {
-    out[kind] = effectivePref(kind, { ...DEFAULT_KIND_PREFS[kind], ...prefs[kind] });
+    out[kind] = effectivePref({ ...DEFAULT_KIND_PREFS[kind], ...prefs[kind] });
   }
   return out;
 }
@@ -353,20 +347,13 @@ function prefsAction(args: Record<string, unknown>, ctx: ToolContext): ToolResul
   const kind = kindRaw;
   const pushRaw = args.push;
   const channelsRaw = args.channels;
-  const linksRaw = args.links;
-  if (pushRaw === undefined && channelsRaw === undefined && linksRaw === undefined) {
+  if (pushRaw === undefined && channelsRaw === undefined) {
     return fail(
-      "prefs 带 kind 时需要 push（true/false）、channels（通道名数组）或 links（true/false）；查看全部偏好请不要传 kind",
+      "prefs 带 kind 时需要 push（true/false）或 channels（通道名数组）；查看全部偏好请不要传 kind",
     );
   }
   if (pushRaw !== undefined && typeof pushRaw !== "boolean") {
     return fail("push 需要布尔值 true/false");
-  }
-  if (linksRaw !== undefined) {
-    if (typeof linksRaw !== "boolean") return fail("links 需要布尔值 true/false");
-    if (!(LINK_KINDS as readonly string[]).includes(kind)) {
-      return fail(`links 只支持 ${LINK_KINDS.join(" / ")}（其它类型的通知不追加操作链接）`);
-    }
   }
   let channels: string[] | undefined;
   if (channelsRaw !== undefined) {
@@ -383,7 +370,6 @@ function prefsAction(args: Record<string, unknown>, ctx: ToolContext): ToolResul
   }
   const next: NotifyKindPref = { ...(stored[kind] ?? {}) };
   if (pushRaw !== undefined) next.push = pushRaw;
-  if (linksRaw !== undefined) next.links = linksRaw as boolean;
   if (channels !== undefined) {
     // 空数组 = 清除通道限制；若落成 `channels: []` 会被读回成「没有限制」，
     // 但存一份空数组在偏好里容易让人误以为「哪个通道都不允许」，所以直接删键。
@@ -395,7 +381,7 @@ function prefsAction(args: Record<string, unknown>, ctx: ToolContext): ToolResul
   const merged: NotifyKindPref = { ...DEFAULT_KIND_PREFS[kind], ...next };
   return okJson({
     已保存: { [kind]: next },
-    生效: effectivePref(kind, merged),
+    生效: effectivePref(merged),
     内置默认: DEFAULT_KIND_PREFS[kind] ?? null,
     说明: PREFS_NOTE,
   });
@@ -613,7 +599,7 @@ const notifyDispatch = defineActionTool({
     retry: { fields: ["notification_id", "delivery_id", "all"], handler: retryAction },
     quiet_hours: { fields: ["start", "end", "clear"], handler: quietHoursAction },
     route: { fields: ["url", "channel", "enabled", "platform", "name"], handler: routeAction },
-    prefs: { fields: ["kind", "push", "channels", "links"], handler: prefsAction },
+    prefs: { fields: ["kind", "push", "channels"], handler: prefsAction },
     test: { fields: [], handler: testAction },
     cancel: { fields: ["id"], handler: cancelAction },
   },
@@ -651,7 +637,7 @@ registerModule({
   tools: [
     {
       name: "notify",
-      description: `通知管理：action=pull 拉取未读通知（会话开始时调用一次，作为主动推送失败的兜底，会标记已读并取消待投递）；history 查看通知历史（limit/offset 分页，可按 kind 精确过滤、unread=true 只看未读；**不改变已读状态**，每条带最近一条投递的状态/尝试次数/最后错误，用于回答「哪条没发出去、为什么」）；retry 手动重试投递（notification_id 一条通知的全部投递 / delivery_id 单条投递 / all=true 批量重试该 Profile 所有 failed+fallback；重新入队后立即触发一轮投递）；quiet_hours 设置/查看/清除静默时段（HH:MM，支持跨午夜）；route 配置/查看主动推送通道（${CHANNEL_DESCRIPTION}）；prefs 查看/设置按类型的推送偏好（不带 kind 返回已保存+内置默认+最终生效值；带 kind+push、kind+channels 或 schedule.reminder+links 写入，push=false 表示不主动推送但通知仍入库、可用 pull 取回；bookkeeping.entry 默认不推，由每日摘要取代）；test 发一条测试通知验证通道（返回是否建立投递与所用通道，无路由时仅入库）；cancel 取消某条通知的待投递。`,
+      description: `通知管理：action=pull 拉取未读通知（会话开始时调用一次，作为主动推送失败的兜底，会标记已读并取消待投递）；history 查看通知历史（limit/offset 分页，可按 kind 精确过滤、unread=true 只看未读；**不改变已读状态**，每条带最近一条投递的状态/尝试次数/最后错误，用于回答「哪条没发出去、为什么」）；retry 手动重试投递（notification_id 一条通知的全部投递 / delivery_id 单条投递 / all=true 批量重试该 Profile 所有 failed+fallback；重新入队后立即触发一轮投递）；quiet_hours 设置/查看/清除静默时段（HH:MM，支持跨午夜）；route 配置/查看主动推送通道（${CHANNEL_DESCRIPTION}）；prefs 查看/设置按类型的推送偏好（不带 kind 返回已保存+内置默认+最终生效值；带 kind+push 或 kind+channels 写入，push=false 表示不主动推送但通知仍入库、可用 pull 取回；bookkeeping.entry 默认不推，由每日摘要取代）；test 发一条测试通知验证通道（返回是否建立投递与所用通道，无路由时仅入库）；cancel 取消某条通知的待投递。`,
       inputSchema: {
         action: notifyDispatch.actionEnum(),
         limit: z
@@ -705,12 +691,6 @@ registerModule({
           .max(10)
           .optional()
           .describe('prefs 限定该类型允许推送的通道（如 ["log"]）；传空数组清除限制，缺省不限通道'),
-        links: z
-          .boolean()
-          .optional()
-          .describe(
-            "prefs 仅 kind=schedule.reminder：是否在待办提醒末尾追加「完成 / 推迟 30 分钟」一键链接（默认 true）",
-          ),
       },
       handler: notifyTool,
     },

@@ -46,7 +46,6 @@ import {
 import { applySecureUmask, createRequestGuard, hardenDataDir } from "./core/security.js";
 import { ensureProfile, pruneCache } from "./core/settings.js";
 import { registerAllModules } from "./modules/index.js";
-import { createActionApp } from "./server/action.js";
 import { createCalendarApp } from "./server/calendar.js";
 import { createOpsApp } from "./server/ops.js";
 import { createQuickApp } from "./server/quick.js";
@@ -315,7 +314,6 @@ export function createHttpHandler(
   const app = createStatusApp(config, db)
     .route("/", createQuickApp(config, db))
     .route("/", createCalendarApp(config, db))
-    .route("/", createActionApp(config, db))
     .route("/", createOpsApp(config, db));
   const honoListener = getRequestListener(app.fetch);
   // Host/Origin 守卫：状态页与 /mcp 都没有 CSRF token，浏览器跨站请求（含 DNS rebinding：

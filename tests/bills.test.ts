@@ -157,9 +157,11 @@ describe("bill 周期账", () => {
         },
       );
       const done = env.db
-        .prepare("SELECT COUNT(*) AS n FROM occurrences WHERE schedule_id = ? AND status = 'done'")
+        .prepare(
+          "SELECT COUNT(*) AS n FROM occurrences WHERE schedule_id = ? AND status = 'done' AND occurrence_key NOT LIKE '%:resend'",
+        )
         .get(sid) as { n: number };
-      assert.equal(done.n, 1);
+      assert.equal(done.n, 1, "只完成当期那一次（同事件的晚间追提醒行一并收敛，不计入）");
     } finally {
       cleanupTestEnv(env);
     }

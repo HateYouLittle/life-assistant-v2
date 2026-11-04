@@ -151,7 +151,7 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
 - 打开老库可能升级 schema 的入口（daemon、`doctor`、`db:cleanup:preview`、`import:v1`）都传
   `openDatabase(dbPath, { backupDir: config.backupDir })`；新增 CLI 若会打开主库也要这样传，
   否则前滚不会有迁移前快照（仅 warn）。
-- 所有 HTTP 请求都过 Host/Origin 守卫：缺 Host 或不在允许名单 → 403；带 Origin 时必须同源（**例外**：自带签名凭据的 `/a/*` 与 `/calendar.ics` 跳过 Origin 校验 —— 凭据在 URL 里、没有 cookie 可被跨站带走，而 IM 内置浏览器打开链接会带 `Origin: null`；Host 检查仍保留）
+- 所有 HTTP 请求都过 Host/Origin 守卫：缺 Host 或不在允许名单 → 403；带 Origin 时必须同源（**例外**：自带签名凭据的 `/calendar.ics` 跳过 Origin 校验 —— 凭据在 URL 里、没有 cookie 可被跨站带走，而 IM 内置浏览器打开链接会带 `Origin: null`；Host 检查仍保留）
   （无 Origin 的 CLI/agent 放行）。绑定 `0.0.0.0` 或经反代/域名访问时，把实际 Host 写进
   `WEB_ALLOWED_HOSTS`，否则是预期内的 403。
 - 启动补发只覆盖 `CATCHUP_POLICY` 白名单内的 job，且只补最近一次；cron **环境变量必须恰好

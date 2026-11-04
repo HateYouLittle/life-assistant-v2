@@ -1,11 +1,10 @@
 import { DateTime } from "luxon";
 import type { DatabaseSync } from "node:sqlite";
-import { now, nowIso, instantToLocalDate, TZ } from "../../time.js";
+import { now, nowIso, instantToLocalDate, localToInstant, TZ } from "../../time.js";
 import { ensureYears } from "../../core/holiday.js";
 import { describeRecurrence } from "../../core/recurrence.js";
 import { errorMessage, type NotifyBlock, type Services } from "../../core/registry.js";
 import { logger } from "../../core/logger.js";
-import { reminderActionLinks } from "../../core/action-link.js";
 import type { ResolvedConfig } from "../../config.js";
 import { anniversaryMilestoneText, countdownText } from "./anniversary.js";
 import {
@@ -25,6 +24,7 @@ import {
   materializeSchedule,
   pausedWarned,
   recheckCrossYearOnce,
+  updateNextRunAt,
   takeYearsNeedingBackfill,
 } from "./materialize.js";
 
@@ -65,6 +65,43 @@ function decorationFor(db: DatabaseSync, schedule: ScheduleRow): ReminderDecorat
     }
   }
   return null;
+}
+
+/**
+ * 循环待办过了当天就作废：事件本地日期早于今天、仍未完成（pending/notified）的发生
+ * 置 cancelled（与 skip 同一终态，物化不会复活）。打卡、巡检这类每日提醒没做就是没做，
+ * 不该一直留在早报的「逾期未完成」里越积越多。
+ *
+ * 不碰：一次性待办（没有下一次，必须一直追）、截止型（设了 escalation，本来就要持续加压）、
+ * 生日/纪念日（没有完成语义，提醒行到点即 notified，不进议程以外的逻辑）、
+ * 以及被 snooze 到今天或以后的行（due_at 仍未过今天零点）。
+ * 返回作废的行数。
+ */
+export function expireStaleRecurringTodos(db: DatabaseSync, at: DateTime = now()): number {
+  const startOfToday = at.setZone(TZ).startOf("day").toUTC().toISO() as string;
+  const targets = db
+    .prepare(
+      `SELECT DISTINCT o.schedule_id AS id FROM occurrences o JOIN schedules s ON s.id = o.schedule_id
+       WHERE s.status = 'active' AND s.kind = 'todo' AND s.recurrence_json IS NOT NULL
+         AND o.status IN ('pending','notified') AND o.event_at < ? AND o.due_at < ?`,
+    )
+    .all(startOfToday, startOfToday) as { id: string }[];
+  let expired = 0;
+  for (const { id } of targets) {
+    const schedule = db.prepare("SELECT escalation_json FROM schedules WHERE id = ?").get(id) as
+      | { escalation_json: string | null }
+      | undefined;
+    if (schedule === undefined || parseEscalation(schedule.escalation_json) !== null) continue;
+    const result = db
+      .prepare(
+        `UPDATE occurrences SET status = 'cancelled'
+         WHERE schedule_id = ? AND status IN ('pending','notified') AND event_at < ? AND due_at < ?`,
+      )
+      .run(id, startOfToday, startOfToday);
+    expired += Number(result.changes);
+    updateNextRunAt(db, id);
+  }
+  return expired;
 }
 
 /** 错过补发清理：每个日程只保留最近一次过期的 pending，其余取消 */
@@ -184,6 +221,35 @@ function isSnoozedRow(schedule: ScheduleRow, occ: DueRow): boolean {
   return expected !== occ.due_at;
 }
 
+/** 循环待办「晚上追一次」的本地时刻 */
+export const EVENING_CHASE_TIME = "20:00";
+/** 事件时刻离追提醒不足这么多分钟就不追（如 19:45 的提醒，20:00 再追一次没有意义） */
+const EVENING_CHASE_MIN_GAP_MINUTES = 30;
+
+/**
+ * 循环待办的晚间追提醒时刻：没设 resend_minutes、没设 escalation 的循环 todo，
+ * 当天 20:00 还没完成就再提醒一次。事件本身在 19:30 之后时不追。
+ * 返回 UTC ISO；不适用返回 null。
+ */
+export function eveningChaseDue(schedule: ScheduleRow, eventAt: string): string | null {
+  if (schedule.kind !== "todo" || schedule.recurrence_json === null) return null;
+  if (schedule.resend_minutes > 0 || parseEscalation(schedule.escalation_json) !== null) {
+    return null;
+  }
+  const event = DateTime.fromISO(eventAt, { zone: TZ });
+  const chase = localToInstant(event.toISODate() as string, EVENING_CHASE_TIME);
+  const gap = DateTime.fromISO(chase).diff(event, "minutes").minutes;
+  return gap >= EVENING_CHASE_MIN_GAP_MINUTES ? chase : null;
+}
+
+/** 该日程派生行（:resend）的期望触发时刻：显式 resend_minutes 优先，否则晚间追提醒 */
+function resendDueFor(schedule: ScheduleRow, eventAt: string): string | null {
+  if (schedule.resend_minutes > 0) {
+    return DateTime.fromISO(eventAt).plus({ minutes: schedule.resend_minutes }).toUTC().toISO();
+  }
+  return eveningChaseDue(schedule, eventAt);
+}
+
 /**
  * 强提醒行的触发前校验。update 会保留 pending 的 :resend 行（本意是别丢掉强提醒），
  * 但用户改了时间、把 resend_minutes 调小/归零、或该事件已被重排删除之后，旧行仍会按
@@ -196,7 +262,7 @@ function resendDueOrNull(
   occurrenceKey: string,
   eventAt: string,
 ): string | null {
-  if (schedule.resend_minutes <= 0) return null;
+  if (resendDueFor(schedule, eventAt) === null) return null;
   // 当前日程已设置 escalation：resend_minutes 被忽略，遗留的 :resend 行一并作废。
   // 否则同一事件会同时收到「强提醒」与「升级链」两条「仍未完成」提醒
   // （先建 resend、后补 escalation 即可触发，复核发现的回归）。
@@ -215,7 +281,7 @@ function resendDueOrNull(
     )
     .get(schedule.id, eventKey);
   if (parent === undefined) return null;
-  return DateTime.fromISO(eventAt).plus({ minutes: schedule.resend_minutes }).toUTC().toISO();
+  return resendDueFor(schedule, eventAt);
 }
 
 /**
@@ -302,32 +368,6 @@ function hasDerivedRow(
 }
 
 /** 到点触发提醒；返回发布的条数 */
-/**
- * 待办提醒的一键操作链接（完成 / 推迟 30 分钟）。只给 todo：生日/纪念日没有「完成」语义，
- * 正文保持简短。生成失败只 warn —— 链接是锦上添花，绝不能让提醒本身发不出去。
- */
-function actionLinksFor(
-  config: ResolvedConfig,
-  db: DatabaseSync,
-  schedule: ScheduleRow,
-  occ: DueRow,
-): string[] {
-  if (schedule.kind !== "todo") return [];
-  try {
-    return reminderActionLinks(config, db, {
-      profileId: schedule.profile_id,
-      scheduleId: schedule.id,
-      occurrenceKey: occ.occurrence_key,
-      snoozable: isNormalReminderKey(occ.occurrence_key),
-    });
-  } catch (e) {
-    logger.warn(
-      `日程「${schedule.title}」(${schedule.id}) 生成操作链接失败，已省略: ${errorMessage(e)}`,
-    );
-    return [];
-  }
-}
-
 export async function fireDue(
   db: DatabaseSync,
   services: Services,
@@ -385,7 +425,9 @@ export async function fireDue(
       const note = isEscalation
         ? `（截止已过 ${formatElapsed(occ.event_at, at)}，仍未完成）`
         : isResend
-          ? "（强提醒：以上事项仍未完成）"
+          ? schedule.resend_minutes > 0
+            ? "（强提醒：以上事项仍未完成）"
+            : "（晚间再提醒一次：还没做的话记得做）"
           : lateMinutes > CATCHUP_GRACE_MINUTES
             ? `（补发：该提醒已错过约 ${Math.round(lateMinutes)} 分钟）`
             : null;
@@ -413,8 +455,6 @@ export async function fireDue(
           blocks.notes = (blocks.notes ?? []).map((n) => (n === REMINDER_REPLY_HINT ? hint : n));
         }
       }
-      const links = config === undefined ? [] : actionLinksFor(config, db, schedule, occ);
-      if (links.length > 0) blocks.notes = [...(blocks.notes ?? []), ...links];
       await services.publishProfile(schedule.profile_id, {
         kind: "schedule.reminder",
         title: deco?.title ?? schedule.title,
@@ -450,23 +490,16 @@ export async function fireDue(
             ) {
               insertEscalation(db, schedule.id, occ.occurrence_key, occ.event_at, 1, escalation);
             }
-          } else if (
-            schedule.resend_minutes > 0 &&
-            !hasDerivedRow(db, schedule.id, eventPrefix, RESEND_SUFFIX)
-          ) {
-            // 「到点后 N 分钟重发」以事件时刻为基准：用 due_at 会被偏移的提前量带偏
-            const resendDue = DateTime.fromISO(occ.event_at).plus({
-              minutes: schedule.resend_minutes,
-            });
-            db.prepare(
-              `INSERT OR IGNORE INTO occurrences (schedule_id, occurrence_key, event_at, due_at, status)
-               VALUES (?, ?, ?, ?, 'pending')`,
-            ).run(
-              schedule.id,
-              `${occ.occurrence_key}${RESEND_SUFFIX}`,
-              occ.event_at,
-              resendDue.toUTC().toISO() ?? occ.due_at,
-            );
+          } else {
+            // 「到点后 N 分钟重发」或循环待办的晚间追提醒，都以事件时刻为基准
+            // （用 due_at 会被偏移的提前量带偏）
+            const resendDue = resendDueFor(schedule, occ.event_at);
+            if (resendDue !== null && !hasDerivedRow(db, schedule.id, eventPrefix, RESEND_SUFFIX)) {
+              db.prepare(
+                `INSERT OR IGNORE INTO occurrences (schedule_id, occurrence_key, event_at, due_at, status)
+                 VALUES (?, ?, ?, ?, 'pending')`,
+              ).run(schedule.id, `${occ.occurrence_key}${RESEND_SUFFIX}`, occ.event_at, resendDue);
+            }
           }
         }
       }
@@ -489,6 +522,8 @@ export async function tickSchedules(
   config?: ResolvedConfig,
 ): Promise<void> {
   catchupSweep(db);
+  const expired = expireStaleRecurringTodos(db, at);
+  if (expired > 0) logger.info(`循环待办过期作废 ${expired} 条（前一天及更早未完成的发生）`);
   await fireDue(db, services, at, config);
   const active = db
     .prepare("SELECT * FROM schedules WHERE status = 'active'")

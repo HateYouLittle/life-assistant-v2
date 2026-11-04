@@ -1124,7 +1124,7 @@ describe("schedule 工具：更新不静默丢提醒", () => {
      * 造出「主提醒已发出、强提醒待触发」的现场：事件定在 2 小时前（必然已过期），
      * reminder 行标 notified，:resend 行按 resendMinutes 排定。
      */
-    function seedOverdueResend(env: TestEnv, resendMinutes: number) {
+    function seedOverdueResend(env: TestEnv, resendMinutes: number, recurring = true) {
       const at = now().minus({ hours: 2 });
       const date = at.toISODate() as string;
       const time = at.toFormat("HH:mm");
@@ -1135,7 +1135,7 @@ describe("schedule 工具：更新不静默丢提醒", () => {
         startDate: date,
         time,
         allDay: false,
-        recurrence: { freq: "daily", interval: 1 },
+        recurrence: recurring ? { freq: "daily", interval: 1 } : null,
         remindOffsets: [0],
         resendMinutes,
         workdayFilter: "any",
@@ -1180,7 +1180,8 @@ describe("schedule 工具：更新不静默丢提醒", () => {
     it("resend_minutes 归零后，已排定的强提醒作废", async () => {
       const env = makeTestEnv();
       try {
-        const { created, resendKey } = seedOverdueResend(env, 30);
+        // 一次性待办：循环待办归零后会落到默认的晚间追提醒（eveningChaseDue），另有用例覆盖
+        const { created, resendKey } = seedOverdueResend(env, 30, false);
         updateSchedule(env.db, "default", created.id, { resendMinutes: 0 });
         await fireDue(env.db, envServices(env), now());
         const row = occurrenceRows(env, created.id).find((r) => r.occurrence_key === resendKey);

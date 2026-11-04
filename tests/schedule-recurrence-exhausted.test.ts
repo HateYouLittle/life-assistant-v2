@@ -137,10 +137,18 @@ describe("P2-6 until/count 耗尽后的终态收口", () => {
       const listed = receipt.日程.find((row) => row.id === created.id);
       assert.equal(listed?.重复, "每天（至 2026-10-21）", "回显必须带上 until，否则看不出为什么停");
 
-      advance(t, "2026-10-21T18:00:30+08:00");
-      await tickSchedules(T("2026-10-21T18:00:30+08:00"), envServices(env), env.db);
+      // 每天 18:00 提醒 + 20:00 晚间追提醒（循环待办默认），两天共 4 条
+      for (const at of [
+        `${D}T18:00:30+08:00`,
+        `${D}T20:00:30+08:00`,
+        "2026-10-21T18:00:30+08:00",
+        "2026-10-21T20:00:30+08:00",
+      ]) {
+        advance(t, at);
+        await tickSchedules(T(at), envServices(env), env.db);
+      }
 
-      assert.equal(reminders(env).length, 2, "两次提醒都必须照常发出（收尾不得吞提醒）");
+      assert.equal(reminders(env).length, 4, "两次提醒及各自的晚间追提醒都必须照常发出");
       assert.equal(statusOf(env, created.id), "done", "until 到期且无 pending 应收敛到终态 done");
       assert.equal(nextRunAt(env, created.id), null);
 
@@ -160,7 +168,12 @@ describe("P2-6 until/count 耗尽后的终态收口", () => {
 
       // 收尾后不得复活：再物化/再 tick 都不产生新 occurrence
       await tickSchedules(T("2026-10-22T09:00:00+08:00"), envServices(env), env.db);
-      assert.deepEqual(occurrenceKeys(env, created.id), [`${D}T18:00#0`, "2026-10-21T18:00#0"]);
+      assert.deepEqual(occurrenceKeys(env, created.id), [
+        `${D}T18:00#0`,
+        `${D}T18:00#0:resend`,
+        "2026-10-21T18:00#0",
+        "2026-10-21T18:00#0:resend",
+      ]);
     } finally {
       cleanupTestEnv(env);
     }
@@ -185,6 +198,11 @@ describe("P2-6 until/count 耗尽后的终态收口", () => {
       advance(t, `${D}T18:00:30+08:00`);
       await tickSchedules(T(`${D}T18:00:30+08:00`), envServices(env), env.db);
       assert.equal(reminders(env).length, 1, "最后一次提醒必须发出（旧实现在此之前就把它吞了）");
+      assert.equal(statusOf(env, created.id), "active", "晚间追提醒还在 pending，不能收尾");
+
+      advance(t, `${D}T20:00:30+08:00`);
+      await tickSchedules(T(`${D}T20:00:30+08:00`), envServices(env), env.db);
+      assert.equal(reminders(env).length, 2, "晚间追提醒发出");
       assert.equal(statusOf(env, created.id), "done", "提醒发完且无 pending，才收尾");
     } finally {
       cleanupTestEnv(env);
@@ -212,15 +230,22 @@ describe("P2-6 until/count 耗尽后的终态收口", () => {
         "回显必须带上 count，否则看不出还剩几次",
       );
 
-      advance(t, "2026-10-21T18:00:30+08:00");
-      await tickSchedules(T("2026-10-21T18:00:30+08:00"), envServices(env), env.db);
-      assert.equal(reminders(env).length, 2, "两次提醒都必须发出");
+      for (const at of [
+        `${D}T18:00:30+08:00`,
+        `${D}T20:00:30+08:00`,
+        "2026-10-21T18:00:30+08:00",
+        "2026-10-21T20:00:30+08:00",
+      ]) {
+        advance(t, at);
+        await tickSchedules(T(at), envServices(env), env.db);
+      }
+      assert.equal(reminders(env).length, 4, "两次提醒及晚间追提醒都必须发出");
       assert.equal(statusOf(env, created.id), "done", "count 用尽且无 pending 应收敛到 done");
 
       await tickSchedules(T("2026-10-23T09:00:00+08:00"), envServices(env), env.db);
       assert.deepEqual(
         occurrenceKeys(env, created.id),
-        [`${D}T18:00#0`, "2026-10-21T18:00#0"],
+        [`${D}T18:00#0`, `${D}T18:00#0:resend`, "2026-10-21T18:00#0", "2026-10-21T18:00#0:resend"],
         "count 是硬上限，终态后不得补出第 3 次",
       );
       assert.equal(statusOf(env, created.id), "done");
