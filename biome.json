@@ -25,5 +25,22 @@
         "noNonNullAssertion": "error"
       }
     }
-  }
+  },
+  "overrides": [
+    {
+      "includes": ["src/server/assets/**"],
+      "javascript": {
+        "formatter": {
+          "quoteStyle": "single"
+        }
+      },
+      "linter": {
+        "rules": {
+          "correctness": {
+            "noInnerDeclarations": "off"
+          }
+        }
+      }
+    }
+  ]
 }
