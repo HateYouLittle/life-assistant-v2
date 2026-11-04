@@ -79,7 +79,7 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   import bookkeeping 的 `expenseCsv`；`src/server/quick.ts` 保留两处**只读** service import
   （bootstrap 首屏聚合 + 幂等命中时回读原记录的事件时间——不能从本次请求参数推算，与 P2-4 同因）；
   以及 `import "../modules/index.js"`（模块注册入口，非模块内部实现）。模块间还有一条：
-  `src/modules/weather` 直接 import `schedule/service.ts` 的 `agendaForDate`。改这些签名可能
+  `src/modules/weather/briefs.ts` 直接 import `schedule/service.ts` 的 `agendaForDate`。改这些签名可能
   静默破坏状态页或简报——记得同步检查这几处。
 - Runtime 是进程级单例（`src/core/registry.ts` 的 `initRuntime`/`runtime`），只能初始化一次。
   测试必须用 `makeTestEnv()` + `cleanupTestEnv()`（`tests/helpers.ts`），后者会重置 runtime
