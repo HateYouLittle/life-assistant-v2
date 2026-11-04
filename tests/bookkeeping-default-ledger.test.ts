@@ -209,6 +209,41 @@ describe("bookkeeping 默认账本：解析顺序", () => {
   });
 });
 
+describe("bookkeeping 默认账本：读类 action 同样缺省", () => {
+  it("list/summary/export 不传 ledger_id 走默认账本；无法确定时报错并列出候选", () => {
+    const env = makeTestEnv();
+    const t = tools(env);
+    try {
+      const home = createLedgerId(t, "家里");
+      const trip = createLedgerId(t, "旅行");
+      t.expense({ action: "add", ledger_id: home, amount: 12.5, category: "餐饮" });
+      t.expense({ action: "add", ledger_id: trip, amount: 300, category: "交通" });
+
+      const ambiguous = t.expense({ action: "summary" });
+      assert.equal(ambiguous.isError, true);
+      assert.match(text(ambiguous), /summary 未传 ledger_id.*家里.*旅行/);
+
+      t.expense({ action: "set_default_ledger", ledger_id: home });
+      const summary = JSON.parse(text(t.expense({ action: "summary" }))) as {
+        账本: string;
+        合计: string;
+      };
+      assert.deepEqual(summary, { ...summary, 账本: "家里", 合计: "¥12.50" });
+      const list = JSON.parse(text(t.expense({ action: "list" }))) as { 匹配总数: number };
+      assert.equal(list.匹配总数, 1);
+      const csv = JSON.parse(text(t.expense({ action: "export" }))) as { 账本: string };
+      assert.equal(csv.账本, "家里");
+      // 显式 ledger_id 仍优先
+      const explicit = JSON.parse(text(t.expense({ action: "summary", ledger_id: trip }))) as {
+        账本: string;
+      };
+      assert.equal(explicit.账本, "旅行");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
+
 describe("bookkeeping 默认账本：跨 Profile 隔离", () => {
   it("每个 Profile 的默认账本互不影响；他人个人账本不可见", () => {
     const env = makeTestEnv();

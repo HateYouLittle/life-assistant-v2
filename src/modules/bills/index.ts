@@ -10,7 +10,7 @@ import {
   registerModule,
   type ToolContext,
 } from "../../core/registry.js";
-import { getLedger } from "../bookkeeping/service.js";
+import { getLedger, resolveAddLedger } from "../bookkeeping/service.js";
 import {
   registerCompletionHook,
   registerReminderDecorator,
@@ -155,8 +155,22 @@ function billToolInner(args: Record<string, unknown>, ctx: ToolContext) {
       if (typeof args.name !== "string") return fail("add 需要 name（如「话费」）");
       if (args.amount === undefined) return fail("add 需要 amount（元）");
       if (typeof args.category !== "string") return fail("add 需要 category（如「通讯」）");
-      if (typeof args.ledger_id !== "string")
-        return fail("add 需要 ledger_id（从 ledger list 取）");
+      // ledger_id 可省略：与 expense add 同口径（默认账本 → 唯一可写账本），不唯一才报错
+      let ledgerId: string;
+      if (typeof args.ledger_id === "string") {
+        ledgerId = args.ledger_id;
+      } else {
+        const resolved = resolveAddLedger(db, ctx.profileId);
+        if (resolved.ledger === null) {
+          const list = resolved.candidates.map((row) => `${row.name}（id=${row.id}）`).join("、");
+          return fail(
+            list === ""
+              ? '当前没有可写账本，请先用 ledger {action:"create", name:"…"} 建一个'
+              : `add 未传 ledger_id，且无法确定默认账本；当前可写账本：${list}。请传 ledger_id`,
+          );
+        }
+        ledgerId = resolved.ledger.id;
+      }
       if (typeof args.date !== "string") return fail("add 需要 date：下次到期日 YYYY-MM-DD");
       const recurrence: Recurrence = {
         freq: (args.freq as Recurrence["freq"] | undefined) ?? "monthly",
@@ -169,7 +183,7 @@ function billToolInner(args: Record<string, unknown>, ctx: ToolContext) {
           name: args.name,
           amountCents: amountCents(args.amount),
           category: args.category,
-          ledgerId: args.ledger_id,
+          ledgerId,
           startDate: args.date,
           recurrence,
           time: (args.time as string | undefined) ?? "09:00",
@@ -244,7 +258,7 @@ function decorate(db: DatabaseSync, schedule: ScheduleRow) {
 registerReminderDecorator(decorate);
 
 /**
- * schedule complete（单次，含 match/recent 与一键「完成」链接）完成的是周期账提醒时，
+ * schedule complete（单次，含 match/recent）完成的是周期账提醒时，
  * 顺手按模板入账；期次 = 该次事件的本地日期，与 bill pay 同一幂等键，两条路径谁先谁后都只入一笔。
  * 入账失败不回滚完成（完成已生效），回执里如实给出失败原因与补救调用。
  */
@@ -267,7 +281,7 @@ registerModule({
     {
       name: "bill",
       description:
-        "周期账 / 订阅提醒：固定周期支出模板（话费、会员、物业费……）。到期按模板推「该交话费了 ¥50（通讯）」提醒（复用 schedule 的提醒链路与一键链接）。" +
+        "周期账 / 订阅提醒：固定周期支出模板（话费、会员、物业费……）。到期按模板推「该交话费了 ¥50（通讯）」提醒（复用 schedule 的提醒链路）。" +
         "action=add 建模板（name/amount/category/ledger_id/date=下次到期日，freq 默认 monthly；可选 request_id 幂等）；list 查看；update 改名称/金额/分类/账本/备注；" +
         "pause 停用（不再提醒，历史入账不动）；resume 恢复；" +
         "pay 一步完成「交了」：标记该期提醒完成并按模板金额/分类/账本入账，同一期重复调用只入一笔（返回 已处理）。" +
@@ -278,7 +292,7 @@ registerModule({
         name: z.string().min(1).max(40).optional().describe("名称，如「话费」「视频会员」"),
         amount: z.number().positive().max(1_000_000).optional().describe("每期金额（元）"),
         category: z.string().min(1).max(20).optional().describe("入账分类，如「通讯」"),
-        ledger_id: z.string().optional().describe("入账账本 id（ledger list 取）"),
+        ledger_id: z.string().optional().describe("入账账本 id；add 可省略，缺省走默认账本"),
         date: z
           .string()
           .regex(DATE_RE)

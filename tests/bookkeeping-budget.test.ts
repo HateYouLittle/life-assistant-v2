@@ -122,7 +122,9 @@ describe("bookkeeping 预算：ledger {action:'budget'} 工具", () => {
         true,
         "账本不存在应报错",
       );
-      assert.equal(tool.ledger({ action: "budget" }).isError, true, "缺 ledger_id 应报错");
+      // 缺 ledger_id 时走默认账本：该 Profile 只有这一个可写账本，直接用它
+      const byDefault = JSON.parse(text(tool.ledger({ action: "budget" }))) as { 账本: string };
+      assert.equal(byDefault.账本, "查询");
     } finally {
       cleanupTestEnv(env);
     }

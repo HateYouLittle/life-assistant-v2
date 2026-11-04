@@ -35,7 +35,7 @@ import {
 } from "./materialize.js";
 
 /**
- * 单次发生被「完成」之后的回调（schedule complete 的单次路径，含 match/recent 与一键链接）。
+ * 单次发生被「完成」之后的回调（schedule complete 的单次路径，含 match/recent）。
  * 返回值合并进 complete 回执；null = 无关。由工具层调用，服务层的 completeSchedule 不触发。
  */
 export interface OccurrenceCompletedEvent {

@@ -145,12 +145,9 @@ function ledgerTransfer(args: Record<string, unknown>, ctx: ToolContext): ToolRe
 
 function ledgerBudget(args: Record<string, unknown>, ctx: ToolContext): ToolResult {
   const db = ctx.db;
-  const ledgerId = args.ledger_id as string | undefined;
-  if (ledgerId === undefined) {
-    return fail('budget 需要 ledger_id（先调用 ledger {action:"list"} 取账本 id）');
-  }
-  const ledger = getVisibleLedger(db, ledgerId, ctx.profileId);
-  if (ledger === undefined) return fail(`账本不存在: ${ledgerId}`);
+  const ledger = readLedger(args, ctx, "budget");
+  if (typeof ledger === "string") return fail(ledger);
+  const ledgerId = ledger.id;
   // 分类预算与 expense add/update 共用同一份字典归一：否则用户用别名（如「吃饭」）
   // 设的预算会落在别名文本下，而归一后的支出记在标准名（「餐饮」）下 —— 已用恒为 0、
   // 阈值提醒永不触发，且没有任何提示。总额预算（空分类）不参与归一。
@@ -298,12 +295,31 @@ function requestIdOf(args: Record<string, unknown>): string | undefined {
 }
 
 /** 未传 ledger_id 且无法确定默认账本时的可操作报错：列出可选账本 + 如何设置默认账本 */
-function noDefaultLedgerMessage(candidates: LedgerRow[]): string {
+function noDefaultLedgerMessage(action: string, candidates: LedgerRow[]): string {
   if (candidates.length === 0) {
-    return 'add 需要 ledger_id：当前 Profile 没有可写的活动账本，请先用 ledger {action:"create", name:"…"} 建一个';
+    return `${action} 需要 ledger_id：当前 Profile 没有可写的活动账本，请先用 ledger {action:"create", name:"…"} 建一个`;
   }
   const list = candidates.map((row) => `${row.name}（id=${row.id}）`).join("、");
-  return `add 未传 ledger_id，且无法确定默认账本；当前可写账本：${list}。请传 ledger_id，或用 expense {action:"set_default_ledger", ledger_id:"<账本 id>"} 指定默认账本`;
+  return `${action} 未传 ledger_id，且无法确定默认账本；当前可写账本：${list}。请传 ledger_id，或用 expense {action:"set_default_ledger", ledger_id:"<账本 id>"} 指定默认账本`;
+}
+
+/**
+ * 读类 action（list/summary/export/budget）的账本解析：显式 ledger_id 按可见性校验（已归档
+ * 账本也能查）；未传时与 add 同口径（默认账本 → 唯一可写账本），用户问「这个月花了多少」
+ * 不必先 ledger list 再带 id。返回 string 表示可直接回给调用方的错误文案。
+ */
+function readLedger(
+  args: Record<string, unknown>,
+  ctx: ToolContext,
+  action: string,
+): LedgerRow | string {
+  const raw = args.ledger_id;
+  if (raw !== undefined) {
+    if (typeof raw !== "string") return `账本不存在: ${String(raw)}`;
+    return getVisibleLedger(ctx.db, raw, ctx.profileId) ?? `账本不存在: ${raw}`;
+  }
+  const resolved = resolveAddLedger(ctx.db, ctx.profileId);
+  return resolved.ledger ?? noDefaultLedgerMessage(action, resolved.candidates);
 }
 function expenseAdd(args: Record<string, unknown>, ctx: ToolContext): ToolResult {
   const db = ctx.db;
@@ -323,7 +339,7 @@ function expenseAdd(args: Record<string, unknown>, ctx: ToolContext): ToolResult
     ledger = found;
   } else {
     const resolved = resolveAddLedger(db, ctx.profileId);
-    if (resolved.ledger === null) return fail(noDefaultLedgerMessage(resolved.candidates));
+    if (resolved.ledger === null) return fail(noDefaultLedgerMessage("add", resolved.candidates));
     ledger = resolved.ledger;
   }
   if (!Number.isFinite(amount) || amount <= 0 || amount > 1_000_000)
@@ -437,13 +453,9 @@ function expenseCategoryAlias(args: Record<string, unknown>, ctx: ToolContext): 
 
 function expenseList(args: Record<string, unknown>, ctx: ToolContext): ToolResult {
   const db = ctx.db;
-  const ledgerId = args.ledger_id as string | undefined;
-  if (ledgerId === undefined) {
-    return fail('list 需要 ledger_id（先调用 ledger {action:"list"} 取账本 id）');
-  }
-  if (getVisibleLedger(db, ledgerId, ctx.profileId) === undefined) {
-    return fail(`账本不存在: ${ledgerId}`);
-  }
+  const resolved = readLedger(args, ctx, "list");
+  if (typeof resolved === "string") return fail(resolved);
+  const ledgerId = resolved.id;
   // offset 非法（负数/NaN/非数字）一律回退 0：分页参数写错不该让整次查询报错，
   // 但也绝不能静默返回第一页却让调用方以为是别的页（所以把生效值回显成「偏移」）。
   const rawOffset = args.offset;
@@ -477,23 +489,18 @@ function expenseList(args: Record<string, unknown>, ctx: ToolContext): ToolResul
 
 function expenseSummary(args: Record<string, unknown>, ctx: ToolContext): ToolResult {
   const db = ctx.db;
-  const ledgerId = args.ledger_id as string | undefined;
-  if (ledgerId === undefined) {
-    return fail('summary 需要 ledger_id（先调用 ledger {action:"list"} 取账本 id）');
-  }
-  if (getVisibleLedger(db, ledgerId, ctx.profileId) === undefined)
-    return fail(`账本不存在: ${ledgerId}`);
-  // 未指定区间时默认「月初 → 今天」（本月至今）；看板的「本月」是自然月全月，
-  // 口径差异见 service.ts 的 monthRange 注释
-  const range = expenseRange(args, {
-    from: `${todayIso().slice(0, 7)}-01`,
-    to: todayIso(),
-  });
+  const resolved = readLedger(args, ctx, "summary");
+  if (typeof resolved === "string") return fail(resolved);
+  const ledgerId = resolved.id;
+  // 未指定区间时默认「本自然月全月」：与看板、预算对照同一口径（含月内已录入的未来日），
+  // 用户问「这个月花了多少」只有一个答案
+  const range = expenseRange(args, monthRange(todayIso().slice(0, 7)));
   const summary = summarizeExpenses(db, ledgerId, {
     ...range,
     by: args.by as string | undefined,
   });
   return okJson({
+    账本: resolved.name,
     区间: range,
     合计: `¥${centsToYuan(summary.total_cents)}`,
     笔数: summary.count,
@@ -581,12 +588,9 @@ function expenseDelete(args: Record<string, unknown>, ctx: ToolContext): ToolRes
 
 function expenseExport(args: Record<string, unknown>, ctx: ToolContext): ToolResult {
   const db = ctx.db;
-  const ledgerId = args.ledger_id as string | undefined;
-  if (ledgerId === undefined) {
-    return fail('export 需要 ledger_id（先调用 ledger {action:"list"} 取账本 id）');
-  }
-  const ledger = getVisibleLedger(db, ledgerId, ctx.profileId);
-  if (ledger === undefined) return fail(`账本不存在: ${ledgerId}`);
+  const ledger = readLedger(args, ctx, "export");
+  if (typeof ledger === "string") return fail(ledger);
+  const ledgerId = ledger.id;
   // 工具 schema 是各 action 共用的，from/to 只属于 list/summary：静默忽略会让
   // 「导出这个区间」变成「导出当月」，宁可明确拒绝。
   if (args.from !== undefined || args.to !== undefined) {
@@ -669,10 +673,7 @@ registerModule({
           .describe("transfer 时的目标 Profile；缺省则转回家庭账本（不可逆）"),
         include_archived: z.boolean().optional(),
         unarchive: z.boolean().optional(),
-        ledger_id: z
-          .string()
-          .optional()
-          .describe('budget 时的账本 id，先调用 ledger {action:"list"} 获取'),
+        ledger_id: z.string().optional().describe("budget 时的账本 id；可选，缺省走默认账本"),
         amount: z
           .number()
           .min(0.01)
@@ -687,7 +688,7 @@ registerModule({
     {
       name: "expense",
       description:
-        "支出记账：add 记一笔（amount 元必填；ledger_id 可选，缺省按「默认账本 → 唯一可写账本」解析；可选 category/note/date/request_id；记账不发推送通知；未显式传 category 时回执附「常用分类」）；list 明细（可按 month/from/to/by 过滤）；summary 汇总（按分类与记账人）；update 更正一笔（id + amount/category/note/date 至少一个，只改显式传入的字段）；delete 删除记错的一笔（id 从 list 获取）；export 导出 CSV（ledger_id + 可选 month，默认当月；表头「日期,账本,分类,金额(元),备注,记账人」，UTF-8 BOM；单次上限 2000 行，超出时 已截断=true 并给出总行数）；set_default_ledger 设置/查看默认账本（传 ledger_id 设置，不传则返回当前默认账本）；categories 列出分类字典（标准名+别名+近 90 天笔数/金额，字典为空时即近 90 天实际用过的分类）；category_alias 维护别名（category + alias 添加，remove=true 删除；别名命中后 add/update 会自动归一成标准名，未知分类仍按自由文本保存）。list 支持 offset 分页（回执带 已返回/偏移/匹配总数/还有更多）。仅能操作当前 Profile 可见的账本（家庭账本或自己的个人账本）。幂等：add 传 request_id 后，同一人用同一个 request_id 重试不会重复记账，返回原记录并附「已存在: true」。CSV 导出对以 = + - @ 或制表符/回车开头的文本单元格做公式注入中和。month 与 from/to 互斥（同时传会报错）；from/to 只给一边就是半边区间（只给 from = [from, 将来)，只给 to = (过去, to]），两个 action 口径一致；默认区间只在 month/from/to **都不传**时生效（summary 默认「月初→今天」，list 不传时不限区间）。金额只支持支出，单位为元。各 action 只接受自己的参数：传其它 action 的字段（如 export 传 by/limit、add 传 ledger 简写）会明确报错，不静默忽略。",
+        "支出记账：add 记一笔（amount 元必填；ledger_id 可选，缺省按「默认账本 → 唯一可写账本」解析；可选 category/note/date/request_id；记账不发推送通知；未显式传 category 时回执附「常用分类」）；list 明细（可按 month/from/to/by 过滤）；summary 汇总（按分类与记账人；不传区间默认本自然月全月）；update 更正一笔（id + amount/category/note/date 至少一个，只改显式传入的字段）；delete 删除记错的一笔（id 从 list 获取）；export 导出 CSV（可选 ledger_id 与 month，默认当月；表头「日期,账本,分类,金额(元),备注,记账人」，UTF-8 BOM；单次上限 2000 行，超出时 已截断=true 并给出总行数）；set_default_ledger 设置/查看默认账本（传 ledger_id 设置，不传则返回当前默认账本）；categories 列出分类字典（标准名+别名+近 90 天笔数/金额，字典为空时即近 90 天实际用过的分类）；category_alias 维护别名（category + alias 添加，remove=true 删除；别名命中后 add/update 会自动归一成标准名，未知分类仍按自由文本保存）。list 支持 offset 分页（回执带 已返回/偏移/匹配总数/还有更多）。仅能操作当前 Profile 可见的账本（家庭账本或自己的个人账本）。幂等：add 传 request_id 后，同一人用同一个 request_id 重试不会重复记账，返回原记录并附「已存在: true」。CSV 导出对以 = + - @ 或制表符/回车开头的文本单元格做公式注入中和。month 与 from/to 互斥（同时传会报错）；from/to 只给一边就是半边区间（只给 from = [from, 将来)，只给 to = (过去, to]），两个 action 口径一致；默认区间只在 month/from/to **都不传**时生效（summary 默认「月初→今天」，list 不传时不限区间）。金额只支持支出，单位为元。各 action 只接受自己的参数：传其它 action 的字段（如 export 传 by/limit、add 传 ledger 简写）会明确报错，不静默忽略。",
       inputSchema: {
         action: expenseDispatch.actionEnum(),
         id: z.string().optional().describe("update/delete 时的账目 id（从 list 获取）"),
@@ -695,7 +696,7 @@ registerModule({
           .string()
           .optional()
           .describe(
-            "账本 id；list/summary/export 必填，add 可选（缺省走默认账本），set_default_ledger 时传它指定默认账本",
+            "账本 id；可选，缺省走默认账本（默认账本 → 唯一可写账本）；set_default_ledger 时传它指定默认账本",
           ),
         ledger: z.string().optional().describe("set_default_ledger 的简写参数，等价于 ledger_id"),
         request_id: z

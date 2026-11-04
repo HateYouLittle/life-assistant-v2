@@ -410,9 +410,9 @@ describe("MCP expense action=export", () => {
       assert.equal(stolen.isError, true);
       assert.match(text(stolen), /账本不存在/);
 
-      const missing = owner.expense({ action: "export" });
-      assert.equal(missing.isError, true);
-      assert.match(text(missing), /export 需要 ledger_id/);
+      // 不传 ledger_id：走默认账本（归属人只有这一个可写账本时直接用它）
+      const byDefault = JSON.parse(text(owner.expense({ action: "export" }))) as { 账本: string };
+      assert.equal(byDefault.账本, "私房钱");
 
       const badMonth = owner.expense({
         action: "export",

@@ -1,135 +1,110 @@
 ---
 name: life-assistant
-description: 个人生活助理：天气/空气质量/节假日调休/日程提醒（公历+农历）/完成回执/支出记账/通知管理
+description: 个人生活助理：天气/空气质量/节假日调休/日程提醒（公历+农历）/完成回执/支出记账/周期账/通知
 read_when:
   - 用户问天气、空气、预警、穿衣出行建议
   - 用户问节假日、调休、某天是否上班
   - 用户想设提醒、待办、生日、纪念日（含农历）
-  - 用户说某件事做完了/搞定了（巡检、打卡、报销等），要把对应待办标记完成
-  - 用户想记账、查支出、看月度账单
+  - 用户说某件事做完了/搞定了/打了/交了，或回一句「好了」
+  - 用户想记账、查支出、看这个月/这周花了多少
   - 用户提到通知、静默时段、推送设置
 ---
 
-# Life Assistant v2
+# Life Assistant
 
-单守护进程 MCP 服务。工具前缀为 `mcp_life_assistant_`（点号转下划线）：`weather`、`air_quality`、`holiday`、`schedule`、`ledger`、`expense`、`notify`。
+工具前缀 `mcp_life_assistant_`：`weather`、`air_quality`、`holiday`、`schedule`、`ledger`、`expense`、`bill`、`notify`。参数名统一用 `action`。
 
-## 会话开始
+## 通用规则
 
-每次会话先调用一次 `notify.pull`，把未读通知转告用户（主动推送失败的兜底）。没有未读则继续，不必提及。
+- 会话开始先调一次 `notify {action:"pull"}`，有未读就转告用户，没有就不提。
+- 定时提醒只走 `schedule`，不要用 LLM cron 或别的机制。
+- 工具报错时照实转述错误文案。错误文案本身就说明了该怎么改，不要编造工具没有的能力（油价、快递等都没有）。
+- 报时间一律用回执里带「(本地)」的键，不带的是 UTC。
+- 写操作重试时带同一个 `request_id`，服务端会回 `已存在: true`，不要再建一条。
+- 服务端会自动推送早报（07:00）、晚报（21:00）、到点提醒、气象预警和调休提醒。这些不用你手动查，也不要重复播报。
 
-## 工具选择
+## 天气
 
-| 意图 | 工具 |
+| 用户说 | 调用 |
 |---|---|
-| 实时天气 / 预报 / 预警 / 设置位置 / 出行模式 | `weather {action}`（`view` 为兼容别名） |
-| 空气质量（国标 AQI） | `air_quality` |
-| 下一假期 / 某月安排 / 某日是否上班 | `holiday {action}`（`view` 为兼容别名） |
-| 待办、生日、纪念日提醒（公历+农历） | `schedule {action}` |
-| 账本管理、月度预算 | `ledger {action}` |
-| 记一笔支出 / 明细 / 汇总 / 编辑 / 删除记错的一笔 / 导出 CSV | `expense {action}` |
-| 固定周期支出（话费/会员/物业费）的模板与「这期交了」 | `bill {action}` |
-| 拉通知 / 通知历史 / 重试失败投递 / 静默时段 / 推送路由 / 类型偏好 / 通道自测 | `notify {action}` |
+| 今天/现在天气怎么样 | `weather {action:"current"}` |
+| 这几天/周末天气 | `weather {action:"forecast"}`（`days` 只能 3 或 7） |
+| 有没有预警 | `weather {action:"alert"}` |
+| 空气怎么样 | `air_quality` |
+| 我住在上海 | `weather {action:"locate", city:"上海"}` |
+| 下周去成都出差 | `weather {action:"set", city:"成都", start, end}`；`show`/`clear` 查看或取消 |
 
-硬性边界：
+- `city` 可省略，服务端按「出行计划 > 已设位置 > 默认城市」解析。
+- 转述时带上回执里的「更新时间 / 数据获取时间」。配额用尽或没配 key 时如实说明，不要编数据。
 
-- 不要用 LLM cron 或其它机制伪造定时任务；所有确定性提醒走 `schedule`。
-- `holiday` 数据未覆盖的日期返回"未知"，绝不按星期猜测调休。
-- `holiday {view:"next"}` 输出带「进行中」布尔：假期期间为 `true` —— 别只看「开始/结束」日期就告诉用户"假期还没到"。
-- 不要虚构工具之外的能力（油价、共享账本角色、快递等 v1 能力已移除）。
-- 只操作当前 Profile 的日程与通知；账本分**家庭**（所有 Profile 共享）与**个人**（仅归属人可见可写）。
-- 写操作失败后重试：记账/日程都支持可选 `request_id`，重试时带同一个值（或原值），服务端会幂等返回首次结果（`已存在: true`）；不要靠「再建一条」来确认。
+## 节假日
 
-## 天气与位置
+- 「哪天放假 / 下个假期」→ `holiday {action:"next"}`。回执里 `进行中: true` 表示正在放假。
+- 「明天上不上班 / 哪天补班」→ `holiday {action:"is_workday", date}` 或 `{action:"month"}`。
+- 返回「未知」就说数据还没发布，**不要按星期猜**。
 
-- 用户首次问天气时：`weather {view: "locate", city}` 让用户确认城市；已设置则直接用。
-- `city` 参数可选；缺省用该 Profile 已设位置或服务端默认城市。
-- 数据源为 QWeather：配额用尽或键缺失时工具返回明确错误，如实转告，不要编造数据。
-- 简报（如用户问"今天穿什么"）：综合 current + air + 预报提示；**把 `天气` 表里的「更新时间 / 数据获取时间」行一并转述**（实时数据有 20 分钟缓存，不标注就等于隐瞒数据新鲜度；v1 上游不提供观测时刻，此时该行是「数据获取时间」）。
-- `weather {view: "forecast"}` 的 `days` 仅接受 3 或 7（默认 7），其它值会被服务端拒绝。
-- **出行模式**：`weather {view:"travel", action:"set", city, start, end}`（日期 `YYYY-MM-DD`，含首尾，窗口最长 366 天）—— 窗口内该 Profile 的天气/空气/预警、每日简报与预警巡检都会自动改用目的地城市，简报里会标注「出行模式」；`action:"show"` 查看当前计划（未设置时返回 `null`；数据损坏时会返回「出行计划数据损坏」说明并忽略），`action:"clear"` 清除。显式传 `city` 的查询仍优先于出行计划；`weather locate` 设置的始终是「家」的位置（出行生效期间调用会提示查询仍走目的地），窗口结束后自动恢复。
+## 日程与提醒
 
-## 日程
+**新建**：`schedule {action:"add", title, date, time}`。
 
-- 生日/纪念日默认按年循环（`schedule {action:"add"}` 省略 `recurrence` 时：`kind=todo` 为一次性，生日/纪念日为每年一次）；`calendar: "lunar"` 需给 `lunar_month/lunar_day`（1-12 / 1-30）。
-- `add` 的默认值：`time` 为 `09:00`、`all_day` 为 `false`（显式传了 `time` 就不会被当成全天；要全天请传 `all_day: true`）。
-- 农历日越界（如腊月三十缺失）默认取当月最后一天（`lunar_clamp` 默认 true）。**传 false 后遇到小月（如腊月三十）会整年跳过、不产生提醒** —— 如实告知用户，不要说成「每年都会提醒」。
-- **农历日程只支持按年循环**：`calendar: "lunar"` 时 `recurrence.freq` 必须是 `yearly` 且 `interval` 必须是 `1`（省略即 1）；不要拿 interval 表达「几年一次」——农历循环不按间隔跳年。实际口径分三种，别一概说成「填了会报错」：① 显式传 `recurrence: {interval: 2}`（`add` 或 `update`）会**直接报错**；② `update` 把公历日程转成农历（`calendar: "lunar"`）但**不传** `recurrence` 时**不报错**，继承来的 interval 按 1 落库（`import:v1` 导入农历 interval>1 的旧数据同样按 1 落库，并在导入报告里给一条 warning）；③ **旧数据**（回显带「interval=N 不生效」的农历行）仍可正常编辑——改标题/备注不会被拒，也不会被顺手改写成 1，要改正循环请显式传 `recurrence`。
-- **旧数据里的农历 + 非 yearly 频率**：`import:v1` 遇到 v1 农历行的 `frequency` 是 `daily`/`weekly`/`monthly` 时，因为农历引擎对任何 freq 都按农历年触发，会**改写成每年循环并给一条 warning**（文案含「无法在 v2 表达/已按每年循环导入」）——agent 读到这类 warning 必须转述给用户「原本的每日/每周/每月已变成每年」，不能只说「导入成功」。同一批里 `once`/`{}`/缺月日的农历行是**永不触发的死行**（导入报告含「不会产生任何提醒」），要么如实告知用户该日程不会提醒，要么用 `update` 显式传 `recurrence: {freq:"yearly", interval:1}` 与 `lunar_month`/`lunar_day` 把它补成能触发的日程。这些畸形行的 `update` 只改标题/备注**不会被拒**（与 ③ 同款宽容），但归一值不落库 —— 想改循环必须显式传 `recurrence`。
-- `remind_offsets` 负数为提前提醒（如 [-30] 提前 30 分钟），**最多 5 项**；新建时不传的默认值：待办 `[0]`，生日/纪念日 `[-10080,-1440,0]`（提前 7 天 + 前 1 天 + 当天），用户另有要求才显式传；老日程保持原配置不变。生日/纪念日提醒会自带「还有 N 天」，公历纪念日还会带「N 周年 · 第 N 天」，不用自己算；`resend_minutes` 是待办到点重发一次，取值 0-1440 分钟。
-- 截止型日程：给待办加 `escalation`（严格升序分钟偏移数组，**首元素固定为 0**＝截止时刻本身，如 `[0,60,360,1440]`，即截止/1h/6h/24h；仅 `kind=todo` 可设）—— 到达截止后按阶梯持续加压提醒，直到 `complete`；此时 `resend_minutes` 被忽略（`update` 传 `escalation: []` 可清除阶梯）。这类日程在列表/状态页显示为「截止」。
-- `workday_filter` 让日程只在法定工作日/节假日触发；节假日数据未覆盖时日程会暂停，如实告知用户。
-- 完成待办用 `complete`：循环日程**必须**带 `occurrence_key`（只完成当前一次——同一事件的各条提醒与派生行一并收敛）；裸调 `complete` 会被拒绝，要结束整个系列须显式传 `all: true` —— `all: true` 对**任意类型**（含生日/纪念日）都会把整个系列置为结束（`状态=done`），回执里会写明。一次性日程不传 key 即可。更新用 `update`；删除用 `delete`。列表/新增的「重复」栏会带限制（`（共 N 次）`/`（至 YYYY-MM-DD）`）；限次或截止型日程在次数用尽/到期且没有待发提醒后会自动收尾为 `done`（不再留在 active 列表里干等）。
-- 只想推迟或跳过某一次：`schedule {action:"snooze"}`（`minutes` 或 `until`，按 `occurrence_key` 顺延该次提醒）与 `schedule {action:"skip"}`（跳过该次；循环系列继续，一次性待办则跳过并结束该待办——回执的 `状态` 为 `done`、`已结束该待办` 为 `true`）。`schedule list` 每行附 `待办发生`（最多 5 条 occurrence_key + 本地时间），就是这两个 action 的取值来源。
-- `schedule {action:"add"}` 可带可选 `request_id`（1-128 字符）：重试时带同一个值，服务端返回首次创建的日程并标 `已存在: true`，不会建出第二条、也不会重复提醒。用户说「刚才好像没成功，再建一次」时先按这个方式重试。
-- **远期日程只保留「下一条」**：occurrence 只物化到未来 62 天；若某日程此刻一条待提醒都没有（远期生日、远期一次性待办），会额外保留 1 条越过该窗口的 occurrence。因此 `upcoming` 里远期日程只出现一条，这不是数据缺失，提醒也不会漏。
-- `schedule {action:"list"}` 默认只列 `status: "active"`、最多 20 条（`status`/`limit` 可调）；`upcoming` 查「接下来要发生的事」，**同一事件的多条提醒（多偏移/升级/到点重发派生行）只出现一条**（按事件去重，不是漏数据）。若某事件只剩派生行（`:resend`/`#esc:N`）待触发，它不会出现在 `upcoming`（这些 key 不支持 snooze/skip）；仍可从 `list` 的 `待办发生` 取 key 用 `complete` 收尾。
-- `list`/`upcoming` 里的 `下次提醒`、`提醒时间` 是 **UTC ISO**；同一对象另给 `下次提醒(本地)`/`提醒时间(本地)`（Asia/Shanghai，`YYYY-MM-DD HH:mm`）—— **向用户报时间一律用「(本地)」键**，直接读 UTC 值会差 8 小时。`list`/`upcoming`/`add`/`update` 的回执还带 `备注`、`工作日筛选`（不限/仅工作日/仅节假日）与 `重发分钟`，需要确认用户设置时直接读这些字段。
-- 历史 occurrence 超 90 天由服务端自动清理（只清**已提醒/已完成/已取消**的行；`pending` 永不删；使用 `recurrence.count` 的日程整条豁免，因为次数上限依赖历史行数）。用户问「很久以前的提醒怎么查不到」时按此解释。
+- 默认是一次性待办、09:00。
+- 循环用 `recurrence: {freq:"daily"|"weekly"|"monthly"|"yearly", interval}`。
+- 生日和纪念日用 `kind:"birthday"|"anniversary"`，默认每年一次，并会提前 7 天、前 1 天、当天各提醒一次。
+- `calendar:"lunar"` 时要给 `lunar_month`、`lunar_day`。
+- 农历日程只支持按年循环：显式传 `recurrence: {interval: 2}` 这类非 1 的间隔会直接报错；旧数据（回显带「interval=N 不生效」）仍可正常编辑。
+- 只在工作日或节假日提醒，加 `workday_filter:"workday"|"holiday"`。
 
-### 完成回执（用户口头报告已做完）
+**查看**：
 
-用户说「巡检搞定了」「下班卡打了」「交了」「XX 已经做完」这类话，是**完成回执**，不是闲聊也不是让我新建日程。服务端负责定位，**不要先 list 再自己挑 key**：
+- 「接下来有什么事」→ `{action:"upcoming"}`。
+- 「我设了哪些提醒」→ `{action:"list"}`。
+- 改用 `update`，删用 `delete`。
 
-- 话里有事项关键词 → `schedule {action:"complete", match:"巡检"}`；用户说的是别的日子（「昨天的巡检做了」）再加 `date:"YYYY-MM-DD"`，缺省今天。
-- 只说「交了 / 做完了 / 打了」、对话里也看不出指哪件事（主动推送不一定在对话上下文里）→ `schedule {action:"complete", recent:true}`：取**今天**已推送且未处理的提醒（昨天及更早的循环待办已自动作废）。不要反问用户「你指什么」，先调它。
-- 对话里刚好有 `[Webhook delivery: life-…]` 开头的提醒原文时，用那条的标题作 `match`。
+**循环待办的规则**（巡检、打卡这类）：
 
-按回执的 `结果` 回报：
-- `已完成` → 「已标记完成 <标题>（<事件时间>），下次 <下次提醒(本地)>」；一次性待办 `状态` 为 done 时说「这件事已结束」。
-- `多个候选` → 把 `候选` 的标题和事件时间列给用户选，选定后用该项的 `id` + `occurrence_key` 调 `complete`。
-- `已处理` → 说明这次之前已经标记过，不重复操作。
-- `未找到` → 如实说没找到对应日程，可以问要不要新建；绝不擅自 `add`。
-- 用户说「推迟半小时 / 晚点再提醒」→ 用候选或匹配到的 `id` 调 `snooze {minutes:30}`。
-- 循环待办过了当天没完成会自动作废（不算逾期、不进早报）；当天 20:00 还没完成会再推一条「晚间再提醒一次」，用户回「好了」照样走 `recent:true`。
+- 到点推送一次。当天 20:00 还没完成，会再推一条「晚间再提醒一次」。
+- 过了当天没完成的自动作废，不算逾期，也不会出现在第二天的早报里。
 
-`complete` 的 `match`/`recent` 与 `id`/`occurrence_key`/`all` 互斥；日常回执永远不要用 `all:true`（会结束整个系列）。
+## 完成回执（最常用）
+
+用户说「好了 / 打了 / 交了 / 搞定了 / 巡检做了」，是在回复刚才的提醒，不是让你新建日程。**不要先 list 再自己挑**：
+
+1. 话里有事项关键词 → `schedule {action:"complete", match:"巡检"}`；说的是别的日子，再加 `date`。
+2. 只说「好了」→ `schedule {action:"complete", recent:true}`，匹配**今天**已推送、还没处理的提醒。不要反问用户指哪件。
+3. 对话里有 `[Webhook delivery: life-…]` 开头的提醒原文时，用它的标题作 `match`。
+
+按回执的 `结果` 回复用户：
+
+- `已完成` → 「好的，<标题> 已完成」。一次性待办 `状态` 为 done 时，说这件事结束了。
+- `多个候选` → 列出标题和时间，让用户选。选定后用 `id` + `occurrence_key` 调 `complete`。
+- `已处理` → 之前已经标记过了。
+- `未找到` → 如实说没找到，可以问要不要新建，但不要擅自 `add`。
+
+「推迟半小时 / 晚点提醒」→ 用同一个 `id` 调 `snooze {minutes:30}`；「这次不做了」→ `skip`。
+日常回执**永远不要**用 `all:true`，它会结束整个系列。
 
 ## 记账
 
-- 只记支出，金额单位为元（`amount: 12.34`）。
-- 账本分**家庭**与**个人**：`ledger {action:"create"}` 缺省建家庭账本（所有 Profile 可见可记账；逐笔回执只发给记账人、预算提醒与月报仍推送给所有配置了路由的 Profile）；`personal: true` 建个人账本（仅归属人可见可写，**不回执、不推预算提醒**，月报只发给归属人）。个人账本可 `ledger {action:"transfer", id, profile}` 转给其他 Profile 归属（目标 Profile 须已存在），省略 `profile` 转回家庭（**不可逆**）；**家庭账本不能转为个人账本**。非归属人访问个人账本一律得到「账本不存在」。账本名**分范围唯一**（家庭账本之间、以及每个人自己的个人账本内）；转移归属时若目标范围已有同名活跃账本会被拒绝。
-- 记账前先 `ledger {action: "list"}` 取得账本 id（**只列当前 Profile 可见的账本**：家庭账本 + 自己的个人账本；**创建账本 `ledger {action:"create"}` 必须给 `name`**）；`expense` 的 `list`/`summary`/`export` 必须传 `ledger_id`，`add` 可以不传：按「该 Profile 的默认账本（`expense {action:"set_default_ledger", ledger_id}` 设置，不带参数则查询）→ 唯一可写活动账本」解析，仍不唯一会报错并列出候选。只有一个账本或已设默认时，用户说「记一笔」就直接记，不必再问。
-- `add` 未显式传 `category` 时，回执附该账本近 90 天 top5「常用分类」；可以把候选顺带提给用户（「还是餐饮？」），但不要凭空替用户填分类。
-- `add` 可带可选 `request_id`（1-128 字符）：重试带同一个值不会重复记账——返回首次记录并标 `已存在: true`，回执与预算提醒都只发一次。
-- `ledger.list` 默认不含归档账本；核账时传 `include_archived: true`。
-- 汇总用 `expense {action: "summary"}`，可按 `month`、`from/to`、`by`（记账人）过滤。`month`（自然月整月，含该月内已录入但尚未到来的日期）与 `from`/`to` **互斥**，同时传会报错；`from > to` 也报错。`from`/`to` **只给一边就是半边区间**（只给 `from` = `[from, 将来)` 不限上界；只给 `to` = `(过去, to]` 不限下界），与 `list` 完全一致 —— 别为了「凑一个区间」自己补另一端。只有 `month`/`from`/`to` **都不传**时才套默认区间：`summary` 是「月初 → 今天」（不含月内未来日），`list` 是不限区间。
-- **「本月」有两个口径，别混**：状态页看板、预算对照、月报里的「本月」是**自然月全月**（含月内未来日 —— `spent_on` 是已录入事实，不因日历没到那天就从数字里消失）；只有 `expense summary` 不传区间时的默认值是「本月至今」。向用户报「本月花了多少」以看板/月报为准。
-- 预算：`ledger {action: "budget", ledger_id}` 查看该账本全部预算与本月对照；带 `amount`（元）设置/覆盖，带 `category` 为分类预算（不传为账本总额），`clear: true` 删除该范围。预算按账本每月滚动，支出**跨越** 80%/100% 时自动提醒（同一预算一笔只推跨过的最高阈值那一条，跨月重新判定，同月同阈值不重推）；提醒标题带该笔支出**所属月份**（补记历史支出报的是那个月，不是本月）。设了预算的账本月报会附预算对照行。**个人账本不推预算提醒**。
-- **编辑**：`expense {action: "update", id, ...}` 可改金额/分类/备注/日期（至少传一个，id 从 `list` 取）。**编辑不触发回执、不推预算提醒**，记账人与创建时间保持不变；不支持把账目挪到另一个账本（要换账本只能删除重记）。用户说「改一下备注/金额」时用 `update`，不要用删除重记。
-- **删除**：`expense {action: "delete", id}` 不可恢复，重记后「记账人」会变成当前 Profile——动手前把这两点告知用户。
-- **导出**：`expense {action: "export", ledger_id, month?}` 返回 CSV 文本（**只按月导出**，传 `from`/`to` 会明确报错；默认当月，行数上限 2000，超出时带 `已截断`），家庭账本也可在状态页「导出 CSV」下载。个人账本只能通过这个 MCP action 导出（看板不展示个人账本）。CSV 是给用户保存/用 Excel 打开的，不要把整段内容粘进聊天；只转述文件名、行数与区间。
-- 账本改名用 `ledger {action: "rename", id, name}`；归档/恢复用 `action: "archive"`（`unarchive: true` 恢复）；转移个人账本归属用 `action: "transfer"`（见上）。**没有删除账本的接口**——要彻底删除只能直连服务端数据库操作。
-- `expense {action: "list"}` 不传 `month`/`from`/`to` 时不限区间（只受 `limit` 限制），且默认只返回 20 条：返回里 `已返回` 与 `匹配总数` 是两个数，别把窗口当全量。
-- 每月 1 号 09:00 自动推送上月月报（分类表格 + 「较上月同期」「较近 3 月均值」两行对比，同期 = 各月 1 号到同一天），不要手动复算。
+- 「记一笔 / 午饭 35」→ `expense {action:"add", amount:35, category:"餐饮"}`。
+  - `ledger_id` 可省略：有默认账本或只有一个账本时直接记。报错列出候选时，问用户记哪本，或用 `expense {action:"set_default_ledger", ledger_id}` 设默认。
+  - 没说分类时，可以拿回执里的「常用分类」问一句，但不要替用户填。
+- 「这个月花了多少」→ `expense {action:"summary"}`，默认整个自然月。「上个月」传 `month:"YYYY-MM"`，「这周」传 `from`/`to`。
+- 「看看明细」→ `expense {action:"list"}`。默认 20 条，`匹配总数` 才是全量。
+- 「记错了，改成 40」→ `update {id, amount:40}`；「删掉那笔」→ `delete {id}`。删除不可恢复，动手前告诉用户。
+- 「导出」→ `export {month}`。CSV 不要贴进聊天，只说文件名和行数。
+- 账本分家庭（共享）和个人（`ledger {action:"create", name, personal:true}`）。
+- 预算：`ledger {action:"budget", amount}` 设置，不传 `amount` 是查看。预算只做对照，不会推送提醒。
 
-## 周期账（固定支出）
+## 周期账（话费、会员、物业费）
 
-- 用户说「每个月要交话费 50」「视频会员每月自动扣 25，提醒我」这类**固定周期支出** → `bill {action:"add", name:"话费", amount:50, category:"通讯", ledger_id, date:"<下次到期日>"}`（`freq` 默认 `monthly`，可 `weekly`/`yearly`）。日期同时是「日号锚点」：31 日的模板在 30 天月份按当月最后一天到期。
-- 到期由服务端推「该交话费了 ¥50（通讯）」，正文带「交了」提示——**不要自己另建 cron 或重复建日程**，模板已经挂了 schedule 物化。
-- 用户回「交了 / 交过了」：
-  - 知道是哪笔 → `bill {action:"pay", id}`；不知道 → `bill {action:"pay", match:"话费"}`（按名称匹配，唯一才执行）。
-  - 只调这一个：`pay` 会同时完成当期提醒并按模板金额/分类/账本入账。同一期重复调用只入一笔，回「已处理」就如实说之前记过。
-  - 用户之前已经用 `schedule complete` 完成过这期提醒时，**支出已经自动入账了**（完成钩子会按模板金额/分类/账本补记这一期）。不确定就再调一次 `bill {action:"pay", id}`：同一期已入账时它幂等回「已处理」，不会重复记；也可以 `expense {action:"list", ledger_id}` 看那一期有没有那笔。
-- 停用/恢复：`bill {action:"pause", id}` / `{action:"resume", id}`。停用后不再提醒，**历史入账不动**；不要说成「删除了模板」。改金额/分类用 `update`，改完从下一期生效。
-- 一个模板只能归属一个账本；个人账本的模板只有归属人可见。用户想记到个人账本时，`ledger_id` 要传自己的个人账本 id。
+- 「每月交话费 50，提醒我」→ `bill {action:"add", name:"话费", amount:50, category:"通讯", date:"<下次到期日>"}`。不要另建日程。
+- 到期会推「该交话费了」。用户回「交了」→ `bill {action:"pay", match:"话费"}`，这一步同时完成提醒并入账；同一期重复调用只记一笔。
+- 停用和恢复用 `pause`/`resume`，历史入账不受影响。
 
 ## 通知
 
-- 分类字典：`expense {action:"categories"}` 看标准分类/别名/近 90 天用量；`expense {action:"category_alias", category:"餐饮", alias:"吃饭"}` 建别名（`remove:true` 删除）。建好后 `expense add` 写「吃饭」会自动记成「餐饮」，历史数据不改。
-- 明细翻页：`expense {action:"list", ledger_id, limit: 50, offset: 50}`，回执里有「偏移」「还有更多」；看板明细有「加载更多」按钮。
-- 静默时段：`notify {action:"quiet_hours"}` 查看；`start:"23:00", end:"07:00"`（HH:MM，可跨午夜，二者必须同时给）设置；`clear:true` 清除。
-- 撤回一条还没发出的推送：`notify {action:"cancel", id}`（id 来自 `pull`/`history`）。回执会如实说明是真取消了、已经发出（撤不回）、还是根本没有投递；已在发送中的那次拦不住。
-- 静默时段内主动推送暂停，`notify.pull` 不受影响——用户说"没收到通知"时先 pull（`pull` 默认 20 条、上限 100；一次拉不完就再拉一次）。
-- 推送路由配置：`notify {action: "route", url: "...", channel: "webhook"}`；secret 由环境变量提供，工具配置失败时检查服务端 env。`channel` 缺省 `webhook`，可选 `log`（只写服务端日志，本地联调）、`bark`（`https://api.day.app/<device_key>`，iOS）、`ntfy`（`https://ntfy.sh/<topic>` 或自建，Android/跨平台）、`telegram`（`https://api.telegram.org/bot<token>/sendMessage?chat_id=<id>`）、`smtp`（`smtp://user:pass@host:587?from=&to=`，`to` 可重复；465/`smtps` 隐式 TLS、587 STARTTLS、25 明文，`?tls=` 可覆盖；SMTP 密码会随路由回显，别放进共享聊天）、`openclaw`（回环 OpenClaw Gateway hook：映射式如 `http://127.0.0.1:18789/hooks/life-default`；微信/QQ 这类多账号通道用直连式 `http://127.0.0.1:18789/hooks/agent?channel=qqbot&to=qqbot%3Ac2c%3A<openid>&agentId=bestie&accountId=bestie`——路径恰好是 `/hooks/agent` 且带 `channel`/`to` 时改发直连载荷，可带 `agentId`/`accountId`，映射式不带 `accountId`；服务端登记 `OPENCLAW_PROFILE_TARGETS_JSON` 后可直接 `notify {action:"route", channel:"openclaw"}` 不传 url，但传了必须与登记目标一致；共享 Gateway 只有一个 `hooks.token`，不要再给 openclaw 配 per-profile secret（`PROFILE_ROUTE_SECRETS_JSON` 只用于每个用户自己的 Gateway）；`OPENCLAW_WAIT_FOR_COMPLETION=1` 时只有 `delivered=true` 才算送达，NO_REPLY/静默抑制会落 fallback；401=token 与 Gateway 不一致，400 `message required`=直连缺 channel/to，409 会自动重试）—— `bark`/`ntfy`/`telegram`/`smtp` 的 URL 本身就是凭据，提醒用户别用可猜的 topic、别把密码贴进群聊。
-- 按类型静音/限通道：`notify {action: "prefs"}` 看当前偏好与内置默认，`notify {action: "prefs", kind: "bookkeeping.entry", push: true}` 恢复逐笔记账回执，`channels: ["ntfy"]` 限定通道。关闭推送的通知仍会入库，`notify.pull` 照样取得到。
-- 验证通道：`notify {action: "test"}` 发一条测试通知，返回是否真的建了投递、走的哪个通道；没有路由时会说明「仅入库，可 pull」。
-- 没收到通知/想查历史：`notify {action: "history", limit: 20}`（`kind` 过滤、`unread:true` 只看未读、`offset` 翻页；**不会把消息标已读**，与 `pull` 区分）。`notify {action: "retry"}` 可把失败/回退的投递重新入队（`notification_id`/`delivery_id` 指定，或 `all:true` 批量，上限 200），确定性拒绝（4xx）要先修好路由/参数再重试。
-- **这些是服务端自动推的，不用手动查**：每日 07:00 天气简报（含**今日日程**、14 天内的生日/纪念日与下个假期倒计时；日程模块异常时只跳过该块；节假日数据未就绪时显示「未知」而不是猜）、21:00 晚报（明日天气/明日日程/明天补班或放假，`EVENING_BRIEF_CRON` 可配）、气象预警巡检（每 20 分钟，同预警同级别只推一次、**级别升级会再推**、降级不重推；静默时段内失效的预警不再补投，`notify.pull` 里还能看到）、调休/补班提醒（**当天补班只由这条独立通知承载，早报不再重复**；假期首日前 N 天放假安排——N 由服务端 `WORKDAY_REMIND_DAYS_BEFORE` 配置、默认 3；假期最后一天恢复上班）、每月 1 号 09:00 月报、**每晚 21:30 每日记账摘要**（当天笔数/合计/分类 top5，只发给记账的人；逐笔回执默认不再单独推送）、**每周日 20:00 周报**（本周支出/分类 top5/最大单笔/环比上周/预算剩余，`WEEKLY_REPORT_CRON` 可配）。状态页有预算看板（进度条 + 可执行建议），用户问「这个月还能花多少」可以先看 `/api/budget` 或用 `expense {action:"budget"}` 查。
-- 服务端停机/升级错过触发时刻时，启动会对白名单内的任务补发一次（含周报；只补最近一次、有窗口限制），所以可能看到「补发的早报/晚报」。`doctor --live` 与状态页「定时任务」卡片能查最近运行与失败——不要凭猜测说「任务没跑」。
-- **备份也是服务端自动行为**：daemon 每日 03:00（`BACKUP_CRON`）在 `$DATA_DIR/backups` 生成快照并保留最近 14 份（`BACKUP_KEEP`），产物会自校验，停机错过的当天备份会在启动时补跑。没有对应的 MCP 工具：用户要求「帮我备份/恢复」时如实说明这是定时任务与运维 CLI（`npm run db:backup` / `npm run db:restore`），不要声称已经手动执行。
-- 用户问"今天/明天要不要上班""哪天补班"时，用 `holiday {view: "is_workday", date}` 或 `view: "month"` 查准，**不要凭星期猜**。
-
-## 输出格式
-
-通知正文是 Markdown 表格。向用户转述时保持结构化（表格或键值对），不要把多行数据挤成一段文字。
+- 「没收到提醒」→ 先 `notify {action:"pull"}`，再 `notify {action:"history"}` 查投递状态，失败的用 `retry`。
+- 「晚上别打扰」→ `notify {action:"quiet_hours", start:"23:00", end:"07:00"}`；`clear:true` 取消。
+- 「不想收某类推送」→ `notify {action:"prefs", kind:"weather.alert", push:false}`。关掉后通知仍入库，pull 能取到。
+- 「测一下推送」→ `notify {action:"test"}`。
+- 备份和恢复是服务端定时任务加运维 CLI（`npm run db:backup` / `db:restore`），没有对应工具，不要说你已经执行了。

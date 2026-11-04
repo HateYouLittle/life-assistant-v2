@@ -157,8 +157,7 @@ describe("bookkeeping：支出", () => {
   });
 
   it("summary 不传 month/from/to 时默认「月初 → 今天」，且不含月内未来日", () => {
-    // 与状态页/预算对照的「本月=自然月全月」不同：工具 summary 无参时是「本月至今」的
-    // 查询默认（to = 今天），刻意不把已录入的月内未来日算进来。
+    // 与状态页/预算对照同一口径：summary 无参时是「本自然月全月」，月内已录入的未来日也算。
     const env = makeTestEnv();
     const t = tools(env);
     try {
@@ -179,9 +178,9 @@ describe("bookkeeping：支出", () => {
         合计: string;
         笔数: number;
       };
-      assert.deepEqual(body.区间, { from: `${today.slice(0, 7)}-01`, to: today });
+      assert.deepEqual(body.区间, monthRange(today.slice(0, 7)));
       assert.equal(body.合计, "¥10.00");
-      assert.equal(body.笔数, 1, "月内未到来的日期不在默认区间内");
+      assert.equal(body.笔数, 1, "别的月份不在默认区间内");
     } finally {
       cleanupTestEnv(env);
     }
@@ -315,9 +314,9 @@ describe("bookkeeping：支出", () => {
       assert.equal(sumFuture.笔数, 0);
       assert.equal(countOf({ from: far }), sumFuture.笔数, "未来区间两个 action 结论也必须一致");
 
-      // 仍然不传：默认区间（月初→今天）整体套用，不退化成逐边兜底
+      // 仍然不传：默认区间（本自然月全月）整体套用，不退化成逐边兜底
       const sumDefault = summaryOf({});
-      assert.deepEqual(sumDefault.区间, { from: `${todayIso().slice(0, 7)}-01`, to: todayIso() });
+      assert.deepEqual(sumDefault.区间, monthRange(todayIso().slice(0, 7)));
     } finally {
       cleanupTestEnv(env);
     }
