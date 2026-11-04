@@ -21,8 +21,18 @@ import { pruneJobRuns } from "../../core/jobs.js";
 import { logger } from "../../core/logger.js";
 import {
   cancelPendingDeliveries,
+  deliveriesForNotifications,
+  deliveryCountsOf,
+  deliveryOwnedBy,
   drainSoon,
+  findProfileNotification,
   getPushRoute,
+  latestDeliveryOf,
+  listUnreadNotifications,
+  markNotificationRead,
+  markNotificationsRead,
+  notificationHistoryPage,
+  notificationOwnedBy,
   publishProfile,
   retryDeliveries,
   routeSecret,
@@ -131,26 +141,18 @@ function pullAction(args: Record<string, unknown>, ctx: ToolContext): ToolResult
   const db = ctx.db;
   const profileId = ctx.profileId;
   const limit = Math.min((args.limit as number) ?? 20, 100);
-  const rows = db
-    .prepare(
-      "SELECT id, kind, title, body_md, created_at FROM notifications WHERE profile_id = ? AND read = 0 ORDER BY created_at DESC LIMIT ?",
-    )
-    .all(profileId, limit) as {
-    id: string;
-    kind: string;
-    title: string;
-    body_md: string;
-    created_at: string;
-  }[];
+  const rows = listUnreadNotifications(db, profileId, limit);
   if (rows.length === 0) return ok("没有未读通知");
   cancelPendingDeliveries(
     db,
     profileId,
     rows.map((r) => r.id),
   );
-  db.prepare(
-    `UPDATE notifications SET read = 1 WHERE profile_id = ? AND read = 0 AND id IN (${rows.map(() => "?").join(",")})`,
-  ).run(profileId, ...rows.map((r) => r.id));
+  markNotificationsRead(
+    db,
+    profileId,
+    rows.map((r) => r.id),
+  );
   return okJson({
     未读通知: rows.map((r) => ({
       // id 是 cancel 的输入；pull 不回传它会让 notify.cancel 无法从工具输出获得 id。
@@ -424,11 +426,7 @@ function testAction(_args: Record<string, unknown>, ctx: ToolContext): ToolResul
     blocks,
     dedupeKey,
   });
-  const delivery = db
-    .prepare(
-      "SELECT route_name, status FROM deliveries WHERE notification_id = ? ORDER BY created_at DESC LIMIT 1",
-    )
-    .get(result.id) as { route_name: string; status: string } | undefined;
+  const delivery = latestDeliveryOf(db, result.id);
   const route = getPushRoute(db, profileId);
   const channel = route === null ? null : (findChannel(route.channel)?.name ?? null);
   return okJson({
@@ -464,32 +462,13 @@ function historyAction(args: Record<string, unknown>, ctx: ToolContext): ToolRes
   if (unreadRaw !== undefined && typeof unreadRaw !== "boolean") {
     return fail("unread 需要布尔值 true/false");
   }
-  const conditions = ["profile_id = ?"];
-  const params: (string | number)[] = [profileId];
-  if (kindRaw !== undefined) {
-    conditions.push("kind = ?");
-    params.push((kindRaw as string).trim());
-  }
-  if (unreadRaw === true) conditions.push("read = 0");
-  const where = conditions.join(" AND ");
-
-  const total = (
-    db.prepare(`SELECT COUNT(*) AS n FROM notifications WHERE ${where}`).get(...params) as {
-      n: number;
-    }
-  ).n;
-  const rows = db
-    .prepare(
-      `SELECT id, kind, title, created_at, read FROM notifications WHERE ${where}
-       ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
-    )
-    .all(...params, limit, offset) as {
-    id: string;
-    kind: string;
-    title: string;
-    created_at: string;
-    read: number;
-  }[];
+  const { total, rows } = notificationHistoryPage(db, {
+    profileId,
+    kind: kindRaw === undefined ? undefined : (kindRaw as string).trim(),
+    unreadOnly: unreadRaw === true,
+    limit,
+    offset,
+  });
 
   // 每条通知最近一条投递；同一通知有多条（换过路由/多通道路由历史）时取最新并标注，
   // 免得用户以为「只有这一条」而漏看另一条通道的失败。
@@ -501,19 +480,10 @@ function historyAction(args: Record<string, unknown>, ctx: ToolContext): ToolRes
   }
   const deliveryOf = new Map<string, DeliveryInfo>();
   if (rows.length > 0) {
-    const placeholders = rows.map(() => "?").join(",");
-    const deliveries = db
-      .prepare(
-        `SELECT notification_id, status, attempts, last_error FROM deliveries
-         WHERE notification_id IN (${placeholders})
-         ORDER BY notification_id, created_at DESC, id DESC`,
-      )
-      .all(...rows.map((r) => r.id)) as {
-      notification_id: string;
-      status: string;
-      attempts: number;
-      last_error: string | null;
-    }[];
+    const deliveries = deliveriesForNotifications(
+      db,
+      rows.map((r) => r.id),
+    );
     for (const delivery of deliveries) {
       const existing = deliveryOf.get(delivery.notification_id);
       if (existing === undefined) {
@@ -581,19 +551,12 @@ function retryAction(args: Record<string, unknown>, ctx: ToolContext): ToolResul
 
   // 归属预检：id 不存在或不属于当前 Profile 时明确报错（而不是回一句「重试 0 条」让人猜）
   if (deliveryId !== undefined) {
-    const found = db
-      .prepare(
-        `SELECT 1 AS ok FROM deliveries d JOIN notifications n ON n.id = d.notification_id
-         WHERE d.id = ? AND n.profile_id = ?`,
-      )
-      .get(deliveryId, profileId);
-    if (found === undefined) return fail(`投递不存在或不属于当前 Profile: ${deliveryId}`);
+    if (!deliveryOwnedBy(db, deliveryId, profileId))
+      return fail(`投递不存在或不属于当前 Profile: ${deliveryId}`);
   }
   if (notificationId !== undefined) {
-    const found = db
-      .prepare("SELECT 1 AS ok FROM notifications WHERE id = ? AND profile_id = ?")
-      .get(notificationId, profileId);
-    if (found === undefined) return fail(`通知不存在或不属于当前 Profile: ${notificationId}`);
+    if (!notificationOwnedBy(db, notificationId, profileId))
+      return fail(`通知不存在或不属于当前 Profile: ${notificationId}`);
   }
 
   const result = retryDeliveries(db, { profileId, notificationId, deliveryId, all });
@@ -611,22 +574,14 @@ function cancelAction(args: Record<string, unknown>, ctx: ToolContext): ToolResu
   const profileId = ctx.profileId;
   const id = args.id as string | undefined;
   if (id === undefined) return fail("cancel 需要 id（可从 pull 结果获取）");
-  const row = db
-    .prepare("SELECT id, title FROM notifications WHERE id = ? AND profile_id = ?")
-    .get(id, profileId) as { id: string; title: string } | undefined;
+  const row = findProfileNotification(db, id, profileId);
   if (row === undefined) return fail(`通知不存在: ${id}`);
   const { cancelled, sending } = cancelPendingDeliveries(db, profileId, [id]);
-  db.prepare("UPDATE notifications SET read = 1 WHERE id = ?").run(id);
+  markNotificationRead(db, id);
   // P2-26：旧回执对「已发出 / 没有投递 / 拦不住的在途行 / 重复 cancel」一律回
   // 「已取消…待投递」，agent 会照抄成「已取消推送」，而用户可能已经收到。这里按实际
   // 条数分档回执：取消了 n 条、有没有发出过、有没有拦不住的 sending。
-  const counts = db
-    .prepare(
-      `SELECT COUNT(*) AS total,
-              SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) AS sent
-       FROM deliveries WHERE notification_id = ?`,
-    )
-    .get(id) as { total: number; sent: number | null };
+  const counts = deliveryCountsOf(db, id);
   const sent = counts.sent ?? 0;
   const detail =
     cancelled > 0

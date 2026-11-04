@@ -1051,3 +1051,167 @@ export function deliveryDetailRows(
     },
   };
 }
+
+/** 取某 Profile 最新的未读通知（pull 用），按创建时间倒序 */
+export function listUnreadNotifications(
+  db: DatabaseSync,
+  profileId: string,
+  limit: number,
+): { id: string; kind: string; title: string; body_md: string; created_at: string }[] {
+  return db
+    .prepare(
+      "SELECT id, kind, title, body_md, created_at FROM notifications WHERE profile_id = ? AND read = 0 ORDER BY created_at DESC LIMIT ?",
+    )
+    .all(profileId, limit) as {
+    id: string;
+    kind: string;
+    title: string;
+    body_md: string;
+    created_at: string;
+  }[];
+}
+
+/** 把指定 Profile 下的一批未读通知标记为已读；ids 为空时直接返回 */
+export function markNotificationsRead(db: DatabaseSync, profileId: string, ids: string[]): void {
+  if (ids.length === 0) return;
+  db.prepare(
+    `UPDATE notifications SET read = 1 WHERE profile_id = ? AND read = 0 AND id IN (${ids.map(() => "?").join(",")})`,
+  ).run(profileId, ...ids);
+}
+
+/** 某通知最新的一条投递（路由名与状态）；没有投递返回 undefined */
+export function latestDeliveryOf(
+  db: DatabaseSync,
+  notificationId: string,
+): { route_name: string; status: string } | undefined {
+  return db
+    .prepare(
+      "SELECT route_name, status FROM deliveries WHERE notification_id = ? ORDER BY created_at DESC LIMIT 1",
+    )
+    .get(notificationId) as { route_name: string; status: string } | undefined;
+}
+
+export interface NotificationHistoryQuery {
+  profileId: string;
+  kind?: string;
+  unreadOnly: boolean;
+  limit: number;
+  offset: number;
+}
+
+export type NotificationHistoryRow = {
+  id: string;
+  kind: string;
+  title: string;
+  created_at: string;
+  read: number;
+};
+
+/** 通知历史分页：只读查询，不改 read/status。WHERE 只拼常量片段，值全部走参数绑定 */
+export function notificationHistoryPage(
+  db: DatabaseSync,
+  q: NotificationHistoryQuery,
+): { total: number; rows: NotificationHistoryRow[] } {
+  const conditions = ["profile_id = ?"];
+  const params: (string | number)[] = [q.profileId];
+  if (q.kind !== undefined) {
+    conditions.push("kind = ?");
+    params.push(q.kind);
+  }
+  if (q.unreadOnly) conditions.push("read = 0");
+  const where = conditions.join(" AND ");
+
+  const total = (
+    db.prepare(`SELECT COUNT(*) AS n FROM notifications WHERE ${where}`).get(...params) as {
+      n: number;
+    }
+  ).n;
+  const rows = db
+    .prepare(
+      `SELECT id, kind, title, created_at, read FROM notifications WHERE ${where}
+       ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
+    )
+    .all(...params, q.limit, q.offset) as NotificationHistoryRow[];
+  return { total, rows };
+}
+
+/** 一批通知的全部投递（按通知、创建时间倒序、id 倒序），ids 为空返回 [] */
+export function deliveriesForNotifications(
+  db: DatabaseSync,
+  ids: string[],
+): {
+  notification_id: string;
+  status: string;
+  attempts: number;
+  last_error: string | null;
+}[] {
+  if (ids.length === 0) return [];
+  const placeholders = ids.map(() => "?").join(",");
+  return db
+    .prepare(
+      `SELECT notification_id, status, attempts, last_error FROM deliveries
+         WHERE notification_id IN (${placeholders})
+         ORDER BY notification_id, created_at DESC, id DESC`,
+    )
+    .all(...ids) as {
+    notification_id: string;
+    status: string;
+    attempts: number;
+    last_error: string | null;
+  }[];
+}
+
+/** 投递是否存在且其通知属于该 Profile（retry 归属预检） */
+export function deliveryOwnedBy(db: DatabaseSync, deliveryId: string, profileId: string): boolean {
+  return (
+    db
+      .prepare(
+        `SELECT 1 AS ok FROM deliveries d JOIN notifications n ON n.id = d.notification_id
+         WHERE d.id = ? AND n.profile_id = ?`,
+      )
+      .get(deliveryId, profileId) !== undefined
+  );
+}
+
+/** 通知是否存在且属于该 Profile（retry 归属预检） */
+export function notificationOwnedBy(
+  db: DatabaseSync,
+  notificationId: string,
+  profileId: string,
+): boolean {
+  return (
+    db
+      .prepare("SELECT 1 AS ok FROM notifications WHERE id = ? AND profile_id = ?")
+      .get(notificationId, profileId) !== undefined
+  );
+}
+
+/** 按 id 取属于该 Profile 的通知（id + 标题）；不存在或不属于返回 undefined */
+export function findProfileNotification(
+  db: DatabaseSync,
+  id: string,
+  profileId: string,
+): { id: string; title: string } | undefined {
+  return db
+    .prepare("SELECT id, title FROM notifications WHERE id = ? AND profile_id = ?")
+    .get(id, profileId) as { id: string; title: string } | undefined;
+}
+
+/** 把单条通知标记为已读 */
+export function markNotificationRead(db: DatabaseSync, id: string): void {
+  db.prepare("UPDATE notifications SET read = 1 WHERE id = ?").run(id);
+}
+
+/** 某通知的投递总数与已发出（sent）条数；无投递时 sent 为 null */
+export function deliveryCountsOf(
+  db: DatabaseSync,
+  notificationId: string,
+): { total: number; sent: number | null } {
+  return db
+    .prepare(
+      `SELECT COUNT(*) AS total,
+              SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) AS sent
+       FROM deliveries WHERE notification_id = ?`,
+    )
+    .get(notificationId) as { total: number; sent: number | null };
+}
