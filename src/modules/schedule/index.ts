@@ -2,6 +2,7 @@ import { z } from "zod";
 import { DateTime } from "luxon";
 import type { DatabaseSync } from "node:sqlite";
 import { DATE_RE, TIME_RE, TZ, instantToLocalDate } from "../../time.js";
+import { defineActionTool } from "../../core/action-tool.js";
 import { describeRecurrence, lunarMonthDayProblem } from "../../core/recurrence.js";
 import type { Recurrence } from "../../core/recurrence.js";
 import {
@@ -12,6 +13,7 @@ import {
   runtime,
   errorMessage,
   type ToolContext,
+  type ToolResult,
 } from "../../core/registry.js";
 import { logger } from "../../core/logger.js";
 import {
@@ -277,195 +279,237 @@ function workdayFilterLabel(value: ScheduleRow["workday_filter"]): string {
   return "不限";
 }
 
-export function scheduleTool(args: Record<string, unknown>, ctx: ToolContext) {
-  try {
-    return scheduleToolInner(args, ctx);
-  } catch (e) {
-    return fail(errorMessage(e));
-  }
+function scheduleAdd(args: Record<string, unknown>, ctx: ToolContext): ToolResult {
+  const db = ctx.db;
+  if (args.title === undefined) return fail("add 需要 title");
+  const patch = buildPartial(args, "add");
+  const kind = patch.kind ?? "todo";
+  const input: ScheduleInput = {
+    title: patch.title as string,
+    note: patch.note ?? null,
+    kind,
+    calendar: patch.calendar ?? "solar",
+    startDate: patch.startDate ?? null,
+    lunarMonth: patch.lunarMonth ?? null,
+    lunarDay: patch.lunarDay ?? null,
+    leapPolicy: patch.leapPolicy ?? "follow",
+    lunarClamp: patch.lunarClamp ?? true,
+    time: patch.time ?? "09:00",
+    // 未显式指定时按"有具体时刻"处理（对齐 v1 的 allDay 可空语义）；
+    // 否则即使传了 time，也会被展示成"全天"。
+    allDay: patch.allDay ?? false,
+    recurrence: patch.recurrence ?? (kind === "todo" ? null : { freq: "yearly", interval: 1 }),
+    // 未显式给 remind_offsets 时按 kind 取默认：生日/纪念日「提前 7 天 + 前 1 天 + 当天」，
+    // 待办到点提醒。只影响新建；存量日程的 remind_offsets_json 不回写。
+    remindOffsets: patch.remindOffsets ?? defaultRemindOffsets(kind),
+    resendMinutes: patch.resendMinutes ?? 0,
+    escalation: patch.escalation ?? null,
+    workdayFilter: patch.workdayFilter ?? "any",
+  };
+  // request_id 是 add 的幂等键（写 schedules.client_token）：MCP 超时重试带同一个值
+  // 会返回首次创建的**原日程**，不重建 occurrence、不重复发提醒。
+  const requestId =
+    args.request_id === undefined || args.request_id === null ? null : String(args.request_id);
+  const { row, existed } = createScheduleIdempotent(db, ctx.profileId, input, requestId);
+  return okJson({ 已创建: rowToPublic(row), ...(existed ? { 已存在: true } : {}) });
 }
 
-function scheduleToolInner(args: Record<string, unknown>, ctx: ToolContext) {
-  const action = args.action as string;
+function scheduleList(args: Record<string, unknown>, ctx: ToolContext): ToolResult {
   const db = ctx.db;
-  switch (action) {
-    case "add": {
-      if (args.title === undefined) return fail("add 需要 title");
-      const patch = buildPartial(args, "add");
-      const kind = patch.kind ?? "todo";
-      const input: ScheduleInput = {
-        title: patch.title as string,
-        note: patch.note ?? null,
-        kind,
-        calendar: patch.calendar ?? "solar",
-        startDate: patch.startDate ?? null,
-        lunarMonth: patch.lunarMonth ?? null,
-        lunarDay: patch.lunarDay ?? null,
-        leapPolicy: patch.leapPolicy ?? "follow",
-        lunarClamp: patch.lunarClamp ?? true,
-        time: patch.time ?? "09:00",
-        // 未显式指定时按"有具体时刻"处理（对齐 v1 的 allDay 可空语义）；
-        // 否则即使传了 time，也会被展示成"全天"。
-        allDay: patch.allDay ?? false,
-        recurrence: patch.recurrence ?? (kind === "todo" ? null : { freq: "yearly", interval: 1 }),
-        // 未显式给 remind_offsets 时按 kind 取默认：生日/纪念日「提前 7 天 + 前 1 天 + 当天」，
-        // 待办到点提醒。只影响新建；存量日程的 remind_offsets_json 不回写。
-        remindOffsets: patch.remindOffsets ?? defaultRemindOffsets(kind),
-        resendMinutes: patch.resendMinutes ?? 0,
-        escalation: patch.escalation ?? null,
-        workdayFilter: patch.workdayFilter ?? "any",
+  const status = (args.status as string) ?? "active";
+  const limit = (args.limit as number) ?? 20;
+  const rows = listSchedules(db, ctx.profileId, status, limit);
+  return okJson({
+    日程: rows.map((row) => rowWithPendingOccurrences(db, row)),
+    数量: rows.length,
+  });
+}
+
+function scheduleUpdate(args: Record<string, unknown>, ctx: ToolContext): ToolResult {
+  const db = ctx.db;
+  const id = args.id as string;
+  if (id === undefined) return fail("update 需要 id");
+  const patch = buildPartial(args);
+  if (args.status !== undefined) {
+    const status = args.status as ScheduleRow["status"];
+    if (status === "active" || status === "done" || status === "cancelled") patch.status = status;
+  }
+  if (Object.keys(patch).length === 0) return fail("没有提供要更新的字段");
+  const row = updateSchedule(db, ctx.profileId, id, patch);
+  return okJson({ 已更新: rowToPublic(row) });
+}
+
+function scheduleComplete(args: Record<string, unknown>, ctx: ToolContext): ToolResult {
+  const db = ctx.db;
+  const id = args.id as string;
+  const byDescription = (args.match !== undefined && args.match !== null) || args.recent === true;
+  if (byDescription) {
+    if (id !== undefined) return fail("complete 的 id 与 match/recent 不能同时提供");
+    if (args.occurrence_key !== undefined && args.occurrence_key !== null) {
+      return fail("complete 的 occurrence_key 只能配合 id 使用");
+    }
+    if (args.all === true) return fail("按描述完成不支持 all=true（结束系列请用 id + all）");
+    return completeByDescription(ctx, args);
+  }
+  if (id === undefined) return fail("complete 需要 id，或用 match / recent:true 按描述完成");
+  // null / 未提供都表示「不指定单次」（HTTP JSON 里 null 很常见，不要落成字符串 "null"）
+  const occurrenceKey =
+    args.occurrence_key === undefined || args.occurrence_key === null
+      ? null
+      : String(args.occurrence_key);
+  const eventAt =
+    occurrenceKey === null || args.all === true
+      ? null
+      : occurrenceEventAt(db, String(id), occurrenceKey);
+  // all=true 才结束整个系列（循环日程裸调 complete 会在 service 层被拒，防误点终止系列）
+  const row = completeSchedule(db, ctx.profileId, id, occurrenceKey, {
+    all: args.all === true,
+  });
+  const extras = occurrenceKey === null ? {} : completionExtras(ctx, row, occurrenceKey, eventAt);
+  // P2-1：all=true 现在对任意 kind（含生日/纪念日）都置终态 done，回执必须说清「系列已结束」，
+  // 不能只给一个「已完成」让调用方以为系列还在。状态字段仍与库内真实值同源（rowToPublic）。
+  return okJson({
+    已完成: rowToPublic(row),
+    ...(args.all === true
+      ? { 说明: "已结束整个系列（状态置 done），不会再物化或提醒后续发生" }
+      : {}),
+    ...extras,
+  });
+}
+
+function scheduleSnooze(args: Record<string, unknown>, ctx: ToolContext): ToolResult {
+  const id = args.id as string;
+  if (id === undefined) return fail("snooze 需要 id");
+  const result = snoozeSchedule(ctx.db, ctx.profileId, id, {
+    occurrenceKey:
+      args.occurrence_key === undefined || args.occurrence_key === null
+        ? null
+        : String(args.occurrence_key),
+    minutes: args.minutes === undefined || args.minutes === null ? null : Number(args.minutes),
+    until: args.until === undefined || args.until === null ? null : String(args.until),
+  });
+  return okJson({
+    已推迟: {
+      id: result.row.id,
+      标题: result.row.title,
+      occurrence_key: result.occurrenceKey,
+      // 与 list/upcoming 同口径：「提醒时间」是 UTC ISO，另给本地文本
+      提醒时间: result.dueAt,
+      "提醒时间(本地)": localStampText(result.dueAt),
+      状态: "pending",
+      版本: result.row.version,
+    },
+  });
+}
+
+function scheduleSkip(args: Record<string, unknown>, ctx: ToolContext): ToolResult {
+  const id = args.id as string;
+  if (id === undefined) return fail("skip 需要 id");
+  const result = skipSchedule(
+    ctx.db,
+    ctx.profileId,
+    id,
+    args.occurrence_key === undefined || args.occurrence_key === null
+      ? null
+      : String(args.occurrence_key),
+  );
+  return okJson({
+    已跳过: {
+      id: result.row.id,
+      标题: result.row.title,
+      occurrence_key: result.occurrenceKey,
+      剩余未完成: result.remaining,
+      // 回执必须与真实状态一致：一次性待办 skip 后整条日程已收尾（done），
+      // 只写「已跳过」会让调用方以为系列还在（P2-2 / C-03）。
+      状态: result.row.status,
+      已结束该待办: result.ended,
+      ...(result.ended
+        ? { 说明: "已跳过并结束该待办（一次性待办没有后续发生，日程已置为 done）" }
+        : {}),
+      版本: result.row.version,
+    },
+  });
+}
+
+function scheduleDelete(args: Record<string, unknown>, ctx: ToolContext): ToolResult {
+  const id = args.id as string;
+  if (id === undefined) return fail("delete 需要 id");
+  if (getSchedule(ctx.db, ctx.profileId, id) === undefined) return fail(`日程不存在: ${id}`);
+  deleteSchedule(ctx.db, ctx.profileId, id);
+  return ok(`已删除日程 ${id}`);
+}
+
+function scheduleUpcoming(args: Record<string, unknown>, ctx: ToolContext): ToolResult {
+  const limit = (args.limit as number) ?? 10;
+  const items = upcoming(ctx.db, ctx.profileId, limit);
+  return okJson({
+    即将到来: items.map((i) => {
+      const escalation = parseEscalation(i.escalation_json);
+      return {
+        标题: i.title,
+        类型: escalation === null ? KIND_LABEL[i.kind] : "截止",
+        id: i.schedule_id,
+        提醒时间: i.due_at,
+        // 原「提醒时间」是 UTC ISO（差 8 小时易误读），补本地时区文本；原键保留不动
+        "提醒时间(本地)": localStampText(i.due_at),
+        事件日期: instantToLocalDate(i.event_at),
+        工作日筛选: workdayFilterLabel(i.workday_filter),
+        重发分钟: i.resend_minutes,
+        ...(i.note === null ? {} : { 备注: i.note }),
+        occurrence_key: i.occurrence_key,
+        ...(escalation === null ? {} : { 升级提醒: escalation }),
       };
-      // request_id 是 add 的幂等键（写 schedules.client_token）：MCP 超时重试带同一个值
-      // 会返回首次创建的**原日程**，不重建 occurrence、不重复发提醒。
-      const requestId =
-        args.request_id === undefined || args.request_id === null ? null : String(args.request_id);
-      const { row, existed } = createScheduleIdempotent(db, ctx.profileId, input, requestId);
-      return okJson({ 已创建: rowToPublic(row), ...(existed ? { 已存在: true } : {}) });
-    }
-    case "list": {
-      const status = (args.status as string) ?? "active";
-      const limit = (args.limit as number) ?? 20;
-      const rows = listSchedules(db, ctx.profileId, status, limit);
-      return okJson({
-        日程: rows.map((row) => rowWithPendingOccurrences(db, row)),
-        数量: rows.length,
-      });
-    }
-    case "update": {
-      const id = args.id as string;
-      if (id === undefined) return fail("update 需要 id");
-      const patch = buildPartial(args);
-      if (args.status !== undefined) {
-        const status = args.status as ScheduleRow["status"];
-        if (status === "active" || status === "done" || status === "cancelled")
-          patch.status = status;
-      }
-      if (Object.keys(patch).length === 0) return fail("没有提供要更新的字段");
-      const row = updateSchedule(db, ctx.profileId, id, patch);
-      return okJson({ 已更新: rowToPublic(row) });
-    }
-    case "complete": {
-      const id = args.id as string;
-      const byDescription =
-        (args.match !== undefined && args.match !== null) || args.recent === true;
-      if (byDescription) {
-        if (id !== undefined) return fail("complete 的 id 与 match/recent 不能同时提供");
-        if (args.occurrence_key !== undefined && args.occurrence_key !== null) {
-          return fail("complete 的 occurrence_key 只能配合 id 使用");
-        }
-        if (args.all === true) return fail("按描述完成不支持 all=true（结束系列请用 id + all）");
-        return completeByDescription(ctx, args);
-      }
-      if (id === undefined) return fail("complete 需要 id，或用 match / recent:true 按描述完成");
-      // null / 未提供都表示「不指定单次」（HTTP JSON 里 null 很常见，不要落成字符串 "null"）
-      const occurrenceKey =
-        args.occurrence_key === undefined || args.occurrence_key === null
-          ? null
-          : String(args.occurrence_key);
-      const eventAt =
-        occurrenceKey === null || args.all === true
-          ? null
-          : occurrenceEventAt(db, String(id), occurrenceKey);
-      // all=true 才结束整个系列（循环日程裸调 complete 会在 service 层被拒，防误点终止系列）
-      const row = completeSchedule(db, ctx.profileId, id, occurrenceKey, {
-        all: args.all === true,
-      });
-      const extras =
-        occurrenceKey === null ? {} : completionExtras(ctx, row, occurrenceKey, eventAt);
-      // P2-1：all=true 现在对任意 kind（含生日/纪念日）都置终态 done，回执必须说清「系列已结束」，
-      // 不能只给一个「已完成」让调用方以为系列还在。状态字段仍与库内真实值同源（rowToPublic）。
-      return okJson({
-        已完成: rowToPublic(row),
-        ...(args.all === true
-          ? { 说明: "已结束整个系列（状态置 done），不会再物化或提醒后续发生" }
-          : {}),
-        ...extras,
-      });
-    }
-    case "snooze": {
-      const id = args.id as string;
-      if (id === undefined) return fail("snooze 需要 id");
-      const result = snoozeSchedule(db, ctx.profileId, id, {
-        occurrenceKey:
-          args.occurrence_key === undefined || args.occurrence_key === null
-            ? null
-            : String(args.occurrence_key),
-        minutes: args.minutes === undefined || args.minutes === null ? null : Number(args.minutes),
-        until: args.until === undefined || args.until === null ? null : String(args.until),
-      });
-      return okJson({
-        已推迟: {
-          id: result.row.id,
-          标题: result.row.title,
-          occurrence_key: result.occurrenceKey,
-          // 与 list/upcoming 同口径：「提醒时间」是 UTC ISO，另给本地文本
-          提醒时间: result.dueAt,
-          "提醒时间(本地)": localStampText(result.dueAt),
-          状态: "pending",
-          版本: result.row.version,
-        },
-      });
-    }
-    case "skip": {
-      const id = args.id as string;
-      if (id === undefined) return fail("skip 需要 id");
-      const result = skipSchedule(
-        db,
-        ctx.profileId,
-        id,
-        args.occurrence_key === undefined || args.occurrence_key === null
-          ? null
-          : String(args.occurrence_key),
-      );
-      return okJson({
-        已跳过: {
-          id: result.row.id,
-          标题: result.row.title,
-          occurrence_key: result.occurrenceKey,
-          剩余未完成: result.remaining,
-          // 回执必须与真实状态一致：一次性待办 skip 后整条日程已收尾（done），
-          // 只写「已跳过」会让调用方以为系列还在（P2-2 / C-03）。
-          状态: result.row.status,
-          已结束该待办: result.ended,
-          ...(result.ended
-            ? { 说明: "已跳过并结束该待办（一次性待办没有后续发生，日程已置为 done）" }
-            : {}),
-          版本: result.row.version,
-        },
-      });
-    }
-    case "delete": {
-      const id = args.id as string;
-      if (id === undefined) return fail("delete 需要 id");
-      if (getSchedule(db, ctx.profileId, id) === undefined) return fail(`日程不存在: ${id}`);
-      deleteSchedule(db, ctx.profileId, id);
-      return ok(`已删除日程 ${id}`);
-    }
-    case "upcoming": {
-      const limit = (args.limit as number) ?? 10;
-      const items = upcoming(db, ctx.profileId, limit);
-      return okJson({
-        即将到来: items.map((i) => {
-          const escalation = parseEscalation(i.escalation_json);
-          return {
-            标题: i.title,
-            类型: escalation === null ? KIND_LABEL[i.kind] : "截止",
-            id: i.schedule_id,
-            提醒时间: i.due_at,
-            // 原「提醒时间」是 UTC ISO（差 8 小时易误读），补本地时区文本；原键保留不动
-            "提醒时间(本地)": localStampText(i.due_at),
-            事件日期: instantToLocalDate(i.event_at),
-            工作日筛选: workdayFilterLabel(i.workday_filter),
-            重发分钟: i.resend_minutes,
-            ...(i.note === null ? {} : { 备注: i.note }),
-            occurrence_key: i.occurrence_key,
-            ...(escalation === null ? {} : { 升级提醒: escalation }),
-          };
-        }),
-      });
-    }
-    default:
-      return fail(`未知 action: ${String(action)}`);
+    }),
+  });
+}
+
+/** buildPartial 读取的全部字段（add / update 共用） */
+const PATCH_FIELDS = [
+  "title",
+  "note",
+  "kind",
+  "calendar",
+  "date",
+  "lunar_month",
+  "lunar_day",
+  "leap_policy",
+  "lunar_clamp",
+  "time",
+  "all_day",
+  "recurrence",
+  "remind_offsets",
+  "resend_minutes",
+  "escalation",
+  "workday_filter",
+] as const;
+
+/**
+ * P2-21 同口径：inputSchema 由所有 action 共享，与当前 action 无关的字段过去被静默忽略。
+ * schedule 本轮补上字段白名单，表外字段显式失败（`未知字段: <名>（action=<action> 不接受）`；
+ * 值为 undefined 的键不算传了。白名单必须与各分支真正读取的字段一一对应，不得扩大既有契约。
+ * complete 的 date 只在 match/recent 路径读取，但保留在白名单里避免误伤。
+ */
+const scheduleDispatch = defineActionTool({
+  actions: {
+    add: { fields: [...PATCH_FIELDS, "request_id"], handler: scheduleAdd },
+    list: { fields: ["status", "limit"], handler: scheduleList },
+    update: { fields: ["id", ...PATCH_FIELDS, "status"], handler: scheduleUpdate },
+    complete: {
+      fields: ["id", "occurrence_key", "all", "match", "recent", "date"],
+      handler: scheduleComplete,
+    },
+    snooze: { fields: ["id", "occurrence_key", "minutes", "until"], handler: scheduleSnooze },
+    skip: { fields: ["id", "occurrence_key"], handler: scheduleSkip },
+    delete: { fields: ["id"], handler: scheduleDelete },
+    upcoming: { fields: ["limit"], handler: scheduleUpcoming },
+  },
+});
+
+export function scheduleTool(args: Record<string, unknown>, ctx: ToolContext): ToolResult {
+  try {
+    return scheduleDispatch.handler(args, ctx);
+  } catch (e) {
+    return fail(errorMessage(e));
   }
 }
 
@@ -483,16 +527,7 @@ registerModule({
         "用户口头说某事做完了时，优先用 complete + match（关键词）或 recent:true（只说「交了/搞定了」时）由服务端定位，不必先 list；" +
         "snooze 推迟单次提醒（minutes 或 until）；skip 跳过单次发生（循环系列继续；一次性待办则跳过并结束该待办，回执的「状态」为 done）；delete 删除；upcoming 查即将提醒。",
       inputSchema: {
-        action: z.enum([
-          "add",
-          "list",
-          "update",
-          "complete",
-          "snooze",
-          "skip",
-          "delete",
-          "upcoming",
-        ]),
+        action: scheduleDispatch.actionEnum(),
         id: z.string().optional().describe("update/complete/snooze/skip/delete 时必填"),
         title: z.string().min(1).max(120).optional(),
         note: z.string().max(500).optional(),

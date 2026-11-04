@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { DatabaseSync } from "node:sqlite";
 import { DATE_RE, TIME_RE, instantToLocalDate } from "../../time.js";
+import { findUnknownField, unknownFieldMessage } from "../../core/action-tool.js";
 import { describeRecurrence, type Recurrence } from "../../core/recurrence.js";
 import {
   errorMessage,
@@ -58,11 +59,8 @@ const ALLOWED: Record<string, readonly string[]> = {
 function rejectUnknown(args: Record<string, unknown>, action: string): string | null {
   const allowed = ALLOWED[action];
   if (allowed === undefined) return null;
-  for (const [key, value] of Object.entries(args)) {
-    if (key === "action" || value === undefined) continue;
-    if (!allowed.includes(key)) return `未知字段: ${key}（action=${action} 不接受）`;
-  }
-  return null;
+  const unknown = findUnknownField(args, allowed);
+  return unknown === null ? null : unknownFieldMessage(unknown, action);
 }
 
 function amountCents(value: unknown): number {
