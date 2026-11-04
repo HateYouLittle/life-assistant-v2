@@ -234,3 +234,29 @@ describe("P2-21 未知字段显式拒绝", () => {
     }
   });
 });
+
+describe("defineActionTool 迁移后的文案", () => {
+  it("ledger / expense 未知 action 文案逐字一致", () => {
+    const env = makeTestEnv();
+    try {
+      const t = tools(env);
+      assert.equal(text(t.ledger({ action: "bogus" })), "错误：未知 action: bogus");
+      assert.equal(text(t.expense({ action: "bogus" })), "错误：未知 action: bogus");
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("expense 未知字段文案形状与 notify 一致", () => {
+    const env = makeTestEnv();
+    try {
+      const t = tools(env);
+      assert.equal(
+        text(t.expense({ action: "delete", id: "x", foo: 1 })),
+        "错误：未知字段: foo（action=delete 不接受）",
+      );
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+});
