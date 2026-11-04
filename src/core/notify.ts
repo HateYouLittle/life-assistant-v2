@@ -928,3 +928,126 @@ function markTransportFailure(db: DatabaseSync, row: DeliveryRow, error: string)
     row.id,
   );
 }
+
+/** 投递明细的一行原始记录（未做本地时区文本化）。 */
+export interface DeliveryDetailRow {
+  id: string;
+  notification_id: string;
+  title: string;
+  profile_id: string;
+  route_name: string;
+  status: string;
+  attempts: number;
+  confirmed_failures: number;
+  transport_failures: number;
+  created_at: string;
+  sent_at: string | null;
+  next_attempt_at: string;
+  last_error: string | null;
+}
+
+/** `deliveryDetailRows` 的查询参数。 */
+export interface DeliveryDetailQuery {
+  /** 给定时只查该 Profile 的投递；缺省为家庭看板的「全部投递」口径 */
+  profileId?: string;
+  limit: number;
+  offset: number;
+  /** 近 7 天起点（UTC ISO），用于日桶的已送达时间列表 */
+  sentSince7d: string;
+  /** 近 24 小时起点（UTC ISO），用于 `sent_24h` 计数 */
+  sentSince24h: string;
+}
+
+/** `deliveryDetailRows` 的查询结果。 */
+export interface DeliveryDetailRows {
+  /** 近 7 天已送达投递的 `sent_at`（UTC ISO），供调用方按本地日分桶 */
+  sentAt: string[];
+  /** 分页后的投递行（created_at 倒序） */
+  items: DeliveryDetailRow[];
+  /** 投递记录总数（不受 limit/offset 影响） */
+  itemsTotal: number;
+  /** 各状态计数；`sent_24h` 为近 24 小时已送达数 */
+  counts: { queued: number; failed: number; fallback: number; sent_24h: number };
+}
+
+/**
+ * 投递明细查询：给了 `profileId` 时过滤必须落在 SQL（连接 notifications），
+ * 不能靠前端隐藏。
+ */
+export function deliveryDetailRows(
+  db: DatabaseSync,
+  query: DeliveryDetailQuery,
+): DeliveryDetailRows {
+  const { profileId, limit, offset } = query;
+  // Profile 视图要连 notifications 过滤；家庭看板保持「全部投递」的历史口径
+  const profileFilter =
+    profileId === undefined
+      ? { sql: "", params: [] as string[] }
+      : { sql: " AND n.profile_id = ?", params: [profileId] };
+  const count = (sql: string, ...params: (string | number)[]): number =>
+    (db.prepare(sql).get(...params) as { n: number } | undefined)?.n ?? 0;
+
+  const sentRows = db
+    .prepare(
+      `SELECT d.sent_at FROM deliveries d JOIN notifications n ON n.id = d.notification_id
+       WHERE d.status = 'sent' AND d.sent_at >= ?${profileFilter.sql}`,
+    )
+    .all(query.sentSince7d, ...profileFilter.params) as { sent_at: string }[];
+
+  const items = db
+    .prepare(
+      // 状态页是共享 token 的「家庭看板」，个人账本的月报标题不应出现在这里。
+      // 通知本身没有可见性列，但月报的 dedupe_key 形如 report:<ledgerId>:<YYYY-MM>，
+      // 可据此识别个人账本并只脱敏标题（其余投递仍照常展示）。
+      `SELECT d.id, d.notification_id,
+              CASE
+                WHEN n.kind = 'bookkeeping.monthly' AND EXISTS (
+                  SELECT 1 FROM ledgers l
+                  WHERE l.owner_profile_id IS NOT NULL
+                    AND substr(n.dedupe_key, 1, length('report:' || l.id || ':')) =
+                        'report:' || l.id || ':'
+                ) THEN '（个人账本月报）'
+                ELSE COALESCE(n.title, '（通知已删除）')
+              END AS title,
+              COALESCE(n.profile_id, '-') AS profile_id, d.route_name, d.status, d.attempts,
+              d.confirmed_failures, d.transport_failures, d.created_at, d.sent_at, d.next_attempt_at, d.last_error
+       FROM deliveries d LEFT JOIN notifications n ON n.id = d.notification_id
+       ${profileId === undefined ? "" : "WHERE n.profile_id = ?"}
+       ORDER BY d.created_at DESC, d.id DESC LIMIT ? OFFSET ?`,
+    )
+    .all(
+      ...(profileId === undefined ? [limit, offset] : [profileId, limit, offset]),
+    ) as unknown as DeliveryDetailRow[];
+
+  const itemsTotal =
+    profileId === undefined
+      ? count("SELECT COUNT(*) AS n FROM deliveries")
+      : count(
+          `SELECT COUNT(*) AS n FROM deliveries d
+           JOIN notifications n ON n.id = d.notification_id WHERE n.profile_id = ?`,
+          profileId,
+        );
+  const countByStatus = (status: string): number =>
+    count(
+      `SELECT COUNT(*) AS n FROM deliveries d JOIN notifications n ON n.id = d.notification_id
+       WHERE d.status = ?${profileFilter.sql}`,
+      status,
+      ...profileFilter.params,
+    );
+  return {
+    sentAt: sentRows.map((r) => r.sent_at),
+    items,
+    itemsTotal,
+    counts: {
+      queued: countByStatus("queued"),
+      failed: countByStatus("failed"),
+      fallback: countByStatus("fallback"),
+      sent_24h: count(
+        `SELECT COUNT(*) AS n FROM deliveries d JOIN notifications n ON n.id = d.notification_id
+         WHERE d.status = 'sent' AND d.sent_at >= ?${profileFilter.sql}`,
+        query.sentSince24h,
+        ...profileFilter.params,
+      ),
+    },
+  };
+}

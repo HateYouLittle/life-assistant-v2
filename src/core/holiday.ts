@@ -501,3 +501,44 @@ export function nextHolidayPeriod(
     inProgress: period.start <= today,
   };
 }
+
+/** 已就绪（status = 'ready'）的假日数据年份，升序。 */
+export function readyHolidayYears(db: DatabaseSync): number[] {
+  return (
+    db.prepare("SELECT year FROM cn_holiday_years WHERE status = 'ready' ORDER BY year").all() as {
+      year: number;
+    }[]
+  ).map((r) => r.year);
+}
+
+/** `year` 这一日历年内，从 `today`（含）起是否还有法定假日。 */
+export function hasUpcomingHolidayInYear(db: DatabaseSync, today: string, year: number): boolean {
+  return (
+    (db
+      .prepare(
+        "SELECT 1 FROM cn_holiday_days WHERE day_type = 'holiday' AND date >= ? AND substr(date, 1, 4) = ? LIMIT 1",
+      )
+      .get(today, String(year)) as unknown) !== undefined
+  );
+}
+
+/** 假日表中一天的原始记录。 */
+export interface HolidayDayRow {
+  date: string;
+  name: string;
+  day_type: string;
+}
+
+/**
+ * 日期落在 [from, to]（含，YYYY-MM-DD）内的假日/调休记录，按日期升序。
+ *
+ * year 列是「数据文件年份」，跨年条目（如 2027.json 里的 2026-12-31）会记成 2027。
+ * 展示必须按**日期所属年份**筛，否则年末的元旦假期会被从当年视图里漏掉。
+ */
+export function holidayDaysInRange(db: DatabaseSync, from: string, to: string): HolidayDayRow[] {
+  return db
+    .prepare(
+      "SELECT date, name, day_type FROM cn_holiday_days WHERE date >= ? AND date <= ? ORDER BY date",
+    )
+    .all(from, to) as unknown as HolidayDayRow[];
+}

@@ -514,3 +514,41 @@ export async function runStartupCatchups(
   else logger.info(summary);
   return { scheduled, succeeded, skipped, failed };
 }
+
+/** 单个 job 的运行统计（近 24 小时口径见 `createJobRunStatsReader`）。 */
+export interface JobRunStats {
+  /** 最近一次成功运行的开始时间（UTC ISO）；从未成功为 null */
+  lastOkStartedAt: string | null;
+  /** 起点之后的失败次数 */
+  failed24h: number;
+  /** 起点之后的失败记录（最多 3 条，新的在前） */
+  recentFailures: { started_at: string; error: string | null }[];
+}
+
+/**
+ * 创建 job 运行统计读取器：statement 只 prepare 一次，供多个 job 复用。
+ * `since24h` 为失败统计的起点（UTC ISO）。
+ */
+export function createJobRunStatsReader(
+  db: DatabaseSync,
+  since24h: string,
+): (jobName: string) => JobRunStats {
+  const lastOkStmt = db.prepare(
+    "SELECT started_at FROM job_runs WHERE job_name = ? AND status = 'ok' ORDER BY started_at DESC, id DESC LIMIT 1",
+  );
+  const failedCountStmt = db.prepare(
+    "SELECT COUNT(*) AS n FROM job_runs WHERE job_name = ? AND status = 'failed' AND started_at >= ?",
+  );
+  const failuresStmt = db.prepare(
+    "SELECT started_at, error FROM job_runs WHERE job_name = ? AND status = 'failed' AND started_at >= ? ORDER BY started_at DESC, id DESC LIMIT 3",
+  );
+  return (jobName) => {
+    const lastOk = lastOkStmt.get(jobName) as { started_at: string } | undefined;
+    const failed = failedCountStmt.get(jobName, since24h) as { n: number };
+    const recentFailures = failuresStmt.all(jobName, since24h) as {
+      started_at: string;
+      error: string | null;
+    }[];
+    return { lastOkStartedAt: lastOk?.started_at ?? null, failed24h: failed.n, recentFailures };
+  };
+}

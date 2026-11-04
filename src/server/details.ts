@@ -1,7 +1,19 @@
 import type { DatabaseSync } from "node:sqlite";
 import { DateTime } from "luxon";
-import { holidayPeriods } from "../core/holiday.js";
-import { type JobRunRow, type JobRunStatus, lastJobRun, recentJobRuns } from "../core/jobs.js";
+import {
+  hasUpcomingHolidayInYear,
+  holidayDaysInRange,
+  holidayPeriods,
+  readyHolidayYears,
+} from "../core/holiday.js";
+import {
+  createJobRunStatsReader,
+  type JobRunRow,
+  type JobRunStatus,
+  lastJobRun,
+  recentJobRuns,
+} from "../core/jobs.js";
+import { deliveryDetailRows } from "../core/notify.js";
 import { allJobs, type JobDef } from "../core/registry.js";
 import {
   type ExpenseEntry,
@@ -272,84 +284,27 @@ export function deliveryDetails(
 ): DeliveryDetails {
   const limit = clampLimit(rawLimit, 60, 500);
   const offset = clampOffset(rawOffset);
-  // Profile 视图要连 notifications 过滤；家庭看板保持「全部投递」的历史口径
-  const profileFilter =
-    profileId === undefined
-      ? { sql: "", params: [] as string[] }
-      : { sql: " AND n.profile_id = ?", params: [profileId] };
-  const count = (sql: string, ...params: (string | number)[]): number =>
-    (db.prepare(sql).get(...params) as { n: number } | undefined)?.n ?? 0;
-
-  const since = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
-  const sentRows = db
-    .prepare(
-      `SELECT d.sent_at FROM deliveries d JOIN notifications n ON n.id = d.notification_id
-       WHERE d.status = 'sent' AND d.sent_at >= ?${profileFilter.sql}`,
-    )
-    .all(since, ...profileFilter.params) as { sent_at: string }[];
+  const rows = deliveryDetailRows(db, {
+    profileId,
+    limit,
+    offset,
+    sentSince7d: new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString(),
+    sentSince24h: new Date(Date.now() - 24 * 3600 * 1000).toISOString(),
+  });
   const buckets = new Map<string, number>();
   const today = DateTime.fromISO(todayIso(), { zone: TZ });
   for (let i = 6; i >= 0; i -= 1) {
     buckets.set(today.minus({ days: i }).toISODate() as string, 0);
   }
-  for (const row of sentRows) {
-    const day = localDay(row.sent_at);
+  for (const sentAt of rows.sentAt) {
+    const day = localDay(sentAt);
     if (buckets.has(day)) buckets.set(day, (buckets.get(day) ?? 0) + 1);
   }
 
-  const items = db
-    .prepare(
-      // 状态页是共享 token 的「家庭看板」，个人账本的月报标题不应出现在这里。
-      // 通知本身没有可见性列，但月报的 dedupe_key 形如 report:<ledgerId>:<YYYY-MM>，
-      // 可据此识别个人账本并只脱敏标题（其余投递仍照常展示）。
-      `SELECT d.id, d.notification_id,
-              CASE
-                WHEN n.kind = 'bookkeeping.monthly' AND EXISTS (
-                  SELECT 1 FROM ledgers l
-                  WHERE l.owner_profile_id IS NOT NULL
-                    AND substr(n.dedupe_key, 1, length('report:' || l.id || ':')) =
-                        'report:' || l.id || ':'
-                ) THEN '（个人账本月报）'
-                ELSE COALESCE(n.title, '（通知已删除）')
-              END AS title,
-              COALESCE(n.profile_id, '-') AS profile_id, d.route_name, d.status, d.attempts,
-              d.confirmed_failures, d.transport_failures, d.created_at, d.sent_at, d.next_attempt_at, d.last_error
-       FROM deliveries d LEFT JOIN notifications n ON n.id = d.notification_id
-       ${profileId === undefined ? "" : "WHERE n.profile_id = ?"}
-       ORDER BY d.created_at DESC, d.id DESC LIMIT ? OFFSET ?`,
-    )
-    .all(
-      ...(profileId === undefined ? [limit, offset] : [profileId, limit, offset]),
-    ) as unknown as DeliveryDetailItem[];
-
-  const itemsTotal =
-    profileId === undefined
-      ? count("SELECT COUNT(*) AS n FROM deliveries")
-      : count(
-          `SELECT COUNT(*) AS n FROM deliveries d
-           JOIN notifications n ON n.id = d.notification_id WHERE n.profile_id = ?`,
-          profileId,
-        );
-  const countByStatus = (status: string): number =>
-    count(
-      `SELECT COUNT(*) AS n FROM deliveries d JOIN notifications n ON n.id = d.notification_id
-       WHERE d.status = ?${profileFilter.sql}`,
-      status,
-      ...profileFilter.params,
-    );
+  const { items, itemsTotal } = rows;
   const hasMore = offset + items.length < itemsTotal;
   return {
-    counts: {
-      queued: countByStatus("queued"),
-      failed: countByStatus("failed"),
-      fallback: countByStatus("fallback"),
-      sent_24h: count(
-        `SELECT COUNT(*) AS n FROM deliveries d JOIN notifications n ON n.id = d.notification_id
-         WHERE d.status = 'sent' AND d.sent_at >= ?${profileFilter.sql}`,
-        new Date(Date.now() - 24 * 3600 * 1000).toISOString(),
-        ...profileFilter.params,
-      ),
-    },
+    counts: rows.counts,
     daily: [...buckets.entries()].map(([date, sent]) => ({
       date,
       label: DateTime.fromISO(date, { zone: TZ }).toFormat("LL-dd"),
@@ -390,21 +345,12 @@ function weekdayLabel(date: string): string {
 }
 
 export function holidayDetails(db: DatabaseSync, rawYear: string | undefined): HolidayDetails {
-  const years = (
-    db.prepare("SELECT year FROM cn_holiday_years WHERE status = 'ready' ORDER BY year").all() as {
-      year: number;
-    }[]
-  ).map((r) => r.year);
+  const years = readyHolidayYears(db);
   const today = todayIso();
   const currentYear = Number(today.slice(0, 4));
   // 默认看「还有假期的年份」：当年的假期已经过完（年末那几天）就顺延到下一年 ——
   // 只判断「年份存在」会让年末的卡片显示「暂无数据」，而不是次年元旦。
-  const currentYearHasUpcoming =
-    (db
-      .prepare(
-        "SELECT 1 FROM cn_holiday_days WHERE day_type = 'holiday' AND date >= ? AND substr(date, 1, 4) = ? LIMIT 1",
-      )
-      .get(today, String(currentYear)) as unknown) !== undefined;
+  const currentYearHasUpcoming = hasUpcomingHolidayInYear(db, today, currentYear);
   const fallbackYear =
     years.includes(currentYear) && currentYearHasUpcoming
       ? currentYear
@@ -415,17 +361,7 @@ export function holidayDetails(db: DatabaseSync, rawYear: string | undefined): H
       ? parsedYear
       : fallbackYear;
 
-  // year 列是「数据文件年份」，跨年条目（如 2027.json 里的 2026-12-31）会记成 2027。
-  // 展示必须按**日期所属年份**筛，否则年末的元旦假期会被从当年视图里漏掉。
-  const days = db
-    .prepare(
-      "SELECT date, name, day_type FROM cn_holiday_days WHERE date >= ? AND date <= ? ORDER BY date",
-    )
-    .all(`${year}-01-01`, `${year}-12-31`) as {
-    date: string;
-    name: string;
-    day_type: string;
-  }[];
+  const days = holidayDaysInRange(db, `${year}-01-01`, `${year}-12-31`);
 
   // 「接下来的假期」复用 core/holiday 的 holidayPeriods：它与 holiday {view:"next"}
   // 使用同一套「日期相邻即同一假期」的合并口径。不能从 today 开始截断 ——
@@ -494,32 +430,19 @@ export interface JobDetailItem {
  */
 export function jobDetails(db: DatabaseSync, nowMs: number = Date.now()): JobDetailItem[] {
   const since24h = new Date(nowMs - 24 * 3600 * 1000).toISOString();
-  const lastOkStmt = db.prepare(
-    "SELECT started_at FROM job_runs WHERE job_name = ? AND status = 'ok' ORDER BY started_at DESC, id DESC LIMIT 1",
-  );
-  const failedCountStmt = db.prepare(
-    "SELECT COUNT(*) AS n FROM job_runs WHERE job_name = ? AND status = 'failed' AND started_at >= ?",
-  );
-  const failuresStmt = db.prepare(
-    "SELECT started_at, error FROM job_runs WHERE job_name = ? AND status = 'failed' AND started_at >= ? ORDER BY started_at DESC, id DESC LIMIT 3",
-  );
+  const readStats = createJobRunStatsReader(db, since24h);
 
   const items: JobDetailItem[] = allJobs().map(({ module, def }) => {
     const lastRun = lastJobRun(db, def.name);
-    const lastOk = lastOkStmt.get(def.name) as { started_at: string } | undefined;
-    const failed = failedCountStmt.get(def.name, since24h) as { n: number };
-    const recentFailures = failuresStmt.all(def.name, since24h) as {
-      started_at: string;
-      error: string | null;
-    }[];
+    const stats = readStats(def.name);
     const item: JobDetailItem = {
       module,
       name: def.name,
       cron: jobCronExpr(def),
       last_run: lastRun === undefined ? null : summarizeRun(lastRun),
-      last_ok_at: lastOk?.started_at ?? null,
-      failed_24h: failed.n,
-      recent_failures: recentFailures,
+      last_ok_at: stats.lastOkStartedAt,
+      failed_24h: stats.failed24h,
+      recent_failures: stats.recentFailures,
       recent_runs: recentJobRuns(db, { jobName: def.name, limit: 3 }).map(summarizeRun),
     };
     const hint = nextRunHint(item.cron);
