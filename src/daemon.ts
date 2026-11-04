@@ -6,6 +6,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { getRequestListener } from "@hono/node-server";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { z } from "zod";
 import { DateTime } from "luxon";
 import cron from "node-cron";
 import {
@@ -86,7 +87,13 @@ async function buildMcpServer(
   for (const { def } of allTools()) {
     server.registerTool(
       def.name,
-      { description: def.description, inputSchema: def.inputSchema },
+      {
+        description: def.description,
+        // passthrough 而不是裸 shape：SDK 会用 z.object(shape) 校验并**只把解析结果**交给回调，
+        // 默认的 strip 会把未知字段吃掉，模块里的「未知字段」白名单就永远不会触发。
+        // 放开后多余键原样进 handler，由它按 action 给出中文报错（与 invokeTool 同一口径）。
+        inputSchema: z.object(def.inputSchema).passthrough(),
+      },
       async (args, extra) => {
         const ctx: ToolContext = {
           profileId:

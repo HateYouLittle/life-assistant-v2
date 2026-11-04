@@ -200,7 +200,10 @@ export async function invokeTool(
 ): Promise<ToolResult> {
   const tool = allTools().find((t) => t.def.name === name);
   if (tool === undefined) return fail(`工具未注册: ${name}`);
-  const parsed = z.object(tool.def.inputSchema).safeParse(args);
+  // passthrough：未知字段必须**原样交给模块**，由模块按 action 给出中文的「未知字段」报错。
+  // 用 zod 默认的 strip 会把多余键悄悄吃掉，各模块的 action 白名单（P2-20/P2-21）永远不触发 ——
+  // 2026-11-04 实测确认过这条路径此前是死的。
+  const parsed = z.object(tool.def.inputSchema).passthrough().safeParse(args);
   if (!parsed.success) {
     const detail = parsed.error.issues
       .map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)

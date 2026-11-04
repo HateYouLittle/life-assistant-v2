@@ -251,6 +251,10 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   都由它生成，文案只在该文件定义（`unknownFieldMessage` / `unknownActionMessage`），模块里不得再
   手写这些字面量。weather/holiday 开 `viewAlias` 且不设 `fields`（不做未知字段校验，保持现状）；
   bookkeeping/notify/schedule 设 `fields`。bills 暂未迁移，只复用 `findUnknownField` + 共享文案。
+  **未知字段能到 handler 的前提**：`registry.invokeTool` 与 MCP 的 `registerTool` 都必须用
+  `z.object(shape).passthrough()`。zod 默认 strip 会在校验阶段把多余键吃掉，白名单就成了死代码
+  （2026-11-04 实测：MCP 与 invokeTool 两条路径都吃掉，只有直接调 handler 的测试能过）。
+  改这两处注册逻辑时要连带跑 `tests/registry.test.ts` 的「invokeTool 的参数透传口径」。
 - **`doctor --live` 的「过期一次性日程」检查**（N-1）：`recurrence_json IS NULL AND calendar='solar'
   AND start_date < 今天 AND status='active'` 的行报 warn（列 id/profile/title + 收尾指引），
   用独立只读连接查（不升级 schema、不写库、不 fail）。

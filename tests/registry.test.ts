@@ -9,6 +9,7 @@ import {
   allTools,
   fail,
   getModules,
+  invokeTool,
   ok,
   okJson,
   registerModule,
@@ -295,5 +296,39 @@ describe("registry 契约", () => {
       moduleImportSpecifiers('const m = await import("../modules/weather/service.js");'),
       ["../modules/weather/service.js"],
     );
+  });
+});
+
+/**
+ * invokeTool 必须把**未知字段原样交给模块**：zod 默认 strip 会在校验阶段吃掉多余键，
+ * 各模块按 action 写的白名单（P2-20 / P2-21）就永远不触发 —— 2026-11-04 实测 MCP 与
+ * invokeTool 两条路径都吃掉了，只有直接调 handler 的测试能过，属于「测试绿、线上假保证」。
+ */
+describe("invokeTool 的参数透传口径", () => {
+  it("未知字段进到模块被拒绝（中文文案），合法字段照常执行", async () => {
+    const env = makeTestEnv();
+    try {
+      registerAllModules();
+      const ctx = {
+        profileId: "default",
+        db: env.db,
+        config: env.config,
+        services: runtime().services,
+      };
+
+      const rejected = await invokeTool("schedule", { action: "upcoming", bogus_field: "x" }, ctx);
+      assert.equal(rejected.isError, true, "未知字段必须报错，而不是被静默忽略");
+      assert.match(String(rejected.content[0]?.text ?? ""), /未知字段: bogus_field/);
+      assert.match(String(rejected.content[0]?.text ?? ""), /action=upcoming/);
+
+      const okResult = await invokeTool("schedule", { action: "upcoming", limit: 1 }, ctx);
+      assert.notEqual(okResult.isError, true, String(okResult.content[0]?.text ?? ""));
+
+      // 没有 fields 白名单的工具（weather/holiday 保持现状）不因多余字段报错
+      const lenient = await invokeTool("holiday", { action: "next" }, ctx);
+      assert.notEqual(lenient.isError, true, String(lenient.content[0]?.text ?? ""));
+    } finally {
+      cleanupTestEnv(env);
+    }
   });
 });
