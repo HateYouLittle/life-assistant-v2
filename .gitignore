@@ -25,3 +25,6 @@ dist/
 
 # LaunchAgent 调用的 node 解析壳（本机部署胶水，不入库；勿删，daemon/backup 依赖它）
 /node-run.sh
+
+# 技能目录里手工留的备份（如 SKILL.md.bak-*）：不入库
+/skill/*.bak*

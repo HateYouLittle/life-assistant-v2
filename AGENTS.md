@@ -90,6 +90,11 @@ CI（`.github/workflows/ci.yml`）在 Node 22.16.0、22 与 24 上按此顺序�
   分范围部分唯一索引 `idx_expenses_client_token` / `idx_schedules_client_token`，NULL 不参与约束）。
   v5 新增 `audit_log` 表（写接口审计，`/api/audit` 按身份过滤）与 `meta.schema_fingerprint`
   （结构指纹：`db:fingerprint` CLI/doctor 可查；启动时对比并更新，漂移会 warn）。
+  v6 新增 `recurring_bills` 周期账模板表（到期提醒复用一条 `schedules` 循环待办，
+  `bill pay` 一步完成并入账、按同一期幂等；删日程时 `schedule_id` 置 NULL、模板保留；
+  `bill` 尚未迁 `defineActionTool`，只复用 `findUnknownField` + 共享文案）。
+  注意 `audit_log` **当前没有写入方**（原 `/api/quick/*` 与 `/a/*` 签名链接已于 2026-11-04 移除，
+  历史行保留）；写类工具用 `client_token` 幂等，不要指望审计表留痕。
   迁移整体包在单个事务里（失败整笔回滚）；升级前若 `openDatabase` 传了 `backupDir` 会先
   `VACUUM INTO` 一份 `life-assistant-pre-v<旧版本>-<时间戳>.db`，备份失败拒绝启动。
   活动账本名唯一索引建不出来现在**拒绝启动**（旧实现只告警；缺索引会让同名账本串范围）。

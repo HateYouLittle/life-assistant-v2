@@ -1,6 +1,6 @@
 # 路线图与进度
 
-> 当前版本 **v2.0.0** · 数据库 **schema v5** · 最后更新 **2026-11-04**
+> 当前版本 **v2.0.0** · 数据库 **schema v6** · 最后更新 **2026-11-12**
 >
 > 口径：以已合入 `main` 的实现为准。完成一项就勾选、补 commit 与落点，并更新顶部「最后更新」。
 > 详细分析与逐项证据（真实库采样、file:line）见 `~/workspace/tasks/life-assistant-review-2026-10/feature-proposal-2026-10-20.md`
@@ -74,9 +74,22 @@ CI 在 Node 22.16.0 / 22 / 24 三档矩阵全绿（`.github/workflows/ci.yml`）
 
 阶段二第 1/2/3/5 项因此划线；阶段三未开始的条目按需再议，新增前先确认真有人用。
 
+## 2026-11-12 仓库维护 —— ✅
+
+> 文档、仓库卫生与纯风格自动修复，不改运行逻辑；线上服务未重启。
+
+| 改动 | 落点 |
+|---|---|
+| 修正 `skill/SKILL.md` 里引用已移除功能（`/quick`、`/api/quick/*`、`/calendar.ics`、`/a/<token>`、`PUBLIC_BASE_URL`）的运维段，补「审计暂无写入方」口径，删除冗余 `.bak` 并同步安装副本 | `skill/SKILL.md` |
+| 本文件补 schema v6 与周期账进度；`AGENTS.md` 补 `recurring_bills` 存储说明；`README.md` 修正审计段（`/api/quick/*` 已移除） | 三个文档 |
+| 清理 `.env` 4 个无代码读取的键（`OPENCLAW_*`、`PUBLIC_BASE_URL`）、移走 `.env.bak-*` 与 `data/_from-oldpath-*`、删除 16 个已全部合并的本地分支 | 本机 |
+| 收尾 2 条过期一次性待办（bestie「交话费」「取消酒店订单」，经 `schedule complete` 置 done） | 数据 |
+| biome 安全自动修复（浏览器脚本的箭头函数/模板字符串），warning 80→15、0 error、测试全绿 | `src/server/assets/*.js` |
+| 2026-11-04 的 4 个提交与本次维护一并推送 `origin/main`（此前 CI 只覆盖到 `d51e42d`） | `origin/main` |
+
 ## 阶段三：新领域 —— 🔲 未开始（6–12 周）
 
-1. 周期账 / 订阅提醒
+1. 周期账 / 订阅提醒 ✅（2026-11-04，`6a7d9a2`，schema v6）：`bill` 工具（`add`/`list`/`update`/`pause`/`resume`/`pay`）+ `recurring_bills` 模板；到期复用 schedule 物化与提醒链路（按日号锚定，31 日模板在小月取当月最后一天），`bill pay` 一步完成提醒并入账、同一期幂等。截至 2026-11-12 库内尚无模板数据，功能可用但未被使用。
 2. 家庭共享日程 / 清单（需先完成阶段二的身份与可见性）
 3. 到期提醒（证件/保险/年检）、礼物与联系人
 4. 数据导出 / 导入（换机迁移）
