@@ -12,7 +12,8 @@ function yuan(cents) {
   );
 }
 function esc(text) {
-  return String(text === null || text === undefined ? '' : text).replace(/[&<>"']/g, function (c) {
-    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
-  });
+  return String(text === null || text === undefined ? '' : text).replace(
+    /[&<>"']/g,
+    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c],
+  );
 }

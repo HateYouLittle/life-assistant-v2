@@ -26,17 +26,15 @@ var current = null;
 /* 未设预算的提示文案 BUDGET_UNSET_TIP 与 src/server/budget.ts 同源（由 page-script.ts 的前导注入） */
 
 function api(path) {
-  return fetch(path, token ? { headers: { Authorization: 'Bearer ' + token } } : {}).then(
-    function (r) {
-      if (!r.ok)
-        throw new Error(
-          r.status === 401
-            ? '未授权：在地址栏给本页加上 ?token=<WEB_API_TOKEN> 刷新一次（本页会记住）'
-            : 'HTTP ' + r.status,
-        );
-      return r.json();
-    },
-  );
+  return fetch(path, token ? { headers: { Authorization: 'Bearer ' + token } } : {}).then((r) => {
+    if (!r.ok)
+      throw new Error(
+        r.status === 401
+          ? '未授权：在地址栏给本页加上 ?token=<WEB_API_TOKEN> 刷新一次（本页会记住）'
+          : 'HTTP ' + r.status,
+      );
+    return r.json();
+  });
 }
 /* 备份文件大小：1.2 MB / 820 KB（不足 1 KB 也按 KB 显示，避免出现 0.0 MB） */
 function mbText(bytes) {
@@ -108,42 +106,38 @@ function render(s) {
 
   var cats = exp.categories || [];
   // 堆叠条只画 Top5 + 其余合并，图例与之严格一一对应（否则条与图例对不上）
-  var segs = cats.slice(0, 5).map(function (c, i) {
-    return { label: c.category, cents: c.cents, color: COLORS[i] };
-  });
-  var restCents = cats.slice(5).reduce(function (a, c) {
-    return a + c.cents;
-  }, 0);
+  var segs = cats
+    .slice(0, 5)
+    .map((c, i) => ({ label: c.category, cents: c.cents, color: COLORS[i] }));
+  var restCents = cats.slice(5).reduce((a, c) => a + c.cents, 0);
   if (restCents > 0) {
     segs.push({ label: '其他 ' + (cats.length - 5) + ' 类', cents: restCents, color: REST_COLOR });
   }
   var monthCents = exp.month_cents || 1;
   el('exp-bar').innerHTML = segs.length
     ? segs
-        .map(function (s) {
-          return (
+        .map(
+          (s) =>
             '<span style="width:' +
             ((s.cents / monthCents) * 100).toFixed(2) +
             '%;background:' +
             s.color +
-            '"></span>'
-          );
-        })
+            '"></span>',
+        )
         .join('')
     : '<span style="width:100%;background:rgba(255,255,255,.06)"></span>';
   el('exp-legend').innerHTML =
     segs
-      .map(function (s) {
-        return (
+      .map(
+        (s) =>
           '<div><i style="background:' +
           s.color +
           '"></i>' +
           esc(s.label) +
           '<b>' +
           yuan(s.cents) +
-          '</b></div>'
-        );
-      })
+          '</b></div>',
+      )
       .join('') || '<div class="muted">本月还没有记账</div>';
 
   var day = Number(s.today.date.slice(8, 10));
@@ -154,9 +148,10 @@ function render(s) {
   ).getDate();
   // 「日均（至今）」必须只除到今天：本月合计按自然月全月含未来记账，
   // 直接用 month_cents / 日号会把提前录入的月末支出摊进「至今」。
-  var spentToDate = (exp.daily || []).reduce(function (a, d) {
-    return d.date <= s.today.date ? a + d.cents : a;
-  }, 0);
+  var spentToDate = (exp.daily || []).reduce(
+    (a, d) => (d.date <= s.today.date ? a + d.cents : a),
+    0,
+  );
   el('exp-stats').innerHTML =
     '<div class="stat"><div class="n">' +
     yuan(Math.round(spentToDate / Math.max(1, day))) +
@@ -176,8 +171,8 @@ function render(s) {
   var shown = next.slice(0, 4);
   el('sch-next').innerHTML = shown.length
     ? shown
-        .map(function (n) {
-          return (
+        .map(
+          (n) =>
             '<li><span class="t" title="' +
             esc(n.title) +
             '">' +
@@ -185,9 +180,8 @@ function render(s) {
             '</span>' +
             '<span class="w">' +
             esc(shortWhen(n.next_local)) +
-            '</span></li>'
-          );
-        })
+            '</span></li>',
+        )
         .join('') +
       (s.schedules.active > shown.length
         ? '<li class="more">还有 ' + (s.schedules.active - shown.length) + ' 项 · 点开看全部 ›</li>'
@@ -222,9 +216,7 @@ function render(s) {
     '</div><div class="l">近 24 小时</div></div>';
   el('spark').innerHTML = sparkline(s.notifications.daily || []);
   var daily = s.notifications.daily || [];
-  var peak = daily.reduce(function (a, d) {
-    return Math.max(a, d.sent);
-  }, 0);
+  var peak = daily.reduce((a, d) => Math.max(a, d.sent), 0);
   el('spark-cap').innerHTML = '<span>近 7 天投递</span><span>峰值 ' + peak + ' 条</span>';
   el('spark-from').textContent = daily.length ? daily[0].label : '';
   el('spark-to').textContent = daily.length ? daily[daily.length - 1].label + ' 今天' : '';
@@ -244,7 +236,7 @@ function render(s) {
     '</div><div class="l">24 小时失败</div></div>';
   /** @type {any} */
   var latestJob = null;
-  jobRuns.forEach(function (j) {
+  jobRuns.forEach((j) => {
     if (j.last_run && (latestJob === null || j.last_run.started_at > latestJob.started_at))
       latestJob = j.last_run;
   });
@@ -332,9 +324,7 @@ function render(s) {
           '节假日抓取失败',
           '<span class="bad">' +
             s.holidays.failed
-              .map(function (f) {
-                return f.year + ' 年（' + esc(String(f.error || '未知原因').slice(0, 80)) + '）';
-              })
+              .map((f) => f.year + ' 年（' + esc(String(f.error || '未知原因').slice(0, 80)) + '）')
               .join('、') +
             '</span>',
         )
@@ -424,7 +414,7 @@ function renderBudget(budget) {
     return;
   }
   body.innerHTML = ledgers
-    .map(function (l) {
+    .map((l) => {
       var html = '<div class="bud-item">';
       if (l.total) {
         html +=
@@ -454,7 +444,7 @@ function renderBudget(budget) {
           '<ul class="bud-cats">' +
           cats
             .slice(0, 6)
-            .map(function (c) {
+            .map((c) => {
               var pct = Math.max(0, Math.min(100, (c.ratio || 0) * 100));
               // 只有「超支 / 花速过快」才把整句建议塞进卡片；正常行保持简洁（完整建议在抽屉里）
               var advice =
@@ -514,26 +504,13 @@ function cronLabel(expr) {
 }
 function sparkline(daily) {
   if (!daily.length) return '';
-  var max = Math.max.apply(
-    null,
-    daily
-      .map(function (d) {
-        return d.sent;
-      })
-      .concat([1]),
-  );
+  var max = Math.max.apply(null, daily.map((d) => d.sent).concat([1]));
   var w = 300,
     h = 58,
     pad = 6;
   var step = daily.length > 1 ? (w - pad * 2) / (daily.length - 1) : 0;
-  var pts = daily.map(function (d, i) {
-    return [pad + i * step, h - 5 - (d.sent / max) * (h - 16)];
-  });
-  var line = pts
-    .map(function (p) {
-      return p[0].toFixed(1) + ',' + p[1].toFixed(1);
-    })
-    .join(' ');
+  var pts = daily.map((d, i) => [pad + i * step, h - 5 - (d.sent / max) * (h - 16)]);
+  var line = pts.map((p) => p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' ');
   var area = '0,' + h + ' ' + line + ' ' + w + ',' + h;
   var last = pts[pts.length - 1];
   return (
@@ -563,7 +540,7 @@ function sparkline(daily) {
 function refresh() {
   return api('/api/status')
     .then(render)
-    .catch(function (e) {
+    .catch((e) => {
       el('date-line').textContent = e.message;
       el('date-line').className = 'date bad';
     });
@@ -694,8 +671,8 @@ function setMoreState(btn, hasMore, nextOffset, loaded, total) {
   }
 }
 function bindLoadMore() {
-  Array.prototype.forEach.call(drawerBody.querySelectorAll('[data-load-more]'), function (btn) {
-    btn.addEventListener('click', function () {
+  Array.prototype.forEach.call(drawerBody.querySelectorAll('[data-load-more]'), (btn) => {
+    btn.addEventListener('click', () => {
       loadMore(btn);
     });
   });
@@ -714,7 +691,7 @@ function loadMore(btn) {
   btn.disabled = true;
   btn.textContent = '加载中…';
   api(path)
-    .then(function (d) {
+    .then((d) => {
       if (kind === 'expenses') {
         var fresh = d.entries || [];
         expEntries = expEntries.concat(fresh);
@@ -735,7 +712,7 @@ function loadMore(btn) {
         setMoreState(btn, d.has_more, d.next_offset, delItems.length, delTotal);
       }
     })
-    .catch(function (e) {
+    .catch((e) => {
       // 失败时保留当前页并恢复按钮：不能让一次网络抖动把已加载内容清空
       btn.disabled = false;
       if (kind === 'expenses') setMoreState(btn, true, Number(raw), expEntries.length, expTotal);
@@ -745,7 +722,7 @@ function loadMore(btn) {
 }
 
 function openExpenses(month) {
-  openDrawer('expenses', '支出明细', function () {
+  openDrawer('expenses', '支出明细', () => {
     var query = '/api/expenses?limit=50' + (month ? '&month=' + encodeURIComponent(month) : '');
     api(query).then(renderExpenses).catch(fail);
   });
@@ -778,8 +755,8 @@ function renderExpenses(d) {
     (d.categories.length
       ? '<table><tbody>' +
         d.categories
-          .map(function (c, i) {
-            return (
+          .map(
+            (c, i) =>
               '<tr><td><i style="display:inline-block;width:7px;height:7px;border-radius:2px;margin-right:8px;background:' +
               COLORS[i % COLORS.length] +
               '"></i>' +
@@ -793,9 +770,8 @@ function renderExpenses(d) {
               '</td>' +
               '<td class="num muted">' +
               (c.share * 100).toFixed(1) +
-              '%</td></tr>'
-            );
-          })
+              '%</td></tr>',
+          )
           .join('') +
         '</tbody></table>'
       : '<div class="empty">本月没有记账</div>') +
@@ -804,24 +780,21 @@ function renderExpenses(d) {
   if (d.daily.length) {
     var dmax = Math.max.apply(
       null,
-      d.daily.map(function (x) {
-        return x.cents;
-      }),
+      d.daily.map((x) => x.cents),
     );
     html +=
       '<div class="sect"><h3>按天</h3><div class="bars">' +
       d.daily
-        .map(function (x) {
-          return (
+        .map(
+          (x) =>
             '<div style="height:' +
             Math.max(4, (x.cents / dmax) * 100) +
             '%" title="' +
             esc(x.date) +
             ' ' +
             yuan(x.cents) +
-            '"></div>'
-          );
-        })
+            '"></div>',
+        )
         .join('') +
       '</div>' +
       '<div class="spark-axis"><span>' +
@@ -838,17 +811,16 @@ function renderExpenses(d) {
     html +=
       '<div class="sect"><h3>账本</h3><table><tbody>' +
       d.ledgers
-        .map(function (l) {
-          return (
+        .map(
+          (l) =>
             '<tr><td>' +
             esc(l.ledger_name) +
             '</td><td class="num muted">' +
             l.count +
             ' 笔</td><td class="num">' +
             yuan(l.cents) +
-            '</td></tr>'
-          );
-        })
+            '</td></tr>',
+        )
         .join('') +
       '</tbody></table></div>';
   }
@@ -866,13 +838,13 @@ function renderExpenses(d) {
   drawerBody.innerHTML = html;
   var list = el('exp-entries');
   if (list) list.innerHTML = expEntries.map(expenseRow).join('');
-  Array.prototype.forEach.call(drawerBody.querySelectorAll('[data-month]'), function (b) {
-    b.addEventListener('click', function () {
+  Array.prototype.forEach.call(drawerBody.querySelectorAll('[data-month]'), (b) => {
+    b.addEventListener('click', () => {
       openExpenses(b.getAttribute('data-month'));
     });
   });
-  Array.prototype.forEach.call(drawerBody.querySelectorAll('[data-export]'), function (b) {
-    b.addEventListener('click', function () {
+  Array.prototype.forEach.call(drawerBody.querySelectorAll('[data-export]'), (b) => {
+    b.addEventListener('click', () => {
       downloadCsv(b.getAttribute('data-export'));
     });
   });
@@ -883,7 +855,7 @@ function renderExpenses(d) {
 function downloadCsv(month) {
   // biome-ignore format: tests/expense-export.test.ts 按单行文本断言「按月拼 URL、凭据只走头」
   fetch('/api/expenses.csv?month=' + encodeURIComponent(month), token ? { headers: { Authorization: 'Bearer ' + token } } : {})
-    .then(function (r) {
+    .then((r) => {
       if (!r.ok)
         throw new Error(
           r.status === 401
@@ -892,7 +864,7 @@ function downloadCsv(month) {
         );
       return r.blob();
     })
-    .then(function (blob) {
+    .then((blob) => {
       var url = URL.createObjectURL(blob);
       var a = document.createElement('a');
       a.href = url;
@@ -900,11 +872,11 @@ function downloadCsv(month) {
       document.body.appendChild(a);
       a.click();
       a.remove();
-      setTimeout(function () {
+      setTimeout(() => {
         URL.revokeObjectURL(url);
       }, 1000);
     })
-    .catch(function (e) {
+    .catch((e) => {
       drawerSub.textContent = '导出失败：' + e.message;
     });
 }
@@ -923,9 +895,9 @@ function shiftMonth(ym, delta) {
 }
 
 function openSchedules() {
-  openDrawer('schedules', '日程明细', function () {
+  openDrawer('schedules', '日程明细', () => {
     api('/api/schedules')
-      .then(function (d) {
+      .then((d) => {
         drawerSub.textContent = d.items.length + ' 项';
         if (!d.items.length) {
           drawerBody.innerHTML = '<div class="empty">没有活跃日程</div>';
@@ -934,7 +906,7 @@ function openSchedules() {
         drawerBody.innerHTML =
           '<ul class="rowlist">' +
           d.items
-            .map(function (s) {
+            .map((s) => {
               var soon = s.days_until !== null && s.days_until <= 1;
               return (
                 '<li><div class="top"><span class="t">' +
@@ -972,7 +944,7 @@ function openSchedules() {
 }
 
 function openDeliveries() {
-  openDrawer('deliveries', '投递明细', function () {
+  openDrawer('deliveries', '投递明细', () => {
     api('/api/deliveries?limit=60').then(renderDeliveries).catch(fail);
   });
 }
@@ -981,19 +953,12 @@ function renderDeliveries(d) {
   delTotal = d.items_total;
   var c = d.counts;
   drawerSub.textContent = c.sent_24h + ' 条 / 24h';
-  var max = Math.max.apply(
-    null,
-    d.daily
-      .map(function (x) {
-        return x.sent;
-      })
-      .concat([1]),
-  );
+  var max = Math.max.apply(null, d.daily.map((x) => x.sent).concat([1]));
   var html =
     '<div class="sect"><h3>近 7 天</h3><div class="bars">' +
     d.daily
-      .map(function (x) {
-        return (
+      .map(
+        (x) =>
           '<div style="height:' +
           Math.max(4, (x.sent / max) * 100) +
           '%" title="' +
@@ -1003,9 +968,8 @@ function renderDeliveries(d) {
           ' 条">' +
           '<span>' +
           esc(x.label) +
-          '</span></div>'
-        );
-      })
+          '</span></div>',
+      )
       .join('') +
     '</div><div style="height:16px"></div>' +
     '<table><tbody>' +
@@ -1041,40 +1005,35 @@ function renderDeliveries(d) {
 }
 
 function openHolidays() {
-  openDrawer('holidays', '节假日明细', function () {
+  openDrawer('holidays', '节假日明细', () => {
     api('/api/holidays')
-      .then(function (d) {
-        var render = function (year) {
+      .then((d) => {
+        var render = (year) => {
           holYear = year;
           api('/api/holidays?year=' + year)
-            .then(function (h) {
+            .then((h) => {
               drawerSub.textContent = h.year + ' 年';
               var html =
                 '<div class="monthnav">' +
                 '<select class="sel" id="hol-year">' +
                 h.years
-                  .map(function (y) {
-                    return (
-                      '<option' + (y === h.year ? ' selected' : '') + '>' + esc(y) + '</option>'
-                    );
-                  })
+                  .map(
+                    (y) =>
+                      '<option' + (y === h.year ? ' selected' : '') + '>' + esc(y) + '</option>',
+                  )
                   .join('') +
                 '</select>' +
                 '<span class="muted">' +
-                h.days.filter(function (x) {
-                  return x.day_type === 'holiday';
-                }).length +
+                h.days.filter((x) => x.day_type === 'holiday').length +
                 ' 天假期 · ' +
-                h.days.filter(function (x) {
-                  return x.day_type === 'workday';
-                }).length +
+                h.days.filter((x) => x.day_type === 'workday').length +
                 ' 天调休</span></div>';
               if (h.upcoming.length) {
                 html +=
                   '<div class="sect"><h3>接下来的假期</h3><table><tbody>' +
                   h.upcoming
-                    .map(function (u) {
-                      return (
+                    .map(
+                      (u) =>
                         '<tr><td>' +
                         esc(u.name) +
                         '</td><td class="muted">' +
@@ -1086,9 +1045,8 @@ function openHolidays() {
                           : u.days_until === 0
                             ? '<span class="chip teal">今天</span>'
                             : u.days_until + ' 天后') +
-                        '</td></tr>'
-                      );
-                    })
+                        '</td></tr>',
+                    )
                     .join('') +
                   '</tbody></table></div>';
               }
@@ -1099,8 +1057,8 @@ function openHolidays() {
                 (h.days.length
                   ? '<table><thead><tr><th>日期</th><th>星期</th><th>名称</th><th class="num">类型</th></tr></thead><tbody>' +
                     h.days
-                      .map(function (x) {
-                        return (
+                      .map(
+                        (x) =>
                           '<tr><td>' +
                           esc(x.date.slice(5)) +
                           '</td><td class="muted">' +
@@ -1112,9 +1070,8 @@ function openHolidays() {
                           (x.day_type === 'holiday'
                             ? '<span class="chip green">休</span>'
                             : '<span class="chip amber">班</span>') +
-                          '</td></tr>'
-                        );
-                      })
+                          '</td></tr>',
+                      )
                       .join('') +
                     '</tbody></table>'
                   : '<div class="empty">该年份暂无数据</div>') +
@@ -1123,7 +1080,7 @@ function openHolidays() {
               /** @type {any} */
               var sel = el('hol-year');
               if (sel)
-                sel.addEventListener('change', function () {
+                sel.addEventListener('change', () => {
                   render(sel.value);
                 });
             })
@@ -1136,9 +1093,9 @@ function openHolidays() {
 }
 
 function openJobs() {
-  openDrawer('jobs', '定时任务', function () {
+  openDrawer('jobs', '定时任务', () => {
     api('/api/jobs')
-      .then(function (d) {
+      .then((d) => {
         var items = d.items || [];
         drawerSub.textContent = items.length + ' 个任务';
         if (!items.length) {
@@ -1148,12 +1105,12 @@ function openJobs() {
         drawerBody.innerHTML =
           '<div class="sect"><h3>任务与最近运行</h3><ul class="rowlist">' +
           items
-            .map(function (j) {
+            .map((j) => {
               var r = j.last_run;
               // 每个 job 展开最近 3 次运行：只看「最近一次」分不清「偶发失败」还是「一直失败」
-              var recent = (j.recent_runs || []).slice(0, 3).map(function (x) {
-                return jobChip(x.status) + ' ' + esc(stampShort(x.started_at));
-              });
+              var recent = (j.recent_runs || [])
+                .slice(0, 3)
+                .map((x) => jobChip(x.status) + ' ' + esc(stampShort(x.started_at)));
               return (
                 '<li><div class="top"><span class="t">' +
                 esc(j.module + '.' + j.name) +
@@ -1186,9 +1143,9 @@ function openJobs() {
 }
 
 function openBudget() {
-  openDrawer('budget', '预算明细', function () {
+  openDrawer('budget', '预算明细', () => {
     api('/api/budget')
-      .then(function (d) {
+      .then((d) => {
         var ledgers = d.ledgers || [];
         drawerSub.textContent = d.month;
         if (!ledgers.length) {
@@ -1196,7 +1153,7 @@ function openBudget() {
           return;
         }
         drawerBody.innerHTML = ledgers
-          .map(function (l) {
+          .map((l) => {
             var html = '<div class="sect"><h3>' + esc(l.ledger_name) + '</h3>';
             if (l.total) {
               html +=
@@ -1218,7 +1175,7 @@ function openBudget() {
               html +=
                 '<table><thead><tr><th>分类</th><th class="num">已用 / 预算</th><th class="num">剩余</th></tr></thead><tbody>' +
                 cats
-                  .map(function (c) {
+                  .map((c) => {
                     var cls = c.ratio >= 1 ? 'bad' : c.pace > 1.1 ? 'warn' : 'muted';
                     return (
                       '<tr><td>' +
@@ -1253,9 +1210,9 @@ function openBudget() {
 }
 
 function openSystem() {
-  openDrawer('system', '系统信息', function () {
+  openDrawer('system', '系统信息', () => {
     api('/api/status')
-      .then(function (s) {
+      .then((s) => {
         drawerBody.innerHTML =
           '<div class="sect"><table><tbody>' +
           '<tr><td>名称</td><td class="num">' +
@@ -1301,7 +1258,7 @@ function openSystem() {
 }
 
 var HANDLERS = {
-  expenses: function () {
+  expenses: () => {
     openExpenses(null);
   },
   schedules: openSchedules,
@@ -1321,7 +1278,7 @@ var TITLES = {
   system: '系统信息',
 };
 
-document.addEventListener('click', function (/** @type {any} */ ev) {
+document.addEventListener('click', (/** @type {any} */ ev) => {
   // 原始状态链接不能直接用 href：普通导航不会带 Authorization 头，配了 token
   // 必然 401。改为走页面已有的 api()（带 Bearer）并把 JSON 渲染在抽屉里。
   var raw = ev.target.closest('[data-api]');
@@ -1331,7 +1288,7 @@ document.addEventListener('click', function (/** @type {any} */ ev) {
     drawerSub.textContent = path;
     drawerBody.innerHTML = '<div class="spin">加载中…</div>';
     api(path)
-      .then(function (d) {
+      .then((d) => {
         drawerBody.innerHTML =
           '<pre style="white-space:pre-wrap;word-break:break-word;font-size:11.5px;margin:0">' +
           esc(JSON.stringify(d, null, 2)) +
@@ -1350,12 +1307,12 @@ document.addEventListener('click', function (/** @type {any} */ ev) {
   }
   if (ev.target === scrim || ev.target.closest('#drawer-close')) closeDrawer();
 });
-document.addEventListener('keydown', function (ev) {
+document.addEventListener('keydown', (ev) => {
   if (ev.key === 'Escape') closeDrawer();
 });
 
 refresh();
-setInterval(function () {
+setInterval(() => {
   refresh();
   // 只刷新「开着的那张抽屉」：关着时不重跑渲染函数（会白拉一次接口）。
   // 必须走已保存的渲染函数，而不是 HANDLERS[kind]——后者会重走 openDrawer，
